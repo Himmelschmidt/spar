@@ -46,15 +46,12 @@ pub fn probe(paths: &SparPaths, provider: &str, dry: bool) -> ProbeReport {
     let key = ProviderRef::parse(provider)
         .map(|pref| {
             if out.verdict == Verdict::Quota {
-                let text = out.output.as_deref().unwrap_or("");
-                match out.window {
-                    // Finished output carries no stream state: the window votes
-                    // alongside the prose, broadest wins, and prose-free output
-                    // leaves the typed bucket standing.
-                    Some(window) => pref
-                        .rejection_key(crate::providers::QuotaSignal::WindowAndText(&window, text)),
-                    None => pref.rejection_key(crate::providers::QuotaSignal::Text(text)),
-                }
+                // Window and text always travel together now: one vote each,
+                // broadest wins, resolved against the probed seat.
+                pref.rejection_key(crate::providers::QuotaSignal {
+                    window: out.window,
+                    text: out.output.as_deref().unwrap_or(""),
+                })
             } else {
                 pref.quota_key()
             }
@@ -523,32 +520,44 @@ mod tests {
 
     #[test]
     fn quota_key_selection_follows_the_output_named_bucket() {
-        use crate::providers::QuotaSignal;
-        let key_for = |provider: &str, output: &str| {
+        use crate::providers::{QuotaSignal, RateLimitWindow};
+        let key_for = |provider: &str, window: Option<RateLimitWindow>, output: &str| {
             ProviderRef::parse(provider)
                 .unwrap()
-                .rejection_key(QuotaSignal::Text(output))
+                .rejection_key(QuotaSignal {
+                    window,
+                    text: output,
+                })
         };
         assert_eq!(
-            key_for("cli:claude@opus", "You've hit your weekly limit"),
+            key_for("cli:claude@opus", None, "You've hit your weekly limit"),
             "cli:claude"
         );
         assert_eq!(
-            key_for("cli:claude@opus", "! rate limit  five_hour  rejected"),
+            key_for("cli:claude@opus", None, "! rate limit  five_hour  rejected"),
             "cli:claude"
         );
         assert_eq!(
-            key_for("cli:claude@opus", "You've reached your Opus limit"),
+            key_for("cli:claude@opus", None, "You've reached your Opus limit"),
             "cli:claude@opus"
         );
         assert_eq!(
-            key_for("cli:claude@sonnet", "You've reached your Opus limit"),
-            "cli:claude@opus"
+            key_for("cli:claude@sonnet", None, "You've reached your Opus limit"),
+            "cli:claude",
+            "another family's prose widens to the login"
         );
         assert_eq!(
-            key_for("cli:claude@haiku", "You've reached your Opus limit"),
-            "cli:claude@opus",
-            "the named bucket wins over the reporting seat"
+            key_for("cli:claude@haiku", None, "You've reached your Opus limit"),
+            "cli:claude"
+        );
+        assert_eq!(
+            key_for(
+                "cli:claude@opus",
+                Some(RateLimitWindow::SevenDayOpus),
+                "You've hit your weekly limit"
+            ),
+            "cli:claude",
+            "a generic line next to a family window widens to the login"
         );
     }
 

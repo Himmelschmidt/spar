@@ -2975,7 +2975,10 @@ fn detect_and_pause_quota(
                 // one hasn't, so a more precise cooldown a scrape *did* write is not
                 // downgraded.
                 let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-                if store.is_usable(key) {
+                // Own record, not the combined view: a weak parent pause must not
+                // suppress this key's own (strong, weekly) pause, or the family
+                // goes eligible again the moment the parent lapses.
+                if !store.record_quota_paused(key) {
                     store.pause_quota(key, format!("{key} {window} limit rejected"));
                     let _ = store.save(paths);
                 }
@@ -2991,7 +2994,8 @@ fn detect_and_pause_quota(
     // marks nothing because there is no record to upgrade.
     if let Some(line) = crate::quota::QuotaStore::scrape_strong_quota_signal(log_text) {
         let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-        if store.is_usable(key) {
+        // Own record, not the combined view: see above.
+        if !store.record_quota_paused(key) {
             store.pause_quota(key, line);
             let _ = store.save(paths);
         }
@@ -3021,19 +3025,20 @@ fn outcome_log_text(log_path: &Path, outcome: &SlotOutcome) -> String {
     }
 }
 
-/// Where a failed dispatch's pause lives, from the adapter's typed window when it
-/// emitted one, else from the log text. One pure function of the same outcome the
-/// scrape will see, computed before the witness is taken so the witness, the scrape,
-/// the classifier verdict and every pause write share the key.
+/// Where a failed dispatch's pause lives: the typed window (when the adapter
+/// emitted one) voting alongside the log tail, broadest wins, like the probe — one
+/// code path for both. One pure function of the same outcome the scrape will see,
+/// computed before the witness is taken so the witness, the scrape, the classifier
+/// verdict and every pause write share the key.
 fn quota_write_key(
     pref: &ProviderRef,
     structured: Option<RateLimitWindow>,
     log_text: &str,
 ) -> String {
-    match structured {
-        Some(window) => pref.rejection_key(QuotaSignal::Window(&window)),
-        None => pref.rejection_key(QuotaSignal::Text(log_text)),
-    }
+    pref.rejection_key(QuotaSignal {
+        window: structured,
+        text: log_text,
+    })
 }
 
 /// The glue between a failed dispatch's tail and [`detect_and_pause_quota`], shared by
@@ -3278,7 +3283,9 @@ fn classifier_verdict(
         ),
         Action::WeakPause if quota_hit && witness.as_ref().is_some_and(|w| w.ours(paths, key)) => {
             let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-            if store.is_usable(key) {
+            // Own record, not the combined view: a weak parent pause must not
+            // suppress weakening this dispatch's own record.
+            if !store.record_quota_paused(key) {
                 store.pause_quota(
                     key,
                     format!(
@@ -7047,18 +7054,18 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(store.blocks_live_dispatch("cli:claude@opus"));
     }
 
-    /// The mirror the other way: a Sonnet-window rejection reported by an opus
-    /// seat's dispatch still pauses only `cli:claude@sonnet` — the named bucket wins
-    /// over the reporting seat — and the opus seat's own key stays usable.
+    /// A window for another family widens to the login: a Sonnet-window rejection
+    /// reported by an opus seat pauses `cli:claude`, holding every seat on the
+    /// login, and writes no family bucket a sonnet seat would never read.
     #[test]
-    fn a_typed_sonnet_window_reported_by_an_opus_seat_pauses_only_sonnet() {
+    fn a_typed_window_for_another_family_widens_to_the_login() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let until = chrono::Utc::now() + chrono::Duration::hours(2);
         let log = "! rate limit  seven_day_sonnet  rejected\n";
         let seat = seat_ref("cli:claude@opus");
         let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDaySonnet), log);
-        assert_eq!(key, "cli:claude@sonnet");
+        assert_eq!(key, "cli:claude");
         assert!(detect_and_pause_quota(
             &paths,
             &seat,
@@ -7069,9 +7076,74 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             false
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        assert!(!store.is_usable("cli:claude"));
+        assert!(!store.is_usable("cli:claude@opus"));
         assert!(!store.is_usable("cli:claude@sonnet"));
-        assert!(store.is_usable("cli:claude@opus"));
-        assert!(store.is_usable("cli:claude"));
+        assert!(
+            store.record("cli:claude@sonnet").status == crate::quota::ProviderStatus::Available,
+            "no family bucket is written"
+        );
+    }
+
+    /// Dispatch uses window AND text: a family window next to a generic limit line
+    /// in the same tail widens to the login, exactly like the probe.
+    #[test]
+    fn a_generic_line_next_to_a_family_window_widens_the_dispatch_to_the_login() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let until = chrono::Utc::now() + chrono::Duration::hours(2);
+        let log = "! rate limit  seven_day_opus  rejected\nYou've hit your limit\n";
+        let seat = seat_ref("cli:claude@opus");
+        let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDayOpus), log);
+        assert_eq!(key, "cli:claude");
+        assert!(detect_and_pause_quota(
+            &paths,
+            &seat,
+            &key,
+            log,
+            Some(RateLimitWindow::SevenDayOpus),
+            Some(until),
+            false
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        assert!(!store.is_usable("cli:claude"));
+        assert!(!store.is_usable("cli:claude@opus"));
+    }
+
+    /// A weak parent pause must not suppress the family's own pause: a prose-only
+    /// family rejection writes its own (strong) record even while the parent holds
+    /// the combined view, so the family is still held once the parent lapses. The
+    /// old combined-view guard dropped this write entirely.
+    #[test]
+    fn a_weak_parent_pause_does_not_suppress_the_family_pause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log = "You've reached your Fable limit\n";
+        let seat = seat_ref("cli:claude@fable");
+        let key = quota_write_key(&seat, None, log);
+        assert_eq!(key, "cli:claude@fable");
+        {
+            let mut store = crate::quota::QuotaStore::load(&paths).unwrap_or_default();
+            store.pause_quota("cli:claude", "an earlier login-wide window");
+            let _ = store.save(&paths);
+        }
+        assert!(
+            !crate::quota::QuotaStore::load(&paths)
+                .unwrap()
+                .is_usable("cli:claude@fable"),
+            "the weak parent holds the family through the combined view"
+        );
+        assert!(detect_and_pause_quota(
+            &paths, &seat, &key, log, None, None, false
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        let own = store.record("cli:claude@fable");
+        assert_eq!(own.status, crate::quota::ProviderStatus::PausedQuota);
+        assert!(own.strong, "the family's own pause is trusted");
+        assert!(
+            store.record_quota_paused("cli:claude@fable"),
+            "the own record stands on its own"
+        );
     }
 
     /// A typed login-wide window on an opus seat pauses the login: sonnet and haiku

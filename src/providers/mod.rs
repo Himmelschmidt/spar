@@ -182,29 +182,13 @@ impl std::fmt::Display for RateLimitWindow {
     }
 }
 
-/// What one quota rejection covers on the login that reported it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuotaScope {
-    /// Every seat on the login (`cli:<name>`).
-    Login,
-    /// The dispatched seat's own bucket (`quota_bucket` of its model, else the login).
-    Seat,
-    /// One named bucket on the login, whichever seat reported it.
-    Bucket(&'static str),
-}
-
-/// What a dispatch said about quota: the adapter's typed window when it emitted one,
-/// else the text the rejection was read from.
+/// What a dispatch said about quota: the adapter's typed window when it emitted
+/// one, plus the text the rejection was read from. Either half may be absent; a
+/// half with nothing to say casts no vote.
 #[derive(Debug, Clone, Copy)]
-pub enum QuotaSignal<'a> {
-    Window(&'a RateLimitWindow),
-    Text(&'a str),
-    /// A typed window together with the full text: the window votes alongside the
-    /// text's rejection lines, broadest wins, while text with no rejection lines
-    /// abstains (unlike `Text` alone, which defaults to login-wide). The probe
-    /// uses this: finished output carries no stream state, so a generic prose line
-    /// next to a family window widens the pause to the login.
-    WindowAndText(&'a RateLimitWindow, &'a str),
+pub struct QuotaSignal<'a> {
+    pub window: Option<RateLimitWindow>,
+    pub text: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,12 +244,16 @@ pub trait ProviderAdapter: Send + Sync {
     fn quota_bucket<'m>(&self, _model: &'m str) -> Option<Cow<'m, str>> {
         None
     }
-    /// What a rejection covers: the typed window when the adapter emitted one, else
-    /// the text it was read from. `seat` is the dispatched seat's model, when the
-    /// seat names one: a `Seat`-scoped vote can only be compared against text votes
-    /// once it is resolved to that seat's bucket. Defaults to the whole login.
-    fn rejection_scope(&self, _seat: Option<&str>, _signal: QuotaSignal<'_>) -> QuotaScope {
-        QuotaScope::Login
+    /// The quota bucket a rejection covers, `None` for the whole login: the
+    /// signal's votes resolved against the dispatched seat's own bucket. No votes,
+    /// any login-wide vote, or disagreeing votes all widen to the login.
+    /// `seat` is the seat's model, when it names one. Defaults to the login.
+    fn rejection_scope<'m>(
+        &self,
+        _seat: Option<&'m str>,
+        _signal: QuotaSignal<'_>,
+    ) -> Option<Cow<'m, str>> {
+        None
     }
     fn binary_names(&self) -> &[&'static str];
     fn capabilities(&self) -> Capabilities;

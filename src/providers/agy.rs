@@ -1,6 +1,6 @@
 use super::{
-    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, QuotaScope, QuotaSignal,
-    SpawnOpts, TrustPolicy,
+    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, QuotaSignal, SpawnOpts,
+    TrustPolicy,
 };
 use std::path::Path;
 use std::process::Command;
@@ -16,8 +16,12 @@ impl ProviderAdapter for AgyAdapter {
         Some(std::borrow::Cow::Borrowed(model))
     }
 
-    fn rejection_scope(&self, _seat: Option<&str>, _signal: QuotaSignal<'_>) -> QuotaScope {
-        QuotaScope::Seat
+    fn rejection_scope<'m>(
+        &self,
+        seat: Option<&'m str>,
+        _signal: QuotaSignal<'_>,
+    ) -> Option<std::borrow::Cow<'m, str>> {
+        seat.and_then(|m| self.quota_bucket(m))
     }
 
     // No turn-boundary push spar drives, so messages wait for the next turn and

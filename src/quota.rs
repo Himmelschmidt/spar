@@ -17,7 +17,7 @@ const DEFAULT_COOLDOWN_MINS: i64 = 30;
 /// "rate limiting") and anything else — an ordinary implementer building or testing a
 /// rate limiter must not trip the same discriminator that routes a run to
 /// `Phase::Quota`, but a provider reporting "rate limits exceeded" must.
-fn contains_phrase(lower: &str, phrase: &str) -> bool {
+pub(crate) fn contains_phrase(lower: &str, phrase: &str) -> bool {
     let mut start = 0;
     while let Some(pos) = lower[start..].find(phrase) {
         let idx = start + pos;
@@ -645,9 +645,12 @@ impl QuotaStore {
                 // "5-hour limit" in its usage-limit messages (changelog). The full
                 // sentence is inferred from the weekly one; no live capture yet.
                 || contains_phrase(&lower, "hit your 5-hour limit")
-                // A generic limit line names no window ("You've hit your limit") and a
-                // per-model one names its family ("You've reached your Fable limit").
-                || contains_phrase(&lower, "hit your limit")
+                // A generic limit line names no window ("You've hit your limit").
+                // Matched with the "you've" framing: bare "hit your limit" also
+                // matches advice prose ("if you hit your limit, wait"). The family
+                // sentences ("you've reached your Fable limit") live in
+                // `ClaudeFamily::limit_line`, matched the same way.
+                || contains_phrase(&lower, "you've hit your limit")
                 || ClaudeFamily::limit_line(&lower).is_some()
                 || is_agy_quota_rejection(&lower)
                 // muse's dispatch-time 429 reads "Subscription quota exhausted" (#153).
@@ -859,24 +862,31 @@ pub fn scrape_claude_rate_limits(
 
 /// The CLI's plain-text rejection states its own reset ("resets 12am
 /// (America/New_York)") rather than emitting the `five_hour` JSON shape above. Only
-/// fires when the log both names a rate/usage limit and states a reset, so it never
-/// fires on an unrelated log that happens to mention "rate limit" in passing. When the
-/// stated reset can be found but not parsed (unknown tz, unexpected format), still
-/// reports the hit so the caller pauses the provider — the fallback is the generic
-/// default-cooldown pause, made visible on stderr rather than silently guessed.
+/// fires when one line both names a rate/usage limit and states a reset, so a limit
+/// phrase on one line and an unrelated "resets the counter" three pages later never
+/// combine into a pause. When the stated reset can be found but not parsed (unknown
+/// tz, unexpected format), still reports the hit so the caller pauses the provider —
+/// the fallback is the generic default-cooldown pause, made visible on stderr
+/// rather than silently guessed.
 pub(crate) fn scrape_claude_stated_reset(log: &str) -> Option<(Option<DateTime<Utc>>, String)> {
-    let lower = log.to_ascii_lowercase();
+    log.lines().find_map(stated_reset_in_line)
+}
+
+/// The single-line version of the gate above: the limit phrase, the reset clause
+/// and the period classification all come from the same line.
+fn stated_reset_in_line(line: &str) -> Option<(Option<DateTime<Utc>>, String)> {
+    let lower = line.to_ascii_lowercase();
     if !lower.contains("resets ") {
         return None;
     }
-    // A per-model family line is a weekly-window rejection (`seven_day_*`), and a
-    // generic limit line is a rejection all the same; both count as limit phrases.
+    // A per-model family sentence is a weekly-window rejection (`seven_day_*`),
+    // and a generic limit sentence is a rejection all the same; both count.
     let family = ClaudeFamily::limit_line(&lower);
     if !(lower.contains("rate limit")
         || lower.contains("weekly limit")
         || lower.contains("usage limit")
         || lower.contains("5-hour limit")
-        || lower.contains("hit your limit")
+        || contains_phrase(&lower, "you've hit your limit")
         || family.is_some())
     {
         return None;
@@ -898,7 +908,7 @@ pub(crate) fn scrape_claude_stated_reset(log: &str) -> Option<(Option<DateTime<U
             format!("claude {period} limit (no stated reset instant, default cooldown)"),
         ));
     }
-    match parse_stated_reset(log, Utc::now()) {
+    match parse_reset_clause_in_line(line, Utc::now()) {
         Some(until) => Some((
             Some(until),
             format!("claude {period} limit, resets {}", until.to_rfc3339()),
@@ -924,17 +934,6 @@ pub(crate) fn scrape_claude_stated_reset(log: &str) -> Option<(Option<DateTime<U
 /// clause. An earlier, unrelated "resets " elsewhere in an 8000-byte tail must not
 /// make a real reset line downstream go unparsed and silently degrade to the generic
 /// cooldown.
-fn parse_stated_reset(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    for line in text.lines() {
-        if line.to_ascii_lowercase().contains("resets ") {
-            if let Some(until) = parse_reset_clause_in_line(line, now) {
-                return Some(until);
-            }
-        }
-    }
-    None
-}
-
 fn parse_reset_clause_in_line(line: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let lower = line.to_ascii_lowercase();
     let resets_at = lower.find("resets ")? + "resets ".len();
@@ -1132,7 +1131,7 @@ mod tests {
         );
 
         let five_hour = "! rate limit  five_hour  rejected\n\
-                         You've hit your session limit \u{b7} resets 12:40pm (America/New_York)\n";
+                         You've hit your 5-hour limit \u{b7} resets 12:40pm (America/New_York)\n";
         let (until, _) = scrape_claude_stated_reset(five_hour).expect("five-hour must be a hit");
         assert!(
             until.is_some(),
@@ -1646,13 +1645,27 @@ mod tests {
     #[test]
     fn scrape_claude_rate_limits_falls_back_when_reset_unparseable() {
         let log = "! rate limit  five_hour  rejected\n\
-            You've hit your session limit \u{b7} resets whenever (Nowhere/Fake)\n";
+            You've hit your 5-hour limit \u{b7} resets whenever (Nowhere/Fake)\n";
         let (until, hint) = scrape_claude_rate_limits("cli:claude", log).unwrap();
         assert!(
             until.is_none(),
             "unparseable reset must fall back to the generic default cooldown, not guess"
         );
         assert!(hint.contains("unparseable"), "hint: {hint}");
+    }
+
+    #[test]
+    fn scrape_claude_stated_reset_needs_phrase_and_reset_on_one_line() {
+        // A limit sentence on one line and an unrelated "resets ..." pages later
+        // must not combine into a pause.
+        assert!(scrape_claude_stated_reset(
+            "You've hit your weekly limit\ncache resets every hour during warmup\n"
+        )
+        .is_none());
+        assert!(scrape_claude_stated_reset(
+            "Known Haiku limitations\nresets the counter every midnight\n"
+        )
+        .is_none());
     }
 
     #[test]
@@ -1677,28 +1690,39 @@ mod tests {
     }
 
     #[test]
-    fn parse_stated_reset_skips_an_earlier_unrelated_resets_line() {
+    fn stated_reset_skips_an_earlier_unrelated_resets_line() {
         // A noisy real log can mention "resets " once before the actual limit line
         // (e.g. an unrelated cache/session message). The anchor must not lock onto
         // that first occurrence and give up — it has to keep scanning to the real one.
         let log = "cache resets every 10 minutes during warmup\n\
             ! rate limit  seven_day  rejected\n\
             You've hit your weekly limit \u{b7} resets 12am (America/New_York)\n";
-        let now = DateTime::parse_from_rfc3339("2026-09-04T20:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let until = parse_stated_reset(log, now).expect("must find the real reset line");
+        let (until, detail) =
+            scrape_claude_stated_reset(log).expect("must find the real reset line");
+        assert!(
+            until.is_none(),
+            "the text path never infers a weekly reset instant"
+        );
+        assert!(detail.contains("weekly limit"));
+        // The same scan through a five-hour line does state a parseable instant.
+        let (until, _) = scrape_claude_stated_reset(
+            "cache resets every 10 minutes during warmup\n\
+            You've hit your 5-hour limit · resets 3:30pm (UTC)\n",
+        )
+        .expect("must find the five-hour reset line");
+        let until = until.expect("a five-hour line states a reset instant");
+        let now = Utc::now();
         assert!(until > now);
-        assert!(until - now < chrono::Duration::hours(9));
+        assert!(until - now < chrono::Duration::hours(24));
     }
 
     #[test]
-    fn parse_stated_reset_rolls_to_next_day_when_already_past() {
+    fn reset_clause_rolls_to_next_day_when_already_past() {
         // Fixed "now" well past midnight ET: the next weekly reset is tomorrow, not today.
         let now = DateTime::parse_from_rfc3339("2026-09-04T20:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let until = parse_stated_reset(
+        let until = parse_reset_clause_in_line(
             "You've hit your weekly limit \u{b7} resets 12am (America/New_York)",
             now,
         )
@@ -1995,6 +2019,14 @@ mod tests {
         let rate_limiter_rejected =
             "test: the rate limiter rejected the request as expected ... FAILED";
         let capacity_doc_edit = "updated docs/capacity-planning.md with Q3 projections";
+        // Bare family mentions and unframed "hit your limit" advice: only the
+        // "you've reached/hit your ..." rejection sentence counts.
+        let family_mentions = [
+            "Known Haiku limitations",
+            "docs: explain the Opus limit to users",
+            "if you hit your limit, wait",
+            "Sonnet limits are documented",
+        ];
         for log in [
             panic_with_429,
             quota_module_edit,
@@ -2005,6 +2037,16 @@ mod tests {
             assert!(
                 QuotaStore::scrape_strong_quota_signal(log).is_none(),
                 "false positive on: {log}"
+            );
+        }
+        for log in family_mentions {
+            assert!(
+                QuotaStore::scrape_strong_quota_signal(log).is_none(),
+                "false positive on: {log}"
+            );
+            assert!(
+                ClaudeFamily::limit_line(&log.to_ascii_lowercase()).is_none(),
+                "family false positive on: {log}"
             );
         }
     }

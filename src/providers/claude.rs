@@ -1,6 +1,6 @@
 use super::{
-    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, QuotaScope, QuotaSignal,
-    RateLimitWindow, SpawnOpts, TrustPolicy,
+    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, QuotaSignal, RateLimitWindow,
+    SpawnOpts, TrustPolicy,
 };
 use std::path::Path;
 use std::process::Command;
@@ -31,18 +31,29 @@ impl ClaudeFamily {
         }
     }
 
-    /// The seat spellings that dispatch as this family: the bare alias, or a
-    /// `claude-<family>-` full id (dated or versioned), case-insensitive, with any
-    /// `[...]` suffix ignored (`opus[1m]`, `claude-opus-5-5[1m]`).
+    /// The seat spellings that dispatch as this family: the bare alias (with an
+    /// optional trailing version digit), or a `claude-` full id holding a family
+    /// segment (`claude-<family>-…`, `claude-<version>-<family>-…`,
+    /// `claude-<family><digit>`), case-insensitive, with any `[...]` suffix
+    /// ignored (`opus[1m]`, `claude-opus-5-5[1m]`). Anything else — `opusplan`,
+    /// `default`, `opus-degraded`, `magnum-opus` — is not a family seat.
     pub fn of(model: &str) -> Option<Self> {
         let lower = model.to_ascii_lowercase();
         let base = lower.split('[').next().unwrap_or("").trim();
-        Self::ALL.into_iter().find(|f| {
-            let name = f.name();
-            base == name
-                || base == format!("claude-{name}")
-                || base.starts_with(&format!("claude-{name}-"))
-        })
+        match base.strip_prefix("claude-") {
+            Some(rest) => Self::ALL.into_iter().find(|f| {
+                let name = f.name();
+                rest == name
+                    || rest.split('-').any(|seg| seg == name)
+                    || rest
+                        .split('-')
+                        .any(|seg| seg.trim_end_matches(|c: char| c.is_ascii_digit()) == name)
+            }),
+            None => Self::ALL.into_iter().find(|f| {
+                let name = f.name();
+                base == name || base.trim_end_matches(|c: char| c.is_ascii_digit()) == name
+            }),
+        }
     }
 
     /// The per-model weekly bucket, `None` for a family with no per-model window.
@@ -53,121 +64,63 @@ impl ClaudeFamily {
         }
     }
 
-    /// The family a per-model rejection line names ("You've reached your Fable limit").
+    /// The family a per-model rejection line names, matched as the rejection
+    /// sentence only ("you've reached your Fable limit", "you've hit your Sonnet
+    /// limit"): a bare "{family} limit" also matches documentation and task
+    /// prose ("Known Haiku limitations", "explain the Opus limit"), which must
+    /// never read as a rejection.
     pub fn limit_line(lower_line: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|f| lower_line.contains(&format!("{} limit", f.name())))
+        Self::ALL.into_iter().find(|f| {
+            crate::quota::contains_phrase(
+                lower_line,
+                &format!("you've reached your {} limit", f.name()),
+            ) || crate::quota::contains_phrase(
+                lower_line,
+                &format!("you've hit your {} limit", f.name()),
+            )
+        })
     }
 }
 
-fn bucket_scope(family: ClaudeFamily) -> QuotaScope {
-    match family.bucket() {
-        Some(bucket) => QuotaScope::Bucket(bucket),
-        None => QuotaScope::Login,
-    }
-}
-
-fn window_scope(window: &RateLimitWindow) -> QuotaScope {
+/// The family a typed window votes for: `None` is a login-wide vote. An
+/// overage-included window names no family on the wire, so it votes the seat it
+/// was dispatched on — which is `None` (login-wide) when the seat names no family.
+fn window_vote(
+    window: &RateLimitWindow,
+    seat_family: Option<ClaudeFamily>,
+) -> Option<ClaudeFamily> {
     match window {
         RateLimitWindow::FiveHour
         | RateLimitWindow::SevenDay
         | RateLimitWindow::Overage
         | RateLimitWindow::RateLimit
-        | RateLimitWindow::Unknown => QuotaScope::Login,
-        RateLimitWindow::SevenDayOpus => bucket_scope(ClaudeFamily::Opus),
-        RateLimitWindow::SevenDaySonnet => bucket_scope(ClaudeFamily::Sonnet),
-        RateLimitWindow::SevenDayOverageIncluded => QuotaScope::Seat,
+        | RateLimitWindow::Unknown => None,
+        RateLimitWindow::SevenDayOpus => Some(ClaudeFamily::Opus),
+        RateLimitWindow::SevenDaySonnet => Some(ClaudeFamily::Sonnet),
+        RateLimitWindow::SevenDayOverageIncluded => seat_family,
     }
 }
 
-/// The scope one rejection line votes for, when the line is a rejection at all: a
-/// rendered `! rate limit <window> rejected` line maps through the window table, a
-/// line the strong signal accepts maps through the family it names (or login-wide
-/// when it names none). `None` for any other line.
-fn line_scope(line: &str) -> Option<QuotaScope> {
+/// The family one text line votes for: `None` is a login-wide vote, and a line
+/// with no rejection content abstains. Rendered `! rate limit <window> rejected`
+/// lines vote their window's family; a line the strong signal accepts votes the
+/// family it names, or login-wide when it names none.
+fn line_vote(line: &str, seat_family: Option<ClaudeFamily>) -> Option<Option<ClaudeFamily>> {
     let trimmed = line.trim();
     let body = trimmed.strip_prefix('!').unwrap_or(trimmed).trim();
     if let Some(rest) = body.strip_prefix("rate limit") {
         let mut parts = rest.split_whitespace();
         if let (Some(window), Some(status)) = (parts.next(), parts.next()) {
             if status == "rejected" {
-                return Some(window_scope(&RateLimitWindow::parse(window)));
+                return Some(window_vote(&RateLimitWindow::parse(window), seat_family));
             }
         }
     }
     if crate::quota::QuotaStore::scrape_strong_quota_signal(line).is_some() {
         let lower = line.to_ascii_lowercase();
-        return Some(match ClaudeFamily::limit_line(&lower) {
-            Some(family) => bucket_scope(family),
-            None => QuotaScope::Login,
-        });
+        return Some(ClaudeFamily::limit_line(&lower));
     }
     None
-}
-
-/// The rejection votes across text lines: the named family bucket when every line
-/// agrees on one, whether any vote is seat-scoped, and whether any vote is
-/// login-wide (or two votes disagree, which also widens to the login).
-fn scope_votes(log: &str) -> (Option<&'static str>, bool, bool) {
-    let mut bucket: Option<&'static str> = None;
-    let mut seat = false;
-    let mut login = false;
-    for line in log.lines() {
-        match line_scope(line) {
-            None => {}
-            Some(QuotaScope::Login) => login = true,
-            Some(QuotaScope::Seat) => seat = true,
-            Some(QuotaScope::Bucket(b)) => match bucket {
-                None => bucket = Some(b),
-                Some(cur) if cur == b => {}
-                Some(_) => login = true,
-            },
-        }
-    }
-    (bucket, seat, login)
-}
-
-fn reduce_votes(bucket: Option<&'static str>, seat: bool, login: bool) -> QuotaScope {
-    if login || (bucket.is_some() && seat) || (bucket.is_none() && !seat) {
-        return QuotaScope::Login;
-    }
-    match bucket {
-        Some(b) => QuotaScope::Bucket(b),
-        None => QuotaScope::Seat,
-    }
-}
-
-fn text_scope(log: &str) -> QuotaScope {
-    let (bucket, seat, login) = scope_votes(log);
-    reduce_votes(bucket, seat, login)
-}
-
-/// A typed window voting alongside text lines: the window's scope joins the same
-/// ballot, broadest wins, and text with no rejection lines contributes nothing, so
-/// a lone typed event keeps its bucket. A seat-scoped window vote is resolved
-/// against the dispatched seat's bucket: when the text names that same bucket,
-/// both votes agree and the bucket stands, otherwise the vote stays seat-scoped
-/// and widens exactly as an unknown seat would.
-fn combined_scope(seat: Option<&str>, window: &RateLimitWindow, log: &str) -> QuotaScope {
-    let (mut bucket, mut seat_vote, mut login) = scope_votes(log);
-    let seat_bucket = seat
-        .and_then(ClaudeFamily::of)
-        .and_then(ClaudeFamily::bucket);
-    match window_scope(window) {
-        QuotaScope::Login => login = true,
-        QuotaScope::Seat => match (seat_bucket, bucket) {
-            (Some(own), Some(named)) if own != named => login = true,
-            (Some(_), Some(_)) => {}
-            _ => seat_vote = true,
-        },
-        QuotaScope::Bucket(b) => match bucket {
-            None => bucket = Some(b),
-            Some(cur) if cur == b => {}
-            Some(_) => login = true,
-        },
-    }
-    reduce_votes(bucket, seat_vote, login)
 }
 
 impl ProviderAdapter for ClaudeAdapter {
@@ -181,12 +134,40 @@ impl ProviderAdapter for ClaudeAdapter {
             .map(std::borrow::Cow::Borrowed)
     }
 
-    fn rejection_scope(&self, seat: Option<&str>, signal: QuotaSignal<'_>) -> QuotaScope {
-        match signal {
-            QuotaSignal::Window(window) => window_scope(window),
-            QuotaSignal::Text(log) => text_scope(log),
-            QuotaSignal::WindowAndText(window, log) => combined_scope(seat, window, log),
+    /// The bucket this rejection covers, `None` for the whole login. The typed
+    /// window (when present) and every rejection line each vote a family — `None`
+    /// for a login-wide vote — resolved against the dispatched seat's own family:
+    /// a vote for another family widens to the login, so a family bucket only ever
+    /// holds the seat it belongs to. No votes, any login-wide vote, or disagreeing
+    /// votes all widen to the login.
+    fn rejection_scope<'m>(
+        &self,
+        seat: Option<&'m str>,
+        signal: QuotaSignal<'_>,
+    ) -> Option<std::borrow::Cow<'m, str>> {
+        let seat_family = seat.and_then(ClaudeFamily::of);
+        let mut any = false;
+        let mut login = false;
+        let mut cast = |vote: Option<ClaudeFamily>| {
+            any = true;
+            if vote != seat_family {
+                login = true;
+            }
+        };
+        if let Some(window) = signal.window {
+            cast(window_vote(&window, seat_family));
         }
+        for line in signal.text.lines() {
+            if let Some(vote) = line_vote(line, seat_family) {
+                cast(vote);
+            }
+        }
+        if !any || login {
+            return None;
+        }
+        seat_family
+            .and_then(|f| f.bucket())
+            .map(std::borrow::Cow::Borrowed)
     }
 
     fn delivery_strategy(&self) -> DeliveryStrategy {
@@ -509,6 +490,18 @@ mod tests {
         for m in ["sonnet", "claude-sonnet-5-5", "claude-sonnet-4-5-20250929"] {
             assert_eq!(F::of(m), Some(F::Sonnet), "{m}");
         }
+        for m in [
+            "claude-3-5-sonnet-20241022",
+            "claude-3-opus-20240229",
+            "claude-opus4",
+        ] {
+            let want = if m.contains("sonnet") {
+                F::Sonnet
+            } else {
+                F::Opus
+            };
+            assert_eq!(F::of(m), Some(want), "{m}");
+        }
         assert_eq!(F::of("haiku"), Some(F::Haiku));
         assert_eq!(F::of("claude-haiku-5-5"), Some(F::Haiku));
         assert_eq!(F::of("fable"), Some(F::Fable));
@@ -516,6 +509,9 @@ mod tests {
         assert_eq!(F::of("pro"), None);
         assert_eq!(F::of(""), None);
         assert_eq!(F::of("opus-degraded"), None);
+        assert_eq!(F::of("opusplan"), None);
+        assert_eq!(F::of("default"), None);
+        assert_eq!(F::of("magnum-opus"), None);
     }
 
     #[test]
@@ -543,8 +539,19 @@ mod tests {
 
     #[test]
     fn rejection_scope_maps_the_window_table() {
-        use QuotaScope as S;
         use RateLimitWindow as W;
+        let scope = |seat: Option<&str>, w: W| {
+            ClaudeAdapter
+                .rejection_scope(
+                    seat,
+                    QuotaSignal {
+                        window: Some(w),
+                        text: "",
+                    },
+                )
+                .as_deref()
+                .map(str::to_string)
+        };
         for w in [
             W::FiveHour,
             W::SevenDay,
@@ -552,102 +559,171 @@ mod tests {
             W::RateLimit,
             W::Unknown,
         ] {
-            assert_eq!(
-                ClaudeAdapter.rejection_scope(None, QuotaSignal::Window(&w)),
-                S::Login,
-                "{w}"
-            );
+            assert_eq!(scope(Some("opus"), w), None, "{w}");
+            assert_eq!(scope(None, w), None, "{w}");
         }
+        assert_eq!(scope(Some("opus"), W::SevenDayOpus), Some("opus".into()));
         assert_eq!(
-            ClaudeAdapter.rejection_scope(None, QuotaSignal::Window(&W::SevenDayOpus)),
-            S::Bucket("opus")
+            scope(Some("sonnet"), W::SevenDayOpus),
+            None,
+            "another family's window widens to the login"
         );
         assert_eq!(
-            ClaudeAdapter.rejection_scope(None, QuotaSignal::Window(&W::SevenDaySonnet)),
-            S::Bucket("sonnet")
+            scope(None, W::SevenDayOpus),
+            None,
+            "a seatless signal widens to the login"
         );
         assert_eq!(
-            ClaudeAdapter.rejection_scope(None, QuotaSignal::Window(&W::SevenDayOverageIncluded)),
-            S::Seat
+            scope(Some("sonnet"), W::SevenDaySonnet),
+            Some("sonnet".into())
         );
+        assert_eq!(scope(Some("opus"), W::SevenDaySonnet), None);
+        assert_eq!(
+            scope(Some("opus"), W::SevenDayOverageIncluded),
+            Some("opus".into())
+        );
+        assert_eq!(
+            scope(Some("haiku"), W::SevenDayOverageIncluded),
+            None,
+            "haiku has no bucket"
+        );
+        assert_eq!(scope(None, W::SevenDayOverageIncluded), None);
     }
 
     #[test]
     fn rejection_scope_reads_prose_lines() {
-        use QuotaScope as S;
-        let text = |l: &str| ClaudeAdapter.rejection_scope(None, QuotaSignal::Text(l));
-        assert_eq!(text("You've reached your Fable limit"), S::Bucket("fable"));
+        let text = |seat: Option<&str>, l: &str| {
+            ClaudeAdapter
+                .rejection_scope(
+                    seat,
+                    QuotaSignal {
+                        window: None,
+                        text: l,
+                    },
+                )
+                .as_deref()
+                .map(str::to_string)
+        };
         assert_eq!(
-            text("! rate limit  seven_day_opus  rejected"),
-            S::Bucket("opus")
+            text(Some("fable"), "You've reached your Fable limit"),
+            Some("fable".into())
         );
-        assert_eq!(text("You've hit your weekly limit"), S::Login);
         assert_eq!(
-            text("You've reached your Fable limit\nYou've hit your weekly limit"),
-            S::Login,
+            text(Some("opus"), "! rate limit  seven_day_opus  rejected"),
+            Some("opus".into())
+        );
+        assert_eq!(
+            text(Some("claude-opus-5-5"), "You've reached your Opus limit"),
+            Some("opus".into()),
+            "full ids share the family bucket"
+        );
+        assert_eq!(
+            text(Some("sonnet"), "You've reached your Opus limit"),
+            None,
+            "another family's prose widens to the login"
+        );
+        assert_eq!(text(None, "You've reached your Fable limit"), None);
+        assert_eq!(text(Some("opus"), "You've hit your weekly limit"), None);
+        assert_eq!(
+            text(
+                Some("opus"),
+                "You've reached your Fable limit\nYou've hit your weekly limit"
+            ),
+            None,
             "any login-wide line wins"
         );
         assert_eq!(
-            text("You've reached your Opus limit\nYou've reached your Sonnet limit"),
-            S::Login,
+            text(
+                Some("opus"),
+                "You've reached your Opus limit\nYou've reached your Sonnet limit"
+            ),
+            None,
             "mixed families widen to the login"
         );
-        assert_eq!(text("all quiet here"), S::Login);
+        assert_eq!(text(Some("opus"), "all quiet here"), None);
+        for (seat, prose) in [
+            (Some("haiku"), "Known Haiku limitations"),
+            (Some("opus"), "docs: explain the Opus limit to users"),
+            (Some("opus"), "if you hit your limit, wait"),
+            (Some("sonnet"), "Sonnet limits are documented"),
+        ] {
+            assert_eq!(text(seat, prose), None, "false positive on: {prose}");
+        }
     }
 
     #[test]
     fn rejection_scope_combines_a_window_with_prose() {
-        use QuotaScope as S;
         use RateLimitWindow as W;
-        let both = |s: Option<&str>, w: &W, l: &str| {
-            ClaudeAdapter.rejection_scope(s, QuotaSignal::WindowAndText(w, l))
+        let both = |s: Option<&str>, w: W, l: &str| {
+            ClaudeAdapter
+                .rejection_scope(
+                    s,
+                    QuotaSignal {
+                        window: Some(w),
+                        text: l,
+                    },
+                )
+                .as_deref()
+                .map(str::to_string)
         };
         assert_eq!(
-            both(None, &W::SevenDayOpus, "{\"type\":\"rate_limit_event\"}"),
-            S::Bucket("opus"),
+            both(
+                Some("opus"),
+                W::SevenDayOpus,
+                "{\"type\":\"rate_limit_event\"}"
+            ),
+            Some("opus".into()),
             "prose-free output leaves the typed bucket standing"
         );
         assert_eq!(
-            both(None, &W::SevenDayOpus, "You've hit your limit"),
-            S::Login,
+            both(Some("opus"), W::SevenDayOpus, "You've hit your limit"),
+            None,
             "a generic line next to a family window widens to the login"
-        );
-        assert_eq!(
-            both(None, &W::SevenDayOpus, "You've reached your Opus limit"),
-            S::Bucket("opus")
-        );
-        assert_eq!(
-            both(None, &W::SevenDayOpus, "You've reached your Fable limit"),
-            S::Login,
-            "conflicting families widen to the login"
-        );
-        assert_eq!(
-            both(None, &W::SevenDayOverageIncluded, "all quiet here"),
-            S::Seat
-        );
-        assert_eq!(both(None, &W::FiveHour, "all quiet here"), S::Login);
-        assert_eq!(
-            both(
-                Some("fable"),
-                &W::SevenDayOverageIncluded,
-                "You've reached your Fable limit"
-            ),
-            S::Bucket("fable"),
-            "both signals name the dispatched family"
         );
         assert_eq!(
             both(
                 Some("opus"),
-                &W::SevenDayOverageIncluded,
+                W::SevenDayOpus,
+                "You've reached your Opus limit"
+            ),
+            Some("opus".into())
+        );
+        assert_eq!(
+            both(
+                Some("opus"),
+                W::SevenDayOpus,
                 "You've reached your Fable limit"
             ),
-            S::Login,
+            None,
+            "conflicting families widen to the login"
+        );
+        assert_eq!(
+            both(Some("opus"), W::SevenDayOverageIncluded, "all quiet here"),
+            Some("opus".into())
+        );
+        assert_eq!(both(Some("opus"), W::FiveHour, "all quiet here"), None);
+        assert_eq!(
+            both(
+                Some("fable"),
+                W::SevenDayOverageIncluded,
+                "You've reached your Fable limit"
+            ),
+            Some("fable".into()),
+            "both signals name the dispatched family"
+        );
+        assert_eq!(
+            both(
+                Some("sonnet"),
+                W::SevenDayOverageIncluded,
+                "You've reached your Fable limit"
+            ),
+            None,
             "the text names another family's bucket"
         );
         assert_eq!(
-            both(Some("opus"), &W::SevenDayOverageIncluded, "all quiet here"),
-            S::Seat,
-            "prose-free output stays seat-scoped for the key to resolve"
+            both(Some("haiku"), W::SevenDayOverageIncluded, "all quiet here"),
+            None,
+            "haiku has no bucket even when the seat matches the prose-free window"
         );
     }
 

@@ -116,23 +116,19 @@ impl ProviderRef {
         }
     }
 
-    /// Where a rejection's pause lives, from the signal, not just the seat: a
-    /// login-wide window lands on the login even when the seat has a bucket, a named
-    /// bucket lands there whichever seat reported it, and the seat's own bucket
-    /// resolves through [`quota_key`](Self::quota_key). No adapter means the login.
+    /// Where a rejection's pause lives, from the signal resolved against this seat:
+    /// the bucket the adapter names, or the login when it names none (no votes, a
+    /// login-wide vote, disagreeing votes, or a vote for another seat's family).
+    /// No adapter means the login.
     pub fn rejection_key(&self, signal: crate::providers::QuotaSignal<'_>) -> String {
         if self.backend != ExecBackend::NativeCli {
             return self.quota_key();
         }
-        let Some(adapter) = crate::providers::adapter_named(&self.storage_key()) else {
-            return self.quota_key();
-        };
-        match adapter.rejection_scope(self.model.as_deref(), signal) {
-            crate::providers::QuotaScope::Login => self.storage_key(),
-            crate::providers::QuotaScope::Seat => self.quota_key(),
-            crate::providers::QuotaScope::Bucket(bucket) => {
-                format!("{}@{bucket}", self.storage_key())
-            }
+        match crate::providers::adapter_named(&self.storage_key())
+            .and_then(|a| a.rejection_scope(self.model.as_deref(), signal))
+        {
+            Some(bucket) => format!("{}@{bucket}", self.storage_key()),
+            None => self.storage_key(),
         }
     }
 
@@ -285,71 +281,92 @@ mod tests {
     #[test]
     fn rejection_key_follows_the_signal_for_claude() {
         use crate::providers::{QuotaSignal, RateLimitWindow as W};
-        let opus = ProviderRef::parse("cli:claude@opus").unwrap();
-        let window = |w: &W| opus.rejection_key(QuotaSignal::Window(w));
-        assert_eq!(window(&W::SevenDayOpus), "cli:claude@opus");
-        assert_eq!(window(&W::SevenDaySonnet), "cli:claude@sonnet");
-        assert_eq!(window(&W::FiveHour), "cli:claude");
-        assert_eq!(window(&W::SevenDay), "cli:claude");
-        assert_eq!(window(&W::SevenDayOverageIncluded), "cli:claude@opus");
-        let haiku = ProviderRef::parse("cli:claude@haiku").unwrap();
+        let key = |seat: &str, window: Option<W>, text: &str| {
+            ProviderRef::parse(seat)
+                .unwrap()
+                .rejection_key(QuotaSignal { window, text })
+        };
         assert_eq!(
-            haiku.rejection_key(QuotaSignal::Window(&W::SevenDayOverageIncluded)),
-            "cli:claude"
-        );
-        let sonnet = ProviderRef::parse("cli:claude@sonnet").unwrap();
-        assert_eq!(
-            sonnet.rejection_key(QuotaSignal::Window(&W::SevenDayOpus)),
-            "cli:claude@opus",
-            "a named bucket lands there whichever seat reported it"
+            key("cli:claude@opus", Some(W::SevenDayOpus), ""),
+            "cli:claude@opus"
         );
         assert_eq!(
-            opus.rejection_key(QuotaSignal::Text("You've reached your Fable limit")),
-            "cli:claude@fable"
-        );
-        assert_eq!(
-            opus.rejection_key(QuotaSignal::Text("You've hit your weekly limit")),
-            "cli:claude"
-        );
-        assert_eq!(
-            opus.rejection_key(QuotaSignal::WindowAndText(
-                &W::SevenDayOpus,
-                "You've hit your limit"
-            )),
+            key("cli:claude@opus", Some(W::SevenDaySonnet), ""),
             "cli:claude",
-            "a generic line next to a family window widens to the login"
+            "another family's window widens to the login"
+        );
+        assert_eq!(key("cli:claude@opus", Some(W::FiveHour), ""), "cli:claude");
+        assert_eq!(key("cli:claude@opus", Some(W::SevenDay), ""), "cli:claude");
+        assert_eq!(
+            key("cli:claude@opus", Some(W::SevenDayOverageIncluded), ""),
+            "cli:claude@opus"
         );
         assert_eq!(
-            opus.rejection_key(QuotaSignal::WindowAndText(&W::SevenDayOpus, "")),
-            "cli:claude@opus",
-            "prose-free output leaves the typed bucket standing"
+            key("cli:claude@haiku", Some(W::SevenDayOverageIncluded), ""),
+            "cli:claude",
+            "haiku has no bucket"
         );
-        let fable = ProviderRef::parse("cli:claude@fable").unwrap();
         assert_eq!(
-            fable.rejection_key(QuotaSignal::WindowAndText(
-                &W::SevenDayOverageIncluded,
+            key("cli:claude", Some(W::SevenDayOpus), ""),
+            "cli:claude",
+            "a bare seat has no family bucket to land on"
+        );
+        assert_eq!(
+            key("cli:claude@opusplan", Some(W::SevenDayOpus), ""),
+            "cli:claude",
+            "an unrecognized model keys the login"
+        );
+        assert_eq!(
+            key(
+                "cli:claude@fable",
+                Some(W::SevenDayOverageIncluded),
                 "You've reached your Fable limit"
-            )),
+            ),
             "cli:claude@fable",
             "an overage window with matching family prose pauses that family"
         );
         assert_eq!(
-            opus.rejection_key(QuotaSignal::WindowAndText(
-                &W::SevenDayOverageIncluded,
+            key(
+                "cli:claude@opus",
+                Some(W::SevenDayOverageIncluded),
                 "You've reached your Fable limit"
-            )),
+            ),
             "cli:claude",
             "an overage window with another family's prose widens to the login"
         );
+        assert_eq!(
+            key("cli:claude@opus", None, "You've reached your Fable limit"),
+            "cli:claude",
+            "prose naming another family widens to the login"
+        );
+        assert_eq!(
+            key("cli:claude@fable", None, "You've reached your Fable limit"),
+            "cli:claude@fable"
+        );
+        assert_eq!(
+            key("cli:claude@opus", None, "You've hit your weekly limit"),
+            "cli:claude"
+        );
+        assert_eq!(
+            key("cli:claude@sonnet", None, ""),
+            "cli:claude",
+            "text with no rejection signal widens to the login"
+        );
         let agy = ProviderRef::parse("cli:agy@flash").unwrap();
         assert_eq!(
-            agy.rejection_key(QuotaSignal::Window(&W::FiveHour)),
+            agy.rejection_key(QuotaSignal {
+                window: Some(W::FiveHour),
+                text: ""
+            }),
             "cli:agy@flash",
             "agy always writes the seat"
         );
         let codex = ProviderRef::parse("cli:codex@gpt-5").unwrap();
         assert_eq!(
-            codex.rejection_key(QuotaSignal::Window(&W::SevenDayOpus)),
+            codex.rejection_key(QuotaSignal {
+                window: Some(W::SevenDayOpus),
+                text: ""
+            }),
             "cli:codex"
         );
     }
