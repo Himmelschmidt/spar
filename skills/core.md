@@ -175,7 +175,11 @@ Exception: claude meters its weekly windows per model family. A `seven_day_opus`
 rejection pauses only `cli:claude@opus`, `seven_day_sonnet` only
 `cli:claude@sonnet`, a "Fable limit" line only `cli:claude@fable`; login-wide
 windows (`five_hour`, `seven_day`, `overage`, generic limit lines) pause
-`cli:claude` and hold every family. `provider resume cli:claude` clears the login
+`cli:claude` and hold every family. A family pause lands only for the reporting
+seat's own family: the same rejection from another family's seat, or from a bare
+`cli:claude` seat, pauses the login instead. The typed window and the rejection
+text vote together under one rule for dispatch and probe, and any login-wide line
+widens to the login. `provider resume cli:claude` clears the login
 and every family; `provider resume cli:claude@opus` clears one. Haiku has no weekly
 window, so a haiku seat keys the login. Fleet keys carry the family
 (`cli:claude#label@opus`). The backup same-login rule stays per login: two claude
