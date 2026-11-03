@@ -1,14 +1,152 @@
 use super::{
-    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, SpawnOpts, TrustPolicy,
+    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, QuotaScope, QuotaSignal,
+    RateLimitWindow, SpawnOpts, TrustPolicy,
 };
 use std::path::Path;
 use std::process::Command;
 
 pub struct ClaudeAdapter;
 
+/// The model family a claude seat dispatches as. Per-model weekly windows cover one
+/// family (`seven_day_opus`, `seven_day_sonnet`, the "Fable limit" prose), so one
+/// family shares one quota bucket regardless of seat spelling (`opus` and
+/// `claude-opus-5-5` are one bucket); haiku has no per-model window and keys the login.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeFamily {
+    Opus,
+    Sonnet,
+    Haiku,
+    Fable,
+}
+
+impl ClaudeFamily {
+    pub const ALL: [Self; 4] = [Self::Opus, Self::Sonnet, Self::Haiku, Self::Fable];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Opus => "opus",
+            Self::Sonnet => "sonnet",
+            Self::Haiku => "haiku",
+            Self::Fable => "fable",
+        }
+    }
+
+    /// The seat spellings that dispatch as this family: the bare alias, or a
+    /// `claude-<family>-` full id (dated or versioned), case-insensitive, with any
+    /// `[...]` suffix ignored (`opus[1m]`, `claude-opus-5-5[1m]`).
+    pub fn of(model: &str) -> Option<Self> {
+        let lower = model.to_ascii_lowercase();
+        let base = lower.split('[').next().unwrap_or("").trim();
+        Self::ALL.into_iter().find(|f| {
+            let name = f.name();
+            base == name
+                || base == format!("claude-{name}")
+                || base.starts_with(&format!("claude-{name}-"))
+        })
+    }
+
+    /// The per-model weekly bucket, `None` for a family with no per-model window.
+    fn bucket(self) -> Option<&'static str> {
+        match self {
+            Self::Haiku => None,
+            _ => Some(self.name()),
+        }
+    }
+
+    /// The family a per-model rejection line names ("You've reached your Fable limit").
+    pub fn limit_line(lower_line: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|f| lower_line.contains(&format!("{} limit", f.name())))
+    }
+}
+
+fn bucket_scope(family: ClaudeFamily) -> QuotaScope {
+    match family.bucket() {
+        Some(bucket) => QuotaScope::Bucket(bucket),
+        None => QuotaScope::Login,
+    }
+}
+
+fn window_scope(window: &RateLimitWindow) -> QuotaScope {
+    match window {
+        RateLimitWindow::FiveHour
+        | RateLimitWindow::SevenDay
+        | RateLimitWindow::Overage
+        | RateLimitWindow::RateLimit
+        | RateLimitWindow::Unknown => QuotaScope::Login,
+        RateLimitWindow::SevenDayOpus => bucket_scope(ClaudeFamily::Opus),
+        RateLimitWindow::SevenDaySonnet => bucket_scope(ClaudeFamily::Sonnet),
+        RateLimitWindow::SevenDayOverageIncluded => QuotaScope::Seat,
+    }
+}
+
+/// The scope one rejection line votes for, when the line is a rejection at all: a
+/// rendered `! rate limit <window> rejected` line maps through the window table, a
+/// line the strong signal accepts maps through the family it names (or login-wide
+/// when it names none). `None` for any other line.
+fn line_scope(line: &str) -> Option<QuotaScope> {
+    let trimmed = line.trim();
+    let body = trimmed.strip_prefix('!').unwrap_or(trimmed).trim();
+    if let Some(rest) = body.strip_prefix("rate limit") {
+        let mut parts = rest.split_whitespace();
+        if let (Some(window), Some(status)) = (parts.next(), parts.next()) {
+            if status == "rejected" {
+                return Some(window_scope(&RateLimitWindow::parse(window)));
+            }
+        }
+    }
+    if crate::quota::QuotaStore::scrape_strong_quota_signal(line).is_some() {
+        let lower = line.to_ascii_lowercase();
+        return Some(match ClaudeFamily::limit_line(&lower) {
+            Some(family) => bucket_scope(family),
+            None => QuotaScope::Login,
+        });
+    }
+    None
+}
+
+fn text_scope(log: &str) -> QuotaScope {
+    let mut bucket: Option<&'static str> = None;
+    let mut seat = false;
+    let mut login = false;
+    for line in log.lines() {
+        match line_scope(line) {
+            None => {}
+            Some(QuotaScope::Login) => login = true,
+            Some(QuotaScope::Seat) => seat = true,
+            Some(QuotaScope::Bucket(b)) => match bucket {
+                None => bucket = Some(b),
+                Some(cur) if cur == b => {}
+                Some(_) => login = true,
+            },
+        }
+    }
+    if login || (bucket.is_some() && seat) || (bucket.is_none() && !seat) {
+        return QuotaScope::Login;
+    }
+    match bucket {
+        Some(b) => QuotaScope::Bucket(b),
+        None => QuotaScope::Seat,
+    }
+}
+
 impl ProviderAdapter for ClaudeAdapter {
     fn name(&self) -> &'static str {
         "claude"
+    }
+
+    fn quota_bucket<'m>(&self, model: &'m str) -> Option<std::borrow::Cow<'m, str>> {
+        ClaudeFamily::of(model)
+            .and_then(|f| f.bucket())
+            .map(std::borrow::Cow::Borrowed)
+    }
+
+    fn rejection_scope(&self, signal: QuotaSignal<'_>) -> QuotaScope {
+        match signal {
+            QuotaSignal::Window(window) => window_scope(window),
+            QuotaSignal::Text(log) => text_scope(log),
+        }
     }
 
     fn delivery_strategy(&self) -> DeliveryStrategy {
@@ -313,6 +451,108 @@ mod tests {
             id,
             Some(1),
         ));
+    }
+
+    #[test]
+    fn family_parsing_canonicalizes_seat_spellings() {
+        use ClaudeFamily as F;
+        for m in [
+            "opus",
+            "Opus",
+            "OPUS",
+            "claude-opus-4-1",
+            "claude-opus-5-5",
+            "opus[1m]",
+        ] {
+            assert_eq!(F::of(m), Some(F::Opus), "{m}");
+        }
+        for m in ["sonnet", "claude-sonnet-5-5", "claude-sonnet-4-5-20250929"] {
+            assert_eq!(F::of(m), Some(F::Sonnet), "{m}");
+        }
+        assert_eq!(F::of("haiku"), Some(F::Haiku));
+        assert_eq!(F::of("claude-haiku-5-5"), Some(F::Haiku));
+        assert_eq!(F::of("fable"), Some(F::Fable));
+        assert_eq!(F::of("claude-fable-5-1"), Some(F::Fable));
+        assert_eq!(F::of("pro"), None);
+        assert_eq!(F::of(""), None);
+        assert_eq!(F::of("opus-degraded"), None);
+    }
+
+    #[test]
+    fn haiku_has_no_bucket_while_siblings_do() {
+        assert_eq!(ClaudeFamily::Haiku.bucket(), None);
+        assert_eq!(ClaudeFamily::Opus.bucket(), Some("opus"));
+        assert_eq!(ClaudeFamily::Sonnet.bucket(), Some("sonnet"));
+        assert_eq!(ClaudeFamily::Fable.bucket(), Some("fable"));
+    }
+
+    #[test]
+    fn quota_bucket_is_the_family_or_nothing() {
+        use std::borrow::Cow;
+        assert_eq!(
+            ClaudeAdapter.quota_bucket("claude-opus-5-5"),
+            Some(Cow::Borrowed("opus"))
+        );
+        assert_eq!(
+            ClaudeAdapter.quota_bucket("opus"),
+            Some(Cow::Borrowed("opus"))
+        );
+        assert_eq!(ClaudeAdapter.quota_bucket("haiku"), None);
+        assert_eq!(ClaudeAdapter.quota_bucket("pro"), None);
+    }
+
+    #[test]
+    fn rejection_scope_maps_the_window_table() {
+        use QuotaScope as S;
+        use RateLimitWindow as W;
+        for w in [
+            W::FiveHour,
+            W::SevenDay,
+            W::Overage,
+            W::RateLimit,
+            W::Unknown,
+        ] {
+            assert_eq!(
+                ClaudeAdapter.rejection_scope(QuotaSignal::Window(&w)),
+                S::Login,
+                "{w}"
+            );
+        }
+        assert_eq!(
+            ClaudeAdapter.rejection_scope(QuotaSignal::Window(&W::SevenDayOpus)),
+            S::Bucket("opus")
+        );
+        assert_eq!(
+            ClaudeAdapter.rejection_scope(QuotaSignal::Window(&W::SevenDaySonnet)),
+            S::Bucket("sonnet")
+        );
+        assert_eq!(
+            ClaudeAdapter.rejection_scope(QuotaSignal::Window(&W::SevenDayOverageIncluded)),
+            S::Seat
+        );
+    }
+
+    #[test]
+    fn rejection_scope_reads_prose_lines() {
+        use QuotaScope as S;
+        let text = |l: &str| ClaudeAdapter.rejection_scope(QuotaSignal::Text(l));
+        assert_eq!(text("You've reached your Fable limit"), S::Bucket("fable"));
+        assert_eq!(
+            text("! rate limit  seven_day_opus  rejected"),
+            S::Bucket("opus")
+        );
+        assert_eq!(text("You've hit your weekly limit"), S::Login);
+        assert_eq!(
+            text("You've reached your Fable limit\nYou've hit your weekly limit"),
+            S::Login,
+            "any login-wide line wins"
+        );
+        assert_eq!(
+            text("You've reached your Opus limit\nYou've reached your Sonnet limit"),
+            S::Login,
+            "mixed families widen to the login"
+        );
+        assert_eq!(text("all quiet here"), S::Login);
     }
 
     #[test]

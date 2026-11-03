@@ -12,12 +12,13 @@ pub mod presence;
 pub mod usage;
 
 use crate::provider_ref::{ExecBackend, ProviderRef};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub use agy::AgyAdapter;
-pub use claude::ClaudeAdapter;
+pub use claude::{ClaudeAdapter, ClaudeFamily};
 pub use codex::CodexAdapter;
 pub use grok::GrokAdapter;
 pub use muse::MuseAdapter;
@@ -129,10 +130,75 @@ impl Default for Capabilities {
     }
 }
 
+/// The wire window of a typed rate-limit rejection, parsed at the stream boundary
+/// (`process.rs`) so scope decisions downstream match on the type, never on strings.
+/// `RateLimit` is spar's own verdict for adapters whose provider error names a rate
+/// limit (pi); `Unknown` covers an empty or unrecognized `rateLimitType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitWindow {
+    FiveHour,
+    SevenDay,
+    SevenDayOpus,
+    SevenDaySonnet,
+    SevenDayOverageIncluded,
+    Overage,
+    RateLimit,
+    #[serde(other)]
+    Unknown,
+}
+
+impl RateLimitWindow {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "five_hour" => Self::FiveHour,
+            "seven_day" => Self::SevenDay,
+            "seven_day_opus" => Self::SevenDayOpus,
+            "seven_day_sonnet" => Self::SevenDaySonnet,
+            "seven_day_overage_included" => Self::SevenDayOverageIncluded,
+            "overage" => Self::Overage,
+            "rate_limit" => Self::RateLimit,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FiveHour => "five_hour",
+            Self::SevenDay => "seven_day",
+            Self::SevenDayOpus => "seven_day_opus",
+            Self::SevenDaySonnet => "seven_day_sonnet",
+            Self::SevenDayOverageIncluded => "seven_day_overage_included",
+            Self::Overage => "overage",
+            Self::RateLimit => "rate_limit",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for RateLimitWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What one quota rejection covers on the login that reported it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaScope {
-    Account,
-    Model,
+    /// Every seat on the login (`cli:<name>`).
+    Login,
+    /// The dispatched seat's own bucket (`quota_bucket` of its model, else the login).
+    Seat,
+    /// One named bucket on the login, whichever seat reported it.
+    Bucket(&'static str),
+}
+
+/// What a dispatch said about quota: the adapter's typed window when it emitted one,
+/// else the text the rejection was read from.
+#[derive(Debug, Clone, Copy)]
+pub enum QuotaSignal<'a> {
+    Window(&'a RateLimitWindow),
+    Text(&'a str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,10 +247,17 @@ pub struct SpawnOpts {
 
 pub trait ProviderAdapter: Send + Sync {
     fn name(&self) -> &'static str;
-    /// Whether quota pauses cover the whole login (`Account`) or one model on it
-    /// (`Model`). The quota key derives from this, never from a name list.
-    fn quota_scope(&self) -> QuotaScope {
-        QuotaScope::Account
+    /// The quota bucket a model on this adapter bills to: the model itself when the
+    /// provider meters models separately (agy), a canonical family bucket when it
+    /// meters families (claude), `None` when every seat bills login-wide. The quota
+    /// key derives from this, never from a name list.
+    fn quota_bucket<'m>(&self, _model: &'m str) -> Option<Cow<'m, str>> {
+        None
+    }
+    /// What a rejection covers: the typed window when the adapter emitted one, else
+    /// the text it was read from. Defaults to the whole login.
+    fn rejection_scope(&self, _signal: QuotaSignal<'_>) -> QuotaScope {
+        QuotaScope::Login
     }
     fn binary_names(&self) -> &[&'static str];
     fn capabilities(&self) -> Capabilities;
