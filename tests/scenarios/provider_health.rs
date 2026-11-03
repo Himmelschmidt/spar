@@ -852,10 +852,293 @@ fn provider_pause_and_resume_span_model_keys_for_model_scoped_providers() {
     assert_eq!(models[0]["name"], "cli:agy@gemini-flash");
     assert_eq!(models[0]["quota_status"], "paused_manual");
 
+    let out = fx
+        .spar()
+        .args(["provider", "resume", "cli:agy@gemini-flash", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value =
+        serde_json::from_slice(&out).expect("resume --json is one JSON value");
+    assert_eq!(v["name"], "cli:agy@gemini-flash");
+    assert_eq!(v["held_by"], "cli:agy");
+
     fx.spar()
         .args(["provider", "resume", "cli:agy"])
         .assert()
         .success();
     let agy = list_entry(&fx, "agy");
     assert_eq!(agy["quota_status"], "available");
+    let models = agy["models"].as_array().unwrap();
+    assert_eq!(models.len(), 1, "a resumed model still lists: {agy}");
+    assert_eq!(models[0]["name"], "cli:agy@gemini-flash");
+    assert_eq!(models[0]["quota_status"], "available");
+}
+
+/// Artifact body for a fake agy: satisfies whatever artifact the slot owes.
+fn agy_artifacts() -> String {
+    "run=\"${SPAR_AGENT_ID%%:*}\"; slot=\"${SPAR_AGENT_ID#*:}\"\n\
+    art=\"$FAKE_PROJECT_ROOT/.spar/runs/$run/artifacts\"\n\
+    mkdir -p \"$art\"\n\
+    printf '## Plan\\ndone\\n' > \"$art/plan.md\"\n\
+    printf '## Tests\\ndone\\n' > \"$art/test-contract.md\"\n\
+    case \"$slot\" in\n\
+      review-*) printf '## Verdict\\napprove\\n\\nReviewed-Commit: %s\\n\\n## Findings\\nnone\\n' \"$(git -C \"$FAKE_PROJECT_ROOT\" rev-parse HEAD)\" > \"$art/review-$slot.md\";;\n\
+      *) printf '## Summary\\ndone\\n' > \"$art/summary-$slot.md\";;\n\
+    esac\nexit 0"
+        .into()
+}
+
+/// A fake agy: counts real dispatches (`--print-timeout` leads the headless
+/// argv) and satisfies whatever artifact the slot owes.
+fn agy_fake(count: bool) -> String {
+    let body = agy_artifacts();
+    if count {
+        counted_agy(&body)
+    } else {
+        format!("case \"$1\" in --print-timeout) ;; *) exit 0;; esac\n{body}")
+    }
+}
+
+/// Counts agy dispatches like `counted` does for claude/codex.
+fn counted_agy(body: &str) -> String {
+    format!(
+        "case \"$1\" in --print-timeout) echo x >> \"$FAKE_COUNT_DIR/agy.count\";; *) exit 0;; esac\n{body}"
+    )
+}
+
+/// AC-1 at the implement run-start gate: a flash-model pause does not bench the
+/// pro seat, while a pro pause parks the run.
+#[test]
+fn implement_run_start_gate_is_per_model_for_agy() {
+    let fx = Fixture::new();
+    fx.cli("agy", &agy_fake(false));
+    fx.spar()
+        .args(["provider", "pause", "cli:agy@flash"])
+        .assert()
+        .success();
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:agy@pro",
+            "--role",
+            "reviewer=cli:agy@pro",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .code(2);
+    assert_eq!(fx.state()["phase"], "awaiting_ship_confirm");
+
+    let fx = Fixture::new();
+    fx.cli("agy", &agy_fake(true));
+    fx.spar()
+        .args(["provider", "pause", "cli:agy@pro"])
+        .assert()
+        .success();
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:agy@pro",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .code(4);
+    assert_eq!(fx.count("agy"), 0, "the paused model never dispatched");
+    assert_eq!(fx.state()["phase"], "quota");
+    assert!(
+        fx.state()["error"]
+            .as_str()
+            .unwrap()
+            .contains("cli:agy@pro"),
+        "{}",
+        fx.state()["error"]
+    );
+}
+
+/// AC-1 at the plan dispatch gate: a flash-model pause does not stop the pro panel.
+#[test]
+fn plan_dispatch_gate_is_per_model_for_agy() {
+    let fx = Fixture::new();
+    fx.cli("agy", &agy_fake(false));
+    fx.spar()
+        .args(["provider", "pause", "cli:agy@flash"])
+        .assert()
+        .success();
+    fx.spar()
+        .args([
+            "plan",
+            "-t",
+            "add a feature",
+            "--role",
+            "planner=cli:agy@pro",
+            "--providers",
+            "cli:agy@pro",
+        ])
+        .assert()
+        .code(2);
+    assert_eq!(fx.state()["phase"], "awaiting_plan_approval");
+}
+
+/// AC-4 in a live implement run: the reviewer sits on a paused pro model with a
+/// flash backup, which is the same subscription, so the run parks with the
+/// no-eligible-backup message exactly as for one provider. The primary comes
+/// from the pool (a declared same-login pair is rejected at launch instead).
+#[test]
+fn reviewer_with_same_sub_backup_parks_with_no_eligible_backup() {
+    let fx = Fixture::new();
+    let spar = assert_cmd::cargo::cargo_bin("spar");
+    fx.cli(
+        "agy",
+        &counted_agy(&format!(
+            "\"{}\" provider pause cli:agy@pro >/dev/null\n{}",
+            spar.display(),
+            agy_artifacts()
+        )),
+    );
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--providers",
+            "cli:agy@pro",
+            "--backup",
+            "reviewer=cli:agy@flash",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .code(4);
+    assert_eq!(fx.count("agy"), 1, "only the implementer dispatched");
+    let state = fx.state();
+    assert_eq!(state["phase"], "quota");
+    let err = state["error"].as_str().unwrap();
+    assert!(
+        err.contains("cli:agy@pro") && err.contains("no eligible backup"),
+        "{err}"
+    );
+}
+
+/// A declared same-login primary/backup pair is rejected at launch, exactly as
+/// one provider with two names for it.
+#[test]
+fn same_sub_primary_and_backup_are_rejected_at_launch() {
+    let fx = Fixture::new();
+    fx.cli("agy", &agy_fake(false));
+    let err = fx
+        .spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "reviewer=cli:agy@pro",
+            "--backup",
+            "reviewer=cli:agy@flash",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    assert!(
+        String::from_utf8(err)
+            .unwrap()
+            .contains("same provider storage key as primary (cli:agy)"),
+        "same-sub pair rejected like one provider"
+    );
+}
+
+/// AC-2 end to end: an auth fault on one agy model sets `auth_fault` on the slot
+/// and pauses neither quota key.
+#[test]
+fn an_implementer_auth_rejection_on_an_agy_model_sets_auth_fault_and_pauses_nothing() {
+    let fx = Fixture::new();
+    fx.cli(
+        "agy",
+        "case \"$1\" in --print-timeout) echo x >> \"$FAKE_COUNT_DIR/agy.count\";; *) exit 0;; esac\necho 'invalid_grant: refresh token expired'\nexit 1",
+    );
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:agy@pro",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .code(4);
+    let state = fx.state();
+    assert_eq!(state["phase"], "quota");
+    assert!(
+        state["error"].as_str().unwrap().contains("auth"),
+        "{}",
+        state["error"]
+    );
+    let slot = fx.slot("implementer");
+    assert_eq!(slot["auth_fault"], true);
+    assert_eq!(slot["model"], "pro");
+    let quota = fx.quota();
+    for key in ["cli:agy", "cli:agy@pro", "cli:agy@flash"] {
+        assert!(
+            quota["providers"].get(key).is_none(),
+            "auth pauses no quota key: {quota}"
+        );
+    }
+}
+
+/// AC-4 on the plan side: the test-author seat on a paused pro model with a
+/// flash backup is the same subscription, so `amend` refuses with the
+/// no-eligible-backup message instead of dispatching the paused model.
+#[test]
+fn amend_with_same_sub_backup_parks_with_no_eligible_backup() {
+    let fx = Fixture::new();
+    fx.cli("agy", &agy_fake(false));
+    fs::write(
+        fx.proj.join("spar.toml"),
+        "[backups]\ntest_author = \"cli:agy@flash\"\n",
+    )
+    .unwrap();
+    fx.spar()
+        .args(["plan", "-t", "add a feature", "--providers", "cli:agy@pro"])
+        .assert()
+        .code(2);
+    let run_id = fx.run_id();
+    fx.spar()
+        .args(["provider", "pause", "cli:agy@pro"])
+        .assert()
+        .success();
+    let err = fx
+        .spar()
+        .args([
+            "amend",
+            "--run",
+            &run_id,
+            "--contract",
+            "tighten the checks",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let err = String::from_utf8(err).unwrap();
+    assert!(
+        err.contains("cli:agy@pro") && err.contains("no eligible backup"),
+        "{err}"
+    );
 }

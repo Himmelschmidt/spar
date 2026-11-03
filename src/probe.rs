@@ -73,16 +73,19 @@ fn apply(
         written: false,
         what: what.into(),
     };
-    if store.is_manually_paused(key) && matches!(verdict, Verdict::Healthy | Verdict::Quota) {
+    if store.record_manually_paused(key) && matches!(verdict, Verdict::Healthy | Verdict::Quota) {
         return kept("manual pause kept");
     }
     match verdict {
-        Verdict::Healthy if store.is_quota_paused(key) => {
-            store.resume(key);
+        Verdict::Healthy
+            if store.record_quota_paused(key)
+                || quota::cli_level(key).is_some_and(|p| store.record_quota_paused(&p)) =>
+        {
+            store.resume_exact(key);
             let mut what = "cleared quota pause".to_string();
             if let Some(parent) = quota::cli_level(key) {
-                if store.is_quota_paused(&parent) {
-                    store.resume(&parent);
+                if store.record_quota_paused(&parent) {
+                    store.resume_exact(&parent);
                     what.push_str(&format!(" (and {parent})"));
                 }
             }
@@ -250,7 +253,7 @@ mod tests {
         let c = apply(&mut store, "cli:grok", Verdict::Healthy, None, None);
         assert!(!c.written);
         assert_eq!(c.what, "manual pause kept");
-        assert!(store.is_manually_paused("cli:grok"));
+        assert!(store.record_manually_paused("cli:grok"));
     }
 
     #[test]
@@ -279,6 +282,11 @@ mod tests {
             "flash limit",
         );
         store.pause_quota_until(
+            "cli:agy@pro",
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            "pro limit",
+        );
+        store.pause_quota_until(
             "cli:agy",
             Some(chrono::Utc::now() + chrono::Duration::hours(1)),
             "whole login limited",
@@ -286,17 +294,72 @@ mod tests {
         let c = apply(&mut store, "cli:agy@flash", Verdict::Healthy, None, None);
         assert!(c.written);
         assert!(store.is_usable("cli:agy@flash"));
-        assert!(store.is_usable("cli:agy@pro"));
+        assert!(store.is_usable("cli:agy"));
+        assert!(
+            !store.is_usable("cli:agy@pro"),
+            "an independently paused sibling is not cleared with the parent"
+        );
+
+        let mut store = QuotaStore::default();
+        store.pause_manual("cli:agy@flash", None);
+        let c = apply(&mut store, "cli:agy@flash", Verdict::Healthy, None, None);
+        assert!(!c.written);
+        assert_eq!(c.what, "manual pause kept");
 
         let mut store = QuotaStore::default();
         store.pause_quota("cli:agy@flash", "flash limit");
         store.pause_manual("cli:agy", None);
         let c = apply(&mut store, "cli:agy@flash", Verdict::Healthy, None, None);
-        assert!(!c.written);
-        assert_eq!(c.what, "manual pause kept");
-        assert!(!store.is_usable("cli:agy@flash"));
+        assert!(c.written);
+        assert!(
+            !store.is_usable("cli:agy@flash"),
+            "the model still reads held through the CLI-level manual pause"
+        );
         assert!(!store.is_usable("cli:agy@pro"));
-        assert!(store.is_manually_paused("cli:agy"));
+        assert!(store.record_manually_paused("cli:agy"));
+        assert_eq!(
+            store.record("cli:agy@flash").status,
+            crate::quota::ProviderStatus::Available,
+            "the probe cleared the model's own quota pause, not the parent manual one"
+        );
+
+        let mut store = QuotaStore::default();
+        store.pause_quota_until(
+            "cli:agy",
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            "legacy login-wide pause, no model records",
+        );
+        let c = apply(&mut store, "cli:agy@flash", Verdict::Healthy, None, None);
+        assert!(c.written);
+        assert!(store.is_usable("cli:agy@flash"));
+        assert!(store.is_usable("cli:agy@pro"));
+    }
+
+    #[test]
+    fn a_quota_probe_records_the_model_pause_past_a_cli_manual_pause() {
+        let mut store = QuotaStore::default();
+        store.pause_manual("cli:agy", None);
+        let c = apply(
+            &mut store,
+            "cli:agy@flash",
+            Verdict::Quota,
+            None,
+            Some("limit reached"),
+        );
+        assert!(c.written);
+        assert!(!store.is_usable("cli:agy@flash"));
+        let rec = store.record("cli:agy@flash");
+        assert_eq!(rec.status, crate::quota::ProviderStatus::PausedQuota);
+        assert!(
+            rec.strong,
+            "the model's own quota signal is recorded despite the CLI-level manual pause"
+        );
+        store.resume("cli:agy");
+        assert!(
+            store.is_usable("cli:agy@flash"),
+            "a CLI-level resume clears every model key by design"
+        );
+        assert!(store.is_usable("cli:agy@pro"));
     }
 
     #[test]

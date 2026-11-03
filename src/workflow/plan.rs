@@ -591,7 +591,9 @@ fn resolve_test_author(
             Some(detected)
         }
     };
-    if !crate::backup::is_provider_eligible(&provider, &store, available.as_ref()) {
+    let seat_ref =
+        crate::provider_ref::ProviderRef::for_seat(&provider, model.as_deref()).display();
+    if !crate::backup::is_provider_eligible(&seat_ref, &store, available.as_ref()) {
         if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg) {
             if crate::backup::backup_eligible(
                 &backup_raw,

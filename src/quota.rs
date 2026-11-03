@@ -395,11 +395,25 @@ impl QuotaStore {
         !self.get(name).holds(Utc::now())
     }
 
-    /// Whether the provider is held by an operator's pause that has not lapsed. Quota
-    /// writers consult this so a rate-limit event never replaces the operator's
-    /// decision, and probes consult it so they never clear one.
-    pub fn is_manually_paused(&self, name: &str) -> bool {
-        self.get(name).status == ProviderStatus::PausedManual && !self.is_usable(name)
+    /// Whether this key itself carries a live manual pause that has not lapsed,
+    /// ignoring any parent a model key combines with. Quota writers consult the own
+    /// record so a rate-limit event never replaces the operator's decision, and a
+    /// probe's manual guard uses it so a CLI-level manual pause never suppresses
+    /// recording the model's own quota signal.
+    pub fn record_manually_paused(&self, name: &str) -> bool {
+        let own = self.record(name);
+        own.status == ProviderStatus::PausedManual && own.holds(Utc::now())
+    }
+
+    /// The own-record half of [`is_quota_paused`](Self::is_quota_paused). A healthy
+    /// probe clears the seat's own stale quota pause even when a parent manual
+    /// pause still holds the seat; the parent is the operator's business.
+    pub fn record_quota_paused(&self, name: &str) -> bool {
+        let own = self.record(name);
+        matches!(
+            own.status,
+            ProviderStatus::PausedQuota | ProviderStatus::Cooldown
+        ) && own.holds(Utc::now())
     }
 
     /// Whether the provider is held by a quota pause that has not lapsed: the only kind
@@ -535,6 +549,22 @@ impl QuotaStore {
         q.status == ProviderStatus::PausedManual || q.strong
     }
 
+    /// Write `available` on exactly one key, with no CLI-level fan-out. The probe's
+    /// parent clear uses this: clearing the parent through [`resume`](Self::resume)
+    /// would also clear every model key, including an independently paused sibling.
+    pub fn resume_exact(&mut self, name: &str) {
+        self.insert(ProviderQuota {
+            name: name.into(),
+            status: ProviderStatus::Available,
+            cooldown_until: None,
+            hint: None,
+            updated_at: Some(Utc::now()),
+            sticky: false,
+            strong: false,
+            version: 0,
+        });
+    }
+
     /// A CLI-level resume clears the login and every model key under it, so one
     /// resume undoes an account-wide pause fleet-wide. A model resume clears only
     /// that model; a CLI-level pause still holding it is reported by the caller.
@@ -550,16 +580,7 @@ impl QuotaStore {
         keys.sort();
         keys.dedup();
         for key in keys {
-            self.insert(ProviderQuota {
-                name: key,
-                status: ProviderStatus::Available,
-                cooldown_until: None,
-                hint: None,
-                updated_at: Some(Utc::now()),
-                sticky: false,
-                strong: false,
-                version: 0,
-            });
+            self.resume_exact(&key);
         }
     }
 
@@ -1424,7 +1445,7 @@ mod tests {
         .unwrap();
         assert!(!legacy.get("cli:claude").sticky);
         assert!(legacy.is_usable("cli:claude"));
-        assert!(!legacy.is_manually_paused("cli:claude"));
+        assert!(!legacy.record_manually_paused("cli:claude"));
         assert_eq!(
             legacy.effective_status("cli:claude"),
             ProviderStatus::Available
@@ -1462,13 +1483,13 @@ mod tests {
         store.pause_manual("cli:grok", Some(until));
         assert_eq!(store.get("cli:grok").status, ProviderStatus::PausedManual);
         assert_eq!(store.get("cli:grok").cooldown_until, Some(until));
-        assert!(store.is_manually_paused("cli:grok"));
+        assert!(store.record_manually_paused("cli:grok"));
         assert!(!store.is_quota_paused("cli:grok"));
 
         store.providers.get_mut("cli:grok").unwrap().cooldown_until =
             Some(Utc::now() - chrono::Duration::seconds(1));
         assert!(store.is_usable("cli:grok"));
-        assert!(!store.is_manually_paused("cli:grok"));
+        assert!(!store.record_manually_paused("cli:grok"));
     }
 
     /// The 2026-10-22 shape: grok paused by hand until 2027, then a live run's slot hit

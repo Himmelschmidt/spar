@@ -989,7 +989,9 @@ fn prepare_implement_slots(
         let mut source = seat.source;
         let mut model = seat.model.clone();
         let mut seat_id = seat.seat.clone();
-        if !crate::backup::is_provider_eligible(&provider, &store, available.as_ref()) {
+        let seat_ref =
+            crate::provider_ref::ProviderRef::for_seat(&provider, model.as_deref()).display();
+        if !crate::backup::is_provider_eligible(&seat_ref, &store, available.as_ref()) {
             let ordinal = if seat.role == SlotRole::Reviewer {
                 reviewer_ordinal(&seat.seat).unwrap_or(0)
             } else {

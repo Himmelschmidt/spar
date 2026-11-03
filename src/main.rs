@@ -3408,15 +3408,15 @@ fn stray_pauses(
     stray
 }
 
-/// Held per-model rows under an adapter's CLI-level key, for model-scoped
-/// providers (`cli:agy@flash`). Only pauses show: an available model key is a
-/// spent resume, not state an operator acts on.
-fn held_model_keys(store: &quota::QuotaStore, key: &str) -> Vec<String> {
+/// Per-model rows under an adapter's CLI-level key, for model-scoped providers
+/// (`cli:agy@flash`). Every stored key lists, paused or available: a resumed
+/// model still reads Available until the record lapses out, and the row is what
+/// shows that.
+fn model_keys(store: &quota::QuotaStore, key: &str) -> Vec<String> {
     let mut out: Vec<String> = store
         .names()
         .into_iter()
         .filter(|name| quota::cli_level(name).as_deref() == Some(key))
-        .filter(|name| store.effective_status(name) != quota::ProviderStatus::Available)
         .collect();
     out.sort();
     out
@@ -3478,7 +3478,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                         let paused = status != quota::ProviderStatus::Available;
                         let hint = paused.then_some(q.hint).flatten();
                         let since = q.updated_at.filter(|_| paused);
-                        let models: Vec<serde_json::Value> = held_model_keys(&quota, &key)
+                        let models: Vec<serde_json::Value> = model_keys(&quota, &key)
                             .iter()
                             .map(|m| {
                                 let mq = quota.get(m);
@@ -3546,7 +3546,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                     if let Some(line) = pause_line(&quota, &key) {
                         println!("         {line}");
                     }
-                    for m in held_model_keys(&quota, &key) {
+                    for m in model_keys(&quota, &key) {
                         let mstatus = quota.effective_status(&m);
                         println!("  {m}  {mstatus:?}");
                         if let Some(line) = pause_line(&quota, &m) {
@@ -3625,10 +3625,10 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 println!("resumed provider {key}");
-            }
-            if let Some(parent) = held_by {
-                let line = pause_line(&store, &parent).unwrap_or_default();
-                println!("still held by {parent} ({line})");
+                if let Some(parent) = held_by {
+                    let line = pause_line(&store, &parent).unwrap_or_default();
+                    println!("still held by {parent} ({line})");
+                }
             }
             Ok(ExitCode::Success)
         }
