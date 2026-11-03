@@ -758,9 +758,24 @@ mod tests {
     }
 
     #[test]
+    fn a_family_pause_holds_only_its_bucket_for_eligibility() {
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota_until(
+            "cli:claude@opus",
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            "opus window",
+        );
+        assert!(!is_provider_eligible("cli:claude@opus", &store, None));
+        assert!(is_provider_eligible("cli:claude@sonnet", &store, None));
+        assert!(is_provider_eligible("cli:claude@haiku", &store, None));
+        assert!(is_provider_eligible("cli:claude", &store, None));
+    }
+
+    #[test]
     fn account_scoped_models_share_one_bucket() {
+        // claude is not here: its families are separate buckets since O152 (see
+        // `a_family_pause_holds_only_its_bucket_for_eligibility`).
         for (seat, other) in [
-            ("cli:claude@opus", "cli:claude@haiku"),
             ("cli:codex@gpt-5", "cli:codex@mini"),
             ("cli:muse@pro", "cli:muse@flash"),
             ("cli:grok@heavy", "cli:grok@fast"),
