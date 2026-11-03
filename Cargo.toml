@@ -159,6 +159,10 @@ name = "provider_health"
 path = "tests/scenarios/provider_health.rs"
 
 [[test]]
+name = "claude_family_quota"
+path = "tests/scenarios/claude_family_quota.rs"
+
+[[test]]
 name = "pi_dispatch"
 path = "tests/scenarios/pi_dispatch.rs"
 
