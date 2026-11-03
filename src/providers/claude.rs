@@ -32,28 +32,43 @@ impl ClaudeFamily {
     }
 
     /// The seat spellings that dispatch as this family: the bare alias (with an
-    /// optional trailing version digit), or a `claude-` full id holding a family
-    /// segment (`claude-<family>-…`, `claude-<version>-<family>-…`,
-    /// `claude-<family><digit>`), case-insensitive, with any `[...]` suffix
-    /// ignored (`opus[1m]`, `claude-opus-5-5[1m]`). Anything else — `opusplan`,
-    /// `default`, `opus-degraded`, `magnum-opus` — is not a family seat.
+    /// optional trailing version digit), or a `claude-` full id with the family
+    /// first (`claude-<family>-…` with version-like segments after it,
+    /// `claude-<family><digit>`) or a numeric version first
+    /// (`claude-<version>-<family>-…`), case-insensitive, with any `[...]`
+    /// suffix ignored (`opus[1m]`, `claude-opus-5-5[1m]`). Anything else —
+    /// `opusplan`, `default`, `opus-degraded`, `magnum-opus`,
+    /// `claude-magnum-opus`, `claude-opus-degraded` — is not a family seat.
     pub fn of(model: &str) -> Option<Self> {
         let lower = model.to_ascii_lowercase();
         let base = lower.split('[').next().unwrap_or("").trim();
         match base.strip_prefix("claude-") {
-            Some(rest) => Self::ALL.into_iter().find(|f| {
-                let name = f.name();
-                rest == name
-                    || rest.split('-').any(|seg| seg == name)
-                    || rest
-                        .split('-')
-                        .any(|seg| seg.trim_end_matches(|c: char| c.is_ascii_digit()) == name)
-            }),
+            Some(rest) => {
+                let segs: Vec<&str> = rest.split('-').collect();
+                let tail = &segs[segs
+                    .iter()
+                    .position(|s| !Self::version_seg(s))
+                    .unwrap_or(segs.len())..];
+                let (head, after) = match tail {
+                    [head, after @ ..] => (*head, after),
+                    [] => return None,
+                };
+                Self::ALL.into_iter().find(|f| {
+                    let name = f.name();
+                    head == name && after.iter().all(|s| Self::version_seg(s))
+                        || after.is_empty()
+                            && head.trim_end_matches(|c: char| c.is_ascii_digit()) == name
+                })
+            }
             None => Self::ALL.into_iter().find(|f| {
                 let name = f.name();
                 base == name || base.trim_end_matches(|c: char| c.is_ascii_digit()) == name
             }),
         }
+    }
+
+    fn version_seg(s: &str) -> bool {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'.')
     }
 
     /// The per-model weekly bucket, `None` for a family with no per-model window.
@@ -512,6 +527,18 @@ mod tests {
         assert_eq!(F::of("opusplan"), None);
         assert_eq!(F::of("default"), None);
         assert_eq!(F::of("magnum-opus"), None);
+        for m in [
+            "claude-magnum-opus",
+            "claude-opus-degraded",
+            "claude-foo-sonnet",
+            "claude-3-5-sonnet-latest",
+            "claude-4-1",
+            "claude-",
+            "claude",
+        ] {
+            assert_eq!(F::of(m), None, "{m}");
+        }
+        assert_eq!(F::of("Claude-Opus-5-5"), Some(F::Opus));
     }
 
     #[test]
