@@ -171,6 +171,15 @@ login and every model under it; `provider resume cli:agy@<model>` clears one and
 so when a login-wide pause still holds it. `provider list` shows held models nested
 under the adapter. The backup same-login rule stays per login: two agy models are one
 subscription, never each other's backup.
+Exception: claude meters its weekly windows per model family. A `seven_day_opus`
+rejection pauses only `cli:claude@opus`, `seven_day_sonnet` only
+`cli:claude@sonnet`, a "Fable limit" line only `cli:claude@fable`; login-wide
+windows (`five_hour`, `seven_day`, `overage`, generic limit lines) pause
+`cli:claude` and hold every family. `provider resume cli:claude` clears the login
+and every family; `provider resume cli:claude@opus` clears one. Haiku has no weekly
+window, so a haiku seat keys the login. Fleet keys carry the family
+(`cli:claude#label@opus`). The backup same-login rule stays per login: two claude
+families are one subscription, never each other's backup.
 
 **Driving an OpenRouter model? Lead with `cli:pi@<slug>`.** It is the recommended
 OpenRouter coder: same OpenRouter-slug routing as `cli:codex` with a much smaller per-turn
@@ -184,12 +193,14 @@ is the fallback when muse is not installed.
 **`@model` suffix.** Any ref may carry an optional model, split off on the **first `@`**:
 `cli:codex@openai/gpt-4o-mini`, `api:openai@gpt-5`. The split happens before the
 provider-name check, so the model may contain `:` and `/` (OpenRouter slugs like
-`tencent/hy3:free`) while the adapter name may not. `@model` variants share one quota
-bucket with their bare provider (`cli:claude@opus` and `cli:claude@haiku` both bucket as
-`cli:claude`) — rate limits are per account, not per model. The one exception is agy,
-whose Gemini models are metered separately: `cli:agy@flash` and `cli:agy@pro` pause
-independently, while a login-wide pause (`cli:agy` with no model) still holds every
-model. An explicit `@model` beats a
+`tencent/hy3:free`) while the adapter name may not. `@model` variants usually share one quota
+bucket with their bare provider — rate limits are per account, not per model. The
+exceptions are agy, whose Gemini models are metered separately (`cli:agy@flash` and
+`cli:agy@pro` pause independently, while a login-wide pause, `cli:agy` with no
+model, still holds every model), and claude, whose weekly windows are metered per
+model family (`cli:claude@opus`, `cli:claude@sonnet` and `cli:claude@fable` pause
+independently of each other and of the login; a haiku seat and login-wide windows
+bucket as `cli:claude`). An explicit `@model` beats a
 model chosen by `--select`.
 
 `cli:codex` (codex, `codex exec --json`) drives whatever backend + model a codex **profile**
