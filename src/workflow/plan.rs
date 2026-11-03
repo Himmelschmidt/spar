@@ -166,8 +166,9 @@ pub fn run(
         };
         let mut still_paused: Vec<String> = Vec::new();
         for job in &jobs {
-            if !crate::backup::is_provider_eligible(&job.provider, &store, available.as_ref()) {
-                let key = crate::quota::normalize_key(&job.provider);
+            let seat = job.provider_ref().display();
+            if !crate::backup::is_provider_eligible(&seat, &store, available.as_ref()) {
+                let key = job.provider_ref().quota_key();
                 if !still_paused.contains(&key) {
                     still_paused.push(key);
                 }
@@ -1250,12 +1251,13 @@ fn amend_author_seat(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> R
         return Ok(seat.id);
     }
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-    if crate::backup::is_provider_eligible(&seat.provider, &store, None) {
+    if crate::backup::is_provider_eligible(&seat.provider_ref().display(), &store, None) {
         return Ok(seat.id);
     }
-    let key = crate::quota::normalize_key(&seat.provider);
+    let key = seat.provider_ref().quota_key();
+    let sub = crate::quota::sub_key(&seat.provider);
     let backup = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg)
-        .filter(|b| crate::quota::normalize_key(b) != key)
+        .filter(|b| crate::quota::sub_key(b) != sub)
         .filter(|b| crate::backup::backup_eligible(b, &store, None, paths, false));
     let Some(raw) = backup else {
         anyhow::bail!(

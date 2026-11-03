@@ -94,7 +94,7 @@ pub fn is_provider_eligible(
     store: &QuotaStore,
     available: Option<&std::collections::HashSet<String>>,
 ) -> bool {
-    let key = crate::quota::normalize_key(provider);
+    let key = crate::quota::quota_key(provider);
     if !store.is_usable(&key) {
         return false;
     }
@@ -107,7 +107,7 @@ pub fn is_provider_eligible(
         }
     }
     if let Some(set) = available {
-        if !set.contains(&key) {
+        if !set.contains(&crate::quota::sub_key(provider)) {
             return false;
         }
     }
@@ -129,7 +129,7 @@ pub fn backup_eligible(
     if is_provider_eligible(backup, store, available) {
         return true;
     }
-    let key = crate::quota::normalize_key(backup);
+    let key = crate::quota::quota_key(backup);
     if dry || !store.is_quota_paused(&key) {
         return false;
     }
@@ -252,10 +252,11 @@ pub fn dispatch_stop_cause(
             || lower.contains("capacity")
             || lower.contains("billing"))
             && {
-                let key = crate::quota::normalize_key(provider);
+                let key = crate::quota::quota_key(provider);
+                let sub = crate::quota::sub_key(provider);
                 store.effective_status(&key) != crate::quota::ProviderStatus::Available
                     || !store.is_usable(&key)
-                    || available.is_some_and(|s| !s.contains(&key))
+                    || available.is_some_and(|s| !s.contains(&sub))
             }
         {
             return StopCause::Environmental;
@@ -266,10 +267,11 @@ pub fn dispatch_stop_cause(
             || lower.contains("os error")
             || lower.contains("executable not found"))
             && {
-                let key = crate::quota::normalize_key(provider);
+                let key = crate::quota::quota_key(provider);
+                let sub = crate::quota::sub_key(provider);
                 store.effective_status(&key) != crate::quota::ProviderStatus::Available
                     || !store.is_usable(&key)
-                    || available.is_some_and(|s| !s.contains(&key))
+                    || available.is_some_and(|s| !s.contains(&sub))
             }
         {
             return StopCause::Environmental;
@@ -675,5 +677,92 @@ mod tests {
             dispatch_stop_cause(&slot, "cli:claude", &store, None),
             StopCause::Environmental
         );
+    }
+
+    #[test]
+    fn agy_model_pause_holds_only_that_model() {
+        let mut store = QuotaStore::default();
+        store.pause_quota_until(
+            "cli:agy@flash",
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            "agy individual quota reached",
+        );
+        store.mark_strong("cli:agy@flash");
+        assert!(!is_provider_eligible("cli:agy@flash", &store, None));
+        assert!(store.blocks_live_dispatch("cli:agy@flash"));
+        assert!(is_provider_eligible("cli:agy@pro", &store, None));
+        assert!(!store.blocks_live_dispatch("cli:agy@pro"));
+
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:agy@pro", "pro limit");
+        store.mark_strong("cli:agy@pro");
+        assert!(!is_provider_eligible("cli:agy@pro", &store, None));
+        assert!(is_provider_eligible("cli:agy@flash", &store, None));
+    }
+
+    #[test]
+    fn agy_cli_level_pause_holds_every_model() {
+        let mut store = QuotaStore::default();
+        store.pause_manual("cli:agy", None);
+        assert!(!is_provider_eligible("cli:agy@flash", &store, None));
+        assert!(!is_provider_eligible("cli:agy@pro", &store, None));
+        assert!(!is_provider_eligible("cli:agy", &store, None));
+
+        let mut legacy = QuotaStore::default();
+        legacy.pause_quota_until(
+            "cli:agy",
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            "legacy record",
+        );
+        legacy.mark_strong("cli:agy");
+        assert!(!is_provider_eligible("cli:agy@flash", &legacy, None));
+        assert!(!is_provider_eligible("cli:agy@pro", &legacy, None));
+        assert!(legacy.blocks_live_dispatch("cli:agy@flash"));
+        assert!(legacy.blocks_live_dispatch("cli:agy@pro"));
+    }
+
+    #[test]
+    fn agy_models_are_one_sub_for_the_backup_rule() {
+        assert_eq!(
+            crate::quota::sub_key("cli:agy@pro"),
+            crate::quota::sub_key("cli:agy@flash")
+        );
+        assert_ne!(
+            crate::quota::quota_key("cli:agy@pro"),
+            crate::quota::quota_key("cli:agy@flash")
+        );
+    }
+
+    #[test]
+    fn account_scoped_models_share_one_bucket() {
+        for (seat, other) in [
+            ("cli:claude@opus", "cli:claude@haiku"),
+            ("cli:codex@gpt-5", "cli:codex@mini"),
+            ("cli:muse@pro", "cli:muse@flash"),
+            ("cli:grok@heavy", "cli:grok@fast"),
+            ("cli:pi@model-a", "cli:pi@model-b"),
+        ] {
+            let mut store = QuotaStore::default();
+            store.pause_quota(&crate::quota::quota_key(seat), "limit");
+            assert!(
+                !is_provider_eligible(other, &store, None),
+                "{seat} must hold {other}"
+            );
+            assert_eq!(
+                crate::quota::quota_key(seat),
+                crate::quota::quota_key(other),
+            );
+        }
+    }
+
+    #[test]
+    fn agy_model_seat_survives_the_detected_cli_set() {
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:agy@flash", "flash limit");
+        let mut set = std::collections::HashSet::new();
+        set.insert("cli:agy".to_string());
+        assert!(!is_provider_eligible("cli:agy@flash", &store, Some(&set)));
+        assert!(is_provider_eligible("cli:agy@pro", &store, Some(&set)));
+        assert!(!is_provider_eligible("cli:codex", &store, Some(&set)));
     }
 }

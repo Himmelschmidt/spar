@@ -220,7 +220,7 @@ fn key(by: GroupBy, project: &str, seat: (&str, &str, Option<&str>)) -> String {
     match by {
         GroupBy::Project => project.to_string(),
         GroupBy::Role => role.to_string(),
-        GroupBy::Provider => crate::quota::normalize_key(provider),
+        GroupBy::Provider => crate::quota::sub_key(provider),
         GroupBy::Model => model.unwrap_or("unknown").to_string(),
     }
 }
@@ -434,7 +434,7 @@ pub fn report(
             if since.is_some_and(|s| ev.ts < s) {
                 continue;
             }
-            let q = quota_row(&mut quota, crate::quota::normalize_key(&ev.provider));
+            let q = quota_row(&mut quota, crate::quota::quota_key(&ev.provider));
             if ev.manual {
                 q.manual_pauses += 1;
             } else {
@@ -455,8 +455,12 @@ pub fn report(
         }
         for r in &run.row.roles {
             if r.source == Some(SeatSource::Backup) {
-                quota_row(&mut quota, crate::quota::normalize_key(&r.provider))
-                    .backup_engagements += 1;
+                quota_row(
+                    &mut quota,
+                    crate::provider_ref::ProviderRef::for_seat(&r.provider, r.model.as_deref())
+                        .quota_key(),
+                )
+                .backup_engagements += 1;
             }
         }
         if run.row.quota_parks > 0 {
@@ -466,7 +470,10 @@ pub fn report(
                 .roles
                 .iter()
                 .filter(|r| r.parked_run)
-                .map(|r| crate::quota::normalize_key(&r.provider))
+                .map(|r| {
+                    crate::provider_ref::ProviderRef::for_seat(&r.provider, r.model.as_deref())
+                        .quota_key()
+                })
                 .collect();
             hit.sort();
             hit.dedup();
@@ -694,7 +701,7 @@ pub fn run_cost(state: &RunState) -> RunCost {
     let mut providers: Vec<String> = state
         .usage
         .iter()
-        .map(|u| crate::quota::normalize_key(&u.provider))
+        .map(|u| crate::quota::sub_key(&u.provider))
         .collect();
     providers.sort();
     providers.dedup();
@@ -713,7 +720,7 @@ pub fn run_cost(state: &RunState) -> RunCost {
                 let usage = state
                     .usage
                     .iter()
-                    .filter(|u| crate::quota::normalize_key(&u.provider) == p);
+                    .filter(|u| crate::quota::sub_key(&u.provider) == p);
                 cost_line(p.clone(), Some(p.clone()), usage)
             })
             .collect(),
@@ -723,7 +730,7 @@ pub fn run_cost(state: &RunState) -> RunCost {
                 let usage = state.usage.iter().filter(|u| u.slot_id == slot);
                 cost_line(
                     slot.to_string(),
-                    Some(crate::quota::normalize_key(provider)),
+                    Some(crate::quota::sub_key(provider)),
                     usage,
                 )
             })

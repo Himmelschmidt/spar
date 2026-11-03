@@ -89,12 +89,47 @@ impl ProviderRef {
         }
     }
 
-    /// Key used in slot.provider, quota buckets, and adapter lookup. Always
-    /// model-free: `cli:claude@opus` and `cli:claude@haiku` share one bucket.
+    /// Key used in slot.provider and adapter lookup. Always model-free.
     pub fn storage_key(&self) -> String {
         match self.backend {
             ExecBackend::NativeCli => format!("cli:{}", self.name),
             ExecBackend::ApiSdk => format!("api:{}", self.name),
+        }
+    }
+
+    /// Where this seat's quota pause lives. A model on a `Model`-scoped adapter
+    /// keys per model (`cli:agy@flash`); everything else keys per login, exactly
+    /// `storage_key()`. The scope is declared on the adapter type.
+    pub fn quota_key(&self) -> String {
+        let model_scoped = self.backend == ExecBackend::NativeCli
+            && self.model.is_some()
+            && crate::providers::adapter_named(&self.storage_key())
+                .is_some_and(|a| a.quota_scope() == crate::providers::QuotaScope::Model);
+        if model_scoped {
+            self.display()
+        } else {
+            self.storage_key()
+        }
+    }
+
+    /// The ref a seat dispatches as. `provider` is the stored form (usually
+    /// model-free) and `model` the seat's recorded model; a `@model` already on
+    /// the ref wins over the recorded one. Writers and gates resolve through
+    /// this one function so both sides key the same seat identically.
+    pub fn for_seat(provider: &str, model: Option<&str>) -> Self {
+        let model = model.filter(|m| !m.is_empty()).map(str::to_string);
+        match Self::parse(provider) {
+            Ok(mut pref) => {
+                if pref.model.is_none() {
+                    pref.model = model;
+                }
+                pref
+            }
+            Err(_) => Self {
+                backend: ExecBackend::NativeCli,
+                name: provider.to_string(),
+                model,
+            },
         }
     }
 
@@ -197,6 +232,20 @@ mod tests {
     fn storage_key_drops_model() {
         let r = ProviderRef::parse("cli:codex@tencent/hy3:free").unwrap();
         assert_eq!(r.storage_key(), "cli:codex");
+    }
+
+    #[test]
+    fn quota_key_is_per_model_only_for_model_scoped_adapters() {
+        let agy = ProviderRef::parse("cli:agy@gemini-3-flash").unwrap();
+        assert_eq!(agy.quota_key(), "cli:agy@gemini-3-flash");
+        let bare = ProviderRef::parse("cli:agy").unwrap();
+        assert_eq!(bare.quota_key(), "cli:agy");
+        let claude = ProviderRef::parse("cli:claude@opus").unwrap();
+        assert_eq!(claude.quota_key(), "cli:claude");
+        let api = ProviderRef::parse("api:openai@gpt-5").unwrap();
+        assert_eq!(api.quota_key(), "api:openai");
+        let unknown = ProviderRef::parse("cli:nothing@x").unwrap();
+        assert_eq!(unknown.quota_key(), "cli:nothing");
     }
 
     #[test]

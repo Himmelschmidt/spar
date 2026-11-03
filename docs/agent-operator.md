@@ -150,6 +150,8 @@ spar wait "$RUN_ID" --timeout 2h --json
 
 API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `*_BASE_URL` / `*_MODEL`.
 
+Quota pauses: `spar provider pause <ref>` / `spar provider resume <ref>`, `spar provider list [--json]` shows every pause with its age. agy (Gemini) meters models separately, so a pause lands per model (`cli:agy@flash` never benches `cli:agy@pro`): `resume cli:agy` clears the login and every model under it, `resume cli:agy@<model>` clears one and reports when a login-wide pause still holds it. Every other provider pauses per login. Two models of one login are one subscription for backups: never a primary's backup.
+
 Failure classifier (O148): opt-in `[classifier]` in `~/.config/spar/config.toml` only.
 When on, a failure spar's rules read as work is also put to `typesafe/jev-1.14`; at
 >= 0.7 a quota answer pauses the provider and takes the backup (exit `4` with none), an

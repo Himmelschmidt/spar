@@ -794,3 +794,68 @@ fn a_tester_log_saying_429_passed_neither_parks_the_run_nor_moves_a_seat() {
         "the codex reviewer dispatched after the weak pause: {events}"
     );
 }
+
+/// Per-model quota state for model-scoped providers (agy): a pause on one model
+/// lists under that model only, a CLI-level resume clears every model key, and a
+/// model resume under a live CLI-level pause says so.
+#[test]
+fn provider_pause_and_resume_span_model_keys_for_model_scoped_providers() {
+    let fx = Fixture::new();
+    fx.spar()
+        .args(["provider", "pause", "cli:agy@gemini-flash"])
+        .assert()
+        .success();
+    let agy = list_entry(&fx, "agy");
+    let models = agy["models"].as_array().unwrap();
+    assert_eq!(models.len(), 1, "{agy}");
+    assert_eq!(models[0]["name"], "cli:agy@gemini-flash");
+    assert_eq!(models[0]["quota_status"], "paused_manual");
+    assert_eq!(agy["quota_status"], "available");
+
+    let human = fx
+        .spar()
+        .args(["provider", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human).unwrap();
+    assert!(human.contains("cli:agy@gemini-flash"), "{human}");
+
+    fx.spar()
+        .args(["provider", "pause", "cli:agy"])
+        .assert()
+        .success();
+    let out = fx
+        .spar()
+        .args(["provider", "resume", "cli:agy@gemini-flash"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .contains("still held by cli:agy"),
+        "a model resume under a CLI-level pause must say so"
+    );
+    let agy = list_entry(&fx, "agy");
+    assert_eq!(agy["quota_status"], "paused_manual");
+    let models = agy["models"].as_array().unwrap();
+    assert_eq!(
+        models.len(),
+        1,
+        "the model still lists, held by its parent: {agy}"
+    );
+    assert_eq!(models[0]["name"], "cli:agy@gemini-flash");
+    assert_eq!(models[0]["quota_status"], "paused_manual");
+
+    fx.spar()
+        .args(["provider", "resume", "cli:agy"])
+        .assert()
+        .success();
+    let agy = list_entry(&fx, "agy");
+    assert_eq!(agy["quota_status"], "available");
+}

@@ -165,6 +165,12 @@ written before it keeps the old ~30-minute lapse.
 `spar provider resume <ref>` clears either immediately. A paused provider is
 never silently swapped into another role: `plan`/`implement` exit `4` (quota) naming the
 paused ref so per-role assignment stays exactly what you specified.
+Exception: agy (Gemini) meters models separately, so quota pauses are per model
+(`cli:agy@flash` never benches `cli:agy@pro`). `provider resume cli:agy` clears the
+login and every model under it; `provider resume cli:agy@<model>` clears one and says
+so when a login-wide pause still holds it. `provider list` shows held models nested
+under the adapter. The backup same-login rule stays per login: two agy models are one
+subscription, never each other's backup.
 
 **Driving an OpenRouter model? Lead with `cli:pi@<slug>`.** It is the recommended
 OpenRouter coder: same OpenRouter-slug routing as `cli:codex` with a much smaller per-turn
@@ -180,7 +186,10 @@ is the fallback when muse is not installed.
 provider-name check, so the model may contain `:` and `/` (OpenRouter slugs like
 `tencent/hy3:free`) while the adapter name may not. `@model` variants share one quota
 bucket with their bare provider (`cli:claude@opus` and `cli:claude@haiku` both bucket as
-`cli:claude`) — rate limits are per account, not per model. An explicit `@model` beats a
+`cli:claude`) — rate limits are per account, not per model. The one exception is agy,
+whose Gemini models are metered separately: `cli:agy@flash` and `cli:agy@pro` pause
+independently, while a login-wide pause (`cli:agy` with no model) still holds every
+model. An explicit `@model` beats a
 model chosen by `--select`.
 
 `cli:codex` (codex, `codex exec --json`) drives whatever backend + model a codex **profile**

@@ -130,6 +130,12 @@ impl Default for Capabilities {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaScope {
+    Account,
+    Model,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustPolicy {
     /// Strongest auto-approve flags each CLI allows (default for swarm).
     FullAuto,
@@ -175,6 +181,11 @@ pub struct SpawnOpts {
 
 pub trait ProviderAdapter: Send + Sync {
     fn name(&self) -> &'static str;
+    /// Whether quota pauses cover the whole login (`Account`) or one model on it
+    /// (`Model`). The quota key derives from this, never from a name list.
+    fn quota_scope(&self) -> QuotaScope {
+        QuotaScope::Account
+    }
     fn binary_names(&self) -> &[&'static str];
     fn capabilities(&self) -> Capabilities;
     fn version_args(&self) -> &[&'static str] {

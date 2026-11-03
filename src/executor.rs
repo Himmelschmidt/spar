@@ -57,6 +57,12 @@ pub struct SlotJob {
     pub effort: Option<crate::effort::EffortLevel>,
 }
 
+impl SlotJob {
+    pub fn provider_ref(&self) -> ProviderRef {
+        ProviderRef::for_seat(&self.provider, self.model.as_deref())
+    }
+}
+
 /// Run multiple slots **concurrently** (live). Dry-run stays sequential for simpler state.
 pub fn run_slots_parallel(
     state: &mut RunState,
@@ -1296,7 +1302,7 @@ fn execute_prepared(
     }
     let agy_quota_hit = enrich_agy_stats(
         &mut res.stats,
-        &prep.job.provider,
+        &prep.job.provider_ref(),
         &prep.cwd,
         &prep.log_path,
         &prep.paths,
@@ -1975,12 +1981,12 @@ fn enrich_muse_stats(stats: &mut process::StreamStats, provider: &str, log_path:
 /// callers OR this into a failed dispatch's `quota_hit` themselves.
 fn enrich_agy_stats(
     stats: &mut process::StreamStats,
-    provider: &str,
+    pref: &ProviderRef,
     cwd: &Path,
     log_path: &Path,
     paths: &SparPaths,
 ) -> bool {
-    if !provider_is_agy(provider) {
+    if !provider_is_agy(&pref.storage_key()) {
         return false;
     }
     let Some(root) = providers::agy_telemetry::root() else {
@@ -1999,15 +2005,16 @@ fn enrich_agy_stats(
     if let (Some(frac), Some(reset)) = (t.quota_remaining_fraction, t.quota_reset_secs) {
         if frac < 0.02 && reset > 0 {
             let until = chrono::Utc::now() + chrono::Duration::seconds(reset);
+            let key = pref.quota_key();
             let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
             store.pause_quota_until(
-                "cli:agy",
+                &key,
                 Some(until),
                 t.quota_hint
                     .clone()
                     .unwrap_or_else(|| "agy quota exhausted".into()),
             );
-            store.mark_strong("cli:agy");
+            store.mark_strong(&key);
             let _ = store.save(paths);
             return true;
         }
@@ -2092,10 +2099,11 @@ fn apply_parallel_outcome(
             // `quota_hit` back off the slot to route the run to `Phase::Quota`. Read
             // through `&result` here, before anything below moves its fields out: see
             // `quota_hit_for_outcome`.
-            let witness = PauseWitness::before(paths, &state.id, &prep.job.provider);
-            let quota_hit =
-                quota_hit_for_outcome(paths, &prep.job.provider, &prep.log_path, &result);
-            let witness = witness.map(|w| w.after_scrape(paths, &prep.job.provider));
+            let pref = seat_ref_for(Some(state), &prep.job);
+            let key = pref.quota_key();
+            let witness = PauseWitness::before(paths, &state.id, &key);
+            let quota_hit = quota_hit_for_outcome(paths, &pref, &prep.log_path, &result);
+            let witness = witness.map(|w| w.after_scrape(paths, &key));
             let err = result.error.clone().unwrap_or_else(|| "failed".into());
             let auth = auth_fault_for(
                 &prep.log_path,
@@ -2108,6 +2116,7 @@ fn apply_parallel_outcome(
                 paths,
                 &state.id,
                 &prep.job,
+                &key,
                 &prep.log_path,
                 &result,
                 &err,
@@ -2162,12 +2171,9 @@ fn apply_parallel_outcome(
             // No outcome exists on this path, so no typed verdict: the stream never
             // produced a rate_limit_event. The text fallback is what catches an
             // api-sdk 429 here.
-            let quota_hit = detect_and_pause_quota_with_err(
-                paths,
-                &prep.job.provider,
-                &log_text,
-                &e.to_string(),
-            );
+            let pref = seat_ref_for(Some(state), &prep.job);
+            let quota_hit =
+                detect_and_pause_quota_with_err(paths, &pref, &log_text, &e.to_string());
             let auth = auth_fault_for(&prep.log_path, &e.to_string(), quota_hit, None, None);
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
@@ -2513,19 +2519,22 @@ pub fn run_slot(
     // (`openai_compat::chat_completion`'s error is never appended to the log before the
     // `?` unwinds), so the error's own `to_string()` is scraped alongside the log tail
     // rather than the log alone.
-    let quota_on_early_err =
-        |state: &mut RunState, log_path: &Path, provider: &str, slot_id: &str, err_text: &str| {
-            let log_text = process::tail_log(log_path, 8000);
-            // No outcome exists on this path either: the backend never produced a
-            // stream to have parsed a `rate_limit_event` out of, so there is no typed
-            // reset instant to thread through.
-            let quota_hit = detect_and_pause_quota_with_err(paths, provider, &log_text, err_text);
-            let auth = auth_fault_for(log_path, err_text, quota_hit, None, None);
-            if let Some(s) = state.slot_mut(slot_id) {
-                s.quota_hit = quota_hit;
-                s.auth_fault = auth.is_some();
-            }
-        };
+    let quota_on_early_err = |state: &mut RunState,
+                              log_path: &Path,
+                              pref: &ProviderRef,
+                              slot_id: &str,
+                              err_text: &str| {
+        let log_text = process::tail_log(log_path, 8000);
+        // No outcome exists on this path either: the backend never produced a
+        // stream to have parsed a `rate_limit_event` out of, so there is no typed
+        // reset instant to thread through.
+        let quota_hit = detect_and_pause_quota_with_err(paths, pref, &log_text, err_text);
+        let auth = auth_fault_for(log_path, err_text, quota_hit, None, None);
+        if let Some(s) = state.slot_mut(slot_id) {
+            s.quota_hit = quota_hit;
+            s.auth_fault = auth.is_some();
+        }
+    };
     let result = if pref.is_api() {
         match run_api(state, paths, job, &pref, &cwd, &log_path, &prompt, timeout) {
             Ok(r) => r,
@@ -2539,13 +2548,11 @@ pub fn run_slot(
                     &cwd,
                     cfg.rounds.carry_forward_chars,
                 );
-                quota_on_early_err(
-                    state,
-                    &log_path,
+                let seat = ProviderRef::for_seat(
                     &job.provider,
-                    &job.slot_id,
-                    &e.to_string(),
+                    slot_model_for(Some(state), job).as_deref(),
                 );
+                quota_on_early_err(state, &log_path, &seat, &job.slot_id, &e.to_string());
                 mark_slot_failed(state, paths, &job.slot_id, &e.to_string(), None, None, None)?;
                 return Err(e);
             }
@@ -2589,13 +2596,8 @@ pub fn run_slot(
                             &cwd,
                             cfg.rounds.carry_forward_chars,
                         );
-                        quota_on_early_err(
-                            state,
-                            &log_path,
-                            &job.provider,
-                            &job.slot_id,
-                            &e.to_string(),
-                        );
+                        let seat = seat_ref_for(Some(state), job);
+                        quota_on_early_err(state, &log_path, &seat, &job.slot_id, &e.to_string());
                         mark_slot_failed(
                             state,
                             paths,
@@ -2633,13 +2635,8 @@ pub fn run_slot(
                             &cwd,
                             cfg.rounds.carry_forward_chars,
                         );
-                        quota_on_early_err(
-                            state,
-                            &log_path,
-                            &job.provider,
-                            &job.slot_id,
-                            &e.to_string(),
-                        );
+                        let seat = seat_ref_for(Some(state), job);
+                        quota_on_early_err(state, &log_path, &seat, &job.slot_id, &e.to_string());
                         mark_slot_failed(
                             state,
                             paths,
@@ -2694,15 +2691,18 @@ pub fn run_slot(
     } else {
         // Read through `&result` before anything below moves its fields out — see
         // `quota_hit_for_outcome`.
-        let witness = PauseWitness::before(paths, &state.id, &job.provider);
-        let quota_hit = quota_hit_for_outcome(paths, &job.provider, &log_path, &result);
-        let witness = witness.map(|w| w.after_scrape(paths, &job.provider));
+        let seat = seat_ref_for(Some(state), job);
+        let key = seat.quota_key();
+        let witness = PauseWitness::before(paths, &state.id, &key);
+        let quota_hit = quota_hit_for_outcome(paths, &seat, &log_path, &result);
+        let witness = witness.map(|w| w.after_scrape(paths, &key));
         let err = result.error.as_deref().unwrap_or("failed");
         auth_rejection = auth_fault_for(&log_path, err, quota_hit, result.exit_code, result.signal);
         let (quota_hit, auth, classified) = classifier_verdict(
             paths,
             &state.id,
             job,
+            &key,
             &log_path,
             &result,
             err,
@@ -2890,13 +2890,13 @@ fn resets_at_from_epoch_secs(secs: Option<i64>) -> Option<chrono::DateTime<chron
 /// paused in the store off a rejection this dispatch already recovered from.
 fn detect_and_pause_quota(
     paths: &SparPaths,
-    provider: &str,
+    pref: &ProviderRef,
     log_text: &str,
     structured: Option<&str>,
     resets_at: Option<chrono::DateTime<chrono::Utc>>,
     quota_recovered: bool,
 ) -> bool {
-    let key = crate::quota::normalize_key(provider);
+    let key = pref.quota_key();
     if quota_recovered && structured.is_none() {
         return false;
     }
@@ -2913,15 +2913,19 @@ fn detect_and_pause_quota(
         store.pause_quota(&key, hint);
         let _ = store.save(paths);
     }
-    if let Some((name, until, hint)) = crate::quota::scrape_claude_rate_limits(provider, log_text) {
+    if let Some((until, hint)) =
+        crate::quota::scrape_claude_rate_limits(&pref.storage_key(), log_text)
+    {
         let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-        store.pause_quota_until(&name, until, hint);
+        store.pause_quota_until(&key, until, hint);
         let _ = store.save(paths);
     }
-    if let Some((name, until, hint)) = crate::quota::scrape_agy_stated_reset(provider, log_text) {
+    if let Some((until, hint)) =
+        crate::quota::scrape_agy_stated_reset(&pref.storage_key(), log_text)
+    {
         let until = until.filter(|u| implausible_reset(*u).is_none());
         let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-        store.pause_quota_until(&name, until, hint);
+        store.pause_quota_until(&key, until, hint);
         let _ = store.save(paths);
     }
     if let Some(window) = structured {
@@ -3004,7 +3008,7 @@ fn mark_pause_strong(paths: &SparPaths, key: &str) {
 /// not pause the provider for every run in the project (#174).
 fn quota_hit_for_outcome(
     paths: &SparPaths,
-    provider: &str,
+    pref: &ProviderRef,
     log_path: &Path,
     outcome: &SlotOutcome,
 ) -> bool {
@@ -3015,7 +3019,7 @@ fn quota_hit_for_outcome(
     };
     detect_and_pause_quota(
         paths,
-        provider,
+        pref,
         &log_text,
         outcome.quota_rejected.as_deref(),
         outcome.quota_resets_at,
@@ -3037,13 +3041,13 @@ fn quota_hit_for_outcome(
 /// signature makes the absence structural instead of a convention callers must uphold.
 fn detect_and_pause_quota_with_err(
     paths: &SparPaths,
-    provider: &str,
+    pref: &ProviderRef,
     log_text: &str,
     extra: &str,
 ) -> bool {
     detect_and_pause_quota(
         paths,
-        provider,
+        pref,
         &format!("{log_text}\n{extra}"),
         None,
         None,
@@ -3160,6 +3164,7 @@ fn classifier_verdict(
     paths: &SparPaths,
     run_id: &str,
     job: &SlotJob,
+    key: &str,
     log_path: &Path,
     outcome: &SlotOutcome,
     err: &str,
@@ -3225,16 +3230,15 @@ fn classifier_verdict(
     ) else {
         return unchanged;
     };
-    let key = crate::quota::normalize_key(&job.provider);
     let p = rec.probability.unwrap_or(0.0);
     let (quota_hit, auth) = match rec.action {
         Action::PauseQuota => {
             let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
             store.pause_quota(
-                &key,
+                key,
                 format!("classifier {} read a quota rejection ({p:.2})", rec.model),
             );
-            store.mark_strong(&key);
+            store.mark_strong(key);
             let _ = store.save(paths);
             (true, auth)
         }
@@ -3245,18 +3249,18 @@ fn classifier_verdict(
                 rec.model
             )),
         ),
-        Action::WeakPause if quota_hit && witness.as_ref().is_some_and(|w| w.ours(paths, &key)) => {
+        Action::WeakPause if quota_hit && witness.as_ref().is_some_and(|w| w.ours(paths, key)) => {
             let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-            if store.is_usable(&key) {
+            if store.is_usable(key) {
                 store.pause_quota(
-                    &key,
+                    key,
                     format!(
                         "{key} quota text vetoed by classifier {} ({p:.2} work)",
                         rec.model
                     ),
                 );
             }
-            store.mark_weak(&key);
+            store.mark_weak(key);
             let _ = store.save(paths);
             (false, None)
         }
@@ -3278,13 +3282,13 @@ struct PauseWitness {
 
 impl PauseWitness {
     /// `None` without reading the store when the run's classifier is off.
-    fn before(paths: &SparPaths, run_id: &str, provider: &str) -> Option<Self> {
+    fn before(paths: &SparPaths, run_id: &str, key: &str) -> Option<Self> {
         crate::config::Config::for_run(paths, run_id)
             .ok()
             .filter(|c| c.classifier.enabled)?;
         let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
         Some(Self {
-            strong_before: store.blocks_live_dispatch(&crate::quota::normalize_key(provider)),
+            strong_before: store.blocks_live_dispatch(key),
             after: None,
         })
     }
@@ -3292,16 +3296,13 @@ impl PauseWitness {
     fn identity(paths: &SparPaths, key: &str) -> (u64, Option<chrono::DateTime<chrono::Utc>>) {
         let q = crate::quota::QuotaStore::load(paths)
             .unwrap_or_default()
-            .get(key);
+            .record(key);
         (q.version, q.updated_at)
     }
 
-    fn after_scrape(self, paths: &SparPaths, provider: &str) -> Self {
+    fn after_scrape(self, paths: &SparPaths, key: &str) -> Self {
         Self {
-            after: Some(Self::identity(
-                paths,
-                &crate::quota::normalize_key(provider),
-            )),
+            after: Some(Self::identity(paths, key)),
             ..self
         }
     }
@@ -4035,7 +4036,8 @@ fn run_headless(
     if !res.timed_out {
         let _ = markers::write_dispatch_verdict(paths, &state.id, &job.slot_id, &verdict);
     }
-    let agy_quota_hit = enrich_agy_stats(&mut res.stats, &job.provider, cwd, log_path, paths);
+    let seat = seat_ref_for(Some(state), job);
+    let agy_quota_hit = enrich_agy_stats(&mut res.stats, &seat, cwd, log_path, paths);
     enrich_muse_stats(&mut res.stats, &job.provider, log_path);
     let quota_rejected = res.stats.quota_rejected.clone();
     let quota_resets_at = resets_at_from_epoch_secs(res.stats.quota_resets_at);
@@ -4616,6 +4618,14 @@ fn slot_model_for(state: Option<&RunState>, job: &SlotJob) -> Option<String> {
     })
 }
 
+/// The ref a dispatch on `job` reads and writes quota under: the job's own
+/// model first, then the slot's recorded model — the same source the gates
+/// resolve through `SlotState::provider_ref`, so a model-key pause the writer
+/// wrote is the key the gate reads.
+fn seat_ref_for(state: Option<&RunState>, job: &SlotJob) -> ProviderRef {
+    ProviderRef::for_seat(&job.provider, slot_model_for(state, job).as_deref())
+}
+
 /// Resolved reasoning effort for a dispatch: the job's own override first,
 /// then the role's `[effort]` / `--effort` assignment. (`SPAR_MUSE_REASONING_EFFORT`
 /// sits below both, inside the muse adapter, so it needs no handling here.)
@@ -4974,6 +4984,10 @@ pub fn wait_run(
 mod tests {
     use super::*;
     use crate::providers::ProviderAdapter;
+
+    fn seat_ref(raw: &str) -> ProviderRef {
+        ProviderRef::parse(raw).unwrap()
+    }
 
     #[test]
     fn reset_slot_log_truncates_the_log_and_drops_its_stats() {
@@ -6198,7 +6212,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let log = format!("working on billing capacity\n{CLAUDE_REVOKED}\n");
         assert!(!detect_and_pause_quota(
             &paths,
-            "cli:claude",
+            &seat_ref("cli:claude"),
             &log,
             None,
             None,
@@ -6220,7 +6234,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let paths = SparPaths::new(tmp.path());
         assert!(!detect_and_pause_quota(
             &paths,
-            "cli:codex",
+            &seat_ref("cli:codex"),
             "test result: ok. 429 passed; 0 failed\nerror: lint failed\n",
             None,
             None,
@@ -6235,7 +6249,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
 
         assert!(detect_and_pause_quota(
             &paths,
-            "cli:codex",
+            &seat_ref("cli:codex"),
             "You've hit your usage limit. Try again later.\n",
             None,
             None,
@@ -6919,7 +6933,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let paths = SparPaths::new(tmp.path());
         assert!(detect_and_pause_quota(
             &paths,
-            "cli:claude",
+            &seat_ref("cli:claude"),
             WEEKLY_LIMIT_LOG,
             None,
             None,
@@ -6944,7 +6958,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let until = chrono::Utc::now() + chrono::Duration::hours(2);
         assert!(detect_and_pause_quota(
             &paths,
-            "cli:claude",
+            &seat_ref("cli:claude"),
             FIVE_HOUR_REJECTION_LOG,
             Some("five_hour"),
             Some(until),
@@ -6968,7 +6982,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let until = chrono::Utc::now() + chrono::Duration::seconds(10);
         assert!(detect_and_pause_quota(
             &paths,
-            "cli:claude",
+            &seat_ref("cli:claude"),
             FIVE_HOUR_REJECTION_LOG,
             Some("five_hour"),
             Some(until),
@@ -6994,7 +7008,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let until = chrono::Utc::now() + chrono::Duration::milliseconds(50);
         assert!(detect_and_pause_quota(
             &paths,
-            "cli:claude",
+            &seat_ref("cli:claude"),
             FIVE_HOUR_REJECTION_LOG,
             Some("five_hour"),
             Some(until),
@@ -7028,7 +7042,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let past = chrono::Utc::now() - chrono::Duration::hours(1);
         assert!(detect_and_pause_quota(
             &paths,
-            "cli:claude",
+            &seat_ref("cli:claude"),
             "",
             Some("five_hour"),
             Some(past),
@@ -7059,7 +7073,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let absurd = chrono::Utc::now() + chrono::Duration::days(365 * 100);
         assert!(detect_and_pause_quota(
             &paths,
-            "cli:claude",
+            &seat_ref("cli:claude"),
             "",
             Some("five_hour"),
             Some(absurd),
@@ -7089,7 +7103,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let paths = SparPaths::new(tmp.path());
         assert!(detect_and_pause_quota(
             &paths,
-            "cli:claude",
+            &seat_ref("cli:claude"),
             "",
             Some("unknown"),
             None,
@@ -7136,7 +7150,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let past = chrono::Utc::now() - chrono::Duration::hours(1);
         assert!(detect_and_pause_quota(
             &paths,
-            "cli:claude",
+            &seat_ref("cli:claude"),
             WEEKLY_LIMIT_LOG,
             Some("seven_day"),
             Some(past),
@@ -7161,7 +7175,12 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let log = "! Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 125h56m29s.\n";
         let before = chrono::Utc::now();
         assert!(detect_and_pause_quota(
-            &paths, "cli:agy", log, None, None, false
+            &paths,
+            &seat_ref("cli:agy"),
+            log,
+            None,
+            None,
+            false
         ));
         let q = crate::quota::QuotaStore::load(&paths)
             .unwrap()
@@ -7172,6 +7191,91 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let stated = chrono::Duration::seconds(125 * 3600 + 56 * 60 + 29);
         assert!(until >= before + stated, "{until}");
         assert!(until <= chrono::Utc::now() + stated, "{until}");
+    }
+
+    #[test]
+    fn an_auth_fault_on_one_agy_model_pauses_neither_quota_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log = "agy run failed\ninvalid_grant: refresh token expired\n";
+        assert!(!detect_and_pause_quota(
+            &paths,
+            &seat_ref("cli:agy@flash"),
+            log,
+            None,
+            None,
+            false
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        for key in ["cli:agy", "cli:agy@flash", "cli:agy@pro"] {
+            assert!(store.is_usable(key), "{key} must stay usable");
+            assert_eq!(
+                store.record(key).status,
+                crate::quota::ProviderStatus::Available,
+                "{key} must carry no pause record at all"
+            );
+        }
+        assert!(crate::backup::is_provider_eligible(
+            "cli:agy@flash",
+            &store,
+            None
+        ));
+        assert!(crate::backup::is_provider_eligible(
+            "cli:agy@pro",
+            &store,
+            None
+        ));
+    }
+
+    /// The writer and every gate resolve a seat's model from the same source: the
+    /// slot's recorded model (which is where a config/model-select default lands).
+    /// A scrape paused through the backfilled job key must be the key the run-start
+    /// gate reads off the slot.
+    #[test]
+    fn agy_seat_with_a_config_default_model_keys_identically_on_write_and_gate() {
+        use crate::state::RunState;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            std::path::PathBuf::from("/x"),
+        );
+        st.slots.push(init_slot_model(
+            "impl",
+            "cli:agy",
+            SlotRole::Implementer,
+            Some("gemini-flash".into()),
+        ));
+        let job = SlotJob {
+            slot_id: "impl".into(),
+            provider: "cli:agy".into(),
+            role: SlotRole::Implementer,
+            template: String::new(),
+            extra_vars: std::collections::HashMap::new(),
+            expected_artifact: None,
+            model: None,
+            effort: None,
+        };
+        let seat = seat_ref_for(Some(&st), &job);
+        assert_eq!(seat.quota_key(), "cli:agy@gemini-flash");
+        let log = "error: Individual quota reached. Resets in 2h.\n";
+        assert!(detect_and_pause_quota(
+            &paths, &seat, log, None, None, false
+        ));
+        let store = crate::quota::QuotaStore::load(&paths).unwrap();
+        let slot = &st.slots[0];
+        assert_eq!(slot.provider_ref().quota_key(), "cli:agy@gemini-flash");
+        assert!(!crate::backup::is_provider_eligible(
+            &slot.provider_ref().display(),
+            &store,
+            None
+        ));
+        let plan_job = SlotJob {
+            model: slot.model.clone(),
+            ..job
+        };
+        assert_eq!(plan_job.provider_ref().quota_key(), "cli:agy@gemini-flash");
     }
 
     /// The wiring between a `SlotOutcome` and `detect_and_pause_quota`, not just the
@@ -7194,7 +7298,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         };
         assert!(quota_hit_for_outcome(
             &paths,
-            "cli:claude",
+            &seat_ref("cli:claude"),
             &log_path,
             &outcome
         ));
@@ -7220,7 +7324,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         };
         assert!(quota_hit_for_outcome(
             &paths,
-            "cli:claude",
+            &seat_ref("cli:claude"),
             &log_path,
             &outcome
         ));
@@ -7239,7 +7343,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let outcome = SlotOutcome::err("boom");
         assert!(quota_hit_for_outcome(
             &paths,
-            "cli:claude",
+            &seat_ref("cli:claude"),
             &log_path,
             &outcome
         ));
@@ -7271,7 +7375,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
                 ..SlotOutcome::err("killed")
             };
             assert!(
-                !quota_hit_for_outcome(&paths, "cli:claude", &log_path, &outcome),
+                !quota_hit_for_outcome(&paths, &seat_ref("cli:claude"), &log_path, &outcome),
                 "signal {signal:?} / exit {exit_code:?} must not be a quota hit"
             );
             let store = crate::quota::QuotaStore::load(&paths).unwrap_or_default();
@@ -7299,7 +7403,10 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             ..SlotOutcome::err("exit 1")
         };
         assert!(quota_hit_for_outcome(
-            &paths, "cli:muse", &log_path, &outcome
+            &paths,
+            &seat_ref("cli:muse"),
+            &log_path,
+            &outcome
         ));
     }
 
@@ -7317,7 +7424,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         };
         assert!(quota_hit_for_outcome(
             &paths,
-            "cli:claude",
+            &seat_ref("cli:claude"),
             &log_path,
             &outcome
         ));
@@ -7340,7 +7447,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(
             !detect_and_pause_quota(
                 &paths,
-                "cli:claude",
+                &seat_ref("cli:claude"),
                 FIVE_HOUR_REJECTION_LOG,
                 None,
                 None,
@@ -7358,7 +7465,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(
             detect_and_pause_quota(
                 &paths,
-                "cli:claude",
+                &seat_ref("cli:claude"),
                 FIVE_HOUR_REJECTION_LOG,
                 None,
                 None,
@@ -7389,7 +7496,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             ..SlotOutcome::err("index out of bounds")
         };
         assert!(
-            !quota_hit_for_outcome(&paths, "cli:claude", &log_path, &outcome),
+            !quota_hit_for_outcome(&paths, &seat_ref("cli:claude"), &log_path, &outcome),
             "a recovered stream's later unrelated failure must not be routed as quota"
         );
     }
@@ -7417,7 +7524,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let log = "thread 'main' panicked at src/main.rs:42:\nindex out of bounds\n";
         assert!(!detect_and_pause_quota(
             &paths,
-            "cli:claude",
+            &seat_ref("cli:claude"),
             log,
             None,
             None,
@@ -7438,7 +7545,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let log = "thread 'main' panicked at src/state.rs:429:\nindex out of bounds\n";
         assert!(!detect_and_pause_quota(
             &paths,
-            "cli:claude",
+            &seat_ref("cli:claude"),
             log,
             None,
             None,
@@ -7456,13 +7563,13 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let paths = SparPaths::new(tmp.path());
         let log = "--- api step 0 model=gpt-5 ---\n";
         assert!(
-            !detect_and_pause_quota(&paths, "api:openai", log, None, None, false),
+            !detect_and_pause_quota(&paths, &seat_ref("api:openai"), log, None, None, false),
             "the log alone carries no rate-limit signal"
         );
         let err_text = "api openai status 429: rate limit exceeded, too many requests";
         assert!(detect_and_pause_quota_with_err(
             &paths,
-            "api:openai",
+            &seat_ref("api:openai"),
             log,
             err_text,
         ));
@@ -7477,7 +7584,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let log = "error: usage limit reached for this account\n";
         assert!(detect_and_pause_quota(
             &paths,
-            "cli:codex",
+            &seat_ref("cli:codex"),
             log,
             None,
             None,
@@ -7491,7 +7598,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     /// operator's "pin the model on every role" rule) must pause under the same
     /// normalized bucket readers look up — writing the raw ref key left the pause
     /// inert for every non-claude adapter, since `is_usable`/`ensure_usable` always
-    /// query `normalize_key(name)`.
+    /// query the seat's quota key.
     #[test]
     fn detect_and_pause_quota_pauses_a_pinned_provider_under_its_normalized_key() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7499,7 +7606,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let log = "error: usage limit reached for this account\n";
         assert!(detect_and_pause_quota(
             &paths,
-            "cli:codex@gpt-5.6-terra",
+            &seat_ref("cli:codex@gpt-5.6-terra"),
             log,
             None,
             None,
@@ -7524,7 +7631,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let paths = SparPaths::new(tmp.path());
         let log = r#"{"rate_limits":{"five_hour":{"used_percentage":96.5}}}"#;
         assert!(
-            !detect_and_pause_quota(&paths, "cli:claude", log, None, None, false),
+            !detect_and_pause_quota(&paths, &seat_ref("cli:claude"), log, None, None, false),
             "bare usage telemetry with no rejection must not route to Phase::Quota"
         );
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
@@ -7554,7 +7661,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let paths = SparPaths::new(tmp.path());
         for (i, log) in FIXTURES.iter().enumerate() {
             assert!(
-                !detect_and_pause_quota(&paths, "cli:claude", log, None, None, false),
+                !detect_and_pause_quota(&paths, &seat_ref("cli:claude"), log, None, None, false),
                 "FIXTURES[{i}] must not route"
             );
         }
@@ -8446,7 +8553,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let job = impl_job("impl");
         let outcome = failed_with(Some(1), None, "exit 1");
         let (quota, auth, rec) = classifier_verdict(
-            &paths, "run1", &job, &log_path, &outcome, "exit 1", false, None, None,
+            &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None, None,
         );
         assert!(quota && auth.is_none());
         assert_eq!(rec.unwrap().action, crate::classifier::Action::PauseQuota);
@@ -8463,7 +8570,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         )
         .unwrap();
         let (quota, auth, rec) = classifier_verdict(
-            &paths, "run1", &job, &log_path, &outcome, "exit 1", false, None, None,
+            &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None, None,
         );
         assert!(!quota && auth.is_none(), "below threshold: today's verdict");
         assert!(!rec.unwrap().acted);
@@ -8484,7 +8591,10 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let outcome = failed_with(Some(1), None, "exit 1");
         let witness = PauseWitness::before(&paths, "run1", "cli:muse").unwrap();
         assert!(quota_hit_for_outcome(
-            &paths, "cli:muse", &log_path, &outcome
+            &paths,
+            &seat_ref("cli:muse"),
+            &log_path,
+            &outcome
         ));
         let witness = witness.after_scrape(&paths, "cli:muse");
         assert!(crate::quota::QuotaStore::load(&paths)
@@ -8494,6 +8604,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &paths,
             "run1",
             &job,
+            "cli:muse",
             &log_path,
             &outcome,
             "exit 1",
@@ -8513,6 +8624,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &paths,
             "run1",
             &job,
+            "cli:muse",
             &log_path,
             &outcome,
             "exit 1",
@@ -8547,6 +8659,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &paths,
             "run1",
             &job,
+            "cli:muse",
             &log_path,
             &outcome,
             "exit 1",
@@ -8569,7 +8682,10 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         std::fs::write(&log_path, WEEKLY_LIMIT_LOG).unwrap();
         let witness = PauseWitness::before(&paths, "run1", "cli:muse").unwrap();
         assert!(quota_hit_for_outcome(
-            &paths, "cli:muse", &log_path, &outcome
+            &paths,
+            &seat_ref("cli:muse"),
+            &log_path,
+            &outcome
         ));
         let witness = witness.after_scrape(&paths, "cli:muse");
         let mut store = crate::quota::QuotaStore::load(&paths).unwrap();
@@ -8584,6 +8700,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &paths,
             "run1",
             &job,
+            "cli:muse",
             &log_path,
             &outcome,
             "exit 1",
@@ -8607,6 +8724,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &paths,
             "run1",
             &job,
+            "cli:muse",
             &log_path,
             &outcome,
             "exit 1",
@@ -8668,14 +8786,14 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         ];
         for (outcome, err, quota_hit) in cases {
             let (quota, auth, rec) = classifier_verdict(
-                &paths, "run1", &job, &log_path, &outcome, &err, quota_hit, None, None,
+                &paths, "run1", &job, "cli:muse", &log_path, &outcome, &err, quota_hit, None, None,
             );
             assert_eq!((quota, auth, rec), (quota_hit, None, None), "{err}");
         }
         std::fs::write(&log_path, "! model `m` does not exist or you lack access\n").unwrap();
         let outcome = failed_with(Some(1), None, "exit 1");
         let (_, _, rec) = classifier_verdict(
-            &paths, "run1", &job, &log_path, &outcome, "exit 1", false, None, None,
+            &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None, None,
         );
         assert!(
             rec.is_none(),

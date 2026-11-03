@@ -40,7 +40,7 @@ pub struct ProbeReport {
 /// Probe one provider and write the verdict into the quota store. Under `dry` nothing
 /// is spawned and nothing is written.
 pub fn probe(paths: &SparPaths, provider: &str, dry: bool) -> ProbeReport {
-    let key = quota::normalize_key(provider);
+    let key = quota::quota_key(provider);
     let (verdict, detail, until) = call(paths, provider, dry);
     let mut store = QuotaStore::load(paths).unwrap_or_default();
     let change = apply(&mut store, &key, verdict, until, detail.as_deref());
@@ -79,9 +79,16 @@ fn apply(
     match verdict {
         Verdict::Healthy if store.is_quota_paused(key) => {
             store.resume(key);
+            let mut what = "cleared quota pause".to_string();
+            if let Some(parent) = quota::cli_level(key) {
+                if store.is_quota_paused(&parent) {
+                    store.resume(&parent);
+                    what.push_str(&format!(" (and {parent})"));
+                }
+            }
             StoreChange {
                 written: true,
-                what: "cleared quota pause".into(),
+                what,
             }
         }
         Verdict::Quota => {
@@ -174,7 +181,7 @@ fn call(
     let until = (verdict == Verdict::Quota)
         .then(|| quota::scrape_claude_rate_limits(provider, &text))
         .flatten()
-        .and_then(|(_, until, _)| until);
+        .and_then(|(until, _)| until);
     (verdict, detail, until)
 }
 
@@ -261,6 +268,35 @@ mod tests {
         let q = store.get("cli:claude");
         assert_eq!(q.cooldown_until, Some(until));
         assert!(!store.is_usable("cli:claude"));
+    }
+
+    #[test]
+    fn a_healthy_model_probe_clears_a_cli_quota_pause_but_never_a_manual_one() {
+        let mut store = QuotaStore::default();
+        store.pause_quota_until(
+            "cli:agy@flash",
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            "flash limit",
+        );
+        store.pause_quota_until(
+            "cli:agy",
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            "whole login limited",
+        );
+        let c = apply(&mut store, "cli:agy@flash", Verdict::Healthy, None, None);
+        assert!(c.written);
+        assert!(store.is_usable("cli:agy@flash"));
+        assert!(store.is_usable("cli:agy@pro"));
+
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:agy@flash", "flash limit");
+        store.pause_manual("cli:agy", None);
+        let c = apply(&mut store, "cli:agy@flash", Verdict::Healthy, None, None);
+        assert!(!c.written);
+        assert_eq!(c.what, "manual pause kept");
+        assert!(!store.is_usable("cli:agy@flash"));
+        assert!(!store.is_usable("cli:agy@pro"));
+        assert!(store.is_manually_paused("cli:agy"));
     }
 
     #[test]

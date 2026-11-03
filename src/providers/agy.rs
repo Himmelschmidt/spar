@@ -1,5 +1,6 @@
 use super::{
-    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, SpawnOpts, TrustPolicy,
+    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, QuotaScope, SpawnOpts,
+    TrustPolicy,
 };
 use std::path::Path;
 use std::process::Command;
@@ -9,6 +10,10 @@ pub struct AgyAdapter;
 impl ProviderAdapter for AgyAdapter {
     fn name(&self) -> &'static str {
         "agy"
+    }
+
+    fn quota_scope(&self) -> QuotaScope {
+        QuotaScope::Model
     }
 
     // No turn-boundary push spar drives, so messages wait for the next turn and

@@ -3395,19 +3395,31 @@ fn stray_pauses(
     store: &quota::QuotaStore,
     report: &[providers::ProviderReport],
 ) -> Vec<quota::ProviderQuota> {
-    let listed: Vec<String> = report
-        .iter()
-        .map(|p| quota::normalize_key(&p.name))
-        .collect();
+    let listed: Vec<String> = report.iter().map(|p| quota::sub_key(&p.name)).collect();
     let mut stray: Vec<quota::ProviderQuota> = store
         .names()
         .into_iter()
         .filter(|name| !listed.contains(name))
+        .filter(|name| quota::cli_level(name).is_none_or(|parent| !listed.contains(&parent)))
         .filter(|name| store.effective_status(name) != quota::ProviderStatus::Available)
         .map(|name| store.get(&name))
         .collect();
     stray.sort_by(|a, b| a.name.cmp(&b.name));
     stray
+}
+
+/// Held per-model rows under an adapter's CLI-level key, for model-scoped
+/// providers (`cli:agy@flash`). Only pauses show: an available model key is a
+/// spent resume, not state an operator acts on.
+fn held_model_keys(store: &quota::QuotaStore, key: &str) -> Vec<String> {
+    let mut out: Vec<String> = store
+        .names()
+        .into_iter()
+        .filter(|name| quota::cli_level(name).as_deref() == Some(key))
+        .filter(|name| store.effective_status(name) != quota::ProviderStatus::Available)
+        .collect();
+    out.sort();
+    out
 }
 
 /// `paused 3h12m ago until 2027-01-01T00:00:00+00:00 (manual pause)`, for a pause that
@@ -3458,7 +3470,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                     .iter()
                     .zip(&usages)
                     .map(|(p, u)| {
-                        let key = quota::normalize_key(&p.name);
+                        let key = quota::sub_key(&p.name);
                         let q = quota.get(&key);
                         // Effective status: a lapsed pause reads Available, so the
                         // listing matches what a run will actually do (auto-recover).
@@ -3466,6 +3478,20 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                         let paused = status != quota::ProviderStatus::Available;
                         let hint = paused.then_some(q.hint).flatten();
                         let since = q.updated_at.filter(|_| paused);
+                        let models: Vec<serde_json::Value> = held_model_keys(&quota, &key)
+                            .iter()
+                            .map(|m| {
+                                let mq = quota.get(m);
+                                serde_json::json!({
+                                    "name": m,
+                                    "quota_status": quota.effective_status(m),
+                                    "quota_hint": mq.hint,
+                                    "paused_since": mq.updated_at,
+                                    "pause_age_secs": mq.updated_at.map(|t| (chrono::Utc::now() - t).num_seconds().max(0)),
+                                    "paused_until": mq.cooldown_until,
+                                })
+                            })
+                            .collect();
                         let mut v = serde_json::json!({
                             "name": p.name,
                             "available": p.available,
@@ -3479,6 +3505,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                             "paused_since": since,
                             "pause_age_secs": since.map(|t| (chrono::Utc::now() - t).num_seconds().max(0)),
                             "paused_until": q.cooldown_until.filter(|_| paused),
+                            "models": models,
                         });
                         if let Some(u) = u {
                             v["usage"] = serde_json::json!(u);
@@ -3508,7 +3535,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                     } else {
                         "ok"
                     };
-                    let key = quota::normalize_key(&p.name);
+                    let key = quota::sub_key(&p.name);
                     let status = quota.effective_status(&key);
                     println!(
                         "{:<8} {mark:<8} {:<12} {}",
@@ -3518,6 +3545,13 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                     );
                     if let Some(line) = pause_line(&quota, &key) {
                         println!("         {line}");
+                    }
+                    for m in held_model_keys(&quota, &key) {
+                        let mstatus = quota.effective_status(&m);
+                        println!("  {m}  {mstatus:?}");
+                        if let Some(line) = pause_line(&quota, &m) {
+                            println!("           {line}");
+                        }
                     }
                     if p.available {
                         println!(
@@ -3555,7 +3589,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
         }
         cli::ProviderAction::Pause { name, until, json } => {
             let (paths, _) = project_ctx()?;
-            let key = quota::normalize_key(&name);
+            let key = quota::quota_key(&name);
             let mut store = quota::QuotaStore::load(&paths)?;
             let until_dt = if let Some(u) = until {
                 if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&u) {
@@ -3578,14 +3612,23 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
         }
         cli::ProviderAction::Resume { name, json } => {
             let (paths, _) = project_ctx()?;
-            let key = quota::normalize_key(&name);
+            let key = quota::quota_key(&name);
             let mut store = quota::QuotaStore::load(&paths)?;
             store.resume(&key);
             store.save(&paths)?;
+            let held_by = quota::cli_level(&key).filter(|parent| !store.is_usable(parent));
             if json {
-                println!("{}", serde_json::to_string_pretty(&store.get(&key))?);
+                let mut v = serde_json::to_value(store.get(&key))?;
+                if let Some(parent) = &held_by {
+                    v["held_by"] = serde_json::Value::String(parent.clone());
+                }
+                println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 println!("resumed provider {key}");
+            }
+            if let Some(parent) = held_by {
+                let line = pause_line(&store, &parent).unwrap_or_default();
+                println!("still held by {parent} ({line})");
             }
             Ok(ExitCode::Success)
         }
