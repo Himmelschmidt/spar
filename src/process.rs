@@ -1,3 +1,4 @@
+use crate::providers::RateLimitWindow;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -48,11 +49,13 @@ pub struct StreamStats {
     pub billed_tokens: u64,
     /// The provider's own structured rate-limit rejection, when it emitted one:
     /// the `rateLimitType` (`five_hour`, `seven_day`, …) from a `rate_limit_event`
-    /// whose status was `rejected`. This is a typed fact from the adapter, not a
-    /// phrase recovered from rendered log text, so it cannot be produced by source
-    /// code, documentation or a task brief that merely discusses limits.
+    /// whose status was `rejected`, parsed at the stream boundary. This is a typed
+    /// fact from the adapter, not a phrase recovered from rendered log text, so it
+    /// cannot be produced by source code, documentation or a task brief that merely
+    /// discusses limits. Old sidecars carry the raw string; every known spelling
+    /// deserializes to its variant, anything else to `Unknown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quota_rejected: Option<String>,
+    pub quota_rejected: Option<RateLimitWindow>,
     /// When that window reopens, epoch seconds, as the provider stated it. An absolute
     /// instant, so it needs no inference from a wall-clock time and no timezone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1102,7 +1105,7 @@ fn stream_to_log(
 struct StreamCoalescer {
     is_err: bool,
     /// Set from the provider's `rate_limit_event` when its status is `rejected`.
-    quota_rejected: Option<String>,
+    quota_rejected: Option<RateLimitWindow>,
     /// The instant that window reopens, epoch seconds, straight from the same event.
     quota_resets_at: Option<i64>,
     /// Set true when an `allowed`/`allowed_warning` event clears a `quota_rejected` that
@@ -1375,11 +1378,7 @@ impl StreamCoalescer {
                             // the rendered line: `status` is the provider's own verdict on
                             // this request, so routing on it cannot false-positive on prose
                             // that merely mentions limits.
-                            self.quota_rejected = Some(if kind.is_empty() {
-                                "unknown".to_string()
-                            } else {
-                                kind.to_string()
-                            });
+                            self.quota_rejected = Some(RateLimitWindow::parse(kind));
                             // The same object states when the window reopens, as an absolute
                             // instant in epoch seconds — day included, no timezone, nothing
                             // inferred. Prefer the window-specific entry when the payload
@@ -1770,7 +1769,7 @@ impl StreamCoalescer {
                 // pi's `errorMessage` is the provider's own API error, never model or
                 // agent text, so a rate-limit phrase in it is the typed verdict here.
                 if crate::quota::QuotaStore::scrape_strong_quota_signal(&err).is_some() {
-                    self.quota_rejected = Some("rate_limit".to_string());
+                    self.quota_rejected = Some(RateLimitWindow::RateLimit);
                 }
                 self.provider_error = Some(err);
             }
@@ -2241,7 +2240,7 @@ impl StreamCoalescer {
         // a clear could never overwrite an already-merged `Some` in `StreamStats`, and
         // a stream that was rejected, recovered, then failed for an unrelated reason
         // still routed to `Phase::Quota` on the stale value.
-        s.quota_rejected = self.quota_rejected.clone();
+        s.quota_rejected = self.quota_rejected;
         s.quota_resets_at = self.quota_resets_at;
         // Unlike `quota_rejected`, this never clears once true: it records that a
         // rejection *did* happen and was later cleared, which `detect_and_pause_quota`
@@ -2529,7 +2528,7 @@ mod tests {
     fn a_rejected_rate_limit_event_is_captured_typed() {
         let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day"}}"#);
-        assert_eq!(c.quota_rejected.as_deref(), Some("seven_day"));
+        assert_eq!(c.quota_rejected, Some(RateLimitWindow::SevenDay));
 
         // An allowed event, and a warning short of rejection, are not rejections.
         for status in ["allowed", "allowed_warning"] {
@@ -2551,7 +2550,7 @@ mod tests {
         c.feed(
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1788000000}}"#,
         );
-        assert_eq!(c.quota_rejected.as_deref(), Some("five_hour"));
+        assert_eq!(c.quota_rejected, Some(RateLimitWindow::FiveHour));
         assert_eq!(c.quota_resets_at, Some(1788000000));
 
         c.feed(
@@ -2597,7 +2596,7 @@ mod tests {
         );
         let mut stats = StreamStats::default();
         c.merge_counters_into(&mut stats);
-        assert_eq!(stats.quota_rejected.as_deref(), Some("seven_day"));
+        assert_eq!(stats.quota_rejected, Some(RateLimitWindow::SevenDay));
         assert_eq!(
             stats.quota_resets_at,
             Some(1788000000),
@@ -2631,12 +2630,29 @@ mod tests {
     /// match a real window entry — this must fall back to the top-level `resetsAt`
     /// rather than come back empty.
     #[test]
+    fn old_sidecar_window_strings_still_deserialize() {
+        for (raw, want) in [
+            ("five_hour", RateLimitWindow::FiveHour),
+            ("seven_day", RateLimitWindow::SevenDay),
+            ("seven_day_opus", RateLimitWindow::SevenDayOpus),
+            ("rate_limit", RateLimitWindow::RateLimit),
+            ("unknown", RateLimitWindow::Unknown),
+            ("a_future_window", RateLimitWindow::Unknown),
+        ] {
+            let mut v = serde_json::to_value(StreamStats::default()).unwrap();
+            v["quota_rejected"] = serde_json::Value::String(raw.into());
+            let stats: StreamStats = serde_json::from_value(v).unwrap();
+            assert_eq!(stats.quota_rejected, Some(want), "{raw}");
+        }
+    }
+
+    #[test]
     fn an_empty_rate_limit_type_falls_back_to_the_top_level_reset_instant() {
         let mut c = StreamCoalescer::new_with_adapter(false, None);
         c.feed(
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1788000000}}"#,
         );
-        assert_eq!(c.quota_rejected.as_deref(), Some("unknown"));
+        assert_eq!(c.quota_rejected, Some(RateLimitWindow::Unknown));
         assert_eq!(c.quota_resets_at, Some(1788000000));
     }
 
@@ -2652,7 +2668,7 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1788000000}}"#,
         );
         c.feed(r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour"}}"#);
-        assert_eq!(c.quota_rejected.as_deref(), Some("five_hour"));
+        assert_eq!(c.quota_rejected, Some(RateLimitWindow::FiveHour));
         assert_eq!(c.quota_resets_at, Some(1788000000));
     }
 
@@ -2669,7 +2685,7 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1788000000}}"#,
         );
         c.merge_counters_into(&mut stats);
-        assert_eq!(stats.quota_rejected.as_deref(), Some("five_hour"));
+        assert_eq!(stats.quota_rejected, Some(RateLimitWindow::FiveHour));
 
         c.feed(
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"}}"#,
@@ -3682,7 +3698,7 @@ mod tests {
         let ok = r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input":10,"output":1,"cacheRead":0,"cacheWrite":0},"stopReason":"stop"}}"#;
         let mut c = StreamCoalescer::new_with_adapter(false, Some("cli:pi"));
         c.feed(err);
-        assert_eq!(c.quota_rejected.as_deref(), Some("rate_limit"));
+        assert_eq!(c.quota_rejected, Some(RateLimitWindow::RateLimit));
         assert!(!c.quota_recovered);
         c.feed(ok);
         let mut s = StreamStats::default();
@@ -3697,7 +3713,7 @@ mod tests {
         // A 429 that is the final word is the provider's typed verdict.
         c.feed(err);
         c.merge_counters_into(&mut s);
-        assert_eq!(s.quota_rejected.as_deref(), Some("rate_limit"));
+        assert_eq!(s.quota_rejected, Some(RateLimitWindow::RateLimit));
 
         // A non-quota error is not typed as quota.
         let mut c = StreamCoalescer::new_with_adapter(false, Some("cli:pi"));

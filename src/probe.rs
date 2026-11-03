@@ -38,10 +38,22 @@ pub struct ProbeReport {
 }
 
 /// Probe one provider and write the verdict into the quota store. Under `dry` nothing
-/// is spawned and nothing is written.
+/// is spawned and nothing is written. A quota verdict lands on the rejection key the
+/// output names: a login-wide claude rejection pauses `cli:claude`, an Opus-limit
+/// one pauses `cli:claude@opus`. Any other verdict uses the seat's own key.
 pub fn probe(paths: &SparPaths, provider: &str, dry: bool) -> ProbeReport {
-    let key = quota::quota_key(provider);
-    let (verdict, detail, until) = call(paths, provider, dry);
+    let (verdict, detail, until, output) = call(paths, provider, dry);
+    let key = ProviderRef::parse(provider)
+        .map(|pref| {
+            if verdict == Verdict::Quota {
+                pref.rejection_key(crate::providers::QuotaSignal::Text(
+                    output.as_deref().unwrap_or(""),
+                ))
+            } else {
+                pref.quota_key()
+            }
+        })
+        .unwrap_or_else(|_| quota::quota_key(provider));
     let mut store = QuotaStore::load(paths).unwrap_or_default();
     let change = apply(&mut store, &key, verdict, until, detail.as_deref());
     if change.written {
@@ -118,23 +130,23 @@ fn call(
     Verdict,
     Option<String>,
     Option<chrono::DateTime<chrono::Utc>>,
+    Option<String>,
 ) {
+    let no_output = |v: Verdict, d: Option<String>| (v, d, None, None);
     let Ok(pref) = ProviderRef::parse(provider) else {
-        return (
+        return no_output(
             Verdict::Skipped,
             Some(format!("bad provider ref `{provider}`")),
-            None,
         );
     };
     let Some(adapter) = providers::adapter_named(provider) else {
-        return (
+        return no_output(
             Verdict::Skipped,
             Some("only cli providers are probed".into()),
-            None,
         );
     };
     let Some(bin) = adapter.resolve_binary() else {
-        return (Verdict::Skipped, Some("not on PATH".into()), None);
+        return no_output(Verdict::Skipped, Some("not on PATH".into()));
     };
     let opts = SpawnOpts {
         prompt: PROBE_PROMPT.into(),
@@ -151,14 +163,13 @@ fn call(
     let mut cmd = adapter.build_headless(&bin, &opts);
     if dry {
         let (program, args) = providers::command_to_parts(&cmd);
-        return (
+        return no_output(
             Verdict::Skipped,
             Some(format!(
                 "dry-run: would run {} {}",
                 program.display(),
                 args.join(" ")
             )),
-            None,
         );
     }
     cmd.current_dir(&paths.project_root);
@@ -166,13 +177,12 @@ fn call(
         cmd.env(k, v);
     }
     let Some(out) = providers::run_with_timeout(&mut cmd, PROBE_TIMEOUT) else {
-        return (
+        return no_output(
             Verdict::Failed,
             Some(format!(
                 "no answer within {}s (or could not spawn)",
                 PROBE_TIMEOUT.as_secs()
             )),
-            None,
         );
     };
     let text = format!(
@@ -185,7 +195,7 @@ fn call(
         .then(|| quota::scrape_claude_rate_limits(provider, &text))
         .flatten()
         .and_then(|(until, _)| until);
-    (verdict, detail, until)
+    (verdict, detail, until, Some(text))
 }
 
 /// Quota first (the more specific refusal), then auth, then the exit status.
@@ -372,6 +382,37 @@ mod tests {
             assert!(!c.written, "{v:?}");
             assert_eq!(store.get("cli:codex").updated_at, before);
         }
+    }
+
+    #[test]
+    fn quota_key_selection_follows_the_output_named_bucket() {
+        use crate::providers::QuotaSignal;
+        let key_for = |provider: &str, output: &str| {
+            ProviderRef::parse(provider)
+                .unwrap()
+                .rejection_key(QuotaSignal::Text(output))
+        };
+        assert_eq!(
+            key_for("cli:claude@opus", "You've hit your weekly limit"),
+            "cli:claude"
+        );
+        assert_eq!(
+            key_for("cli:claude@opus", "! rate limit  five_hour  rejected"),
+            "cli:claude"
+        );
+        assert_eq!(
+            key_for("cli:claude@opus", "You've reached your Opus limit"),
+            "cli:claude@opus"
+        );
+        assert_eq!(
+            key_for("cli:claude@sonnet", "You've reached your Opus limit"),
+            "cli:claude@opus"
+        );
+        assert_eq!(
+            key_for("cli:claude@haiku", "You've reached your Opus limit"),
+            "cli:claude@opus",
+            "the named bucket wins over the reporting seat"
+        );
     }
 
     #[test]
