@@ -447,6 +447,23 @@ fn a_ceiling_kill_with_uncommitted_edits_becomes_a_wip_round() {
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
     assert_eq!(st["round"], 1, "same round goes on to review: {st}");
+    let impl_slot = st["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "implementer")
+        .expect("implementer slot")
+        .clone();
+    assert_eq!(impl_slot["status"], "done", "{impl_slot}");
+    let summary = std::fs::read_to_string(
+        proj.join(".spar/runs")
+            .join(&run_id)
+            .join("artifacts")
+            .join("summary.md"),
+    )
+    .unwrap();
+    assert!(summary.contains("Done"), "{summary}");
+    assert!(!summary.contains("Failed"), "{summary}");
     let branch = format!("spar/{run_id}/impl");
     let log = git(&proj, &["log", &branch, "--format=%s"]);
     assert!(
@@ -510,6 +527,144 @@ fn a_ceiling_kill_with_no_work_still_fails() {
     assert!(
         !log.lines().any(|l| l.contains("cut short at hard ceiling")),
         "no WIP commit without work: {log}"
+    );
+}
+
+/// A fake `muse` for the #228 follow-ups. The implementer hangs past the hard
+/// ceiling leaving its edit uncommitted; the first review requests changes, the
+/// rest approve whatever HEAD they are shown.
+fn install_ceiling_requesting_muse(bin: &Path) {
+    std::fs::create_dir_all(bin).unwrap();
+    let p = bin.join("muse");
+    std::fs::write(
+        &p,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "fake-muse 0"; exit 0; fi
+PROMPT_FILE=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--prompt-file" ]; then PROMPT_FILE="$a"; fi
+  prev="$a"
+done
+NAME=$(basename "$PROMPT_FILE" .md)
+NAME=${NAME#prompt-}
+ART="$(dirname "$PROMPT_FILE")/artifacts"
+mkdir -p "$ART"
+echo '{"schema_version":1,"stream":{"kind":"session","id":"sess-c"},"record_type":"event","payload_type":"run.model.configured","payload":{"kind":"run_model_configured","model_id":"m"}}'
+case "$NAME" in
+  impl)
+    echo ceiling >> "$SPAR_TEST_MUSE_STATE/calls"
+    echo work > work.txt
+    sleep 60
+    ;;
+  *)
+    echo "review-$NAME" >> "$SPAR_TEST_MUSE_STATE/calls"
+    n=$(cat "$SPAR_TEST_MUSE_STATE/reviews" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" > "$SPAR_TEST_MUSE_STATE/reviews"
+    CWD=$(sed -n 's/.*Code under review (worktree): \([^ ]*\).*/\1/p' "$PROMPT_FILE" | head -n 1)
+    SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null)
+    if [ "$n" = "1" ]; then
+      printf '## Verdict\nrequest_changes\n\nReviewed-Commit: %s\n' "$SHA" > "$ART/review-$NAME.md"
+    else
+      printf '## Verdict\napprove\n\nReviewed-Commit: %s\n' "$SHA" > "$ART/review-$NAME.md"
+    fi
+    ;;
+esac
+exit 0
+"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn run_requesting_ceiling_implement(proj: &Path, bin: &Path, calls_dir: &Path, max: u32) -> String {
+    std::fs::write(
+        proj.join("spar.toml"),
+        format!(
+            "[suite]\nenabled = false\n[rounds]\nmax = {max}\n[timeouts]\nslot_secs = 2\nhard_ceiling_multiple = 1.5\n",
+        ),
+    )
+    .unwrap();
+    install_ceiling_requesting_muse(bin);
+    std::fs::create_dir_all(calls_dir).unwrap();
+    run_ceiling_leftover_implement(proj, bin, calls_dir)
+}
+
+/// #228 follow-up: the round after a ceiling-cut WIP round is told the previous
+/// pass never finished. The first review requests changes, so the fix round's
+/// implementer prompt carries the cut-short notice.
+#[test]
+fn ceiling_cut_notice_reaches_the_next_round_implementer() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    let bin = tmp.path().join("bin");
+    let calls_dir = tmp.path().join("muse-state");
+
+    let run_id = run_requesting_ceiling_implement(&proj, &bin, &calls_dir, 2);
+    let st = read_state(&proj, &run_id);
+    assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
+    assert_eq!(st["round"], 2, "{st}");
+    let prompt =
+        std::fs::read_to_string(proj.join(".spar/runs").join(&run_id).join("prompt-impl.md"))
+            .unwrap();
+    assert!(
+        prompt.contains("cut short at its hard time ceiling"),
+        "round-2 prompt carries the cut-short notice"
+    );
+    let calls = std::fs::read_to_string(calls_dir.join("calls")).unwrap();
+    assert!(
+        calls.lines().filter(|l| *l == "ceiling").count() == 2 && !calls.contains("recovery"),
+        "both rounds died at the ceiling, no recovery turn: {calls}"
+    );
+}
+
+/// #228 follow-up: the cut-short notice survives the round-ceiling gate. Past it
+/// the operator buys a round and a fresh process re-enters; the rebuilt
+/// `prompt-impl.md` still tells the new round its WIP commit is partial work.
+#[test]
+fn ceiling_cut_notice_survives_the_round_ceiling_gate() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    let bin = tmp.path().join("bin");
+    let calls_dir = tmp.path().join("muse-state");
+
+    let run_id = run_requesting_ceiling_implement(&proj, &bin, &calls_dir, 1);
+    let st = read_state(&proj, &run_id);
+    assert_eq!(st["phase"], "awaiting_round_extension", "{st}");
+
+    let reentry = spar_cmd()
+        .current_dir(&proj)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("SPAR_TEST_MUSE_STATE", &calls_dir)
+        .args(["implement", "--run", &run_id, "--max-rounds", "2", "--json"])
+        .output()
+        .unwrap();
+    let reentry_out = format!(
+        "re-entry status={} stdout={} stderr={}",
+        reentry.status,
+        String::from_utf8_lossy(&reentry.stdout),
+        String::from_utf8_lossy(&reentry.stderr),
+    );
+    let st = read_state(&proj, &run_id);
+    assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}\n{reentry_out}");
+    assert_eq!(st["round"], 2, "{st}\n{reentry_out}");
+    let prompt =
+        std::fs::read_to_string(proj.join(".spar/runs").join(&run_id).join("prompt-impl.md"))
+            .unwrap();
+    assert!(
+        prompt.contains("cut short at its hard time ceiling"),
+        "rebuilt round-2 prompt carries the cut-short notice"
     );
 }
 
