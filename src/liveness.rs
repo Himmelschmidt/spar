@@ -240,6 +240,7 @@ mod tests {
             review: None,
             source: None,
             auth_fault: false,
+            timeout_cause: None,
             build_cache: None,
             former_ids: Vec::new(),
             classifier: None,

@@ -94,6 +94,7 @@ pub fn run_slots_parallel(
                 if let Some(s) = state.slot_mut(&job.slot_id) {
                     s.quota_hit = false;
                     s.auth_fault = false;
+                    s.timeout_cause = None;
                     s.classifier = None;
                 }
                 let _ =
@@ -381,6 +382,7 @@ fn prepare_slot_execution(
         s.usage = None;
         s.quota_hit = false;
         s.auth_fault = false;
+        s.timeout_cause = None;
         s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
@@ -1137,6 +1139,7 @@ fn execute_prepared(
                 quota_rejected: None,
                 quota_resets_at: None,
                 quota_recovered: false,
+                timeout_cause: None,
             }
         } else {
             SlotOutcome {
@@ -1150,6 +1153,7 @@ fn execute_prepared(
                 quota_rejected: None,
                 quota_resets_at: None,
                 quota_recovered: false,
+                timeout_cause: None,
             }
         });
     }
@@ -1358,6 +1362,7 @@ fn execute_prepared(
                 quota_rejected,
                 quota_resets_at,
                 quota_recovered,
+                timeout_cause: None,
             });
         }
         return Ok(SlotOutcome {
@@ -1371,6 +1376,7 @@ fn execute_prepared(
             quota_rejected,
             quota_resets_at,
             quota_recovered,
+            timeout_cause: Some(TimeoutCause::HardCeiling),
         });
     }
     // A refused assigned id fails here, before the generic gate: the pre-written
@@ -1409,6 +1415,7 @@ fn execute_prepared(
             quota_rejected,
             quota_resets_at,
             quota_recovered,
+            timeout_cause: None,
         });
     }
     if res.exit_code != Some(0) {
@@ -1429,6 +1436,7 @@ fn execute_prepared(
             quota_rejected,
             quota_resets_at,
             quota_recovered,
+            timeout_cause: None,
         });
     }
     if let Some(err) = &res.stats.provider_error {
@@ -1443,6 +1451,7 @@ fn execute_prepared(
             quota_rejected,
             quota_resets_at,
             quota_recovered,
+            timeout_cause: None,
         });
     }
     // A clean exit is not success on its own: a slot that produced no artifact (e.g. an
@@ -1493,6 +1502,7 @@ fn execute_prepared(
                     quota_rejected,
                     quota_resets_at,
                     quota_recovered,
+                    timeout_cause: None,
                 });
             }
             let recovered = recover_artifact(&ArtifactRecovery {
@@ -1534,6 +1544,7 @@ fn execute_prepared(
                     quota_rejected,
                     quota_resets_at,
                     quota_recovered,
+                    timeout_cause: None,
                 });
             }
         }
@@ -1549,6 +1560,7 @@ fn execute_prepared(
         quota_rejected,
         quota_resets_at,
         quota_recovered,
+        timeout_cause: None,
     })
 }
 
@@ -1638,7 +1650,7 @@ fn ceiling_kill_kept_work(
 ///
 /// `base_commit` is `None` for pre-O26 runs and when git couldn't answer; there the
 /// dirty check stands alone rather than guessing at HEAD.
-fn slot_has_work(cwd: &Path, base_commit: Option<&str>) -> bool {
+pub fn slot_has_work(cwd: &Path, base_commit: Option<&str>) -> bool {
     let git = |args: &[&str]| {
         std::process::Command::new("git")
             .args(args)
@@ -2073,6 +2085,7 @@ fn apply_parallel_outcome(
                 s.pid = result.pid;
                 s.exit_code = result.exit_code.or(Some(0));
                 s.signal = result.signal;
+                s.timeout_cause = result.timeout_cause;
                 if let Some(u) = &result.usage {
                     s.usage = Some(u.clone());
                 }
@@ -2128,6 +2141,7 @@ fn apply_parallel_outcome(
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
                 s.auth_fault = auth.is_some();
+                s.timeout_cause = result.timeout_cause;
                 s.classifier = classified;
             }
             salvage_expected_artifact(
@@ -2466,6 +2480,7 @@ pub fn run_slot(
         s.usage = None;
         s.quota_hit = false;
         s.auth_fault = false;
+        s.timeout_cause = None;
         s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
@@ -2674,6 +2689,7 @@ pub fn run_slot(
             s.pid = result.pid;
             s.exit_code = result.exit_code.or(Some(0));
             s.signal = result.signal;
+            s.timeout_cause = result.timeout_cause;
             if let Some(u) = &result.usage {
                 s.usage = Some(u.clone());
             }
@@ -2741,6 +2757,7 @@ pub fn run_slot(
             s.pid = result.pid;
             s.exit_code = result.exit_code;
             s.signal = result.signal;
+            s.timeout_cause = result.timeout_cause;
             if let Some(u) = &result.usage {
                 s.usage = Some(u.clone());
             }
@@ -3098,6 +3115,16 @@ pub fn slot_parks_on_quota(state: &RunState, slot_id: &str) -> bool {
         .is_some_and(|s| s.parks_on_quota())
 }
 
+/// Why a failed dispatch ended early, as the outcome reported it: the typed route
+/// for ceiling kills, so the workflow never matches the rendered error prose.
+pub fn slot_timeout_cause(state: &RunState, slot_id: &str) -> Option<TimeoutCause> {
+    state
+        .slots
+        .iter()
+        .find(|s| s.id == slot_id)
+        .and_then(|s| s.timeout_cause)
+}
+
 /// The auth rejection a failed dispatch ended on, from its log tail or its error text.
 /// `None` when the failure was a quota hit (the more specific verdict), and when the CLI
 /// exited 0 or was killed: a refused credential is a non-zero exit, and an implementer
@@ -3211,7 +3238,7 @@ fn classifier_verdict(
         .and_then(|p| p.cli_name().map(str::to_string));
     let adapter = cli_name.as_deref().and_then(providers::adapter_named);
     if process::ended_by_signal(outcome.signal, outcome.exit_code)
-        || crate::nudge::is_ceiling_kill(err)
+        || outcome.timeout_cause.is_some()
         || err.contains(crate::state::STOPPED_SLOT)
         || err.contains(REFUSED_SESSION_REMEDIATION)
         || adapter.as_ref().is_some_and(|a| {
@@ -3346,6 +3373,13 @@ impl PauseWitness {
     }
 }
 
+/// Why a dispatch ended before its agent did. Recorded on the outcome and the slot
+/// so callers route on the variant, never on the rendered error prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TimeoutCause {
+    HardCeiling,
+}
+
 struct SlotOutcome {
     ok: bool,
     pid: Option<u32>,
@@ -3353,6 +3387,7 @@ struct SlotOutcome {
     signal: Option<i32>,
     error: Option<String>,
     usage: Option<SlotUsage>,
+    timeout_cause: Option<TimeoutCause>,
     /// Set when `enrich_agy_stats` detected exhausted agy quota telemetry during *this*
     /// dispatch. The stream's `result.error` can carry rejection prose the log-based
     /// scrape (`detect_and_pause_quota`) recognizes, but the structured gemini-* quota
@@ -3386,6 +3421,7 @@ impl SlotOutcome {
             signal: None,
             error: Some(msg.into()),
             usage: None,
+            timeout_cause: None,
             agy_quota_hit: false,
             quota_rejected: None,
             quota_resets_at: None,
@@ -3899,6 +3935,7 @@ fn run_api(
             quota_rejected: None,
             quota_resets_at: None,
             quota_recovered: false,
+            timeout_cause: None,
         })
     } else {
         Ok(SlotOutcome {
@@ -3912,6 +3949,7 @@ fn run_api(
             quota_rejected: None,
             quota_resets_at: None,
             quota_recovered: false,
+            timeout_cause: None,
         })
     }
 }
@@ -4122,6 +4160,7 @@ fn run_headless(
                 quota_rejected,
                 quota_resets_at,
                 quota_recovered,
+                timeout_cause: None,
             });
         }
         return Ok(SlotOutcome {
@@ -4135,6 +4174,7 @@ fn run_headless(
             quota_rejected,
             quota_resets_at,
             quota_recovered,
+            timeout_cause: Some(TimeoutCause::HardCeiling),
         });
     }
     // See `execute_prepared`: a refused assigned id fails as spar's usage error with
@@ -4166,6 +4206,7 @@ fn run_headless(
             quota_rejected,
             quota_resets_at,
             quota_recovered,
+            timeout_cause: None,
         });
     }
     let code = res.exit_code;
@@ -4187,6 +4228,7 @@ fn run_headless(
             quota_rejected,
             quota_resets_at,
             quota_recovered,
+            timeout_cause: None,
         });
     }
     if let Some(err) = &res.stats.provider_error {
@@ -4201,6 +4243,7 @@ fn run_headless(
             quota_rejected,
             quota_resets_at,
             quota_recovered,
+            timeout_cause: None,
         });
     }
     if let Some(name) = &job.expected_artifact {
@@ -4238,6 +4281,7 @@ fn run_headless(
                     quota_rejected,
                     quota_resets_at,
                     quota_recovered,
+                    timeout_cause: None,
                 });
             }
             let recovered = recover_artifact(&ArtifactRecovery {
@@ -4274,6 +4318,7 @@ fn run_headless(
                     quota_rejected,
                     quota_resets_at,
                     quota_recovered,
+                    timeout_cause: None,
                 });
             }
         }
@@ -4289,6 +4334,7 @@ fn run_headless(
         quota_rejected,
         quota_resets_at,
         quota_recovered,
+        timeout_cause: None,
     })
 }
 
@@ -4401,6 +4447,7 @@ fn tmux_refused_assigned_outcome(
         quota_rejected: None,
         quota_resets_at: None,
         quota_recovered: false,
+        timeout_cause: None,
     })
 }
 
@@ -4560,6 +4607,7 @@ fn run_tmux(
                     quota_rejected: None,
                     quota_resets_at: None,
                     quota_recovered: false,
+                    timeout_cause: None,
                 });
             }
             TmuxDecision::Failed => {
@@ -4592,6 +4640,7 @@ fn run_tmux(
                     quota_rejected: None,
                     quota_resets_at: None,
                     quota_recovered: false,
+                    timeout_cause: None,
                 });
             }
             TmuxDecision::DoneButAlive => {
@@ -4606,6 +4655,7 @@ fn run_tmux(
                     quota_rejected: None,
                     quota_resets_at: None,
                     quota_recovered: false,
+                    timeout_cause: None,
                 })
             }
             TmuxDecision::Wait => {
@@ -4743,6 +4793,7 @@ pub fn init_slot_model(
         review: None,
         source: None,
         auth_fault: false,
+        timeout_cause: None,
         build_cache: None,
         former_ids: Vec::new(),
         classifier: None,
@@ -7721,6 +7772,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         .unwrap();
         let outcome = SlotOutcome {
             quota_recovered: true,
+            timeout_cause: None,
             ..SlotOutcome::err("index out of bounds")
         };
         assert!(
@@ -9043,6 +9095,10 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             quota_rejected: Some(RateLimitWindow::FiveHour),
             ..failed_with(Some(1), None, "exit 1")
         };
+        let ceiling_outcome = SlotOutcome {
+            timeout_cause: Some(TimeoutCause::HardCeiling),
+            ..failed_with(Some(1), None, &ceiling)
+        };
         let cases = [
             (
                 failed_with(None, Some(9), "killed"),
@@ -9054,7 +9110,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
                 "exit 143".into(),
                 false,
             ),
-            (failed_with(Some(1), None, &ceiling), ceiling.clone(), false),
+            (ceiling_outcome, ceiling.clone(), false),
             (
                 failed_with(Some(1), None, crate::state::STOPPED_SLOT),
                 crate::state::STOPPED_SLOT.into(),

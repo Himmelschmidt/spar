@@ -548,6 +548,12 @@ pub struct SlotState {
     /// Reset at the start of every dispatch, like `quota_hit`.
     #[serde(default)]
     pub auth_fault: bool,
+    /// Why this dispatch ended before its agent did, as the outcome reported it
+    /// (`executor::TimeoutCause`). A ceiling kill with work left behind commits it as
+    /// a partial WIP round instead of failing; a ceiling kill with none still fails.
+    /// Reset at the start of every dispatch, like `quota_hit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_cause: Option<crate::executor::TimeoutCause>,
     /// The build-cache pool directory this implementer leased (O143). Kept after the
     /// dispatch ends so the next one prefers the same warm directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -603,6 +609,7 @@ impl SlotState {
         self.usage = None;
         self.quota_hit = false;
         self.auth_fault = false;
+        self.timeout_cause = None;
         self.classifier = None;
     }
 }
