@@ -1688,6 +1688,31 @@ fn without_reviewer_middle_ordinal_drops_and_renumbers_above_only() {
     );
 }
 
+/// #234: a seat id names a slot of an existing run, so a fresh launch refuses it
+/// and names the valid forms (`--run <id>`, or the ordinal spelling).
+#[test]
+fn fresh_launch_seat_id_without_names_the_valid_forms() {
+    let tmp = project("[suite]\nenabled = false\n");
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "plan",
+            "--task",
+            "drop by seat id",
+            "--dry-run",
+            "--json",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--without",
+            "review-1-cli-claude",
+        ])
+        .assert()
+        .code(1)
+        .stdout(
+            predicate::str::contains("--run <id>").and(predicate::str::contains("reviewer[N]")),
+        );
+}
+
 /// #234: an explicit `--role reviewer=...` replaces the panel, so when it lands
 /// after a `--without reviewer[N]` drop the operator is warned the drop is lost.
 #[test]
@@ -1825,6 +1850,131 @@ fn reload_after_amend_disengages_a_spent_reviewer_backup() {
     assert!(
         cfg["backups"]["reviewer"].is_null(),
         "the reload carries the disengaged list: {:?}",
+        cfg["backups"]["reviewer"]
+    );
+}
+
+/// #234: blanking keeps the positional mapping: a rotated survivor below another
+/// survivor with its own backup must not hand its neighbour's backup down.
+#[test]
+fn reload_after_amend_keeps_higher_reviewer_backups_in_place() {
+    let tmp = project(
+        "[roles]\nreviewer = [\"cli:codex\", \"cli:grok\", \"cli:agy\"]\n[suite]\nenabled = false\n",
+    );
+    let v = plan_json(
+        tmp.path(),
+        &[
+            "--providers",
+            "cli:claude,cli:codex,cli:grok,cli:agy",
+            "--backup",
+            "reviewer[0]=cli:agy@b0",
+            "--backup",
+            "reviewer[1]=cli:codex@b1",
+            "--backup",
+            "reviewer[2]=cli:grok@b2",
+        ],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    let _ = spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:codex,cli:grok,cli:agy",
+            "--dry-run",
+            "--json",
+        ])
+        .assert();
+    // Seat 0 fails over onto its backup: it now serves agy under a backup source.
+    let p = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("state.json");
+    let mut state: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    let seat = state["slots"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["id"] == "review-0-cli-codex")
+        .unwrap();
+    seat["provider"] = serde_json::json!("cli:agy");
+    seat["source"] = serde_json::json!("backup");
+    std::fs::write(&p, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--without",
+            "reviewer[2]",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        vec!["review-0-cli-codex", "review-1-cli-grok"],
+        "only the dropped seat leaves: {:?}",
+        state["slots"]
+    );
+    let sources: Vec<(&str, &str)> = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["role"] == "reviewer")
+        .map(|s| (s["id"].as_str().unwrap(), s["source"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        sources,
+        vec![
+            ("review-0-cli-codex", "backup"),
+            ("review-1-cli-grok", "cli-providers"),
+        ],
+        "surgery keeps every survivor's source: {:?}",
+        state["slots"]
+    );
+    let cfg = read_run_config(tmp.path(), &run_id);
+    assert_eq!(
+        cfg["roles"]["reviewer"],
+        serde_json::json!(["cli:agy", "cli:grok"]),
+        "the pin names the serving providers: {:?}",
+        cfg["roles"]["reviewer"]
+    );
+    assert_eq!(
+        cfg["backups"]["reviewer"],
+        serde_json::json!(["", "cli:codex@b1"]),
+        "the spent entry blanks in place, seat 1 keeps its backup: {:?}",
+        cfg["backups"]["reviewer"]
+    );
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--reload-config",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let cfg = read_run_config(tmp.path(), &run_id);
+    assert_eq!(
+        cfg["backups"]["reviewer"],
+        serde_json::json!(["", "cli:codex@b1"]),
+        "the reload carries the positional list: {:?}",
         cfg["backups"]["reviewer"]
     );
 }

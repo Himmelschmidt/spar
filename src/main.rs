@@ -1511,8 +1511,8 @@ fn implement_ctx(
         }
         // A surviving seat that rotated to its backup serves the fallback as its
         // primary; its same-ordinal backup entry is spent and would fail
-        // backup-against-primary validation on reload, so drop it and carry the
-        // shortened list like any other backup shift.
+        // backup-against-primary validation on reload, so blank it in place and
+        // carry the positional list like any other backup shift.
         if workflow::implement::disengage_spent_reviewer_backups(&st, &mut cfg.backups.reviewer) {
             cfg.cli_backup_keys.insert(state::SlotRole::Reviewer);
         }

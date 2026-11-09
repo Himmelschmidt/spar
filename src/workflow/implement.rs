@@ -3357,14 +3357,16 @@ pub(crate) fn drop_reviewer_seats(
     Ok(removed)
 }
 
-/// Drop the same-ordinal backup entries a surviving reviewer seat already serves:
+/// Blank the same-ordinal backup entries a surviving reviewer seat already serves:
 /// the seat rotated to its backup, so the fallback is spent and keeping it would
 /// fail backup-against-primary validation on reload. Runs on the post-drop
-/// ordinals, after `drop_reviewer_seats` renumbered, matching entries by
-/// provider so earlier removals cannot shift the indices out from under it.
-/// Returns whether anything was removed.
+/// ordinals, after `drop_reviewer_seats` renumbered. Entries are blanked, never
+/// removed: the list is positional per ordinal and deleting one would hand every
+/// higher seat its neighbour's backup. The comparison is the validation's own
+/// storage-key equality, and trailing blanks trim since an empty list is unset.
+/// Returns whether anything was blanked.
 pub fn disengage_spent_reviewer_backups(state: &RunState, backups: &mut Vec<String>) -> bool {
-    let mut spent: Vec<usize> = Vec::new();
+    let mut blanked = false;
     for s in state
         .slots
         .iter()
@@ -3373,21 +3375,18 @@ pub fn disengage_spent_reviewer_backups(state: &RunState, backups: &mut Vec<Stri
         let Some(o) = reviewer_ordinal(&s.id) else {
             continue;
         };
-        let Some(entry) = backups.get(o).filter(|b| !b.is_empty()) else {
+        let Some(entry) = backups.get_mut(o).filter(|b| !b.is_empty()) else {
             continue;
         };
         if backup_key(entry) == backup_key(&s.provider) {
-            spent.push(o);
+            entry.clear();
+            blanked = true;
         }
     }
-    spent.sort_unstable();
-    spent.dedup();
-    let mut removed = false;
-    for o in spent.into_iter().rev() {
-        backups.remove(o);
-        removed = true;
+    while backups.last().is_some_and(|s| s.is_empty()) {
+        backups.pop();
     }
-    removed
+    blanked
 }
 
 fn backup_key(raw: &str) -> String {
