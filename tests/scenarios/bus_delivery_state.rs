@@ -1,8 +1,10 @@
 //! Per-message delivery state in `bus log` (issue #231, part (a)): every entry
 //! carries `delivery` — `queued` while a copy still waits in an inbox,
 //! `delivered` once it has landed in the recipient's channel, `acknowledged`
-//! once an ack answers it — in both `--json` and human output. Derived from the
-//! receipts plus the ack events at read time; nothing new is stored.
+//! once a recipient's ack answers it, `withdrawn` when no copy waits anywhere
+//! and nothing ever landed — in both `--json` and human output. Derived at read
+//! time from the inbox directories, the delivery receipts and the ack events;
+//! nothing new is stored.
 
 mod common;
 use std::path::{Path, PathBuf};
@@ -213,4 +215,85 @@ fn bus_log_reports_queued_delivered_acknowledged() {
         line_for(&text, &needy_id).contains("[acknowledged"),
         "{text}"
     );
+}
+
+/// An ack from a non-recipient never confirms: the message keeps the word its
+/// copies earn. Only the recipient's ack flips to `acknowledged`.
+#[test]
+fn bus_log_ignores_a_strangers_ack() {
+    let env = env();
+    let tmp = tempdir().unwrap();
+    init_repo(tmp.path());
+    let run = implemented_run(&env, tmp.path());
+    let dir = tmp.path();
+
+    let needy = send(
+        &env,
+        dir,
+        &[
+            "--run",
+            &run,
+            "--to",
+            "impl",
+            "--requires-ack",
+            "-m",
+            "confirm this",
+        ],
+    );
+    let needy_id = needy["id"].as_str().unwrap().to_string();
+
+    spar(&env, dir)
+        .args(["bus", "ack", &needy_id, "--from", "critic", "--run", &run])
+        .assert()
+        .success();
+    let entries = log_json(&env, dir, &run);
+    assert_eq!(
+        entry(&entries, &needy_id)["delivery"],
+        "queued",
+        "a stranger's ack leaves the waiting copy queued"
+    );
+}
+
+/// A message superseded before claim reads `withdrawn` — no copy waits anywhere
+/// and nothing ever landed — while the superseding message itself reads `queued`.
+#[test]
+fn bus_log_reports_withdrawn_for_superseded_before_claim() {
+    let env = env();
+    let tmp = tempdir().unwrap();
+    init_repo(tmp.path());
+    let run = implemented_run(&env, tmp.path());
+    let dir = tmp.path();
+
+    let old = send(
+        &env,
+        dir,
+        &["--run", &run, "--to", "impl", "-m", "first draft"],
+    );
+    let old_id = old["id"].as_str().unwrap().to_string();
+    let new = send(
+        &env,
+        dir,
+        &[
+            "--run",
+            &run,
+            "--to",
+            "impl",
+            "--supersedes",
+            &old_id,
+            "-m",
+            "second draft",
+        ],
+    );
+    let new_id = new["id"].as_str().unwrap().to_string();
+
+    let entries = log_json(&env, dir, &run);
+    let old_entry = entry(&entries, &old_id);
+    assert_eq!(old_entry["delivery"], "withdrawn");
+    assert_eq!(
+        old_entry["superseded_by"], new_id,
+        "the withdrawn word rides with the superseded-by marker"
+    );
+    assert_eq!(entry(&entries, &new_id)["delivery"], "queued");
+    let text = log_text(&env, dir, &run);
+    assert!(line_for(&text, &old_id).contains("[withdrawn"), "{text}");
 }

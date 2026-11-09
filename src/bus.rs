@@ -456,13 +456,19 @@ pub fn send(paths: &SparPaths, msg: BusMessage, budget: MessageBudget) -> Result
     if msg.kind == MsgKind::Ack {
         if let Some(target) = msg.refs.reply_to.as_deref() {
             clear_pending_ack(paths, target)?;
-            record_receipt(
-                paths,
-                target,
-                &resolve_addr(msg.run.as_deref(), &msg.from),
-                ReceiptEvent::Read,
-                "ack",
-            );
+            // A `read` receipt claims the message reached the acker's input, so only
+            // the recipient's ack may record one — a stranger's ack stops the
+            // redelivery but leaves the word (and the receipts) untouched.
+            let counts = find_event(paths, target)?.is_none_or(|t| ack_counts(&msg, &t));
+            if counts {
+                record_receipt(
+                    paths,
+                    target,
+                    &resolve_addr(msg.run.as_deref(), &msg.from),
+                    ReceiptEvent::Read,
+                    "ack",
+                );
+            }
         }
     } else if msg.requires_ack {
         record_pending_ack(paths, &msg)?;
@@ -570,13 +576,16 @@ pub fn message_targets(paths: &SparPaths, msg: &BusMessage) -> Result<Vec<String
 
 fn deliver_inbox(paths: &SparPaths, msg: &BusMessage) -> Result<()> {
     let targets = message_targets(paths, msg)?;
-    for t in targets {
-        let dir = inbox_dir(paths, &t);
+    for t in &targets {
+        let dir = inbox_dir(paths, t);
         fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}-{}.json", msg.ts.timestamp_millis(), msg.id));
         fs::write(&path, serde_json::to_string_pretty(msg)?)?;
-        record_receipt(paths, &msg.id, &t, ReceiptEvent::Queued, "inbox");
+        record_receipt(paths, &msg.id, t, ReceiptEvent::Queued, "inbox");
     }
+    // The one filing choke point: `send` and `tick_acks` both land here, so every
+    // producer's PollFile copies reach the poll file at file time.
+    crate::providers::delivery::drain_poll_files(paths, &targets);
     Ok(())
 }
 
@@ -1072,19 +1081,20 @@ pub struct RecipientReceipt {
 }
 
 /// Where one message stands for the operator: still waiting to be picked up,
-/// landed in the recipient's channel, or confirmed. Read off the inbox
-/// directories plus the ack events every time a listing is built — never
-/// stored, so there is no second copy of the state to keep in step, and
-/// nothing a lossy record (a dropped receipt write, a rotated receipts file)
-/// can desynchronise. Withdrawal and round expiry ride their own markers
-/// (`withdrawn_at`, `superseded_by`, `expired`) and do not change this: it
-/// answers only whether the message landed.
+/// landed in the recipient's channel, confirmed, or gone with no trace of ever
+/// landing. Read off the inbox directories, the delivery receipts and the ack
+/// events every time a listing is built — never stored, so there is no second
+/// copy of the state to keep in step. The disk scan is the primary signal; a
+/// `Delivered`/`Read` receipt only ever upgrades toward delivered (prompt
+/// inclusion leaves the inbox copy behind), never downgrades, so a dropped
+/// receipt write merely falls back to the disk word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryState {
     Queued,
     Delivered,
     Acknowledged,
+    Withdrawn,
 }
 
 impl std::fmt::Display for DeliveryState {
@@ -1093,6 +1103,7 @@ impl std::fmt::Display for DeliveryState {
             DeliveryState::Queued => write!(f, "queued"),
             DeliveryState::Delivered => write!(f, "delivered"),
             DeliveryState::Acknowledged => write!(f, "acknowledged"),
+            DeliveryState::Withdrawn => write!(f, "withdrawn"),
         }
     }
 }
@@ -1146,21 +1157,39 @@ pub fn disk_positions(paths: &SparPaths) -> DiskPositions {
     positions
 }
 
-/// Roll one message's disk positions up to a single word. `acked` is whether an
-/// `Ack` answering the message sits in the event log, and wins: an ack is
-/// terminal (redelivery stops, escalation stops), while the per-recipient
-/// receipts beside it still show who never picked up a copy. Otherwise a copy
-/// still waiting in any inbox reads `Queued` — even a redelivery behind an
-/// older claim — and a message with no trace left on disk reads `Queued` too:
-/// it was never observed to land.
-pub fn delivery_state(acked: bool, positions: &DiskPositions, id: &str) -> DeliveryState {
+/// Roll one message's disk positions up to a single word. `acked` is whether a
+/// recipient's `Ack` answering the message sits in the event log, and wins: an
+/// ack is terminal (redelivery stops, escalation stops), while the per-recipient
+/// receipts beside it still show who never picked up a copy. Otherwise any
+/// landing wins — a claimed copy, or a `Delivered`/`Read` receipt from a prompt
+/// inclusion that left the inbox copy behind — even with other copies still
+/// waiting. A message with no copy and no landing reads `Withdrawn`: superseded
+/// or expired before claim, or fanned out to nobody.
+pub fn delivery_state(
+    acked: bool,
+    positions: &DiskPositions,
+    id: &str,
+    receipt_delivered: bool,
+) -> DeliveryState {
     if acked {
         DeliveryState::Acknowledged
-    } else if !positions.queued.contains(id) && positions.delivered.contains(id) {
+    } else if positions.delivered.contains(id) || receipt_delivered {
         DeliveryState::Delivered
-    } else {
+    } else if positions.queued.contains(id) {
         DeliveryState::Queued
+    } else {
+        DeliveryState::Withdrawn
     }
+}
+
+/// Whether an `Ack` answers its target for the log word. A directed message is
+/// acknowledged only by its own recipient; a broadcast's recipients are whoever
+/// was present at send time, unknowable now, so any acker counts.
+fn ack_counts(ack: &BusMessage, target: &BusMessage) -> bool {
+    if target.to == "broadcast" || target.to == "*" {
+        return true;
+    }
+    resolve_addr(ack.run.as_deref(), &ack.from) == resolve_addr(target.run.as_deref(), &target.to)
 }
 
 pub const LOG_SCHEMA: u32 = 1;
@@ -1225,9 +1254,16 @@ pub fn log_entries(paths: &SparPaths, run: Option<&str>) -> Result<Vec<LogEntry>
         .iter()
         .filter_map(|m| m.refs.supersedes.clone().map(|old| (old, m.id.clone())))
         .collect();
+    let by_id: HashMap<&str, &BusMessage> = all.iter().map(|m| (m.id.as_str(), m)).collect();
     let acked: HashSet<String> = all
         .iter()
         .filter(|m| m.kind == MsgKind::Ack)
+        .filter(|m| {
+            m.refs
+                .reply_to
+                .as_deref()
+                .is_some_and(|t| by_id.get(t).is_some_and(|target| ack_counts(m, target)))
+        })
         .filter_map(|m| m.refs.reply_to.clone())
         .collect();
     let mut receipts = receipts_by_message(paths);
@@ -1238,10 +1274,12 @@ pub fn log_entries(paths: &SparPaths, run: Option<&str>) -> Result<Vec<LogEntry>
         .filter(|m| run.is_none() || m.run.as_deref() == run)
         .map(|m| {
             let is_acked = acked.contains(&m.id);
-            let delivery = delivery_state(is_acked, &positions, &m.id);
+            let list = receipts.remove(&m.id).unwrap_or_default();
+            let receipt_delivered = list.iter().any(|r| r.delivered_at.is_some());
+            let delivery = delivery_state(is_acked, &positions, &m.id, receipt_delivered);
             LogEntry {
                 schema_version: LOG_SCHEMA,
-                receipts: receipts.remove(&m.id).unwrap_or_default(),
+                receipts: list,
                 delivery,
                 superseded_by: superseded.get(&m.id).cloned(),
                 expired: rounds.expired(paths, &m),
@@ -2362,36 +2400,68 @@ mod tests {
         };
         // `old` has no receipt rows at all (rotated out): the claimed file still lands it.
         assert_eq!(
-            delivery_state(false, &positions, "old"),
+            delivery_state(false, &positions, "old", false),
             DeliveryState::Delivered
         );
         assert_eq!(
-            delivery_state(false, &positions, "q1"),
+            delivery_state(false, &positions, "q1", false),
             DeliveryState::Queued
         );
         assert_eq!(
-            delivery_state(false, &positions, "d1"),
+            delivery_state(false, &positions, "d1", false),
             DeliveryState::Delivered
         );
         assert_eq!(
-            delivery_state(false, &positions, "both"),
-            DeliveryState::Queued,
-            "one inbox still holding out keeps the message queued"
+            delivery_state(false, &positions, "both", false),
+            DeliveryState::Delivered,
+            "any landing wins even with a copy still waiting"
         );
         assert_eq!(
-            delivery_state(false, &positions, "redelivered"),
-            DeliveryState::Queued,
-            "a redelivery behind an older claim reads queued again"
+            delivery_state(false, &positions, "redelivered", false),
+            DeliveryState::Delivered,
+            "a redelivery behind an older claim stays landed"
         );
         assert_eq!(
-            delivery_state(true, &positions, "both"),
+            delivery_state(true, &positions, "both", false),
             DeliveryState::Acknowledged,
             "an ack is terminal even with copies still waiting"
         );
         assert_eq!(
-            delivery_state(false, &positions, "withdrawn-before-claim"),
-            DeliveryState::Queued,
-            "no trace on disk means never observed to land"
+            delivery_state(false, &positions, "withdrawn-before-claim", false),
+            DeliveryState::Withdrawn,
+            "no copy and no landing means gone, not waiting"
+        );
+        assert_eq!(
+            delivery_state(false, &DiskPositions::default(), "prompted", true),
+            DeliveryState::Delivered,
+            "a prompt inclusion lands without claiming the inbox copy"
+        );
+        assert_eq!(
+            delivery_state(false, &positions, "q1", true),
+            DeliveryState::Delivered,
+            "a delivered receipt beats the waiting inbox copy"
+        );
+    }
+
+    #[test]
+    fn ack_counts_only_when_the_acker_is_a_recipient() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let target = directed(&paths, "r1", "human", "impl", "x");
+        let mut ack = target.clone();
+        ack.kind = MsgKind::Ack;
+        ack.from = "impl".into();
+        assert!(ack_counts(&ack, &target));
+        ack.from = "critic".into();
+        assert!(
+            !ack_counts(&ack, &target),
+            "a stranger's ack never confirms a directed message"
+        );
+        let mut wide = target.clone();
+        wide.to = "broadcast".into();
+        assert!(
+            ack_counts(&ack, &wide),
+            "a broadcast's send-time recipients are unknowable, so any acker counts"
         );
     }
 

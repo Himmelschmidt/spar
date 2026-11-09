@@ -1056,8 +1056,6 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                 .as_deref()
                 .map(|old| bus::withdraw(&paths, old))
                 .transpose()?;
-            // Withdraw first so a superseded copy never joins the fan-out below.
-            fan_out_poll_files(&paths, &msg);
             if json {
                 let mut v = serde_json::to_value(&msg)?;
                 v["schema_version"] = serde_json::json!(bus::LOG_SCHEMA);
@@ -1227,59 +1225,6 @@ fn implementer_id(st: &state::RunState) -> Result<String> {
     }
 }
 
-/// Resolve `agent`'s delivery strategy from its run slot's provider adapter. An agent
-/// with no slot or no CLI adapter (bare agent / api slot) has no injection channel.
-fn agent_delivery_strategy(state: &state::RunState, agent: &str) -> providers::DeliveryStrategy {
-    state
-        .slots
-        .iter()
-        .find(|s| s.id == agent)
-        .and_then(|s| providers::adapter_named(&s.provider))
-        .map(|a| a.delivery_strategy())
-        .unwrap_or(providers::DeliveryStrategy::None)
-}
-
-/// PollFile slots have no push channel, so a CLI send fans each such
-/// recipient's inbox straight into its poll file while the send is in hand —
-/// the batch is there at the slot's next poll with no explicit `bus deliver`.
-/// Every other strategy keeps its own pulse (the Stop-hook drain, the native
-/// queue); bare ids and `@human` resolve to no slot and stay inbox-queued.
-/// Best effort: the send already succeeded, so a fan-out failure must not fail
-/// it. The message waits safely in the inbox, and the next fan-out retries the
-/// whole drain.
-fn fan_out_poll_files(paths: &paths::SparPaths, msg: &bus::BusMessage) {
-    let Ok(targets) = bus::message_targets(paths, msg) else {
-        return;
-    };
-    // Group by run so each state loads once; a broadcast can span runs.
-    let mut by_run: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-    for t in &targets {
-        if let Some((run, _)) = t.split_once(':') {
-            by_run.entry(run).or_default().push(t);
-        }
-    }
-    for (run, agents) in by_run {
-        let Ok(state) = state::RunState::load(paths, run) else {
-            continue;
-        };
-        let dry_run = state.dry_run || util::env_truthy("SPAR_DRY_RUN");
-        for agent in agents {
-            let short = agent.strip_prefix(&format!("{run}:")).unwrap_or(agent);
-            if agent_delivery_strategy(&state, short) != providers::DeliveryStrategy::PollFile {
-                continue;
-            }
-            let _ = providers::delivery::deliver(
-                paths,
-                Some(run),
-                agent,
-                providers::DeliveryStrategy::PollFile,
-                None,
-                dry_run,
-            );
-        }
-    }
-}
-
 fn bus_deliver(
     paths: &paths::SparPaths,
     run_id: Option<&str>,
@@ -1298,7 +1243,7 @@ fn bus_deliver(
     let (strategy, session_id, dry_run) = match run_id {
         Some(run) => {
             let state = state::RunState::load(paths, run)?;
-            let strat = agent_delivery_strategy(&state, short);
+            let strat = providers::delivery::strategy_for_slot(&state, short);
             // The slot's own live sidecar, not `state.usage` (only set once a dispatch
             // finishes): a mid-run codex thread id must be found while it is still
             // running, the exact moment a turn-boundary push needs it.

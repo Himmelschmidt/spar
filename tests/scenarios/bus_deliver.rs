@@ -387,6 +387,93 @@ fn agy_send_fans_out_to_the_poll_file() {
     );
 }
 
+/// A `requires_ack` redelivery reaches the agy poll file too: the tick re-files
+/// the message into the inbox, and file-time fan-out drains it like any other
+/// producer's filing — no explicit `bus deliver` needed for the copy to land.
+#[test]
+fn agy_redelivery_reaches_the_poll_file() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run_id = plan_and_approve(tmp.path());
+    let agent = slot_for_provider(tmp.path(), &run_id, "cli:agy");
+    set_dry_run(tmp.path(), &run_id, false);
+
+    let out = spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "bus",
+            "send",
+            "--run",
+            &run_id,
+            "--to",
+            &agent,
+            "--requires-ack",
+            "-m",
+            "confirm the migration plan",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let sent: Value = serde_json::from_slice(&out).unwrap();
+    let msg_id = sent["id"].as_str().unwrap().to_string();
+
+    let poll_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("logs")
+        .join(format!("nudges-{agent}.md"));
+    let poll = || std::fs::read_to_string(&poll_path).unwrap();
+    assert_eq!(
+        poll().matches("confirm the migration plan").count(),
+        1,
+        "the send itself fans out exactly one copy"
+    );
+
+    // Make the redelivery due now by backdating its pending_ack record; the
+    // message JSON comes straight from the send above.
+    let pending = tmp
+        .path()
+        .join(".spar/bus/pending_ack")
+        .join(format!("{msg_id}.json"));
+    let record = serde_json::json!({
+        "msg": sent,
+        "attempts": 0,
+        "next_at": "2000-01-01T00:00:00Z",
+    });
+    std::fs::write(&pending, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+
+    // `bus deliver` ticks acks before draining: the due redelivery re-files and
+    // fans straight out to the poll file.
+    deliver_json(tmp.path(), &run_id, &agent);
+    assert_eq!(
+        poll().matches("confirm the migration plan").count(),
+        2,
+        "the redelivered copy lands in the poll file with no explicit drain"
+    );
+
+    let log = spar_cmd()
+        .current_dir(tmp.path())
+        .args(["bus", "log", "--run", &run_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let entries: Value = serde_json::from_slice(&log).unwrap();
+    assert!(
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["id"] == msg_id && e["delivery"] == "delivered"),
+        "{entries}"
+    );
+}
+
 /// Flip a run between dry-run and live by editing its state file. Only for tests
 /// that need the real write path (dry runs stub poll-file writes).
 fn set_dry_run(dir: &std::path::Path, run_id: &str, dry_run: bool) {

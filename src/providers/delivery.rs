@@ -9,6 +9,7 @@
 use super::DeliveryStrategy;
 use crate::bus::{self, BusMessage};
 use crate::paths::SparPaths;
+use crate::state::RunState;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
@@ -273,6 +274,61 @@ fn codex_native_deliver_with(
         DeliveryAction::PolledFile
     };
     Ok((action, path))
+}
+
+/// Resolve `slot`'s delivery strategy from its run slot's provider adapter. A slot
+/// with no adapter has no injection channel.
+pub fn strategy_for_slot(state: &RunState, slot: &str) -> DeliveryStrategy {
+    state
+        .slots
+        .iter()
+        .find(|s| s.id == slot)
+        .and_then(|s| crate::providers::adapter_named(&s.provider))
+        .map(|a| a.delivery_strategy())
+        .unwrap_or(DeliveryStrategy::None)
+}
+
+/// File-time fan-out for PollFile slots: [`crate::bus`] calls this on every inbox
+/// filing, so every producer (CLI sends, broadcasts, acks, ack redeliveries)
+/// lands in a PollFile slot's poll file — not just the producers that remember
+/// to drain. Each recipient's whole inbox drains through [`deliver`], which also
+/// picks up copies filed while the run state was unreadable. Other strategies
+/// keep their own pulse; bare ids resolve to no slot and stay inbox-queued.
+/// Best effort with a stderr line, never an error: the filing already succeeded,
+/// the inbox stays the durable queue, and the next filing retries the drain.
+/// Skipped under dry runs: the write would be stubbed while the drain still
+/// claimed, stranding the batch where neither the inbox nor the poll file shows it.
+pub fn drain_poll_files(paths: &SparPaths, targets: &[String]) {
+    let mut by_run: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for t in targets {
+        if let Some((run, _)) = t.split_once(':') {
+            by_run.entry(run).or_default().push(t);
+        }
+    }
+    for (run, agents) in by_run {
+        let Ok(state) = RunState::load(paths, run) else {
+            continue;
+        };
+        if state.dry_run || crate::util::env_truthy("SPAR_DRY_RUN") {
+            continue;
+        }
+        for agent in agents {
+            let short = agent.strip_prefix(&format!("{run}:")).unwrap_or(agent);
+            if strategy_for_slot(&state, short) != DeliveryStrategy::PollFile {
+                continue;
+            }
+            if let Err(e) = deliver(
+                paths,
+                Some(run),
+                agent,
+                DeliveryStrategy::PollFile,
+                None,
+                false,
+            ) {
+                eprintln!("warning: poll-file fan-out to {agent} failed: {e:#}");
+            }
+        }
+    }
 }
 
 /// Where spar leaves messages for an adapter with no push channel into its running
