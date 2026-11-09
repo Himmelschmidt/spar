@@ -89,6 +89,29 @@ pub fn scrape_auth_signal(text: &str) -> Option<String> {
         .map(|l| l.trim().chars().take(300).collect())
 }
 
+/// Quota-aware: also ineligible when the provider's fleet key sits under a pause
+/// record (O106) or when the availability set (when provided) excludes it.
+/// The set is built from `ProviderReport::usable`, so probe-failed providers
+/// are excluded upstream; a `None` set means dry-run or no detection and
+/// checks quota only. Readiness itself is gated in `backup_eligible` and
+/// `resolve_with_backup`, which know whether probing is allowed.
+/// Whether a seat may stay on its provider: explicit CLI pins dispatch despite
+/// probe-failed readiness (they warn at launch instead), so only a quota or
+/// manual pause benches them; any other seat must also sit in the usable set.
+/// The set is an auto-selection artifact — it must not park or rotate a pin —
+/// and `None` (no backup declared, or dry-run) leaves every seat to the store.
+pub fn seat_eligible(
+    provider: &str,
+    source: Option<crate::state::SeatSource>,
+    store: &QuotaStore,
+    available: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    if source.is_some_and(crate::state::SeatSource::is_explicit_pin) {
+        return is_provider_eligible(provider, store, None);
+    }
+    is_provider_eligible(provider, store, available)
+}
+
 pub fn is_provider_eligible(
     provider: &str,
     store: &QuotaStore,
@@ -118,7 +141,8 @@ pub fn is_provider_eligible(
 /// is probed before it is skipped (#153, O106): that pause is a failure recorded at some
 /// point in the past, and a week-old one benched a working backup while its primary
 /// died. A manual pause is the operator's decision and is never probed past, and
-/// `dry` never spawns.
+/// `dry` never spawns. A backup whose readiness probe failed is never eligible:
+/// rotation skips it while the run stays on (or falls back to) the primary.
 pub fn backup_eligible(
     backup: &str,
     store: &QuotaStore,
@@ -126,7 +150,7 @@ pub fn backup_eligible(
     paths: &crate::paths::SparPaths,
     dry: bool,
 ) -> bool {
-    if is_provider_eligible(backup, store, available) {
+    if is_provider_eligible(backup, store, available) && health_allows(backup, dry) {
         return true;
     }
     let key = crate::quota::quota_key(backup);
@@ -141,7 +165,13 @@ pub fn backup_eligible(
         );
     }
     let fresh = QuotaStore::load(paths).unwrap_or_default();
-    is_provider_eligible(backup, &fresh, available)
+    is_provider_eligible(backup, &fresh, available) && health_allows(backup, dry)
+}
+
+/// Rotation-target readiness gate. `dry` never spawns: without a probe there is
+/// no signal, so dry runs keep today's quota-only verdict.
+fn health_allows(provider: &str, dry: bool) -> bool {
+    dry || crate::providers::is_provider_usable(provider, false)
 }
 
 static PROBED_BACKUPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
@@ -203,7 +233,18 @@ pub fn resolve_with_backup(
     );
     let (prov, src) = primary?;
     let seat = crate::provider_ref::ProviderRef::for_seat(&prov, primary_model).display();
-    if is_provider_eligible(&seat, store, available) {
+    // An auto-selected seat on a probe-failed provider yields to the backup;
+    // an explicit pin still dispatches (seat resolution keeps it and the launch
+    // warns) unless a healthy backup is declared. `dry` never probes.
+    if is_provider_eligible(&seat, store, available)
+        && (health_allows(&seat, dry)
+            || matches!(
+                src,
+                crate::state::SeatSource::CliProviders
+                    | crate::state::SeatSource::CliRole
+                    | crate::state::SeatSource::Backup
+            ))
+    {
         return Some((prov, src));
     }
     let backup_raw = backup_for_role(role, role_index, cfg)?;

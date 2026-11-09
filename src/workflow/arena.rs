@@ -81,6 +81,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     );
     ranker.source = sources.last().copied();
     state.slots.push(ranker);
+    state.record_unhealthy_pin_warnings();
 
     paths.ensure_run_dirs(&state.id)?;
     state.save(paths)?;

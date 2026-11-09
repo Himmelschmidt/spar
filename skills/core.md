@@ -79,8 +79,10 @@ reads its `.credentials.json` for an expired refresh token; `cli:codex` runs `co
 login status` (logged out). grok, muse and agy have no local check that fails on a dead
 login, so they report unknown; use `spar provider probe <ref>` for a real call. Limit:
 no local probe sees a token revoked server-side; that surfaces at dispatch as an auth
-fault. An `unhealthy` provider is still eligible for dispatch; doctor warns, it does not
-exclude.
+fault. An `unhealthy` provider is skipped by auto-selection and backup rotation
+(`unknown` stays eligible); an explicit pin (`--providers`, `--role`, `--backup`)
+still dispatches, with a launch warning carried on the run as `warnings` (stderr
+and `--json`).
 
 **A reviewer that cannot run is not a verdict (O103).** In the implement loop, a
 reviewer dispatch that fails because the provider could not serve it (rate limit, auth

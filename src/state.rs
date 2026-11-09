@@ -38,6 +38,11 @@ pub struct RunState {
     pub slots: Vec<SlotState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Launch warnings that did not stop the run: explicitly pinned providers
+    /// dispatched despite a failed readiness probe. Recorded once at launch so
+    /// `--json` output carries what stderr printed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     #[serde(default)]
     pub project_root: PathBuf,
     /// Ref every slot worktree is cut from, as the operator named it (branch, tag, sha).
@@ -629,6 +634,17 @@ pub enum SeatSource {
     Unknown,
 }
 
+impl SeatSource {
+    /// Named by an explicit CLI pin (`--providers`, `--role`, `--backup`): the seat
+    /// dispatches despite probe-failed readiness and warns at launch instead.
+    pub fn is_explicit_pin(self) -> bool {
+        matches!(
+            self,
+            SeatSource::CliProviders | SeatSource::CliRole | SeatSource::Backup
+        )
+    }
+}
+
 /// Provenance of the positional pool a run resolved, at the moment a phase's seats were
 /// built. `CliProviders`/`Selected` are real overrides (an operator-supplied `--providers`
 /// list, or a `--select` result); `Synth` means the pool itself was synthesized from
@@ -823,6 +839,7 @@ impl RunState {
             updated_at: now,
             slots: Vec::new(),
             error: None,
+            warnings: Vec::new(),
             project_root,
             base_ref: None,
             base_commit: None,
@@ -875,6 +892,29 @@ impl RunState {
 
     pub fn touch(&mut self) {
         self.updated_at = Utc::now();
+    }
+
+    /// Warn once per explicitly pinned provider (`--providers`, `--role`,
+    /// `--backup`) whose readiness probe failed. The pin still dispatches; the
+    /// warning is printed at launch and kept on the run so `--json` output
+    /// carries it. Dry runs never probe, so they record nothing.
+    pub fn record_unhealthy_pin_warnings(&mut self) {
+        if self.dry_run {
+            return;
+        }
+        for slot in &self.slots {
+            if !slot.source.is_some_and(SeatSource::is_explicit_pin) {
+                continue;
+            }
+            let Some(warning) = crate::providers::unhealthy_pin_warning(&slot.provider) else {
+                continue;
+            };
+            if self.warnings.iter().any(|w| w == &warning) {
+                continue;
+            }
+            eprintln!("warning: {warning}");
+            self.warnings.push(warning);
+        }
     }
 
     /// Open a new round on this run (O45). Bumps the counter, un-archives, and hands

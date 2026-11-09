@@ -152,7 +152,7 @@ pub fn run(
         } else {
             let detected: std::collections::HashSet<String> = crate::providers::detect_all()
                 .into_iter()
-                .filter(|r| r.available)
+                .filter(|r| r.usable())
                 .map(|r| format!("cli:{}", r.name))
                 .collect();
             if detected.is_empty() {
@@ -164,7 +164,12 @@ pub fn run(
         let mut still_paused: Vec<String> = Vec::new();
         for job in &jobs {
             let seat = job.provider_ref().display();
-            if !crate::backup::is_provider_eligible(&seat, &store, available.as_ref()) {
+            let source = state
+                .slots
+                .iter()
+                .find(|s| s.id == job.slot_id)
+                .and_then(|s| s.source);
+            if !crate::backup::seat_eligible(&seat, source, &store, available.as_ref()) {
                 let key = job.provider_ref().quota_key();
                 if !still_paused.contains(&key) {
                     still_paused.push(key);
@@ -189,6 +194,7 @@ pub fn run(
         }
     }
 
+    state.record_unhealthy_pin_warnings();
     // Printed after the slots resolve, not off `state.providers`: the pool lists what the
     // run *may* draw from, which is not what any role got.
     if !opts.json {
@@ -253,7 +259,7 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> Vec<PlanSeat> {
     } else {
         let detected: std::collections::HashSet<String> = crate::providers::detect_all()
             .into_iter()
-            .filter(|r| r.available)
+            .filter(|r| r.usable())
             .map(|r| format!("cli:{}", r.name))
             .collect();
         if detected.is_empty() {
@@ -348,7 +354,7 @@ pub fn execute_plan(
             } else {
                 let detected: std::collections::HashSet<String> = crate::providers::detect_all()
                     .into_iter()
-                    .filter(|r| r.available)
+                    .filter(|r| r.usable())
                     .map(|r| format!("cli:{}", r.name))
                     .collect();
                 if detected.is_empty() {
@@ -600,7 +606,7 @@ fn resolve_test_author(
     } else {
         let detected: std::collections::HashSet<String> = crate::providers::detect_all()
             .into_iter()
-            .filter(|r| r.available)
+            .filter(|r| r.usable())
             .map(|r| format!("cli:{}", r.name))
             .collect();
         if detected.is_empty() {
@@ -611,7 +617,7 @@ fn resolve_test_author(
     };
     let seat_ref =
         crate::provider_ref::ProviderRef::for_seat(&provider, model.as_deref()).display();
-    if !crate::backup::is_provider_eligible(&seat_ref, &store, available.as_ref()) {
+    if !crate::backup::seat_eligible(&seat_ref, Some(source), &store, available.as_ref()) {
         if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg) {
             if crate::backup::backup_eligible(
                 &backup_raw,
@@ -713,7 +719,7 @@ fn run_test_author(
         } else {
             let detected: std::collections::HashSet<String> = crate::providers::detect_all()
                 .into_iter()
-                .filter(|r| r.available)
+                .filter(|r| r.usable())
                 .map(|r| format!("cli:{}", r.name))
                 .collect();
             if detected.is_empty() {

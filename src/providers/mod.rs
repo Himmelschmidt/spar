@@ -76,13 +76,18 @@ pub enum Readiness {
     /// The probe ran and passed.
     Healthy,
     /// The probe ran and failed. The provider is still `available`, but
-    /// `doctor` and `provider list` report it as unhealthy instead.
+    /// auto-selection and backup rotation skip it; an explicit pin still
+    /// dispatches, with a launch warning.
     Unhealthy,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderReport {
     pub name: String,
+    /// The binary resolves on PATH. Serialization and `doctor` / `provider list`
+    /// display read this directly; every auto-selection, dispatch and backup
+    /// path goes through `usable()` instead, so a probe-failed provider is not
+    /// rotated onto.
     pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -98,6 +103,16 @@ pub struct ProviderReport {
     pub delivery: DeliveryStrategy,
     /// Where this adapter's presence transitions come from.
     pub presence: PresenceSource,
+}
+
+impl ProviderReport {
+    /// Auto-selection eligibility: the binary resolves and its readiness probe
+    /// did not fail. `Unknown` (no probe, timeout, spawn failure) stays eligible;
+    /// only a failed probe (`Unhealthy`) benches the provider. Explicit pins
+    /// bypass this and warn at launch instead.
+    pub fn usable(&self) -> bool {
+        self.available && self.readiness != Readiness::Unhealthy
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -734,28 +749,65 @@ pub fn adapter_named(name: &str) -> Option<Box<dyn ProviderAdapter>> {
     all_adapters().into_iter().find(|a| a.name() == bare)
 }
 
-/// Whether a provider ref can be used for a live slot.
-pub fn is_provider_usable(raw: &str, allow_missing: bool) -> bool {
+/// Whether a provider ref names something spar can dispatch: a known adapter whose
+/// binary resolves (or a supported api-sdk name). Says nothing about readiness;
+/// an explicitly pinned provider passes this while `Unhealthy` and warns at
+/// launch instead of being dropped.
+pub fn is_provider_present(raw: &str, allow_missing: bool) -> bool {
+    if allow_missing || crate::util::env_truthy("SPAR_DRY_RUN") {
+        return ProviderRef::parse(raw).is_ok();
+    }
     let Ok(pref) = ProviderRef::parse(raw) else {
         return false;
     };
     match pref.backend {
-        ExecBackend::NativeCli => {
-            if allow_missing {
-                return true;
-            }
-            adapter_named(&pref.storage_key())
-                .or_else(|| adapter_named(&pref.name))
-                .map(|a| a.resolve_binary().is_some())
-                .unwrap_or(false)
-        }
-        ExecBackend::ApiSdk => {
-            if allow_missing {
-                return true;
-            }
-            api_provider_supported(&pref.name)
-        }
+        ExecBackend::NativeCli => adapter_named(&pref.storage_key())
+            .or_else(|| adapter_named(&pref.name))
+            .is_some_and(|a| a.resolve_binary().is_some()),
+        ExecBackend::ApiSdk => api_provider_supported(&pref.name),
     }
+}
+
+/// Whether a provider ref can take an auto-selected seat: present plus, for
+/// native CLIs, not probe-failed (`Unknown` stays eligible). Probes never run
+/// under `--dry-run` / `allow_missing`.
+pub fn is_provider_usable(raw: &str, allow_missing: bool) -> bool {
+    if allow_missing || crate::util::env_truthy("SPAR_DRY_RUN") {
+        return ProviderRef::parse(raw).is_ok();
+    }
+    let Ok(pref) = ProviderRef::parse(raw) else {
+        return false;
+    };
+    match pref.backend {
+        ExecBackend::NativeCli => adapter_named(&pref.storage_key())
+            .or_else(|| adapter_named(&pref.name))
+            .is_some_and(|a| a.detect().usable()),
+        ExecBackend::ApiSdk => api_provider_supported(&pref.name),
+    }
+}
+
+/// The launch warning for an explicitly pinned provider whose readiness probe
+/// failed. `None` for anything auto-selection would already skip or keep
+/// (missing, healthy, `Unknown`, api-sdk): only a present-but-`Unhealthy` CLI
+/// pin warns, and it still dispatches.
+pub fn unhealthy_pin_warning(provider: &str) -> Option<String> {
+    let pref = ProviderRef::parse(provider).ok()?;
+    if pref.backend != ExecBackend::NativeCli {
+        return None;
+    }
+    let adapter = adapter_named(&pref.storage_key()).or_else(|| adapter_named(&pref.name))?;
+    let report = adapter.detect();
+    if !report.available || report.readiness != Readiness::Unhealthy {
+        return None;
+    }
+    Some(format!(
+        "explicitly pinned provider {provider} is unhealthy{}; dispatching anyway",
+        report
+            .readiness_message
+            .as_deref()
+            .map(|m| format!(": {m}"))
+            .unwrap_or_default()
+    ))
 }
 
 /// Named API providers the api-sdk backend actually has an adapter for.
@@ -786,12 +838,13 @@ pub fn ensure_known(raw: &str) -> anyhow::Result<()> {
     )
 }
 
-/// Providers that are on PATH, as `cli:name` keys, optionally filtered by `order`.
+/// Providers eligible for auto-selection, as `cli:name` keys, optionally filtered
+/// by `order`. Skips probe-failed (`Unhealthy`) providers; `Unknown` stays in.
 pub fn available_providers(order: &[String]) -> Vec<String> {
     if order.is_empty() {
         detect_all()
             .into_iter()
-            .filter(|p| p.available)
+            .filter(|p| p.usable())
             .map(|p| format!("cli:{}", p.name))
             .collect()
     } else {
@@ -817,8 +870,12 @@ pub fn pick_providers(
 ) -> Vec<String> {
     let allow_missing = allow_missing || crate::util::env_truthy("SPAR_DRY_RUN");
     let base = if let Some(req) = requested {
+        // Explicit pins survive a failed readiness probe: they still dispatch,
+        // with a launch warning. Only unknown names and (live) missing binaries
+        // are dropped here; auto-selection health-gating lives in
+        // `available_providers` / `is_provider_usable`.
         req.iter()
-            .filter(|n| is_provider_usable(n, allow_missing))
+            .filter(|n| is_provider_present(n, allow_missing))
             .filter_map(|n| ProviderRef::parse(n).ok().map(|p| p.display()))
             .collect::<Vec<_>>()
     } else if allow_missing {
@@ -955,6 +1012,31 @@ mod tests {
     }
 
     #[test]
+    fn usable_skips_only_unhealthy() {
+        let report = |available: bool, readiness: Readiness| ProviderReport {
+            name: "stub".into(),
+            available,
+            path: None,
+            version: None,
+            readiness,
+            readiness_message: None,
+            capabilities: Capabilities::default(),
+            delivery: DeliveryStrategy::StopHookInject,
+            presence: PresenceSource::None,
+        };
+        assert!(
+            report(true, Readiness::Unknown).usable(),
+            "no probe stays eligible"
+        );
+        assert!(report(true, Readiness::Healthy).usable());
+        assert!(!report(true, Readiness::Unhealthy).usable());
+        assert!(
+            !report(false, Readiness::Unknown).usable(),
+            "binary must still resolve"
+        );
+    }
+
+    #[test]
     fn no_probe_reports_unknown_and_stays_available() {
         let r = StubAdapter { probe: None }.detect();
         assert!(
@@ -985,6 +1067,22 @@ mod tests {
         assert!(r.available, "binary still resolves; only readiness changes");
         assert_eq!(r.readiness, Readiness::Unhealthy);
         assert_eq!(r.readiness_message.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn detect_feeds_usable() {
+        let healthy = StubAdapter {
+            probe: Some(&["-c", "exit 0"]),
+        }
+        .detect();
+        assert!(healthy.usable());
+        let unhealthy = StubAdapter {
+            probe: Some(&["-c", "exit 1"]),
+        }
+        .detect();
+        assert!(!unhealthy.usable());
+        let unknown = StubAdapter { probe: None }.detect();
+        assert!(unknown.usable());
     }
 
     #[test]

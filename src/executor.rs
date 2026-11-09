@@ -4791,6 +4791,7 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "providers": state.providers,
         "gates": state.gates,
         "error": state.error,
+        "warnings": state.warnings,
         "project_root": state.project_root,
         // `providers` is the pool; this is what each role actually drew from it.
         "roles": role_assignments(state),
@@ -4867,6 +4868,9 @@ pub fn print_run_human(state: &RunState) {
     }
     if state.dry_run {
         println!("dry_run: true  (no git worktrees; agent processes stubbed only)");
+    }
+    for warning in &state.warnings {
+        println!("warning: {warning}");
     }
     // Gate phases only (feature 011, item C): that is where a human decides whether to
     // pay for the panel, and a table on every status print would just be noise.

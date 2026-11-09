@@ -76,7 +76,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     } else {
         let detected: std::collections::HashSet<String> = crate::providers::detect_all()
             .into_iter()
-            .filter(|r| r.available)
+            .filter(|r| r.usable())
             .map(|r| format!("cli:{}", r.name))
             .collect();
         if detected.is_empty() {
@@ -99,7 +99,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             .ok()
             .and_then(|p| p.model);
         let backup_pin =
-            if !crate::backup::is_provider_eligible(&provider, &store, available.as_ref()) {
+            if !crate::backup::seat_eligible(&provider, source, &store, available.as_ref()) {
                 if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Reviewer, i, cfg)
                 {
                     if crate::backup::backup_eligible(
@@ -139,6 +139,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         slot.source = source;
         state.slots.push(slot);
     }
+    state.record_unhealthy_pin_warnings();
 
     paths.ensure_run_dirs(&state.id)?;
     bus::ensure_bus(paths)?;
@@ -230,7 +231,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
     } else {
         let detected: std::collections::HashSet<String> = crate::providers::detect_all()
             .into_iter()
-            .filter(|r| r.available)
+            .filter(|r| r.usable())
             .map(|r| format!("cli:{}", r.name))
             .collect();
         if detected.is_empty() {

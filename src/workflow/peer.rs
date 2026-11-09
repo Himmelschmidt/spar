@@ -75,6 +75,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     let mut slot_b = executor::init_slot(&id_b, &b, SlotRole::Peer);
     slot_b.source = sources.get(1).copied();
     state.slots.push(slot_b);
+    state.record_unhealthy_pin_warnings();
 
     paths.ensure_run_dirs(&state.id)?;
     bus::ensure_bus(paths)?;

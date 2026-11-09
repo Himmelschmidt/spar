@@ -70,6 +70,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     let mut be_slot = executor::init_slot(format!("role-backend-{be}"), &be, SlotRole::Peer);
     be_slot.source = sources.get(1).copied();
     state.slots.push(be_slot);
+    state.record_unhealthy_pin_warnings();
 
     paths.ensure_run_dirs(&state.id)?;
     bus::ensure_bus(paths)?;

@@ -214,6 +214,27 @@ fn an_implementer_auth_rejection_moves_to_the_declared_backup() {
     assert!(fx.state()["error"].as_str().unwrap().contains("auth"));
 }
 
+/// A fake CLI that fails its readiness probe and fails dispatches with `dispatch`.
+/// `probe_argv` is the probe's `$1` (`auth` for claude, `login` for codex).
+fn unhealthy_cli(name: &str, probe_argv: &str, dispatch: &str) -> String {
+    format!(
+        "case \"$1\" in -p|exec) echo x >> \"$FAKE_COUNT_DIR/{name}.count\"\n{dispatch};; {probe_argv}) echo 'probe failed' >&2; exit 1;; *) exit 0;; esac"
+    )
+}
+
+/// Seeds a fresh vals bench cache so `--select` ranks without network.
+fn seed_bench(home: &Path, models: &str) {
+    let dir = home.join("cache/vals");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("swebench.json"),
+        format!(
+            "{{\"bench\":\"swebench\",\"source\":\"vals\",\"url\":\"https://example.invalid\",\"fetched_at\":\"2026-01-01T00:00:00Z\",\"models\":[{models}]}}"
+        ),
+    )
+    .unwrap();
+}
+
 fn list_entry(fx: &Fixture, name: &str) -> serde_json::Value {
     let out = fx
         .spar()
@@ -1140,5 +1161,179 @@ fn amend_with_same_sub_backup_parks_with_no_eligible_backup() {
     assert!(
         err.contains("cli:agy@pro") && err.contains("no eligible backup"),
         "{err}"
+    );
+}
+
+#[test]
+fn provider_list_reports_unhealthy_and_unknown_readiness() {
+    let fx = Fixture::new();
+    fx.cli("claude", &unhealthy_cli("claude", "auth", "exit 1"));
+    let claude = list_entry(&fx, "claude");
+    assert_eq!(claude["readiness"], "unhealthy");
+    assert!(
+        claude["available"].as_bool().unwrap(),
+        "the binary resolves"
+    );
+    assert!(
+        claude["readiness_message"]
+            .as_str()
+            .unwrap()
+            .contains("probe failed"),
+        "{claude}"
+    );
+    let grok = list_entry(&fx, "grok");
+    assert_eq!(
+        grok["readiness"], "unknown",
+        "no probe stays eligible: {grok}"
+    );
+    assert!(grok["available"].as_bool().unwrap());
+}
+
+#[test]
+fn unhealthy_provider_is_skipped_by_auto_select_and_unknown_is_kept() {
+    let fx = Fixture::new();
+    fx.cli("claude", &unhealthy_cli("claude", "auth", "exit 1"));
+    fx.cli("grok", "echo x >> \"$FAKE_COUNT_DIR/grok.count\"\nexit 1");
+    // claude's model strictly dominates on accuracy and latency, so it would
+    // rank first if readiness were ignored. CLI-only: the bench ids also map to
+    // api fallbacks, which count usable without keys in this keyless fixture.
+    std::fs::write(
+        fx.proj.join("spar.toml"),
+        "[model_select]\nallow = [\"cli:*\"]\n",
+    )
+    .unwrap();
+    seed_bench(
+        &fx.home,
+        r#"{"id":"anthropic/claude-opus-4-8","accuracy":99.0,"latency":10.0,"cost_per_test":1.0},{"id":"xai/grok-4","accuracy":92.0,"latency":60.0,"cost_per_test":1.0}"#,
+    );
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--select",
+            "auto",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .failure();
+    assert_eq!(fx.count("claude"), 0, "unhealthy is never dispatched");
+    assert!(fx.count("grok") >= 1, "unknown stays eligible");
+    let state = fx.state();
+    let providers: Vec<&str> = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["provider"].as_str().unwrap())
+        .collect();
+    assert!(!providers.is_empty());
+    assert!(
+        providers.iter().all(|p| *p == "cli:grok"),
+        "every seat skips claude: {providers:?}"
+    );
+    assert!(
+        state.get("warnings").is_none(),
+        "auto-selection warns nothing: {}",
+        state["warnings"]
+    );
+}
+
+#[test]
+fn unhealthy_backup_is_skipped_by_rotation_and_stays_on_the_primary() {
+    let fx = Fixture::new();
+    fx.cli(
+        "claude",
+        &unhealthy_cli(
+            "claude",
+            "auth",
+            &format!("echo '{CLAUDE_REVOKED}'\nexit 1"),
+        ),
+    );
+    fx.cli(
+        "codex",
+        &unhealthy_cli("codex", "login", "echo 'Not logged in' >&2\nexit 1"),
+    );
+    let out = fx
+        .spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--providers",
+            "cli:claude",
+            "--backup",
+            "implementer=cli:codex",
+            "--without",
+            "suite",
+            "--json",
+        ])
+        .assert()
+        .code(4)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("cli:claude") && stderr.contains("unhealthy"),
+        "the pinned primary warns: {stderr}"
+    );
+    let run: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        run["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("cli:claude")),
+        "the --json launch output carries the warning: {run}"
+    );
+    let slot = fx.slot("implementer");
+    assert_eq!(slot["provider"], "cli:claude", "{slot}");
+    assert_ne!(slot["source"], "backup", "rotation skipped codex: {slot}");
+    assert_eq!(
+        fx.count("codex"),
+        0,
+        "the unhealthy backup never dispatches"
+    );
+}
+
+#[test]
+fn explicitly_pinned_unhealthy_provider_still_dispatches_with_a_warning() {
+    let fx = Fixture::new();
+    fx.cli(
+        "codex",
+        &unhealthy_cli("codex", "login", "echo 'Not logged in' >&2\nexit 1"),
+    );
+    let out = fx
+        .spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:codex",
+            "--without",
+            "suite",
+            "--json",
+        ])
+        .assert()
+        .code(4)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("warning") && stderr.contains("cli:codex") && stderr.contains("unhealthy"),
+        "{stderr}"
+    );
+    let run: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = run["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("cli:codex")),
+        "the --json launch output carries the warning: {run}"
+    );
+    assert!(
+        fx.count("codex") >= 1,
+        "the pin still dispatches despite the probe"
     );
 }

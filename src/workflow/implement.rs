@@ -835,7 +835,7 @@ fn run_from_approved(
         } else {
             let detected: std::collections::HashSet<String> = crate::providers::detect_all()
                 .into_iter()
-                .filter(|r| r.available)
+                .filter(|r| r.usable())
                 .map(|r| format!("cli:{}", r.name))
                 .collect();
             if detected.is_empty() {
@@ -849,8 +849,9 @@ fn run_from_approved(
             if matches!(
                 slot.role,
                 SlotRole::Implementer | SlotRole::Reviewer | SlotRole::Tester
-            ) && !crate::backup::is_provider_eligible(
+            ) && !crate::backup::seat_eligible(
                 &slot.provider_ref().display(),
+                slot.source,
                 &store,
                 available.as_ref(),
             ) {
@@ -879,6 +880,7 @@ fn run_from_approved(
     if state.slots.iter().all(|s| s.role != SlotRole::Implementer) {
         bail!("no implementer slot after provider pick");
     }
+    state.record_unhealthy_pin_warnings();
     state.save(paths)?;
     if opts.detach {
         // The detached child takes the lock itself, and flock refuses a second holder.
@@ -975,7 +977,7 @@ fn prepare_implement_slots(
     } else {
         let detected: std::collections::HashSet<String> = crate::providers::detect_all()
             .into_iter()
-            .filter(|r| r.available)
+            .filter(|r| r.usable())
             .map(|r| format!("cli:{}", r.name))
             .collect();
         if detected.is_empty() {
@@ -991,7 +993,7 @@ fn prepare_implement_slots(
         let mut seat_id = seat.seat.clone();
         let seat_ref =
             crate::provider_ref::ProviderRef::for_seat(&provider, model.as_deref()).display();
-        if !crate::backup::is_provider_eligible(&seat_ref, &store, available.as_ref()) {
+        if !crate::backup::seat_eligible(&seat_ref, Some(source), &store, available.as_ref()) {
             let ordinal = if seat.role == SlotRole::Reviewer {
                 reviewer_ordinal(&seat.seat).unwrap_or(0)
             } else {
@@ -1903,7 +1905,7 @@ fn run_with_task(
         } else {
             let detected: std::collections::HashSet<String> = crate::providers::detect_all()
                 .into_iter()
-                .filter(|r| r.available)
+                .filter(|r| r.usable())
                 .map(|r| format!("cli:{}", r.name))
                 .collect();
             if detected.is_empty() {
@@ -1914,8 +1916,9 @@ fn run_with_task(
         };
         let mut still_paused: Vec<String> = Vec::new();
         for slot in &state.slots {
-            if !crate::backup::is_provider_eligible(
+            if !crate::backup::seat_eligible(
                 &slot.provider_ref().display(),
+                slot.source,
                 &store,
                 available.as_ref(),
             ) {
@@ -1942,6 +1945,7 @@ fn run_with_task(
             return Ok(ExitCode::Quota);
         }
     }
+    state.record_unhealthy_pin_warnings();
 
     paths.ensure_run_dirs(&state.id)?;
     let _ = crate::bus::ensure_bus(paths);
@@ -2294,7 +2298,7 @@ pub fn execute_loop(
                             let detected: std::collections::HashSet<String> =
                                 crate::providers::detect_all()
                                     .into_iter()
-                                    .filter(|r| r.available)
+                                    .filter(|r| r.usable())
                                     .map(|r| format!("cli:{}", r.name))
                                     .collect();
                             if detected.is_empty() {
@@ -2380,7 +2384,7 @@ pub fn execute_loop(
                         let detected: std::collections::HashSet<String> =
                             crate::providers::detect_all()
                                 .into_iter()
-                                .filter(|r| r.available)
+                                .filter(|r| r.usable())
                                 .map(|r| format!("cli:{}", r.name))
                                 .collect();
                         if detected.is_empty() {
@@ -3422,7 +3426,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
             } else {
                 let detected: std::collections::HashSet<String> = crate::providers::detect_all()
                     .into_iter()
-                    .filter(|r| r.available)
+                    .filter(|r| r.usable())
                     .map(|r| format!("cli:{}", r.name))
                     .collect();
                 if detected.is_empty() {
