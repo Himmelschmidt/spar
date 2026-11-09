@@ -771,10 +771,12 @@ fn a_tester_log_saying_429_passed_neither_parks_the_run_nor_moves_a_seat() {
     assert_ne!(state["phase"], "quota", "{state}");
     let quota = fx.quota();
     assert_eq!(
-        quota["providers"]["cli:codex"]["status"], "paused_quota",
-        "the broad scrape did pause codex, weakly: {quota}"
+        quota["providers"]["cli:codex@openrouter"]["status"], "paused_quota",
+        "the broad scrape did pause the seat's openrouter bucket, weakly: {quota}"
     );
-    assert!(quota["providers"]["cli:codex"].get("strong").is_none());
+    assert!(quota["providers"]["cli:codex@openrouter"]
+        .get("strong")
+        .is_none());
     let rev = fx.slot("reviewer");
     assert_eq!(rev["id"], "review-0-cli-codex", "{rev}");
     assert_eq!(rev["provider"], "cli:codex");
