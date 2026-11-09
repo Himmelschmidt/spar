@@ -350,7 +350,7 @@ fn a_healthy_probe_clears_the_paused_bucket_it_reads() {
     )
     .unwrap();
     fx.spar()
-        .args(["provider", "probe", "cli:codex"])
+        .args(["provider", "probe", "cli:codex@openrouter"])
         .assert()
         .success();
     assert_eq!(

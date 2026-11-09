@@ -3431,12 +3431,21 @@ fn recheck_seat(
     let seat = slot.provider_ref();
     let key = seat.quota_key();
     let sub = seat.storage_key();
-    // Only a pause a live run can trust stops it here: a weak heuristic pause ("429"
-    // in "429 passed") written by this very run must not park it or reseat it (O106).
+    // A live run trusts only pauses it can trust: manual and strong (O106). A
+    // weak heuristic pause ("429" in "429 passed") written by this very run
+    // must not park it or reseat it — but a weak pause that predates the run
+    // steers the next run onto its backup, so the first dispatch reads it
+    // strict while later dispatches stay trust-only.
     let blocked = if strict {
         !store.is_usable(&key)
+    } else if store.blocks_live_dispatch(&key) {
+        true
     } else {
-        store.blocks_live_dispatch(&key)
+        !store.is_usable(&key)
+            && store
+                .get(&key)
+                .updated_at
+                .is_none_or(|at| at < state.created_at)
     };
     if !blocked {
         return Ok(SeatCheck::Ready(slot_id.to_string()));
@@ -3938,16 +3947,81 @@ mod recheck_seat_tests {
         assert_eq!(st.slots[0].provider, "cli:claude");
     }
 
+    /// A weak pause written before the run started steers the next run onto its
+    /// backup (O106): only pauses this run wrote stay trust-only.
+    #[test]
+    fn a_weak_pause_older_than_the_run_moves_a_reviewer_to_its_backup() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:grok", "possible quota signal: 429");
+        store.providers.get_mut("cli:grok").unwrap().updated_at =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(10));
+        store.save(&paths).unwrap();
+        let mut st = state_with("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        let mut cfg = Config::default();
+        cfg.backups.reviewer = vec!["cli:codex".into()];
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-grok", false).unwrap();
+        assert!(
+            matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-codex"),
+            "a pre-existing weak pause steers onto the backup"
+        );
+    }
+
+    #[test]
+    fn a_weak_pause_older_than_the_run_parks_a_tester_with_no_backup() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:codex", "possible quota signal: 429");
+        store.providers.get_mut("cli:codex").unwrap().updated_at =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(10));
+        store.save(&paths).unwrap();
+        let mut st = state_with("test", "cli:codex", SlotRole::Tester);
+        let got = recheck_seat(&mut st, &paths, &Config::default(), "test", false).unwrap();
+        assert!(
+            matches!(got, SeatCheck::Park(_)),
+            "a pre-existing weak pause parks a tester with no backup"
+        );
+    }
+
+    /// A pre-existing weak pause benches a reviewer with no backup too: the
+    /// re-check parks, and the review panel loop stands the seat down instead
+    /// of parking the run.
+    #[test]
+    fn a_weak_pause_older_than_the_run_parks_a_reviewer_with_no_backup() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:grok", "possible quota signal: 429");
+        store.providers.get_mut("cli:grok").unwrap().updated_at =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(10));
+        store.save(&paths).unwrap();
+        let mut st = state_with("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        let got = recheck_seat(
+            &mut st,
+            &paths,
+            &Config::default(),
+            "review-0-cli-grok",
+            false,
+        )
+        .unwrap();
+        assert!(
+            matches!(got, SeatCheck::Park(_)),
+            "a pre-existing weak pause parks a reviewer with no backup"
+        );
+    }
+
     /// The broad scrape paused codex because a test log said "429 passed". That pause is
     /// weak: it must not park this run or move its seat.
     #[test]
     fn a_weak_heuristic_pause_never_moves_or_parks_a_live_seat() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
+        let mut st = state_with("review-0-cli-codex", "cli:codex", SlotRole::Reviewer);
         let mut store = crate::quota::QuotaStore::default();
         store.pause_quota("cli:codex", "possible quota signal: 429");
         store.save(&paths).unwrap();
-        let mut st = state_with("review-0-cli-codex", "cli:codex", SlotRole::Reviewer);
         let mut cfg = Config::default();
         cfg.backups.reviewer = vec!["cli:grok".into()];
         let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-codex", false).unwrap();

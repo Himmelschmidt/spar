@@ -1629,11 +1629,19 @@ mod tests {
 
     #[test]
     fn quota_key_splits_model_scoped_providers_only() {
+        // Codex buckets read the profile route from process env, so pin it:
+        // every other test thread shares this process.
+        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
         assert_eq!(quota_key("claude"), "cli:claude");
         assert_eq!(quota_key("cli:claude@opus"), "cli:claude@opus");
         assert_eq!(quota_key("cli:claude@claude-opus-5-5"), "cli:claude@opus");
         assert_eq!(quota_key("cli:claude@haiku"), "cli:claude");
-        assert_eq!(quota_key("cli:codex@opus"), "cli:codex");
+        assert_eq!(
+            quota_key("cli:codex@opus"),
+            "cli:codex@native",
+            "an explicit bare codex model dispatches with -m only, under codex's own default"
+        );
         assert_eq!(quota_key("cli:agy@flash"), "cli:agy@flash");
         assert_eq!(quota_key("cli:agy"), "cli:agy");
         assert_eq!(quota_key("api:openai@gpt-5"), "api:openai@gpt-5");

@@ -374,20 +374,31 @@ mod tests {
             "cli:agy@flash",
             "agy always writes the seat"
         );
+        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
         let codex = ProviderRef::parse("cli:codex@gpt-5").unwrap();
         assert_eq!(
             codex.rejection_key(QuotaSignal {
                 window: Some(W::SevenDayOpus),
                 text: ""
             }),
-            "cli:codex"
+            "cli:codex@native",
+            "codex ignores the signal window; the seat's own route decides"
         );
     }
 
     #[test]
     fn quota_key_splits_codex_by_route() {
-        let native = ProviderRef::parse("cli:codex@gpt-5.2-codex").unwrap();
-        assert_eq!(native.quota_key(), "cli:codex");
+        // The profile route is process env, so pin it: every other test thread
+        // shares this process.
+        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+        let routed = ProviderRef::parse("cli:codex@gpt-5.2-codex").unwrap();
+        assert_eq!(
+            routed.quota_key(),
+            "cli:codex@native",
+            "an explicit model omits -p, so a bare model bills codex's own default"
+        );
         let via_openrouter = ProviderRef::parse("cli:codex@openai/gpt-5").unwrap();
         assert_eq!(via_openrouter.quota_key(), "cli:codex@openrouter");
         let bare = ProviderRef::parse("cli:codex").unwrap();
@@ -396,6 +407,25 @@ mod tests {
             "cli:codex@openrouter",
             "a model-less seat dispatches under the default profile, which layers OpenRouter"
         );
+        let native = ProviderRef::parse("cli:codex@native").unwrap();
+        assert_eq!(native.quota_key(), "cli:codex@native");
+        std::env::set_var("SPAR_CODEX_PROFILE", "");
+        assert_eq!(
+            routed.quota_key(),
+            "cli:codex@native",
+            "an explicit model omits -p under any profile"
+        );
+        assert_eq!(
+            bare.quota_key(),
+            "cli:codex@native",
+            "without -p a model-less seat runs native too"
+        );
+        assert_eq!(
+            via_openrouter.quota_key(),
+            "cli:codex@openrouter",
+            "an explicit slug forces OpenRouter under any profile"
+        );
+        std::env::remove_var("SPAR_CODEX_PROFILE");
     }
 
     #[test]
@@ -429,14 +459,16 @@ mod tests {
         // Bucket names are not seat models, but every layer re-resolves what it
         // reads (stats, operator pause/resume/probe), so feeding a stored key
         // back through `quota_key` must be a fixed point, never a collapse.
-        // A native-model seat ref (`cli:codex@gpt-5.2-codex`) is not a stored
-        // key: its bucket is the bare login, which itself reads as a model-less
-        // seat, so it is excluded here; `operator_key` keeps the bare login
-        // out of seat resolution.
+        // Codex bucketing reads the profile route from process env, so pin it:
+        // every other test thread shares this process.
+        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
         for seat in [
             "cli:codex",
             "cli:codex@openrouter",
             "cli:codex@openai/gpt-5",
+            "cli:codex@gpt-5.2-codex",
+            "cli:codex@native",
             "cli:pi",
             "cli:pi@openrouter",
             "cli:pi@google/gemini-2.5-flash",
@@ -478,6 +510,8 @@ mod tests {
     #[test]
     fn rejection_key_lands_in_the_seat_bucket() {
         use crate::providers::{QuotaSignal, RateLimitWindow as W};
+        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
         let key = |seat: &str, window: Option<W>, text: &str| {
             ProviderRef::parse(seat)
                 .unwrap()
@@ -489,7 +523,12 @@ mod tests {
         );
         assert_eq!(
             key("cli:codex@gpt-5.2-codex", None, "rate limited, slow down"),
-            "cli:codex"
+            "cli:codex@native",
+            "an explicit bare model omits -p, so it bills native"
+        );
+        assert_eq!(
+            key("cli:codex@native", None, "rate limited, slow down"),
+            "cli:codex@native"
         );
         assert_eq!(
             key("cli:codex", None, "too many requests"),

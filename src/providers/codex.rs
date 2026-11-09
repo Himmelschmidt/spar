@@ -254,29 +254,40 @@ impl ProviderAdapter for CodexAdapter {
         "codex"
     }
 
-    /// Billing follows the route, not the model: a `/` slug runs through the
-    /// OpenRouter provider, every other model through the ChatGPT login, so
-    /// those are the two buckets. A model-less seat dispatches under the
-    /// default profile, which layers OpenRouter. `openrouter` names the bucket
-    /// itself, so a stored bucket key re-resolves instead of collapsing to the
-    /// login; no codex model is called that, so no seat model collides.
+    /// Billing follows the route, not the model. An explicit model supersedes the
+    /// profile (`exec_command` omits `-p` for it): a `/` slug forces OpenRouter
+    /// (`-c model_provider=openrouter`), while a bare model runs with `-m` only
+    /// under codex's own default, the native ChatGPT login. Only a model-less
+    /// seat dispatches under the profile, and the default `muse` profile sets
+    /// `model_provider = "openrouter"` (`$CODEX_HOME/muse.config.toml`,
+    /// verified). So the two buckets are `openrouter` and `native`, and the
+    /// bare login stays the operator/account key holding both.
+    /// `openrouter` and `native` name the buckets themselves, so a stored
+    /// bucket key re-resolves instead of collapsing; no codex model is called
+    /// either, so no seat model collides.
     fn quota_bucket<'m>(&self, model: &'m str) -> Option<Cow<'m, str>> {
-        (model.contains('/') || model == "openrouter").then_some(Cow::Borrowed("openrouter"))
+        if model.contains('/') || model == "openrouter" {
+            Some(Cow::Borrowed("openrouter"))
+        } else {
+            Some(Cow::Borrowed("native"))
+        }
     }
 
+    /// The model-less seat's bucket: the profile it dispatches under. Read from
+    /// this process's `SPAR_CODEX_PROFILE`, so every spar process that keys the
+    /// same seat (the run, `provider list`, `provider probe`, stats) must share
+    /// the same value; a dropped `-p` (an emptied `SPAR_CODEX_PROFILE`) runs
+    /// codex's own default, the native login.
     fn default_bucket(&self) -> Option<&'static str> {
-        // An explicitly emptied `SPAR_CODEX_PROFILE` drops `-p`, so the seat
-        // runs under codex's own config default (the native login), not the
-        // OpenRouter-layering default profile.
         match std::env::var("SPAR_CODEX_PROFILE") {
-            Ok(p) if p.trim().is_empty() => None,
+            Ok(p) if p.trim().is_empty() => Some("native"),
             _ => Some("openrouter"),
         }
     }
 
     /// Rejections carry no route of their own, so every rejection lands in the
-    /// dispatched seat's own bucket: the seat's route, or the login for a
-    /// native-model seat.
+    /// dispatched seat's own bucket: the seat's route, or the login when the
+    /// adapter cannot bucket it.
     fn rejection_scope<'s>(
         &self,
         seat: Option<&'s str>,
@@ -646,8 +657,31 @@ mod tests {
         std::env::set_var("SPAR_CODEX_PROFILE", "");
         assert_eq!(
             CodexAdapter.default_bucket(),
-            None,
-            "an emptied profile drops -p, so the seat runs native and keys the login"
+            Some("native"),
+            "an emptied profile drops -p, so the seat runs native"
+        );
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+    }
+
+    #[test]
+    fn explicit_models_omit_the_profile() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+        assert_eq!(
+            CodexAdapter.quota_bucket("gpt-5.2-codex").as_deref(),
+            Some("native"),
+            "an explicit bare model dispatches with -m only, under codex's own default"
+        );
+        std::env::set_var("SPAR_CODEX_PROFILE", "");
+        assert_eq!(
+            CodexAdapter.quota_bucket("gpt-5.2-codex").as_deref(),
+            Some("native"),
+            "an explicit model omits -p under any profile"
+        );
+        assert_eq!(
+            CodexAdapter.quota_bucket("openai/gpt-5").as_deref(),
+            Some("openrouter"),
+            "an explicit slug forces OpenRouter under any profile"
         );
         std::env::remove_var("SPAR_CODEX_PROFILE");
     }

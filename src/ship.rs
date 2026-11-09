@@ -247,7 +247,7 @@ fn review_verdicts(paths: &SparPaths, state: &RunState) -> Vec<String> {
                     .map(|c| format!(" (last judged `{}`)", &c[..c.len().min(8)]))
                     .unwrap_or_default();
                 return format!(
-                    "- `{}` ({}): stood down — {reason}{judged}",
+                    "- `{}` ({}): stood down: {reason}{judged}",
                     s.id, s.provider
                 );
             }

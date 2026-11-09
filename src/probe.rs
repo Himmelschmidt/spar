@@ -38,16 +38,15 @@ pub struct ProbeReport {
 }
 
 /// Probe one provider and write the verdict into the quota store. Under `dry` nothing
-/// is spawned and nothing is written. The probe ran this seat's route, so its
-/// verdict lands on the seat's keys: a quota verdict on the rejection key the
-/// output names (a login-wide claude rejection pauses `cli:claude`, an
-/// Opus-limit one pauses `cli:claude@opus`, a bare codex rejection pauses the
-/// default route's `cli:codex@openrouter` bucket), and any other verdict on the
-/// seat's own quota key, so a healthy probe retires the pause the eligibility
-/// check reads. A bare name that keys the login still denotes the account.
+/// is spawned and nothing is written. A bare ref names no model, so it names the
+/// login: `provider probe cli:codex` reads and clears the whole login, while a
+/// modeled probe resolves through the seat's keys (a quota verdict on the
+/// rejection key the output names, any other verdict on the seat's own quota
+/// key), so it reads and clears only the bucket the seat dispatches under.
 pub fn probe(paths: &SparPaths, provider: &str, dry: bool) -> ProbeReport {
     let out = call(paths, provider, dry);
     let key = match ProviderRef::parse(provider) {
+        Ok(pref) if pref.model.is_none() => quota::operator_key(provider),
         Ok(pref) if out.verdict == Verdict::Quota => {
             // Window and text always travel together now: one vote each,
             // broadest wins, resolved against the probed seat.
@@ -429,6 +428,8 @@ mod tests {
 
     #[test]
     fn a_healthy_probe_clears_the_bucket_key_the_seat_reads() {
+        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
         let mut store = QuotaStore::default();
         store.pause_quota("cli:codex@openrouter", "route limit");
         store.mark_strong("cli:codex@openrouter");

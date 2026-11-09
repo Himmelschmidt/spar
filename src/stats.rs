@@ -894,6 +894,10 @@ mod tests {
 
     #[test]
     fn groups_by_provider_without_mixing_context_semantics() {
+        // Park attribution resolves the null-model history role through the
+        // profile route, which is process env shared with every test thread.
+        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
         let tmp = fixture();
         let now = DateTime::parse_from_rfc3339("2026-10-30T00:00:00Z")
             .unwrap()

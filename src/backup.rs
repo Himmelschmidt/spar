@@ -326,6 +326,10 @@ mod tests {
 
     #[test]
     fn bucket_pause_benches_only_its_own_route() {
+        // Bare codex models follow the profile route from process env, so pin
+        // it: every other test thread shares this process.
+        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
         let mut store = QuotaStore::default();
         store.pause_quota("cli:codex@openrouter", "test");
         assert!(
@@ -334,7 +338,21 @@ mod tests {
         );
         assert!(
             is_provider_eligible("cli:codex@gpt-5.2-codex", &store, None),
+            "an explicit bare model omits -p, so it bills native and keeps running"
+        );
+        assert!(
+            is_provider_eligible("cli:codex@native", &store, None),
             "a native seat keeps running while the OpenRouter bucket is paused"
+        );
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:codex@native", "test");
+        assert!(
+            !is_provider_eligible("cli:codex@native", &store, None),
+            "the paused native bucket benches its own seats"
+        );
+        assert!(
+            is_provider_eligible("cli:codex@openai/gpt-5", &store, None),
+            "a native pause leaves an OpenRouter seat eligible"
         );
         assert!(
             is_provider_eligible("cli:grok@grok-4-1-fast", &store, None),
