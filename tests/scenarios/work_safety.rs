@@ -369,6 +369,7 @@ echo '{{"schema_version":1,"stream":{{"kind":"session","id":"sess-c"}},"record_t
 case "$NAME" in
   impl)
     echo ceiling >> "$SPAR_TEST_MUSE_STATE/calls"
+    echo $$ > "$ART/agent.pid"
     {leftover}
     sleep 60
     ;;
@@ -377,6 +378,8 @@ case "$NAME" in
     CWD=$(sed -n 's/.*Code under review (worktree): \([^ ]*\).*/\1/p' "$PROMPT_FILE" | head -n 1)
     SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null)
     printf '## Verdict\napprove\n\nReviewed-Commit: %s\n' "$SHA" > "$ART/review-$NAME.md"
+    RUN_DIR="$(dirname "$PROMPT_FILE")"
+    printf 'ok\n' > "$RUN_DIR/markers/$NAME.done"
     ;;
 esac
 exit 0
@@ -388,9 +391,14 @@ exit 0
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn run_ceiling_leftover_implement(proj: &Path, bin: &Path, calls_dir: &Path) -> String {
-    let out = spar_cmd()
-        .current_dir(proj)
+fn run_ceiling_leftover_implement(
+    proj: &Path,
+    bin: &Path,
+    calls_dir: &Path,
+    backend: Option<&str>,
+) -> String {
+    let mut cmd = spar_cmd();
+    cmd.current_dir(proj)
         .env(
             "PATH",
             format!(
@@ -409,9 +417,11 @@ fn run_ceiling_leftover_implement(proj: &Path, bin: &Path, calls_dir: &Path) -> 
             "--fleet",
             "small",
             "--json",
-        ])
-        .output()
-        .unwrap();
+        ]);
+    if let Some(b) = backend {
+        cmd.args(["--backend", b]);
+    }
+    let out = cmd.output().unwrap();
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
         if let Some(run_id) = v.get("run_id").and_then(|r| r.as_str()) {
             return run_id.to_string();
@@ -443,7 +453,7 @@ fn a_ceiling_kill_with_uncommitted_edits_becomes_a_wip_round() {
     let calls_dir = tmp.path().join("muse-state");
     std::fs::create_dir_all(&calls_dir).unwrap();
 
-    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir);
+    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
     assert_eq!(st["round"], 1, "same round goes on to review: {st}");
@@ -513,7 +523,7 @@ fn a_ceiling_kill_with_no_work_still_fails() {
     let calls_dir = tmp.path().join("muse-state");
     std::fs::create_dir_all(&calls_dir).unwrap();
 
-    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir);
+    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "failed", "{st}");
     let calls = std::fs::read_to_string(calls_dir.join("calls")).unwrap();
@@ -527,6 +537,51 @@ fn a_ceiling_kill_with_no_work_still_fails() {
     assert!(
         !log.lines().any(|l| l.contains("cut short at hard ceiling")),
         "no WIP commit without work: {log}"
+    );
+}
+
+/// #228 (tmux backend): a ceiling kill terminates the agent's process group
+/// before the WIP snapshot, so the round still goes to review on the committed
+/// partial work and nothing is left alive to keep mutating the tree under the
+/// suite and panel.
+#[test]
+fn a_ceiling_kill_on_tmux_kills_the_agent_before_the_wip_snapshot() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    std::fs::write(
+        proj.join("spar.toml"),
+        "[suite]\nenabled = false\n[rounds]\nmax = 1\n[timeouts]\nslot_secs = 2\nhard_ceiling_multiple = 1.5\n",
+    )
+    .unwrap();
+    let bin = tmp.path().join("bin");
+    install_ceiling_leftover_muse(&bin, true);
+    let calls_dir = tmp.path().join("muse-state");
+    std::fs::create_dir_all(&calls_dir).unwrap();
+
+    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, Some("tmux"));
+    let st = read_state(&proj, &run_id);
+    assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
+    let branch = format!("spar/{run_id}/impl");
+    let log = git(&proj, &["log", &branch, "--format=%s"]);
+    assert!(
+        log.lines()
+            .any(|l| l.contains("WIP: implementer cut short at hard ceiling")),
+        "WIP commit missing on {branch}: {log}"
+    );
+    let pid: u32 = std::fs::read_to_string(
+        proj.join(".spar/runs")
+            .join(&run_id)
+            .join("artifacts")
+            .join("agent.pid"),
+    )
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
+    assert!(
+        std::fs::metadata(format!("/proc/{pid}")).is_err(),
+        "ceiling-killed tmux agent (pid {pid}) is still alive"
     );
 }
 
@@ -589,7 +644,7 @@ fn run_requesting_ceiling_implement(proj: &Path, bin: &Path, calls_dir: &Path, m
     .unwrap();
     install_ceiling_requesting_muse(bin);
     std::fs::create_dir_all(calls_dir).unwrap();
-    run_ceiling_leftover_implement(proj, bin, calls_dir)
+    run_ceiling_leftover_implement(proj, bin, calls_dir, None)
 }
 
 /// #228 follow-up: the round after a ceiling-cut WIP round is told the previous
