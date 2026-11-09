@@ -7,7 +7,8 @@
 //!   - Grok    → `StopHookInject`       (same turn-boundary injection as Claude: grok's
 //!     Stop hook honors the same `{"decision":"block",…}` payload per docs ch. 10;
 //!     the end-to-end re-drive is not yet observed live, see O90)
-//!   - agy     → `None`                 (inbox left untouched for the agent's next turn)
+//!   - agy     → `PollFile`             (claimed, then appended to the poll file its
+//!     prompt tells it to read before any new major step)
 //!   - muse    → `StopHookInject`       (same turn-boundary injection as Claude: muse's
 //!     Stop hook honors the same `{"decision":"block",…}` payload, probed live)
 
@@ -315,10 +316,12 @@ fn muse_stop_hook_inject_claims_and_builds_block_payload() {
     );
 }
 
-/// agy: no injection channel, so deliver must NOT consume the inbox — the agent reads
-/// it itself on its next turn. `--claim` afterwards still returns the message.
+/// agy: no push channel into the running process, so deliver claims the inbox and
+/// drops the batch in the slot's poll file — the file every role prompt (agy's
+/// included) tells the agent to read before starting any new major step. A second
+/// deliver drains nothing (exactly-once).
 #[test]
-fn none_leaves_inbox_for_agent_to_claim() {
+fn agy_poll_file_claims_and_reports_polled() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
     let run_id = plan_and_approve(tmp.path());
@@ -327,29 +330,26 @@ fn none_leaves_inbox_for_agent_to_claim() {
     send(tmp.path(), &run_id, &agent, "write the acceptance test");
 
     let d = deliver_json(tmp.path(), &run_id, &agent);
-    assert_eq!(d["strategy"], "none");
-    assert_eq!(d["action"], "left_for_inbox");
-    assert_eq!(d["delivered"], 0);
-    assert!(d["pending"].as_u64().unwrap() >= 1, "{d}");
+    assert_eq!(d["strategy"], "poll_file");
+    assert_eq!(d["action"], "polled_file");
+    assert!(d["delivered"].as_u64().unwrap() >= 1, "{d}");
 
-    // The agent's own claim still finds the message (deliver did not strand it). The
-    // slot scopes the claim to its run (`--run`), matching how a run slot self-drains.
-    let claimed = spar_cmd()
-        .current_dir(tmp.path())
-        .args([
-            "bus", "inbox", &agent, "--claim", "--run", &run_id, "--json",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let msgs: Value = serde_json::from_slice(&claimed).unwrap();
+    // Exactly-once: nothing left to drain.
+    let again = deliver_json(tmp.path(), &run_id, &agent);
+    assert_eq!(again["action"], "empty");
+    assert_eq!(again["delivered"], 0);
+
+    // The slot's prompt names its poll file, so the claimed batch is where the
+    // agent is told to look before its next major step.
+    let prompt = std::fs::read_to_string(
+        tmp.path()
+            .join(".spar/runs")
+            .join(&run_id)
+            .join(format!("prompt-{agent}.md")),
+    )
+    .unwrap();
     assert!(
-        msgs.as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["body"] == "write the acceptance test"),
-        "{msgs}"
+        prompt.contains(&format!("nudges-{agent}.md")),
+        "agy prompt names its poll file"
     );
 }

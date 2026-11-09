@@ -34,8 +34,8 @@ pub enum DeliveryAction {
     /// is known yet — `codex exec` is single-turn, so this is what actually reaches the
     /// *next* dispatch, not the running one.
     PolledFile,
-    /// No injection channel (agy / unknown provider): the inbox is left untouched so
-    /// the agent claims it itself on its next turn.
+    /// No injection channel (unknown provider / bare agent): the inbox is left
+    /// untouched so the agent claims it itself on its next turn.
     LeftForInbox,
     /// Nothing to do — the inbox was empty.
     Empty,
@@ -392,8 +392,9 @@ pub fn nudge(
                 codex_native_deliver(paths, run, agent, session_id, text, dry_run)?;
             (action, Some(path))
         }
-        // `None` is agy, which has no channel at all. The poll file is still the best
-        // available drop: worst case the agent never reads it, which is where it started.
+        // `None` is an adapter with no channel at all (unknown provider / bare
+        // agent). The poll file is still the best available drop: worst case the
+        // agent never reads it, which is where it started.
         DeliveryStrategy::PollFile | DeliveryStrategy::None => (
             DeliveryAction::PolledFile,
             Some(append_poll_file(paths, run, agent, text, dry_run)?),
