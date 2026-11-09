@@ -215,7 +215,7 @@ pub(crate) fn render_poll_file(
             }
             (m.to == "broadcast" || m.to == "*")
                 && m.kind == bus::MsgKind::Chat
-                && m.from != "orchestrator"
+                && m.from != bus::ORCHESTRATOR_SEAT
                 && m.from != ORCHESTRATOR
         })
         .filter(|m| !acked.contains(&m.id))
@@ -265,8 +265,8 @@ pub(crate) fn lock_poll_file(
 }
 
 /// Re-render every PollFile slot's poll file on `run_id`: the round-start and
-/// turn-boundary sweep that drops expired messages with no new filing.
-/// Dry-run runs never get poll files, so there is nothing to sweep.
+/// replan sweep that drops expired messages with no new filing. Dry-run runs
+/// never get poll files, so there is nothing to sweep.
 pub fn refresh_run_poll_files(paths: &SparPaths, run_id: &str) {
     let Ok(state) = RunState::load(paths, run_id) else {
         return;
@@ -420,8 +420,8 @@ pub fn strategy_for_slot(state: &RunState, slot: &str) -> DeliveryStrategy {
 /// keep their own pulse; bare ids resolve to no slot and stay inbox-queued.
 /// Best effort with a stderr line, never an error: the filing already succeeded,
 /// the inbox stays the durable queue, and the next filing retries the drain.
-/// Skipped for dry-run runs: no live slot polls their files, so the inbox keeps
-/// the messages for inspection and the turn-boundary drain. Gated on the run's
+/// Skipped for dry-run runs: no live slot polls their files, so the messages
+/// stay in the inbox for inspection and no poll file is written. Gated on the run's
 /// own `dry_run` flag, never the sender's `SPAR_DRY_RUN` env: an ambient export
 /// in the sender's shell must not silence delivery to a live run's slots. The
 /// drain writes for real here (`deliver` is called with dry-run off); the stub

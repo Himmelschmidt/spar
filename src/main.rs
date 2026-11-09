@@ -1051,11 +1051,13 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                 expires_after_round,
                 meta: std::collections::HashMap::new(),
             };
-            let msg = bus::send(&paths, msg, bus::MessageBudget::Normal)?;
+            // Withdraw first: a slot polling between the two renders sees neither
+            // instruction, never both at once.
             let withdrawal = supersedes
                 .as_deref()
                 .map(|old| bus::withdraw(&paths, old))
                 .transpose()?;
+            let msg = bus::send(&paths, msg, bus::MessageBudget::Normal)?;
             if json {
                 let mut v = serde_json::to_value(&msg)?;
                 v["schema_version"] = serde_json::json!(bus::LOG_SCHEMA);

@@ -864,7 +864,7 @@ fn seed_spec_bus(
             bus::BusMessage {
                 id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
                 ts: chrono::Utc::now(),
-                from: "orchestrator".into(),
+                from: bus::ORCHESTRATOR_SEAT.into(),
                 to: to.into(),
                 kind: MsgKind::Hello,
                 body: note,

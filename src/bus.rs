@@ -30,6 +30,11 @@ use std::path::PathBuf;
 /// operator wired one, pushed to an external notifier (`[notify]` in config).
 pub const HUMAN: &str = "@human";
 
+/// Sender id the orchestrator's own sends carry (peer hellos, spec notes). Peer
+/// slots send under their own slot ids, so this name is how the poll-file
+/// render tells orchestrator traffic apart from agent-to-agent broadcasts.
+pub const ORCHESTRATOR_SEAT: &str = "orchestrator";
+
 /// Reserved bus sinks — they address a role, not a per-run slot, so they are never
 /// run-qualified and pass through verbatim on both send and delivery.
 pub fn is_reserved_sink(to: &str) -> bool {
@@ -1177,9 +1182,11 @@ pub fn disk_positions(paths: &SparPaths) -> DiskPositions {
 /// receipts beside it still show who never picked up a copy. Otherwise a claimed
 /// copy still on disk wins: it sits in the slot's next prompt, so a withdrawal
 /// that arrived after the claim reads `Delivered` (a message cannot be unread).
-/// With no copy on disk a withdrawal that postdates every landing takes the word
-/// back to `Withdrawn` — the poll-file case, where the claimed copy is deleted
-/// on withdrawal. A landing with no later withdrawal still reads `Delivered`:
+/// With no copy on disk a withdrawal that postdates every landing of an unread
+/// message takes the word back to `Withdrawn` — the poll-file case, whose
+/// claimed copies are deleted on withdrawal while a claim records no `Read`.
+/// A landing the model already saw (any `Read` receipt) stays `Delivered`, as
+/// does a landing with no later withdrawal:
 /// prompt inclusion records a `Delivered` receipt with no copy behind. A message
 /// with no copy, no landing and no withdrawal reads `Withdrawn`: superseded or
 /// expired before claim, or fanned out to nobody.
@@ -1205,10 +1212,16 @@ pub fn delivery_state(
 }
 
 /// Whether some recipient's withdrawal postdates every landing: the message was
-/// taken back everywhere it had reached. A `Read` lands like a `Delivered` (the
-/// receipts fold already backfills `delivered_at` from `read_at`), so a
-/// withdrawal only takes the word back when it is strictly later.
+/// taken back everywhere it had reached. Only an unread message can be taken
+/// back — a `Read` means a model already saw it (prompt inclusion, Stop-hook
+/// injection, inbox claim or ack all record one), so the word stays
+/// `delivered` no matter how late the withdrawal arrives. The receipts fold
+/// backfills `delivered_at` from `read_at`, so a read landing still counts as
+/// a landing for the timestamp comparison.
 fn taken_back(receipts: &[RecipientReceipt]) -> bool {
+    if receipts.iter().any(|r| r.read_at.is_some()) {
+        return false;
+    }
     let landed = receipts.iter().filter_map(|r| r.delivered_at).max();
     let withdrawn = receipts.iter().filter_map(|r| r.withdrawn_at).max();
     withdrawn.is_some_and(|w| landed.is_none_or(|d| w > d))
@@ -1453,6 +1466,18 @@ pub fn withdraw(paths: &SparPaths, msg_id: &str) -> Result<Withdrawal> {
     let acked = acked_by_map(paths, &agents);
     let mut gate = ExpiryGate::new();
     for (run, agent) in refresh {
+        // Dry-run runs never get poll files: the copies are already deleted and
+        // receipted above, so skip the re-render rather than creating the file.
+        let dry = run.as_deref().is_some_and(|r| {
+            states
+                .entry(r.to_string())
+                .or_insert_with(|| crate::state::RunState::load(paths, r).ok())
+                .as_ref()
+                .is_some_and(|s| s.dry_run)
+        });
+        if dry {
+            continue;
+        }
         let empty = HashSet::new();
         let slot_acked = acked.get(&agent).unwrap_or(&empty);
         if let Err(e) = crate::providers::delivery::render_poll_file(
@@ -1492,9 +1517,18 @@ pub(crate) fn filed_copies(paths: &SparPaths, agent: &str) -> Vec<BusMessage> {
     out
 }
 
+/// The cheapest slice of an event line: the scan below probes every line of the
+/// workspace log, and most lines are not acks.
+#[derive(serde::Deserialize)]
+struct AckProbe {
+    kind: Option<MsgKind>,
+}
+
 /// Message ids each listed slot acked, in one streaming pass over the workspace
 /// log. A slot that acked a message is done with it, so its poll file stops
-/// listing it.
+/// listing it. The workspace log is the only complete source — an ack sent
+/// without `--run` skips the run mirror — so the scan stays complete; the kind
+/// probe keeps non-ack lines cheap instead of bounding the read.
 pub(crate) fn acked_by_map(
     paths: &SparPaths,
     agents: &HashSet<String>,
@@ -1507,12 +1541,15 @@ pub(crate) fn acked_by_map(
         if line.trim().is_empty() {
             continue;
         }
+        let Ok(probe) = serde_json::from_str::<AckProbe>(&line) else {
+            continue;
+        };
+        if probe.kind != Some(MsgKind::Ack) {
+            continue;
+        }
         let Ok(m) = serde_json::from_str::<BusMessage>(&line) else {
             continue;
         };
-        if m.kind != MsgKind::Ack {
-            continue;
-        }
         let from = resolve_addr(m.run.as_deref(), &m.from);
         if !agents.contains(&from) {
             continue;
@@ -2780,6 +2817,22 @@ mod tests {
             ),
             DeliveryState::Withdrawn,
             "a withdrawal after the landing takes the word back once no copy remains"
+        );
+        assert_eq!(
+            delivery_state(
+                false,
+                &DiskPositions::default(),
+                "seen",
+                &[RecipientReceipt {
+                    recipient: "r1:impl".into(),
+                    delivered_at: Some(Utc::now() - Duration::seconds(60)),
+                    read_at: Some(Utc::now() - Duration::seconds(60)),
+                    withdrawn_at: Some(Utc::now()),
+                    ..Default::default()
+                }]
+            ),
+            DeliveryState::Delivered,
+            "a prompt inclusion the model already saw stays delivered under a later withdrawal"
         );
         assert_eq!(
             delivery_state(

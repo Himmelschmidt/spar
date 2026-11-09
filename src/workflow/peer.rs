@@ -86,7 +86,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         bus::BusMessage {
             id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
             ts: chrono::Utc::now(),
-            from: "orchestrator".into(),
+            from: bus::ORCHESTRATOR_SEAT.into(),
             to: id_a.clone(),
             kind: MsgKind::Hello,
             body: "You are peer A. Coordinate with peer B via the swarm bus.".into(),
@@ -105,7 +105,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         bus::BusMessage {
             id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
             ts: chrono::Utc::now(),
-            from: "orchestrator".into(),
+            from: bus::ORCHESTRATOR_SEAT.into(),
             to: id_b.clone(),
             kind: MsgKind::Hello,
             body: "You are peer B. Coordinate with peer A via the swarm bus.".into(),

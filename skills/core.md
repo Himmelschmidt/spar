@@ -1275,10 +1275,13 @@ copies still waiting; a broadcast's send-time recipients are unknowable, so any 
 counts there), else `delivered` while a claimed copy sits on disk — a withdrawal that
 arrives after the claim cannot unread a message already in the model's input — or a
 `Delivered`/`Read` receipt from a prompt inclusion that left the inbox copy behind,
-else `withdrawn` once a withdrawal postdates every landing and no copy remains (the
-poll-file case: the claimed copy is deleted on withdrawal), else `queued` while a copy
-still waits in an inbox, else `withdrawn` when no copy waits anywhere and nothing ever
-landed. It is derived at read time from the inbox directories, the receipts and the
+else `withdrawn` once a withdrawal postdates every landing, no copy remains, and the
+message was never read (the poll-file case: a claim records no `Read`, and the
+claimed copy is deleted on withdrawal), else `queued` while a copy still waits in
+an inbox, else `withdrawn` when no copy waits anywhere and nothing ever landed.
+A landing the model already saw — any `Read` receipt, from a prompt inclusion,
+a Stop-hook injection, an inbox claim or an ack — stays `delivered` under a
+later withdrawal. It is derived at read time from the inbox directories, the receipts and the
 ack events — never stored, so there is no second copy of the state to drift. A slot's
 poll file (agy, pi) renders its inbox, not an append-only log (O156): every filing,
 withdrawal and round start rewrites it from the pending messages, so a withdrawn or
@@ -1287,7 +1290,11 @@ chat broadcasts from humans and peer slots — the default `--to broadcast` reac
 poll-file slot — while acks, system prompts and orchestrator broadcasts stay in the
 inbox and the bus log but never become action items. Posting into the live poll file
 counts as `delivered`. Dry-run runs skip the fan-out (nothing live polls their
-files); the inbox keeps the messages for the turn-boundary drain.
+files); the messages stay in the inbox for inspection and no poll file is
+written. A message stays listed until it is acked, withdrawn or expired — ack
+handled items so they leave the file; claiming alone does not clear them.
+`bus deliver --json` reports `delivered` as the messages actually listed in the
+poll file, which can exceed what that call just claimed.
 `receipts.jsonl` rolls to `receipts.jsonl.1` at
 8 MiB (about the last 16 MiB are kept); `bus log` streams both. `bus send --json` returns the message with
 `schema_version` (and `withdrawal` under `--supersedes`). The human `bus log` shows the
