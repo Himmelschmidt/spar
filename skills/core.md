@@ -1263,21 +1263,26 @@ recipient acked it), `withdrawn` (superseded or expired). A poll file or codex q
  "persist": true, "expires_after_round": 3, "refs": {"supersedes": "..."},
  "receipts": [{"recipient": "ab12cd34:impl", "queued_at": "...", "delivered_at": "..." | null,
                "read_at": "..." | null, "withdrawn_at": "..." | null}],
- "delivery": "queued" | "delivered" | "acknowledged",
+ "delivery": "queued" | "delivered" | "acknowledged" | "withdrawn",
  "superseded_by": "msg id" | null, "expired": false}
 ```
 
 Each time is the earliest of its kind. `delivery` reads one word off disk per message
-(O153, O154): `queued` while any copy still waits in an inbox, `delivered` once a claimed
-copy sits on disk, `acknowledged` once an ack answers it (terminal, even with copies
-still waiting). It is derived at read time from the inbox directories plus the ack
-events — never stored, so a dropped receipt write or a rotated `receipts.jsonl` cannot
-desynchronise it. A `bus send` fans PollFile recipients (agy, pi) straight into their
-poll files, so the batch is there at the slot's next poll with no explicit `bus deliver`.
+(O155): `acknowledged` once a recipient's ack answers it (terminal, even with copies
+still waiting; a broadcast's send-time recipients are unknowable, so any acker counts
+there), else `delivered` once anything landed — a claimed copy on disk, or a
+`Delivered`/`Read` receipt from a prompt inclusion that left the inbox copy behind —
+else `queued` while a copy still waits in an inbox, else `withdrawn` when no copy
+waits anywhere and nothing ever landed. It is derived at read time from the inbox
+directories, the receipts and the ack events — never stored, so there is no second
+copy of the state to drift. Every inbox filing fans PollFile recipients (agy, pi)
+straight into their poll files, so the batch is there at the slot's next poll with no
+explicit `bus deliver`, whoever filed it (a send, a broadcast, an ack, a redelivery);
+dry runs skip the fan-out and leave the inbox for the turn-boundary drain.
 `receipts.jsonl` rolls to `receipts.jsonl.1` at
 8 MiB (about the last 16 MiB are kept); `bus log` streams both. `bus send --json` returns the message with
 `schema_version` (and `withdrawal` under `--supersedes`). The human `bus log` shows the
-message id and `[queued|delivered|acknowledged; delivered n/m, read n/m; superseded by …; expired]`.
+message id and `[queued|delivered|acknowledged|withdrawn; delivered n/m, read n/m; superseded by …; expired]`.
 
 A message to `@human` (or any `Blocked` agent) lands in the `@human` inbox
 (`spar bus inbox @human`) and,
