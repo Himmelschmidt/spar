@@ -1065,6 +1065,49 @@ pub struct RecipientReceipt {
     pub withdrawn_at: Option<DateTime<Utc>>,
 }
 
+/// Where one message stands for the operator: still waiting to be picked up,
+/// landed in the recipient's channel, or confirmed. Derived from the receipts
+/// plus the ack events every time it is read — never stored, so there is no
+/// second copy of the state to keep in step. Withdrawal and round expiry ride
+/// their own markers (`withdrawn_at`, `superseded_by`, `expired`) and do not
+/// change this: it answers only whether the message landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryState {
+    Queued,
+    Delivered,
+    Acknowledged,
+}
+
+impl std::fmt::Display for DeliveryState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeliveryState::Queued => write!(f, "queued"),
+            DeliveryState::Delivered => write!(f, "delivered"),
+            DeliveryState::Acknowledged => write!(f, "acknowledged"),
+        }
+    }
+}
+
+/// Roll one message's receipts up to a single state. `acked` is whether an
+/// `Ack` answering the message sits in the event log. Anything still waiting
+/// in any inbox reads `Queued`, even when another recipient already claimed
+/// its copy; a message with no delivery evidence at all reads `Queued` too.
+pub fn delivery_state(acked: bool, receipts: &[RecipientReceipt]) -> DeliveryState {
+    if acked {
+        DeliveryState::Acknowledged
+    } else if receipts
+        .iter()
+        .any(|r| r.queued_at.is_some() && r.delivered_at.is_none() && r.withdrawn_at.is_none())
+    {
+        DeliveryState::Queued
+    } else if receipts.iter().any(|r| r.delivered_at.is_some()) {
+        DeliveryState::Delivered
+    } else {
+        DeliveryState::Queued
+    }
+}
+
 pub const LOG_SCHEMA: u32 = 1;
 
 /// One `bus log --json` entry: the message plus what happened to it.
@@ -1074,6 +1117,7 @@ pub struct LogEntry {
     #[serde(flatten)]
     pub msg: BusMessage,
     pub receipts: Vec<RecipientReceipt>,
+    pub delivery: DeliveryState,
     pub superseded_by: Option<String>,
     pub expired: bool,
 }
@@ -1126,17 +1170,28 @@ pub fn log_entries(paths: &SparPaths, run: Option<&str>) -> Result<Vec<LogEntry>
         .iter()
         .filter_map(|m| m.refs.supersedes.clone().map(|old| (old, m.id.clone())))
         .collect();
+    let acked: HashSet<String> = all
+        .iter()
+        .filter(|m| m.kind == MsgKind::Ack)
+        .filter_map(|m| m.refs.reply_to.clone())
+        .collect();
     let mut receipts = receipts_by_message(paths);
     let mut rounds = RunRounds::default();
     Ok(all
         .into_iter()
         .filter(|m| run.is_none() || m.run.as_deref() == run)
-        .map(|m| LogEntry {
-            schema_version: LOG_SCHEMA,
-            receipts: receipts.remove(&m.id).unwrap_or_default(),
-            superseded_by: superseded.get(&m.id).cloned(),
-            expired: rounds.expired(paths, &m),
-            msg: m,
+        .map(|m| {
+            let is_acked = acked.contains(&m.id);
+            let row = receipts.remove(&m.id).unwrap_or_default();
+            let delivery = delivery_state(is_acked, &row);
+            LogEntry {
+                schema_version: LOG_SCHEMA,
+                receipts: row,
+                delivery,
+                superseded_by: superseded.get(&m.id).cloned(),
+                expired: rounds.expired(paths, &m),
+                msg: m,
+            }
         })
         .collect())
 }
@@ -2236,6 +2291,40 @@ mod tests {
         send(&paths, sup, MessageBudget::Chatty).unwrap();
         ack(&paths, None, "r1:impl", &b.id).unwrap();
         assert!(persisted_for(&paths, "r1", "impl").unwrap().is_empty());
+    }
+
+    #[test]
+    fn delivery_state_rolls_receipts_up_to_one_word() {
+        let row = |queued: bool, delivered: bool, withdrawn: bool| RecipientReceipt {
+            recipient: "r1:impl".into(),
+            queued_at: queued.then(Utc::now),
+            delivered_at: delivered.then(Utc::now),
+            read_at: None,
+            withdrawn_at: withdrawn.then(Utc::now),
+        };
+        assert_eq!(
+            delivery_state(false, &[row(true, false, false)]),
+            DeliveryState::Queued
+        );
+        assert_eq!(
+            delivery_state(false, &[row(true, true, false)]),
+            DeliveryState::Delivered
+        );
+        assert_eq!(
+            delivery_state(true, &[row(true, true, false)]),
+            DeliveryState::Acknowledged
+        );
+        assert_eq!(
+            delivery_state(false, &[row(true, true, false), row(true, false, false)]),
+            DeliveryState::Queued,
+            "one inbox still holding out keeps the message queued"
+        );
+        assert_eq!(
+            delivery_state(false, &[row(true, false, true)]),
+            DeliveryState::Queued,
+            "withdrawn before delivery leaves no landing evidence"
+        );
+        assert_eq!(delivery_state(false, &[]), DeliveryState::Queued);
     }
 
     /// Past the size limit the live file rolls to `.1`, and the log still reads both.

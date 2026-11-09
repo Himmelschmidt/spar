@@ -199,6 +199,10 @@ name = "bus_receipts"
 path = "tests/scenarios/bus_receipts.rs"
 
 [[test]]
+name = "bus_delivery_state"
+path = "tests/scenarios/bus_delivery_state.rs"
+
+[[test]]
 name = "operator_surgery"
 path = "tests/scenarios/operator_surgery.rs"
 

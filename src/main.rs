@@ -1090,7 +1090,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                     let count = |f: fn(&bus::RecipientReceipt) -> bool| {
                         e.receipts.iter().filter(|r| f(r)).count()
                     };
-                    let mut notes = Vec::new();
+                    let mut notes = vec![e.delivery.to_string()];
                     if total > 0 {
                         notes.push(format!(
                             "delivered {}/{total}, read {}/{total}",
