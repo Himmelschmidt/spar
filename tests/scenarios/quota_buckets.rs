@@ -166,6 +166,57 @@ impl Fixture {
             ])
             .assert()
     }
+
+    /// Mixed panel: claude implements, grok and pi review. `FAKE_RC=1` makes the
+    /// grok seat request changes; otherwise it approves like its sibling.
+    fn implement_mixed(&self, rc: bool, extra: &[&str]) -> assert_cmd::assert::Assert {
+        let mut cmd = self.spar();
+        if rc {
+            cmd.env("FAKE_RC", "1");
+        }
+        cmd.args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:claude",
+            "--role",
+            "reviewer=cli:grok",
+            "--role",
+            &format!("reviewer=cli:pi@{ANTHROPIC_MODEL}"),
+            "--without",
+            "suite",
+        ])
+        .args(extra)
+        .assert()
+    }
+
+    /// Re-enter a bound run: no `--role` (O27 pins the run to its creation
+    /// config), only the raised ceiling.
+    fn implement_round(
+        &self,
+        run_id: &str,
+        rc: bool,
+        extra: &[&str],
+    ) -> assert_cmd::assert::Assert {
+        let mut cmd = self.spar();
+        if rc {
+            cmd.env("FAKE_RC", "1");
+        }
+        cmd.args(["implement", "--run", run_id])
+            .args(extra)
+            .assert()
+    }
+
+    fn grok_slot(&self) -> serde_json::Value {
+        self.state()["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["role"] == "reviewer" && s["provider"] == "cli:grok")
+            .cloned()
+            .expect("a grok reviewer seat")
+    }
 }
 
 /// The implementer prompt asks for a summary file; write it and exit clean.
@@ -181,6 +232,28 @@ done
 case "$DEST" in
   "") exit 0 ;;
   *) printf '# Summary\nDid the stub thing.\n' > "$DEST"; exit 0 ;;
+esac"#;
+
+/// `FAKE_RC=1` requests changes, otherwise approves. Anchored on the checkout
+/// HEAD the prompt names so the commit gate counts the verdict. Grok arrives
+/// via `--prompt-file`, so the prompt is read from there as well as argv.
+const FAKE_GROK_REVIEWER: &str = r#"TEXT="$*"
+PREV=""
+for a in "$@"; do
+  if [ "$PREV" = "--prompt-file" ] && [ -f "$a" ]; then TEXT="$TEXT $(cat "$a")"; fi
+  PREV="$a"
+done
+TEXT="$TEXT $(cat)"
+DEST=$(printf '%s' "$TEXT" | sed -n 's/.*Write review to: \([^ ]*\).*/\1/p' | head -n 1)
+CWD=$(printf '%s' "$TEXT" | sed -n 's/.*Code under review (worktree): \([^ ]*\).*/\1/p' | head -n 1)
+case "$DEST" in
+  "") exit 0 ;;
+  *)
+    SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null || true)
+    if [ "$FAKE_RC" = "1" ]; then V=request_changes; else V=approve; fi
+    { printf '## Verdict\n%s\n' "$V"; [ -n "$SHA" ] && printf 'Reviewed-Commit: %s\n' "$SHA"; } > "$DEST"
+    exit 0
+    ;;
 esac"#;
 
 /// Honest approve for whichever reviewer slot dispatches, anchored on the
@@ -212,7 +285,7 @@ fn a_paused_bucket_stands_down_while_the_sibling_bucket_reviews() {
     let fx = Fixture::new();
     fx.pause(&format!("cli:pi@{ANTHROPIC_MODEL}"));
     assert_eq!(
-        fx.quota()["providers"]["cli:pi@anthropic"]["status"],
+        fx.quota()["providers"]["cli:pi@direct:anthropic"]["status"],
         "paused_manual",
         "the anthropic bucket is paused: {}",
         fx.quota()
@@ -240,15 +313,114 @@ fn a_paused_bucket_stands_down_while_the_sibling_bucket_reviews() {
         "the stand-down is said out loud"
     );
     assert_eq!(
-        fx.quota()["providers"]["cli:pi@anthropic"]["status"],
+        fx.quota()["providers"]["cli:pi@direct:anthropic"]["status"],
         "paused_manual",
         "the pause survives the run: {}",
         fx.quota()
     );
     assert!(
-        fx.quota()["providers"].get("cli:pi@openai").is_none(),
+        fx.quota()["providers"]
+            .get("cli:pi@direct:openai")
+            .is_none(),
         "the sibling bucket is untouched: {}",
         fx.quota()
+    );
+}
+
+#[test]
+fn a_healthy_probe_clears_the_paused_bucket_it_reads() {
+    let fx = Fixture::new();
+    fx.cli("codex", "echo OK");
+    // Seed the quota pause a rejection would record: `provider pause` writes a
+    // manual pause, which a healthy probe must keep, so write the store row.
+    let seed = serde_json::json!({
+        "providers": {
+            "cli:codex@openrouter": {
+                "name": "cli:codex@openrouter",
+                "status": "paused_quota",
+                "hint": "simulated rejection",
+                "strong": true,
+            }
+        }
+    });
+    fs::create_dir_all(fx.proj.join(".spar")).unwrap();
+    fs::write(
+        fx.proj.join(".spar/quota.json"),
+        serde_json::to_string_pretty(&seed).unwrap(),
+    )
+    .unwrap();
+    fx.spar()
+        .args(["provider", "probe", "cli:codex"])
+        .assert()
+        .success();
+    assert_eq!(
+        fx.quota()["providers"]["cli:codex@openrouter"]["status"],
+        "available",
+        "the healthy probe retires the bucket the eligibility check reads: {}",
+        fx.quota()
+    );
+    assert!(
+        fx.quota()["providers"].get("cli:codex").is_none(),
+        "nothing was ever written to the login: {}",
+        fx.quota()
+    );
+}
+
+/// O153. A `request_changes` recorded on the shipping head still blocks ship after
+/// its seat stands down on quota: the panel head has not moved, so the veto carries
+/// instead of dying with the seat's dispatch. Dry runs cannot cover this — they
+/// skip pause gating — so the panel runs on fake CLIs.
+#[test]
+fn a_stood_down_request_changes_on_this_head_still_blocks_ship() {
+    let fx = Fixture::new();
+    fx.cli("grok", FAKE_GROK_REVIEWER);
+    fs::write(fx.proj.join("spar.toml"), "[rounds]\nmax = 2\n").unwrap();
+
+    // Rounds 1-2: grok requests changes on this head while pi approves, then the
+    // ceiling stops the run.
+    fx.implement_mixed(true, &[]).code(2);
+    let run_id = fx.run_id();
+    let st = fx.state();
+    assert_eq!(st["phase"], "awaiting_round_extension", "{st}");
+    assert_eq!(st["round"].as_u64(), Some(2), "{st}");
+
+    // Pause grok's login: the combined bucket-plus-parent read holds its seat,
+    // while claude (implementer) and pi (sibling reviewer) stay usable.
+    fx.pause("cli:grok");
+
+    // Past a raised ceiling: grok never dispatches, pi approves, and grok's
+    // round-2 veto on this unchanged head still holds the run.
+    fx.implement_round(&run_id, false, &["--max-rounds", "3"])
+        .code(2);
+    let st = fx.state();
+    assert_eq!(st["phase"], "awaiting_round_extension", "{st}");
+    assert_eq!(st["round"].as_u64(), Some(3), "{st}");
+
+    let grok = fx.grok_slot();
+    let grok_id = grok["id"].as_str().unwrap();
+    assert!(
+        grok.get("stood_down").is_some_and(|v| v.is_string()),
+        "the seat is marked stood down: {grok}"
+    );
+    assert_eq!(
+        grok["round"].as_u64(),
+        Some(2),
+        "the stood-down seat never re-dispatched: {grok}"
+    );
+    assert_eq!(
+        grok["review"]["verdict"].as_str(),
+        Some("request_changes"),
+        "its recorded verdict is untouched: {grok}"
+    );
+
+    let pi = fx.reviewer_slot(ANTHROPIC_MODEL);
+    let pi_id = pi["id"].as_str().unwrap();
+    let text = fs::read_to_string(fx.review_artifact(pi_id)).unwrap();
+    assert!(text.contains("approve"), "the sibling seat reviews: {text}");
+    let text = fs::read_to_string(fx.review_artifact(grok_id)).unwrap();
+    assert!(
+        text.contains("request_changes"),
+        "the carried artifact is round 2's verdict: {text}"
     );
 }
 
