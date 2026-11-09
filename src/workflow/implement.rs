@@ -2207,6 +2207,11 @@ pub fn execute_loop(
     );
 
     loop {
+        // Set when the implementer is killed at its hard ceiling with work left
+        // behind: the leftovers are committed as a partial WIP round and the loop
+        // goes on to the suite and the panel instead of failing (O114 follow-up).
+        // Per-round state: a later fix round sets it again or leaves it empty.
+        let mut ceiling_partial_note: Option<String> = None;
         // Stop boundary: before the implementer (and every fix-round re-dispatch).
         if should_stop(paths, &state.id) {
             return stop_now(state, paths);
@@ -2280,11 +2285,121 @@ pub fn execute_loop(
             effort: None,
         };
         if let Err(e) = executor::run_slot(state, paths, cfg, &impl_job) {
-            let quota_hit = executor::slot_parks_on_quota(state, &impl_job.slot_id);
-            if quota_hit {
-                if let Some(backup_raw) =
-                    crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
-                {
+            // A hard-ceiling kill is reported as a typed cause on the slot, never
+            // matched from the error prose. With work left behind the round goes on:
+            // the leftovers are committed as WIP below and judged like any round.
+            // With no work at all the round fails as before.
+            if let Some(note) = try_commit_ceiling_partial(state, paths, &impl_job.slot_id) {
+                eprintln!("note: {note}");
+                let _ = crate::events::append(
+                    paths,
+                    &state.id,
+                    &crate::events::Event::slot_note(&impl_job.slot_id, note.clone()),
+                );
+                let _ = crate::bus::broadcast(
+                    paths,
+                    Some(&state.id),
+                    "orchestrator",
+                    note.clone(),
+                    state.message_budget,
+                );
+                ceiling_partial_note = Some(note);
+            } else {
+                let quota_hit = executor::slot_parks_on_quota(state, &impl_job.slot_id);
+                if quota_hit {
+                    if let Some(backup_raw) =
+                        crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
+                    {
+                        let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+                        let has_backup = cfg.backups.implementer.is_some();
+                        let available: Option<std::collections::HashSet<String>> =
+                            if state.dry_run || !has_backup {
+                                None
+                            } else {
+                                let detected: std::collections::HashSet<String> =
+                                    crate::providers::detect_all()
+                                        .into_iter()
+                                        .filter(|r| r.available)
+                                        .map(|r| format!("cli:{}", r.name))
+                                        .collect();
+                                if detected.is_empty() {
+                                    None
+                                } else {
+                                    Some(detected)
+                                }
+                            };
+                        let slot_state = state
+                            .slots
+                            .iter()
+                            .find(|s| s.id == impl_job.slot_id)
+                            .cloned()
+                            .unwrap();
+                        let cause = crate::backup::dispatch_stop_cause(
+                            &slot_state,
+                            &store,
+                            available.as_ref(),
+                        );
+                        if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
+                            let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
+                                .map(|r| r.storage_key())
+                                .unwrap_or_else(|_| backup_raw.clone());
+                            let cur_key =
+                                crate::provider_ref::ProviderRef::parse(&impl_slot.provider)
+                                    .map(|r| r.storage_key())
+                                    .unwrap_or_else(|_| impl_slot.provider.clone());
+                            if backup_key != cur_key
+                                && crate::backup::backup_eligible(
+                                    &backup_raw,
+                                    &store,
+                                    available.as_ref(),
+                                    paths,
+                                    state.dry_run,
+                                )
+                            {
+                                if let Some(s) = state.slot_mut(&impl_job.slot_id) {
+                                    let pin = crate::provider_ref::Pin::parse(&backup_raw)
+                                        .map(|p| p.display())
+                                        .unwrap_or(backup_raw.clone());
+                                    s.point_at(&pin);
+                                    s.source = Some(SeatSource::Backup);
+                                }
+                                state.save(paths)?;
+                                // Retry the implementer with backup in the same round
+                                let retry_impl_slot = state
+                                    .slots
+                                    .iter()
+                                    .find(|s| s.id == impl_job.slot_id)
+                                    .cloned()
+                                    .unwrap();
+                                let retry_job = SlotJob {
+                                    slot_id: retry_impl_slot.id.clone(),
+                                    provider: retry_impl_slot.provider.clone(),
+                                    role: SlotRole::Implementer,
+                                    template: "implementer".into(),
+                                    extra_vars: extra.clone(),
+                                    expected_artifact: Some(format!(
+                                        "summary-{}.md",
+                                        retry_impl_slot.id
+                                    )),
+                                    model: retry_impl_slot.model.clone(),
+                                    effort: None,
+                                };
+                                if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
+                                    let quota_hit2 =
+                                        executor::slot_parks_on_quota(state, &retry_job.slot_id);
+                                    return fail(state, paths, e2, quota_hit2);
+                                }
+                                // Retry succeeded, continue to review phase
+                            } else {
+                                return fail(state, paths, e, quota_hit);
+                            }
+                        } else {
+                            return fail(state, paths, e, quota_hit);
+                        }
+                    } else {
+                        return fail(state, paths, e, quota_hit);
+                    }
+                } else {
                     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
                     let has_backup = cfg.backups.implementer.is_some();
                     let available: Option<std::collections::HashSet<String>> =
@@ -2311,143 +2426,65 @@ pub fn execute_loop(
                         .unwrap();
                     let cause =
                         crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
-                    if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
-                        let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
-                            .map(|r| r.storage_key())
-                            .unwrap_or_else(|_| backup_raw.clone());
-                        let cur_key = crate::provider_ref::ProviderRef::parse(&impl_slot.provider)
-                            .map(|r| r.storage_key())
-                            .unwrap_or_else(|_| impl_slot.provider.clone());
-                        if backup_key != cur_key
-                            && crate::backup::backup_eligible(
+                    if cause.engages_backup() {
+                        if let Some(backup_raw) =
+                            crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
+                        {
+                            if crate::backup::backup_eligible(
                                 &backup_raw,
                                 &store,
                                 available.as_ref(),
                                 paths,
                                 state.dry_run,
-                            )
-                        {
-                            if let Some(s) = state.slot_mut(&impl_job.slot_id) {
-                                let pin = crate::provider_ref::Pin::parse(&backup_raw)
-                                    .map(|p| p.display())
-                                    .unwrap_or(backup_raw.clone());
-                                s.point_at(&pin);
-                                s.source = Some(SeatSource::Backup);
-                            }
-                            state.save(paths)?;
-                            // Retry the implementer with backup in the same round
-                            let retry_impl_slot = state
-                                .slots
-                                .iter()
-                                .find(|s| s.id == impl_job.slot_id)
-                                .cloned()
-                                .unwrap();
-                            let retry_job = SlotJob {
-                                slot_id: retry_impl_slot.id.clone(),
-                                provider: retry_impl_slot.provider.clone(),
-                                role: SlotRole::Implementer,
-                                template: "implementer".into(),
-                                extra_vars: extra.clone(),
-                                expected_artifact: Some(format!(
-                                    "summary-{}.md",
-                                    retry_impl_slot.id
-                                )),
-                                model: retry_impl_slot.model.clone(),
-                                effort: None,
-                            };
-                            if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
-                                let quota_hit2 =
-                                    executor::slot_parks_on_quota(state, &retry_job.slot_id);
-                                return fail(state, paths, e2, quota_hit2);
-                            }
-                            // Retry succeeded, continue to review phase
-                        } else {
-                            return fail(state, paths, e, quota_hit);
-                        }
-                    } else {
-                        return fail(state, paths, e, quota_hit);
-                    }
-                } else {
-                    return fail(state, paths, e, quota_hit);
-                }
-            } else {
-                let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-                let has_backup = cfg.backups.implementer.is_some();
-                let available: Option<std::collections::HashSet<String>> =
-                    if state.dry_run || !has_backup {
-                        None
-                    } else {
-                        let detected: std::collections::HashSet<String> =
-                            crate::providers::detect_all()
-                                .into_iter()
-                                .filter(|r| r.available)
-                                .map(|r| format!("cli:{}", r.name))
-                                .collect();
-                        if detected.is_empty() {
-                            None
-                        } else {
-                            Some(detected)
-                        }
-                    };
-                let slot_state = state
-                    .slots
-                    .iter()
-                    .find(|s| s.id == impl_job.slot_id)
-                    .cloned()
-                    .unwrap();
-                let cause =
-                    crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
-                if cause.engages_backup() {
-                    if let Some(backup_raw) =
-                        crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
-                    {
-                        if crate::backup::backup_eligible(
-                            &backup_raw,
-                            &store,
-                            available.as_ref(),
-                            paths,
-                            state.dry_run,
-                        ) && slot_state.source != Some(SeatSource::Backup)
-                        {
-                            let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
-                                .map(|r| r.storage_key())
-                                .unwrap_or_else(|_| backup_raw.clone());
-                            let cur_key =
-                                crate::provider_ref::ProviderRef::parse(&impl_slot.provider)
-                                    .map(|r| r.storage_key())
-                                    .unwrap_or_else(|_| impl_slot.provider.clone());
-                            if backup_key != cur_key {
-                                if let Some(s) = state.slot_mut(&impl_job.slot_id) {
-                                    let pin = crate::provider_ref::Pin::parse(&backup_raw)
-                                        .map(|p| p.display())
-                                        .unwrap_or(backup_raw);
-                                    s.point_at(&pin);
-                                    s.source = Some(SeatSource::Backup);
-                                }
-                                state.save(paths)?;
-                                let retry_impl_slot = state
-                                    .slots
-                                    .iter()
-                                    .find(|s| s.id == impl_job.slot_id)
-                                    .cloned()
-                                    .unwrap();
-                                let retry_job = SlotJob {
-                                    slot_id: retry_impl_slot.id.clone(),
-                                    provider: retry_impl_slot.provider.clone(),
-                                    role: SlotRole::Implementer,
-                                    template: "implementer".into(),
-                                    extra_vars: extra.clone(),
-                                    expected_artifact: Some(format!(
-                                        "summary-{}.md",
-                                        retry_impl_slot.id
-                                    )),
-                                    model: retry_impl_slot.model.clone(),
-                                    effort: None,
-                                };
-                                if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
-                                    let quota_hit2 =
-                                        executor::slot_parks_on_quota(state, &retry_job.slot_id);
-                                    return fail(state, paths, e2, quota_hit2);
+                            ) && slot_state.source != Some(SeatSource::Backup)
+                            {
+                                let backup_key =
+                                    crate::provider_ref::ProviderRef::parse(&backup_raw)
+                                        .map(|r| r.storage_key())
+                                        .unwrap_or_else(|_| backup_raw.clone());
+                                let cur_key =
+                                    crate::provider_ref::ProviderRef::parse(&impl_slot.provider)
+                                        .map(|r| r.storage_key())
+                                        .unwrap_or_else(|_| impl_slot.provider.clone());
+                                if backup_key != cur_key {
+                                    if let Some(s) = state.slot_mut(&impl_job.slot_id) {
+                                        let pin = crate::provider_ref::Pin::parse(&backup_raw)
+                                            .map(|p| p.display())
+                                            .unwrap_or(backup_raw);
+                                        s.point_at(&pin);
+                                        s.source = Some(SeatSource::Backup);
+                                    }
+                                    state.save(paths)?;
+                                    let retry_impl_slot = state
+                                        .slots
+                                        .iter()
+                                        .find(|s| s.id == impl_job.slot_id)
+                                        .cloned()
+                                        .unwrap();
+                                    let retry_job = SlotJob {
+                                        slot_id: retry_impl_slot.id.clone(),
+                                        provider: retry_impl_slot.provider.clone(),
+                                        role: SlotRole::Implementer,
+                                        template: "implementer".into(),
+                                        extra_vars: extra.clone(),
+                                        expected_artifact: Some(format!(
+                                            "summary-{}.md",
+                                            retry_impl_slot.id
+                                        )),
+                                        model: retry_impl_slot.model.clone(),
+                                        effort: None,
+                                    };
+                                    if let Err(e2) =
+                                        executor::run_slot(state, paths, cfg, &retry_job)
+                                    {
+                                        let quota_hit2 = executor::slot_parks_on_quota(
+                                            state,
+                                            &retry_job.slot_id,
+                                        );
+                                        return fail(state, paths, e2, quota_hit2);
+                                    }
+                                } else {
+                                    return fail(state, paths, e, quota_hit);
                                 }
                             } else {
                                 return fail(state, paths, e, quota_hit);
@@ -2458,8 +2495,6 @@ pub fn execute_loop(
                     } else {
                         return fail(state, paths, e, quota_hit);
                     }
-                } else {
-                    return fail(state, paths, e, quota_hit);
                 }
             }
         }
@@ -2779,7 +2814,15 @@ pub fn execute_loop(
             eprintln!("warning: {msg}");
             let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
         }
-        let prior_findings = scoped_review_section(state, cfg, &review_cwd);
+        let scoped_findings = scoped_review_section(state, cfg, &review_cwd);
+        // A ceiling-cut round reaches the panel on a partial WIP commit: the
+        // reviewers judge what is here, and the note rides along so a missing
+        // surface reads as unfinished work, not a regression.
+        let prior_findings = match &ceiling_partial_note {
+            Some(note) if scoped_findings.is_empty() => note.clone(),
+            Some(note) => format!("{note}\n\n{scoped_findings}"),
+            None => scoped_findings.clone(),
+        };
         // Read per panel, so a waiver added while the run is live counts from the next
         // gate on. The contract stays frozen (O43); the waiver is the operator's (O121).
         let rulings = crate::rules::for_run(paths, &state.id);
@@ -2969,7 +3012,7 @@ pub fn execute_loop(
                 // Fail closed: only an anchored `## Verdict` / approve clears the gate,
                 // and every contract criterion must be reported as passing (O19/O20).
                 let res = review_result::ReviewResult {
-                    scoped: !prior_findings.is_empty(),
+                    scoped: !scoped_findings.is_empty(),
                     ..review_result::parse_review(&text)
                 };
                 review_result::record_review(state, paths, &rev.id, &res);
@@ -3076,6 +3119,12 @@ pub fn execute_loop(
                     );
                 }
             }
+        }
+        // The next round continues from the partial WIP commit, so its
+        // implementer prompt carries the cut-short notice as a blocker: without
+        // this the fix round would start from partial work with no idea it is.
+        if let Some(note) = ceiling_partial_note.clone() {
+            blockers.push(note);
         }
         if !any_request_changes {
             write_impl_summary(state, paths)?;
@@ -3190,6 +3239,85 @@ fn commit_before_review(state: &mut RunState, paths: &SparPaths, cfg: &Config, i
         }
     };
     let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
+}
+
+/// What the reviewers and the next round are told when the implementer is cut
+/// short at its hard ceiling: the commit under review is partial work, saved so
+/// the round can be judged and continued rather than thrown away.
+fn ceiling_partial_notice(round: u32) -> String {
+    format!(
+        "NOTE: the implementer pass for round {round} was cut short at its hard time \
+         ceiling before it could finish, so the commit under review is partial work \
+         (saved as a WIP commit). Judge what is here and continue it; missing scope is \
+         unfinished work, not a regression."
+    )
+}
+
+/// Commit an implementer's leftovers after a hard-ceiling kill as a WIP round and
+/// report the notice for the reviewers and the next round. `None` when the kill
+/// was not at the ceiling or left no work at all: that round fails as before.
+///
+/// The message names the ceiling kill, so the WIP commit reads as an interrupted
+/// round on the branch rather than a normal one. Like `commit_before_review`, a
+/// commit the hooks refuse is said out loud and the round still goes on.
+fn try_commit_ceiling_partial(
+    state: &mut RunState,
+    paths: &SparPaths,
+    impl_id: &str,
+) -> Option<String> {
+    if executor::slot_timeout_cause(state, impl_id) != Some(executor::TimeoutCause::HardCeiling) {
+        return None;
+    }
+    let wt = state
+        .worktrees
+        .iter()
+        .find(|w| w.slot_id == impl_id)
+        .cloned()?;
+    if state.dry_run || !wt.path.is_dir() || wt.path.starts_with(state.project_root.join(".spar")) {
+        return None;
+    }
+    if !executor::slot_has_work(&wt.path, state.base_commit.as_deref()) {
+        return None;
+    }
+    if let Some(msg) = worktree::restore_branch(&wt.path, &wt.branch, state.base_commit.as_deref())
+    {
+        eprintln!("warning: {msg}");
+        let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+    }
+    let round = state.round;
+    let subject =
+        format!("WIP: implementer cut short at hard ceiling (round {round}, partial work)");
+    let body = format!(
+        "spar: the round {round} implementer was killed at its hard time ceiling before it \
+         could finish. Its leftovers are committed here so the suite and the review panel \
+         judge what is on the branch, and the next round continues from this commit."
+    );
+    match worktree::commit_leftovers(&wt.path, &subject, &body) {
+        Ok(Some(sha)) => {
+            let note = format!(
+                "committed partial round-{round} implementer work on {} as {} (ceiling kill WIP)",
+                wt.branch,
+                sha.chars().take(8).collect::<String>(),
+            );
+            let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
+        }
+        Ok(None) => {
+            let note = format!(
+                "ceiling kill left committed work on {} with a clean tree; round {round} goes on",
+                wt.branch
+            );
+            let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
+        }
+        Err(e) => {
+            let msg = format!(
+                "could not commit partial round-{round} implementer work (ceiling kill WIP): {e}; \
+                 the panel judges HEAD without it"
+            );
+            eprintln!("warning: {msg}");
+            let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+        }
+    }
+    Some(ceiling_partial_notice(round))
 }
 
 /// The tree reviewer `seat` judges from: its own detached checkout at the panel head
