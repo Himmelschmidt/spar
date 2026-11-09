@@ -1651,10 +1651,14 @@ mod tests {
         );
         assert_eq!(
             operator_key("cli:pi@direct:anthropic/x"),
-            "cli:pi@anthropic"
+            "cli:pi@direct:anthropic"
         );
         assert_eq!(operator_key("cli:claude@opus"), "cli:claude@opus");
-        assert_eq!(operator_key("cli:codex@openrouter"), "cli:codex");
+        assert_eq!(operator_key("cli:codex@openrouter"), "cli:codex@openrouter");
+        assert_eq!(
+            operator_key("cli:pi@direct:anthropic"),
+            "cli:pi@direct:anthropic"
+        );
     }
 
     /// The real captured log text from the dogfooding incident (roadmap/BACKLOG.md).

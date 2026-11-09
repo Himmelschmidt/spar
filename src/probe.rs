@@ -38,15 +38,17 @@ pub struct ProbeReport {
 }
 
 /// Probe one provider and write the verdict into the quota store. Under `dry` nothing
-/// is spawned and nothing is written. A quota verdict lands on the rejection key the
-/// output names: a login-wide claude rejection pauses `cli:claude`, an Opus-limit
-/// one pauses `cli:claude@opus`. Any other verdict uses the seat's own key.
+/// is spawned and nothing is written. The probe ran this seat's route, so its
+/// verdict lands on the seat's keys: a quota verdict on the rejection key the
+/// output names (a login-wide claude rejection pauses `cli:claude`, an
+/// Opus-limit one pauses `cli:claude@opus`, a bare codex rejection pauses the
+/// default route's `cli:codex@openrouter` bucket), and any other verdict on the
+/// seat's own quota key, so a healthy probe retires the pause the eligibility
+/// check reads. A bare name that keys the login still denotes the account.
 pub fn probe(paths: &SparPaths, provider: &str, dry: bool) -> ProbeReport {
     let out = call(paths, provider, dry);
-    // A quota verdict on a modeled seat lands in the seat's bucket; a bare name
-    // denotes the account, whatever the default route bills.
     let key = match ProviderRef::parse(provider) {
-        Ok(pref) if out.verdict == Verdict::Quota && pref.model.is_some() => {
+        Ok(pref) if out.verdict == Verdict::Quota => {
             // Window and text always travel together now: one vote each,
             // broadest wins, resolved against the probed seat.
             pref.rejection_key(crate::providers::QuotaSignal {
@@ -54,7 +56,8 @@ pub fn probe(paths: &SparPaths, provider: &str, dry: bool) -> ProbeReport {
                 text: out.output.as_deref().unwrap_or(""),
             })
         }
-        _ => quota::operator_key(provider),
+        Ok(pref) => pref.quota_key(),
+        Err(_) => quota::operator_key(provider),
     };
     let mut store = QuotaStore::load(paths).unwrap_or_default();
     let change = apply(
@@ -422,6 +425,29 @@ mod tests {
         assert!(c.written);
         assert!(store.is_usable("cli:agy@flash"));
         assert!(store.is_usable("cli:agy@pro"));
+    }
+
+    #[test]
+    fn a_healthy_probe_clears_the_bucket_key_the_seat_reads() {
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:codex@openrouter", "route limit");
+        store.mark_strong("cli:codex@openrouter");
+        assert!(!crate::backup::is_provider_eligible(
+            "cli:codex",
+            &store,
+            None
+        ));
+        let seat = crate::provider_ref::ProviderRef::parse("cli:codex")
+            .unwrap()
+            .quota_key();
+        assert_eq!(seat, "cli:codex@openrouter");
+        let c = apply(&mut store, &seat, Verdict::Healthy, None, None);
+        assert!(c.written);
+        assert!(crate::backup::is_provider_eligible(
+            "cli:codex",
+            &store,
+            None
+        ));
     }
 
     #[test]

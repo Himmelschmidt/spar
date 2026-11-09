@@ -434,7 +434,16 @@ pub fn report(
             if since.is_some_and(|s| ev.ts < s) {
                 continue;
             }
-            let q = quota_row(&mut quota, crate::quota::quota_key(&ev.provider));
+            // A stored quota key already names where the pause lived: report it
+            // verbatim. Re-deriving it through `quota_key` treats a bucket as a
+            // seat ref and moves legacy login pauses into the default bucket.
+            // Only legacy bare names (`codex`) gain their `cli:` prefix.
+            let name = if ev.provider.contains(':') {
+                ev.provider.clone()
+            } else {
+                format!("cli:{}", ev.provider)
+            };
+            let q = quota_row(&mut quota, name);
             if ev.manual {
                 q.manual_pauses += 1;
             } else {
@@ -925,7 +934,21 @@ mod tests {
         let q = r.quota.iter().find(|q| q.provider == "cli:codex").unwrap();
         assert_eq!(
             (q.pauses, q.manual_pauses, q.parks, q.backup_engagements),
-            (1, 1, 2, 2)
+            (1, 1, 0, 0)
+        );
+        let bucket = r
+            .quota
+            .iter()
+            .find(|q| q.provider == "cli:codex@openrouter")
+            .unwrap();
+        assert_eq!(
+            (
+                bucket.pauses,
+                bucket.manual_pauses,
+                bucket.parks,
+                bucket.backup_engagements
+            ),
+            (0, 0, 2, 2)
         );
     }
 

@@ -89,22 +89,12 @@ pub fn scrape_auth_signal(text: &str) -> Option<String> {
         .map(|l| l.trim().chars().take(300).collect())
 }
 
-/// The quota key a seat on `provider` reads: the seat's own bucket when the
-/// ref names one (`cli:codex@openrouter`, `api:openai@gpt-5`), else the login.
-/// Eligibility, backup probing and rotation all resolve through this one
-/// function so a paused bucket benches only its own seats (O153).
-fn seat_quota_key(provider: &str) -> String {
-    crate::provider_ref::ProviderRef::parse(provider)
-        .map(|pref| pref.quota_key())
-        .unwrap_or_else(|_| crate::quota::quota_key(provider))
-}
-
 pub fn is_provider_eligible(
     provider: &str,
     store: &QuotaStore,
     available: Option<&std::collections::HashSet<String>>,
 ) -> bool {
-    let key = seat_quota_key(provider);
+    let key = crate::quota::quota_key(provider);
     if !store.is_usable(&key) {
         return false;
     }
@@ -139,7 +129,7 @@ pub fn backup_eligible(
     if is_provider_eligible(backup, store, available) {
         return true;
     }
-    let key = seat_quota_key(backup);
+    let key = crate::quota::quota_key(backup);
     if dry || !store.is_quota_paused(&key) {
         return false;
     }

@@ -257,13 +257,21 @@ impl ProviderAdapter for CodexAdapter {
     /// Billing follows the route, not the model: a `/` slug runs through the
     /// OpenRouter provider, every other model through the ChatGPT login, so
     /// those are the two buckets. A model-less seat dispatches under the
-    /// default profile, which layers OpenRouter.
+    /// default profile, which layers OpenRouter. `openrouter` names the bucket
+    /// itself, so a stored bucket key re-resolves instead of collapsing to the
+    /// login; no codex model is called that, so no seat model collides.
     fn quota_bucket<'m>(&self, model: &'m str) -> Option<Cow<'m, str>> {
-        model.contains('/').then_some(Cow::Borrowed("openrouter"))
+        (model.contains('/') || model == "openrouter").then_some(Cow::Borrowed("openrouter"))
     }
 
     fn default_bucket(&self) -> Option<&'static str> {
-        Some("openrouter")
+        // An explicitly emptied `SPAR_CODEX_PROFILE` drops `-p`, so the seat
+        // runs under codex's own config default (the native login), not the
+        // OpenRouter-layering default profile.
+        match std::env::var("SPAR_CODEX_PROFILE") {
+            Ok(p) if p.trim().is_empty() => None,
+            _ => Some("openrouter"),
+        }
     }
 
     /// Rejections carry no route of their own, so every rejection lands in the
@@ -626,6 +634,22 @@ mod tests {
             command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &opts("x", None)));
         assert!(a.windows(2).any(|w| w[0] == "-p" && w[1] == "muse"));
         assert!(!a.iter().any(|x| x == "-m"));
+    }
+
+    #[test]
+    fn default_bucket_follows_the_profile_route() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+        assert_eq!(CodexAdapter.default_bucket(), Some("openrouter"));
+        std::env::set_var("SPAR_CODEX_PROFILE", "gpt");
+        assert_eq!(CodexAdapter.default_bucket(), Some("openrouter"));
+        std::env::set_var("SPAR_CODEX_PROFILE", "");
+        assert_eq!(
+            CodexAdapter.default_bucket(),
+            None,
+            "an emptied profile drops -p, so the seat runs native and keys the login"
+        );
+        std::env::remove_var("SPAR_CODEX_PROFILE");
     }
 
     #[test]

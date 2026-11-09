@@ -100,12 +100,17 @@ impl ProviderAdapter for PiAdapter {
 
     /// Billing follows the resolved upstream: OpenRouter slugs share the
     /// `openrouter` bucket, each `direct:<provider>` bills to that provider,
-    /// and a bare word keys the login (pi's own resolution).
+    /// and any other bare word keys the login (pi's own resolution). Buckets
+    /// keep the `direct:` form, so a stored bucket key re-resolves instead of
+    /// collapsing: `direct:anthropic` strips to a bare provider that still
+    /// bills that provider. `openrouter` alone names the bucket (pi's provider
+    /// of that name bills the same OpenRouter account as the slugs).
     fn quota_bucket<'m>(&self, model: &'m str) -> Option<Cow<'m, str>> {
         if let Some(native) = model.strip_prefix(DIRECT_PREFIX).filter(|s| !s.is_empty()) {
-            return Some(Cow::Borrowed(native.split('/').next().unwrap_or(native)));
+            let provider = native.split('/').next().unwrap_or(native);
+            return Some(Cow::Owned(format!("{DIRECT_PREFIX}{provider}")));
         }
-        if model.contains('/') {
+        if model.contains('/') || model == "openrouter" {
             return Some(Cow::Borrowed("openrouter"));
         }
         None

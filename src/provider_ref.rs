@@ -405,7 +405,7 @@ mod tests {
         let explicit = ProviderRef::parse("cli:pi@openrouter/anthropic/claude").unwrap();
         assert_eq!(explicit.quota_key(), "cli:pi@openrouter");
         let direct = ProviderRef::parse("cli:pi@direct:anthropic/claude-sonnet-4-5").unwrap();
-        assert_eq!(direct.quota_key(), "cli:pi@anthropic");
+        assert_eq!(direct.quota_key(), "cli:pi@direct:anthropic");
         let bare_word = ProviderRef::parse("cli:pi@gemini-2.5-flash").unwrap();
         assert_eq!(
             bare_word.quota_key(),
@@ -422,6 +422,41 @@ mod tests {
         assert_eq!(modeled.quota_key(), "api:anthropic@claude-opus-4-6");
         let bare = ProviderRef::parse("api:anthropic").unwrap();
         assert_eq!(bare.quota_key(), "api:anthropic");
+    }
+
+    #[test]
+    fn quota_key_is_stable_on_its_own_output() {
+        // Bucket names are not seat models, but every layer re-resolves what it
+        // reads (stats, operator pause/resume/probe), so feeding a stored key
+        // back through `quota_key` must be a fixed point, never a collapse.
+        // A native-model seat ref (`cli:codex@gpt-5.2-codex`) is not a stored
+        // key: its bucket is the bare login, which itself reads as a model-less
+        // seat, so it is excluded here; `operator_key` keeps the bare login
+        // out of seat resolution.
+        for seat in [
+            "cli:codex",
+            "cli:codex@openrouter",
+            "cli:codex@openai/gpt-5",
+            "cli:pi",
+            "cli:pi@openrouter",
+            "cli:pi@google/gemini-2.5-flash",
+            "cli:pi@openrouter/anthropic/claude",
+            "cli:pi@direct:anthropic/claude-sonnet-4-5",
+            "cli:pi@direct:anthropic",
+            "cli:pi@gemini-2.5-flash",
+            "api:openai@gpt-5",
+            "api:openai",
+            "cli:grok",
+            "cli:grok@grok-4-1-fast",
+            "cli:muse",
+            "cli:claude@opus",
+            "cli:claude@claude-haiku-5-5",
+            "cli:agy@flash",
+        ] {
+            let once = ProviderRef::parse(seat).unwrap().quota_key();
+            let twice = ProviderRef::parse(&once).unwrap().quota_key();
+            assert_eq!(twice, once, "{seat} does not round-trip");
+        }
     }
 
     #[test]
@@ -467,7 +502,7 @@ mod tests {
                 None,
                 "error 429"
             ),
-            "cli:pi@anthropic"
+            "cli:pi@direct:anthropic"
         );
         assert_eq!(
             key("cli:pi@google/gemini-2.5-flash", None, "rate limit"),
