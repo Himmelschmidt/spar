@@ -248,7 +248,9 @@ fn run() -> Result<ExitCode> {
                 if let Some(preset) = &fleet {
                     cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
                 }
-                cfg.apply_without(&without)?;
+                let (pool, origin) =
+                    cfg.fresh_reviewer_pool(&providers, &select, &urgency, dry_run)?;
+                cfg.apply_without(&pool, origin, dry_run, &without)?;
                 cfg.apply_role_overrides(&role)?;
                 cfg.apply_backup_overrides(&backup)?;
                 cfg.apply_effort_overrides(&effort)?;
@@ -434,6 +436,10 @@ fn run() -> Result<ExitCode> {
                     &backup,
                     &effort,
                     &without,
+                    &providers,
+                    &select,
+                    &urgency,
+                    dry_run,
                     &suite_command,
                     fleet.as_deref(),
                     reload_config,
@@ -608,7 +614,9 @@ fn run() -> Result<ExitCode> {
                 if let Some(preset) = &fleet {
                     cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
                 }
-                cfg.apply_without(&without)?;
+                let (pool, origin) =
+                    cfg.fresh_reviewer_pool(&providers, &select, &urgency, dry_run)?;
+                cfg.apply_without(&pool, origin, dry_run, &without)?;
                 cfg.apply_role_overrides(&role)?;
                 cfg.apply_backup_overrides(&backup)?;
                 cfg.apply_effort_overrides(&effort)?;
@@ -1318,6 +1326,10 @@ fn implement_ctx(
     backup: &[String],
     effort: &[String],
     without: &[String],
+    providers: &[String],
+    select: &[String],
+    urgency: &str,
+    dry_run: bool,
     suite_command: &[String],
     fleet: Option<&str>,
     reload_config: bool,
@@ -1329,7 +1341,8 @@ fn implement_ctx(
         if let Some(preset) = fleet {
             cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
         }
-        cfg.apply_without(without)?;
+        let (pool, origin) = cfg.fresh_reviewer_pool(providers, select, urgency, dry_run)?;
+        cfg.apply_without(&pool, origin, dry_run, without)?;
         cfg.apply_role_overrides(role)?;
         cfg.apply_backup_overrides(backup)?;
         cfg.apply_effort_overrides(effort)?;
@@ -1403,17 +1416,17 @@ fn implement_ctx(
     } else {
         frozen
     };
-    if !reload_config
-        && cfg.roles.reviewer.is_empty()
-        && without
-            .iter()
-            .any(|w| config::parse_reviewer_without(w.trim()).is_ok())
-    {
-        // An ordinal drop indexes the run's own panel, not a fresh draw from the
-        // provider order: the implementer seat already consumed the head of the
-        // order at launch. Pre-pin from the live slots so the config drop and
-        // the seat surgery below index the same panel.
-        let st = state::RunState::load(&paths, run_id)?;
+    // An ordinal drop indexes the run's own panel. With live reviewer slots the panel
+    // is the slots themselves — never the file pin, which the launch pool may have
+    // beaten (rung 2 outranks `[roles]`), and never a fresh draw from the provider
+    // order. With no slots yet (a plan continuation not yet dispatched) the panel
+    // is materialized from the run's recorded pool, the same seats the dispatch builds.
+    let panel_state = without
+        .iter()
+        .any(|w| config::parse_reviewer_without(w.trim()).is_ok())
+        .then(|| state::RunState::load(&paths, run_id))
+        .transpose()?;
+    if let Some(st) = &panel_state {
         let mut panel: Vec<(usize, String)> = st
             .slots
             .iter()
@@ -1424,28 +1437,33 @@ fn implement_ctx(
             })
             .collect();
         panel.sort_by_key(|(o, _)| *o);
-        cfg.roles.reviewer = panel.into_iter().map(|(_, p)| p).collect();
+        if !panel.is_empty() {
+            cfg.roles.reviewer = panel.into_iter().map(|(_, p)| p).collect();
+        }
     }
     if let Some(preset) = fleet {
         cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
     }
-    let dropped_reviewers = cfg.apply_without(without)?;
+    let (pool, pool_origin, dry) = match &panel_state {
+        Some(st) if !st.providers.is_empty() => (st.providers.clone(), st.pool_origin, st.dry_run),
+        _ => (cfg.providers.order.clone(), state::PoolOrigin::Synth, false),
+    };
+    let dropped_reviewers = cfg.apply_without(&pool, pool_origin, dry, without)?;
     cfg.apply_role_overrides(role)?;
     cfg.apply_backup_overrides(backup)?;
     cfg.apply_effort_overrides(effort)?;
-    if let Some(owner) = runlock::RunLock::owner(&paths, run_id).filter(|o| o.alive()) {
-        if reload_config {
-            return Err(runlock::OrchestratorBusy {
-                run_id: run_id.to_string(),
-                owner_pid: owner.pid,
-            }
-            .into());
+    // Amending while the orchestrator is alive is refused with the same busy type
+    // as the live path; when persisting, the lock is held across the surgery and
+    // the snapshot write so no second CLI can interleave between the check and the
+    // save. The guard drops on return, before the dispatch re-acquires for its round.
+    if persist {
+        let _lock = runlock::RunLock::acquire(&paths, run_id)?;
+    } else if let Some(owner) = runlock::RunLock::owner(&paths, run_id).filter(|o| o.alive()) {
+        return Err(runlock::OrchestratorBusy {
+            run_id: run_id.to_string(),
+            owner_pid: owner.pid,
         }
-        anyhow::bail!(
-            "refusing to amend run {run_id}'s config while its orchestrator (pid {}) is alive; \
-             stop it first (spar stop {run_id})",
-            owner.pid
-        );
+        .into());
     }
     cfg.apply_suite_command(suite_command, without)?;
     if !persist {
@@ -1489,7 +1507,7 @@ fn resolve_without_seat_ids(
         .iter()
         .map(|w| {
             let item = w.trim();
-            if matches!(item, "critic" | "spec" | "suite")
+            if config::DroppedChannel::parse(item).is_some()
                 || config::parse_reviewer_without(item).is_ok()
             {
                 return Ok(w.clone());

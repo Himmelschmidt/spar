@@ -38,10 +38,7 @@ pub const DEFAULT_REVIEWERS: usize = 2;
 /// exact too, except `--fleet small` may narrow it (never widen it) to keep the first
 /// pin. Unpinned falls back to the preset override, else `DEFAULT_REVIEWERS`.
 pub fn panel_size(cfg: &Config) -> usize {
-    if cfg
-        .cli_role_keys
-        .contains(SlotRole::Reviewer.as_config_key())
-    {
+    if cfg.cli_role_keys.contains(&SlotRole::Reviewer) {
         return cfg.roles.reviewer.len();
     }
     if !cfg.roles.reviewer.is_empty() {
@@ -66,8 +63,7 @@ pub fn pool_width(cfg: &Config) -> usize {
 /// `[providers].order` (Bug A) — including the unpinned-but-narrowed `small` panel, or
 /// widening would silently re-add the seat the preset was asked to drop.
 pub fn reviewer_panel_pinned(cfg: &Config) -> bool {
-    cfg.cli_role_keys
-        .contains(SlotRole::Reviewer.as_config_key())
+    cfg.cli_role_keys.contains(&SlotRole::Reviewer)
         || !cfg.roles.reviewer.is_empty()
         || cfg.fleet_reviewer_override.is_some()
 }
@@ -80,9 +76,7 @@ pub fn reviewer_panel_pinned(cfg: &Config) -> bool {
 /// pool / `[providers].order` the way an ordinary unpinned panel does, or a failed
 /// unpinned-but-narrowed reviewer loses its only retry.
 pub fn reviewer_panel_has_pins(cfg: &Config) -> bool {
-    cfg.cli_role_keys
-        .contains(SlotRole::Reviewer.as_config_key())
-        || !cfg.roles.reviewer.is_empty()
+    cfg.cli_role_keys.contains(&SlotRole::Reviewer) || !cfg.roles.reviewer.is_empty()
 }
 
 fn singleton_role_value(role: SlotRole, cfg: &Config) -> Option<String> {
@@ -115,7 +109,7 @@ pub fn resolve_seat(
     cfg: &Config,
 ) -> Option<(String, SeatSource)> {
     // 1. CLI --role for this role always wins, even under an explicit pool (Bug B).
-    if cfg.cli_role_keys.contains(role.as_config_key()) {
+    if cfg.cli_role_keys.contains(&role) {
         let value = if role == SlotRole::Reviewer {
             cfg.roles.reviewer.get(role_index).cloned()
         } else {
@@ -441,7 +435,7 @@ mod tests {
     fn cli_role_outranks_explicit_pool() {
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:codex".into()];
-        cfg.cli_role_keys.insert("reviewer".into());
+        cfg.cli_role_keys.insert(SlotRole::Reviewer);
         let pool = vec!["cli:claude".into(), "cli:grok".into(), "cli:agy".into()];
         assert_eq!(
             resolve_seat(

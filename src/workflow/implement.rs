@@ -1165,7 +1165,7 @@ fn resolve_suite_provider(
         crate::provider_ref::ProviderRef::parse(p)
             .map_err(|e| anyhow::anyhow!("invalid [roles].tester {p:?}: {e}"))?;
         if dry || providers::is_provider_usable(p, false) {
-            let source = if cfg.cli_role_keys.contains(SlotRole::Tester.as_config_key()) {
+            let source = if cfg.cli_role_keys.contains(&SlotRole::Tester) {
                 SeatSource::CliRole
             } else {
                 SeatSource::RolesFile
@@ -3260,32 +3260,31 @@ pub(crate) fn drop_reviewer_seats(
     paths: &SparPaths,
     ordinals: &[usize],
 ) -> Result<Vec<String>> {
-    let mut removed: Vec<String> = Vec::new();
     let mut gone: Vec<usize> = ordinals.to_vec();
     gone.sort_unstable();
     gone.dedup();
-    for ordinal in gone.iter().rev() {
-        let Some(slot_id) = panel_seat_with_ordinal(state, *ordinal) else {
-            continue;
-        };
-        crate::markers::clear_pid(paths, &state.id, &slot_id);
-        for name in [
-            format!("review-{slot_id}.md"),
-            format!("review-{slot_id}.json"),
-        ] {
-            let path = paths.artifact(&state.id, &name);
-            if path.is_file() {
-                std::fs::remove_file(&path)?;
-            }
+    // Resolve the doomed seats first. A missing ordinal means no slot was ever
+    // seated for it (e.g. a plan continuation), so there is nothing to reap.
+    let mut removed: Vec<String> = Vec::new();
+    for ordinal in &gone {
+        if let Some(slot_id) = panel_seat_with_ordinal(state, *ordinal) {
+            removed.push(slot_id);
         }
-        state.review_history.retain(|e| e.slot_id != slot_id);
-        state.slots.retain(|s| s.id != slot_id);
-        removed.push(slot_id);
     }
     if removed.is_empty() {
         return Ok(removed);
     }
-    // Close ranks: rename higher remaining seats down over the gaps.
+    let doomed: std::collections::BTreeSet<String> = removed.iter().cloned().collect();
+    // History entries keep the id of the seat that wrote them (`former_ids` maps a
+    // renamed seat back); pruning by every id the doomed seats ever held drops the
+    // whole seat, whatever it was called in earlier rounds.
+    let mut doomed_ids = doomed.clone();
+    for slot in state.slots.iter().filter(|s| doomed.contains(&s.id)) {
+        doomed_ids.extend(slot.former_ids.iter().cloned());
+    }
+    // Close ranks: rename higher remaining seats down over the gaps. The full plan
+    // is computed up front and checked against the post-rename id set, so a rename
+    // can never collide with a seat that is itself about to move.
     let mut renames: Vec<(String, String)> = Vec::new();
     for slot in state
         .slots
@@ -3295,22 +3294,51 @@ pub(crate) fn drop_reviewer_seats(
         let Some(current) = reviewer_ordinal(&slot.id) else {
             continue;
         };
+        if doomed.contains(&slot.id) {
+            continue;
+        }
         let target = current - gone.iter().filter(|g| **g < current).count();
         if target != current {
             let prefix = format!("review-{current}-");
             let Some(rest) = slot.id.strip_prefix(&prefix) else {
                 continue;
             };
-            let new_id = format!("review-{target}-{rest}");
-            if state.slots.iter().any(|s| s.id == new_id) {
-                anyhow::bail!(
-                    "cannot drop reviewer seat: rename {} to {new_id} collides with an existing seat",
-                    slot.id
-                );
-            }
-            renames.push((slot.id.clone(), new_id));
+            renames.push((slot.id.clone(), format!("review-{target}-{rest}")));
         }
     }
+    let mut final_ids: std::collections::BTreeSet<String> =
+        state.slots.iter().map(|s| s.id.clone()).collect();
+    for id in &doomed {
+        final_ids.remove(id);
+    }
+    for (old, new) in &renames {
+        final_ids.remove(old);
+        if !final_ids.insert(new.clone()) {
+            anyhow::bail!(
+                "cannot drop reviewer seat: rename {old} to {new} collides with a live seat"
+            );
+        }
+    }
+    // Every fallible check is done: now mutate. Gone seats lose their checkouts
+    // (renamed survivors recreate theirs on the next dispatch), their slots, their
+    // verdict artifacts and their history — the gate reads history entries directly,
+    // so pruning is what stops the seat's findings from counting.
+    for id in doomed.iter().chain(renames.iter().map(|(old, _)| old)) {
+        crate::worktree::remove_reviewer_checkout(state, id);
+    }
+    for id in &doomed {
+        crate::markers::clear_pid(paths, &state.id, id);
+        for ext in ["md", "json"] {
+            let path = paths.artifact(&state.id, &format!("review-{id}.{ext}"));
+            if path.is_file() {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+    state
+        .review_history
+        .retain(|e| !doomed_ids.contains(&e.slot_id));
+    state.slots.retain(|s| !doomed.contains(&s.id));
     renames.sort_by(|a, b| {
         reviewer_ordinal(&a.0)
             .unwrap_or(0)
@@ -3318,13 +3346,6 @@ pub(crate) fn drop_reviewer_seats(
     });
     for (old, new) in renames {
         state.rename_slot(paths, &old, &new);
-        // History entries name seats by id: point them at the new id too, so a
-        // later drop prunes them and the gate stops counting them either way.
-        for e in state.review_history.iter_mut() {
-            if e.slot_id == old {
-                e.slot_id = new.clone();
-            }
-        }
         for ext in ["md", "json"] {
             let from = paths.artifact(&state.id, &format!("review-{old}.{ext}"));
             let to = paths.artifact(&state.id, &format!("review-{new}.{ext}"));
@@ -3573,10 +3594,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
     // Candidate order: [roles].implementer, then [providers].order, then the live fleet.
     // Rotation must report the rung it actually drew from (`SlotState::point_at` only
     // touches provider/model), not leave the slot claiming its original source.
-    let implementer_role_source = if cfg
-        .cli_role_keys
-        .contains(SlotRole::Implementer.as_config_key())
-    {
+    let implementer_role_source = if cfg.cli_role_keys.contains(&SlotRole::Implementer) {
         SeatSource::CliRole
     } else {
         SeatSource::RolesFile
@@ -3771,10 +3789,7 @@ fn try_rotate_reviewer_provider(
     }
     let eligible =
         |p: &String| -> bool { *p != cur && crate::backup::is_provider_eligible(p, &store, None) };
-    let reviewer_role_source = if cfg
-        .cli_role_keys
-        .contains(SlotRole::Reviewer.as_config_key())
-    {
+    let reviewer_role_source = if cfg.cli_role_keys.contains(&SlotRole::Reviewer) {
         SeatSource::CliRole
     } else {
         SeatSource::RolesFile
@@ -4357,7 +4372,7 @@ mod try_rotate_implementer_tests {
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
         cfg.roles.implementer = Some("cli:claude".into());
-        cfg.cli_role_keys.insert("implementer".into());
+        cfg.cli_role_keys.insert(SlotRole::Implementer);
         cfg.backups.implementer = Some("cli:grok@backup".into());
         // ensure backup provider is available (detect_all would list claude,grok,codex as available if binaries exist? But we use store only, and available None because we didn't set detect. is_provider_eligible will check store and available; with available None, only store matters. backup grok is not paused, so eligible)
         let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
@@ -4375,7 +4390,7 @@ mod try_rotate_implementer_tests {
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
         cfg.roles.implementer = Some("cli:claude".into());
-        cfg.cli_role_keys.insert("implementer".into());
+        cfg.cli_role_keys.insert(SlotRole::Implementer);
         cfg.backups.implementer = Some("cli:grok@backup".into());
         let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
         assert!(
@@ -4407,7 +4422,7 @@ mod try_rotate_implementer_tests {
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
         cfg.roles.implementer = Some("cli:claude".into());
-        cfg.cli_role_keys.insert("implementer".into());
+        cfg.cli_role_keys.insert(SlotRole::Implementer);
         cfg.backups.implementer = None;
         let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
         assert!(
@@ -4426,7 +4441,7 @@ mod try_rotate_implementer_tests {
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
         cfg.roles.implementer = Some("cli:claude".into());
-        cfg.cli_role_keys.insert("implementer".into());
+        cfg.cli_role_keys.insert(SlotRole::Implementer);
         cfg.backups.implementer = Some("cli:grok@backup".into());
         let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
         assert!(
@@ -4462,7 +4477,7 @@ mod try_rotate_implementer_tests {
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
         cfg.roles.implementer = Some("cli:claude".into());
-        cfg.cli_role_keys.insert("implementer".into());
+        cfg.cli_role_keys.insert(SlotRole::Implementer);
         cfg.backups.implementer = Some("cli:grok@backup".into());
         st.providers = vec!["cli:grok".into(), "cli:codex".into()];
         let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
@@ -4488,7 +4503,7 @@ mod try_rotate_implementer_tests {
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
         cfg.roles.implementer = Some("cli:claude".into());
-        cfg.cli_role_keys.insert("implementer".into());
+        cfg.cli_role_keys.insert(SlotRole::Implementer);
         cfg.backups.implementer = Some("cli:grok@backup".into());
         let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
         assert!(!changed, "ineligible backup must not be selected");
@@ -4508,7 +4523,7 @@ mod try_rotate_implementer_tests {
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into()];
         cfg.roles.implementer = Some("cli:claude".into());
-        cfg.cli_role_keys.insert("implementer".into());
+        cfg.cli_role_keys.insert(SlotRole::Implementer);
         cfg.backups.implementer = Some("cli:grok@backup".into());
         let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
         assert!(changed);
