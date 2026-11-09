@@ -1,6 +1,8 @@
 use super::{
-    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, SpawnOpts, TrustPolicy,
+    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, QuotaSignal, SpawnOpts,
+    TrustPolicy,
 };
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -250,6 +252,32 @@ fn prompt_arg(opts: &SpawnOpts, stdin_prompt: bool) -> String {
 impl ProviderAdapter for CodexAdapter {
     fn name(&self) -> &'static str {
         "codex"
+    }
+
+    /// Billing follows the route, not the model: a `/` slug runs through the
+    /// OpenRouter provider, every other model through the ChatGPT login, so
+    /// those are the two buckets. A model-less seat dispatches under the
+    /// default profile, which layers OpenRouter.
+    fn quota_bucket<'m>(&self, model: &'m str) -> Option<Cow<'m, str>> {
+        model.contains('/').then_some(Cow::Borrowed("openrouter"))
+    }
+
+    fn default_bucket(&self) -> Option<&'static str> {
+        Some("openrouter")
+    }
+
+    /// Rejections carry no route of their own, so every rejection lands in the
+    /// dispatched seat's own bucket: the seat's route, or the login for a
+    /// native-model seat.
+    fn rejection_scope<'s>(
+        &self,
+        seat: Option<&'s str>,
+        _signal: QuotaSignal<'_>,
+    ) -> Option<Cow<'s, str>> {
+        match seat {
+            Some(model) => self.quota_bucket(model),
+            None => self.default_bucket().map(Cow::Borrowed),
+        }
     }
 
     // `codex exec --json` emits JSONL (thread/turn/item events with turn.completed

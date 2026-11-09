@@ -43,20 +43,19 @@ pub struct ProbeReport {
 /// one pauses `cli:claude@opus`. Any other verdict uses the seat's own key.
 pub fn probe(paths: &SparPaths, provider: &str, dry: bool) -> ProbeReport {
     let out = call(paths, provider, dry);
-    let key = ProviderRef::parse(provider)
-        .map(|pref| {
-            if out.verdict == Verdict::Quota {
-                // Window and text always travel together now: one vote each,
-                // broadest wins, resolved against the probed seat.
-                pref.rejection_key(crate::providers::QuotaSignal {
-                    window: out.window,
-                    text: out.output.as_deref().unwrap_or(""),
-                })
-            } else {
-                pref.quota_key()
-            }
-        })
-        .unwrap_or_else(|_| quota::quota_key(provider));
+    // A quota verdict on a modeled seat lands in the seat's bucket; a bare name
+    // denotes the account, whatever the default route bills.
+    let key = match ProviderRef::parse(provider) {
+        Ok(pref) if out.verdict == Verdict::Quota && pref.model.is_some() => {
+            // Window and text always travel together now: one vote each,
+            // broadest wins, resolved against the probed seat.
+            pref.rejection_key(crate::providers::QuotaSignal {
+                window: out.window,
+                text: out.output.as_deref().unwrap_or(""),
+            })
+        }
+        _ => quota::operator_key(provider),
+    };
     let mut store = QuotaStore::load(paths).unwrap_or_default();
     let change = apply(
         &mut store,

@@ -1030,6 +1030,27 @@ pub fn quota_key(raw: &str) -> String {
         .unwrap_or_else(|_| raw.to_string())
 }
 
+/// Where an operator's pause, resume, or probe lands. A named model keys its bucket,
+/// exactly like a seat; a bare name denotes the account, not the default route's
+/// bucket (`provider pause cli:codex` holds native and OpenRouter seats alike).
+/// Idempotent on its own output.
+pub fn operator_key(raw: &str) -> String {
+    let candidate = if raw.contains(':') {
+        raw.to_string()
+    } else {
+        format!("cli:{raw}")
+    };
+    crate::provider_ref::ProviderRef::parse(&candidate)
+        .map(|p| {
+            if p.model.is_none() {
+                p.storage_key()
+            } else {
+                p.quota_key()
+            }
+        })
+        .unwrap_or_else(|_| raw.to_string())
+}
+
 pub fn filter_usable(names: &[String], store: &QuotaStore) -> Vec<String> {
     names
         .iter()
@@ -1615,8 +1636,25 @@ mod tests {
         assert_eq!(quota_key("cli:codex@opus"), "cli:codex");
         assert_eq!(quota_key("cli:agy@flash"), "cli:agy@flash");
         assert_eq!(quota_key("cli:agy"), "cli:agy");
-        assert_eq!(quota_key("api:openai@gpt-5"), "api:openai");
+        assert_eq!(quota_key("api:openai@gpt-5"), "api:openai@gpt-5");
         assert_eq!(quota_key("cli:agy@flash"), quota_key("cli:agy@flash"));
+    }
+
+    #[test]
+    fn operator_key_names_a_model_bucket_or_the_bare_login() {
+        assert_eq!(operator_key("codex"), "cli:codex");
+        assert_eq!(operator_key("cli:codex"), "cli:codex");
+        assert_eq!(operator_key("cli:pi"), "cli:pi");
+        assert_eq!(
+            operator_key("cli:codex@openai/gpt-5"),
+            "cli:codex@openrouter"
+        );
+        assert_eq!(
+            operator_key("cli:pi@direct:anthropic/x"),
+            "cli:pi@anthropic"
+        );
+        assert_eq!(operator_key("cli:claude@opus"), "cli:claude@opus");
+        assert_eq!(operator_key("cli:codex@openrouter"), "cli:codex");
     }
 
     /// The real captured log text from the dogfooding incident (roadmap/BACKLOG.md).

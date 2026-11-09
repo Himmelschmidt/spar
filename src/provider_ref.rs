@@ -1,6 +1,7 @@
 //! Provider identity: always `cli:name` or `api:name` (no bare names).
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -102,15 +103,25 @@ impl ProviderRef {
     /// everything else keys per login, exactly `storage_key()`. The scope is declared
     /// on the adapter type. Idempotent on its own output.
     pub fn quota_key(&self) -> String {
-        if self.backend != ExecBackend::NativeCli {
-            return self.storage_key();
+        // api providers have no adapter; every model bills separately, so the
+        // model is its own bucket and a model-less seat keys at the login.
+        if self.backend == ExecBackend::ApiSdk {
+            return match &self.model {
+                Some(model) => format!("{}@{model}", self.storage_key()),
+                None => self.storage_key(),
+            };
         }
-        let Some(model) = self.model.as_deref() else {
-            return self.storage_key();
+        // A model-less seat dispatches under the adapter's default route
+        // (codex's default profile layers OpenRouter); without one the seat
+        // keys at the login (O151).
+        let bucket = match self.model.as_deref() {
+            Some(model) => crate::providers::adapter_named(&self.storage_key())
+                .and_then(|a| a.quota_bucket(model)),
+            None => crate::providers::adapter_named(&self.storage_key())
+                .and_then(|a| a.default_bucket())
+                .map(Cow::Borrowed),
         };
-        match crate::providers::adapter_named(&self.storage_key())
-            .and_then(|a| a.quota_bucket(model))
-        {
+        match bucket {
             Some(bucket) => format!("{}@{bucket}", self.storage_key()),
             None => self.storage_key(),
         }
@@ -269,7 +280,9 @@ mod tests {
         let full_haiku = ProviderRef::parse("cli:claude@claude-haiku-5-5").unwrap();
         assert_eq!(full_haiku.quota_key(), "cli:claude");
         let api = ProviderRef::parse("api:openai@gpt-5").unwrap();
-        assert_eq!(api.quota_key(), "api:openai");
+        assert_eq!(api.quota_key(), "api:openai@gpt-5");
+        let api_bare = ProviderRef::parse("api:openai").unwrap();
+        assert_eq!(api_bare.quota_key(), "api:openai");
         let unknown = ProviderRef::parse("cli:nothing@x").unwrap();
         assert_eq!(unknown.quota_key(), "cli:nothing");
         assert_eq!(
@@ -369,6 +382,108 @@ mod tests {
             }),
             "cli:codex"
         );
+    }
+
+    #[test]
+    fn quota_key_splits_codex_by_route() {
+        let native = ProviderRef::parse("cli:codex@gpt-5.2-codex").unwrap();
+        assert_eq!(native.quota_key(), "cli:codex");
+        let via_openrouter = ProviderRef::parse("cli:codex@openai/gpt-5").unwrap();
+        assert_eq!(via_openrouter.quota_key(), "cli:codex@openrouter");
+        let bare = ProviderRef::parse("cli:codex").unwrap();
+        assert_eq!(
+            bare.quota_key(),
+            "cli:codex@openrouter",
+            "a model-less seat dispatches under the default profile, which layers OpenRouter"
+        );
+    }
+
+    #[test]
+    fn quota_key_splits_pi_by_upstream() {
+        let slug = ProviderRef::parse("cli:pi@google/gemini-2.5-flash").unwrap();
+        assert_eq!(slug.quota_key(), "cli:pi@openrouter");
+        let explicit = ProviderRef::parse("cli:pi@openrouter/anthropic/claude").unwrap();
+        assert_eq!(explicit.quota_key(), "cli:pi@openrouter");
+        let direct = ProviderRef::parse("cli:pi@direct:anthropic/claude-sonnet-4-5").unwrap();
+        assert_eq!(direct.quota_key(), "cli:pi@anthropic");
+        let bare_word = ProviderRef::parse("cli:pi@gemini-2.5-flash").unwrap();
+        assert_eq!(
+            bare_word.quota_key(),
+            "cli:pi",
+            "pi's own resolution keys the login"
+        );
+        let bare = ProviderRef::parse("cli:pi").unwrap();
+        assert_eq!(bare.quota_key(), "cli:pi");
+    }
+
+    #[test]
+    fn quota_key_splits_api_per_model() {
+        let modeled = ProviderRef::parse("api:anthropic@claude-opus-4-6").unwrap();
+        assert_eq!(modeled.quota_key(), "api:anthropic@claude-opus-4-6");
+        let bare = ProviderRef::parse("api:anthropic").unwrap();
+        assert_eq!(bare.quota_key(), "api:anthropic");
+    }
+
+    #[test]
+    fn quota_key_stays_login_wide_for_grok_and_muse() {
+        for seat in [
+            "cli:grok",
+            "cli:grok@grok-4-1-fast",
+            "cli:muse",
+            "cli:muse@auto",
+        ] {
+            assert_eq!(
+                ProviderRef::parse(seat).unwrap().quota_key(),
+                seat.split('@').next().unwrap(),
+                "{seat} has no separate windows"
+            );
+        }
+    }
+
+    #[test]
+    fn rejection_key_lands_in_the_seat_bucket() {
+        use crate::providers::{QuotaSignal, RateLimitWindow as W};
+        let key = |seat: &str, window: Option<W>, text: &str| {
+            ProviderRef::parse(seat)
+                .unwrap()
+                .rejection_key(QuotaSignal { window, text })
+        };
+        assert_eq!(
+            key("cli:codex@openai/gpt-5", Some(W::RateLimit), "rate limit"),
+            "cli:codex@openrouter"
+        );
+        assert_eq!(
+            key("cli:codex@gpt-5.2-codex", None, "rate limited, slow down"),
+            "cli:codex"
+        );
+        assert_eq!(
+            key("cli:codex", None, "too many requests"),
+            "cli:codex@openrouter",
+            "a model-less rejection lands in the default route's bucket"
+        );
+        assert_eq!(
+            key(
+                "cli:pi@direct:anthropic/claude-sonnet-4-5",
+                None,
+                "error 429"
+            ),
+            "cli:pi@anthropic"
+        );
+        assert_eq!(
+            key("cli:pi@google/gemini-2.5-flash", None, "rate limit"),
+            "cli:pi@openrouter"
+        );
+        assert_eq!(key("cli:pi@gemini-2.5-flash", None, "rate limit"), "cli:pi");
+        assert_eq!(
+            key("api:openai@gpt-5", None, "too many requests"),
+            "api:openai@gpt-5"
+        );
+        assert_eq!(key("api:openai", None, "too many requests"), "api:openai");
+        assert_eq!(
+            key("cli:grok@grok-4-1-fast", None, "rate limit"),
+            "cli:grok"
+        );
+        assert_eq!(key("cli:muse@auto", None, "rate limit"), "cli:muse");
     }
 
     #[test]

@@ -244,6 +244,12 @@ pub trait ProviderAdapter: Send + Sync {
     fn quota_bucket<'m>(&self, _model: &'m str) -> Option<Cow<'m, str>> {
         None
     }
+    /// The bucket a model-less seat bills to (`None` for the whole login).
+    /// Only adapters whose no-model dispatch routes somewhere other than the
+    /// login override this: codex's default profile layers OpenRouter.
+    fn default_bucket(&self) -> Option<&'static str> {
+        None
+    }
     /// The quota bucket a rejection covers, `None` for the whole login: the
     /// signal's votes resolved against the dispatched seat's own bucket. No votes,
     /// any login-wide vote, or disagreeing votes all widen to the login.
