@@ -325,10 +325,11 @@ pub enum Command {
         #[arg(long, value_name = "PRESET")]
         fleet: Option<String>,
         /// Drop seats for THIS run only, comma-separated: `critic`, `spec`, `suite`,
-        /// plus reviewer seats as `reviewer[N]` (0-based panel ordinal) or an existing
-        /// seat id (`review-1-cli-claude`). Dropping a reviewer removes the seat and
-        /// its verdicts stop gating the ship. Applied before `--role`, so an explicit
-        /// role flag still wins.
+        /// plus reviewer seats as `reviewer[N]` (0-based panel ordinal). Dropping a
+        /// reviewer removes the seat and its verdicts stop gating the ship. A bound
+        /// run (`implement --run`) also takes an existing seat id
+        /// (`review-1-cli-claude`). Applied before `--role`, so an explicit role flag
+        /// still wins.
         #[arg(long, value_delimiter = ',')]
         without: Vec<String>,
         /// Idempotency key: refuse to start while an unfinished run with this key

@@ -1317,8 +1317,23 @@ fn without_reviewer_seat_id_drops_and_renumbers() {
         .map(|e| e["slot_id"].as_str().unwrap())
         .collect();
     assert!(
-        history.iter().all(|s| *s == "review-0-cli-claude"),
-        "history follows the rename: {history:?}"
+        history.iter().all(|s| *s == "review-1-cli-claude"),
+        "history keeps the id of the seat that wrote it: {history:?}"
+    );
+    let survivor = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "review-0-cli-claude")
+        .unwrap();
+    assert!(
+        survivor["former_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "review-1-cli-claude"),
+        "the renamed seat maps its old id: {:?}",
+        survivor["former_ids"]
     );
     for ext in ["md", "json"] {
         assert!(
@@ -1335,6 +1350,315 @@ fn without_reviewer_seat_id_drops_and_renumbers() {
         pin,
         serde_json::json!(["cli:claude"]),
         "the frozen pin keeps the surviving seat: {pin}"
+    );
+}
+
+/// #234 (M1): a fresh-run `--without reviewer[1]` indexes the pool-derived panel,
+/// not the provider order. With pool `[claude, codex, grok]` the implementer takes
+/// pool position 0, so reviewer 1 is `cli:grok` and the frozen pin keeps `cli:codex`.
+#[test]
+fn without_reviewer_ordinal_indexes_the_pool_derived_panel() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(
+        tmp.path(),
+        &[
+            "--providers",
+            "cli:claude,cli:codex,cli:grok",
+            "--without",
+            "reviewer[1]",
+        ],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    let cfg = read_run_config(tmp.path(), &run_id);
+    assert_eq!(
+        cfg["roles"]["reviewer"],
+        serde_json::json!(["cli:codex"]),
+        "the drop hits the pool-derived seat, not provider position 1: {:?}",
+        cfg["roles"]["reviewer"]
+    );
+    assert!(
+        cfg["cli_role_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k == "reviewer"),
+        "the ordinal drop records the reviewer key: {:?}",
+        cfg["cli_role_keys"]
+    );
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        2,
+    );
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        providers_for(&state, "reviewer"),
+        vec!["cli:codex".to_string()],
+        "the continuation keeps the pool-derived survivor: {:?}",
+        state["slots"]
+    );
+}
+
+/// #234 (M2): a bound-run amend re-derives the reviewer pin from the live slots,
+/// so a file pin edited in after the seats were cut is ignored.
+#[test]
+fn bound_amend_ignores_a_stale_file_reviewer_pin() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(tmp.path(), &["--providers", "cli:claude,cli:grok"]);
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    let _ = spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--without",
+            "reviewer[1]",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    std::fs::write(
+        tmp.path().join("spar.toml"),
+        "[roles]\nreviewer = [\"cli:codex\"]\n[suite]\nenabled = false\n",
+    )
+    .unwrap();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--effort",
+            "implementer=low",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        vec!["review-0-cli-grok"],
+        "the live slots win over the file pin: {:?}",
+        state["slots"]
+    );
+    let pin = read_run_config(tmp.path(), &run_id)["roles"]["reviewer"].clone();
+    assert_eq!(
+        pin,
+        serde_json::json!(["cli:grok"]),
+        "the frozen pin follows the slots, not the file: {pin}"
+    );
+}
+
+/// #234 (M3): dropping the first seat shifts the survivor's per-ordinal backup
+/// down, records the reviewer backup key, and `--reload-config` carries the
+/// shifted list instead of re-reading the file's full-length list.
+#[test]
+fn reload_config_keeps_the_shifted_reviewer_backups() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(
+        tmp.path(),
+        &[
+            "--providers",
+            "cli:claude,cli:codex,cli:grok",
+            "--backup",
+            "reviewer[0]=cli:agy@b0",
+            "--backup",
+            "reviewer[1]=cli:agy@b1",
+        ],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    let _ = spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:codex,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--without",
+            "reviewer[0]",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let cfg = read_run_config(tmp.path(), &run_id);
+    assert_eq!(
+        cfg["backups"]["reviewer"],
+        serde_json::json!(["cli:agy@b1"]),
+        "the survivor's backup shifts down: {:?}",
+        cfg["backups"]["reviewer"]
+    );
+    assert!(
+        cfg["cli_backup_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k == "reviewer"),
+        "the shift records the reviewer backup key: {:?}",
+        cfg["cli_backup_keys"]
+    );
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--reload-config",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let cfg = read_run_config(tmp.path(), &run_id);
+    assert_eq!(
+        cfg["backups"]["reviewer"],
+        serde_json::json!(["cli:agy@b1"]),
+        "the reload carries the shifted backups: {:?}",
+        cfg["backups"]["reviewer"]
+    );
+    assert_eq!(
+        cfg["roles"]["reviewer"],
+        serde_json::json!(["cli:grok"]),
+        "the reload keeps the surviving seat: {:?}",
+        cfg["roles"]["reviewer"]
+    );
+}
+
+/// #234 (M4): dropping the middle seat of a three-seat panel renumbers only the
+/// seats above it, prunes the dropped seat's history, and pins the survivors.
+#[test]
+fn without_reviewer_middle_ordinal_drops_and_renumbers_above_only() {
+    let tmp = project(
+        "[roles]\nreviewer = [\"cli:codex\", \"cli:grok\", \"cli:agy\"]\n[suite]\nenabled = false\n",
+    );
+    let v = plan_json(
+        tmp.path(),
+        &["--providers", "cli:claude,cli:codex,cli:grok,cli:agy"],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    let _ = spar_cmd()
+        .current_dir(tmp.path())
+        .env("SPAR_FORCE_REQUEST_CHANGES", "1")
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:codex,cli:grok,cli:agy",
+            "--dry-run",
+            "--json",
+        ])
+        .assert();
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        vec![
+            "review-0-cli-codex",
+            "review-1-cli-grok",
+            "review-2-cli-agy"
+        ],
+        "the panel under test: {:?}",
+        state["slots"]
+    );
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--without",
+            "reviewer[1]",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "dropped reviewer seat(s) review-1-cli-grok",
+        ));
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        vec!["review-0-cli-codex", "review-1-cli-agy"],
+        "only the seats above the drop renumber: {:?}",
+        state["slots"]
+    );
+    let history: Vec<&str> = state["review_history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["slot_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        !history.contains(&"review-1-cli-grok"),
+        "the dropped seat's history goes with it: {history:?}"
+    );
+    let survivor = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "review-1-cli-agy")
+        .unwrap();
+    assert!(
+        survivor["former_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "review-2-cli-agy"),
+        "the renamed seat maps its old id: {:?}",
+        survivor["former_ids"]
+    );
+    let pin = read_run_config(tmp.path(), &run_id)["roles"]["reviewer"].clone();
+    assert_eq!(
+        pin,
+        serde_json::json!(["cli:codex", "cli:agy"]),
+        "the frozen pin keeps the survivors in order: {pin}"
     );
 }
 
