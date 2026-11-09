@@ -977,8 +977,12 @@ slot is stuck on.**
   during this dispatch keeps the slot `done`; new commits since the dispatch began earn the
   same artifact-only recovery turn a clean exit without its artifact gets (below). Either
   way the slot note reads `killed at the hard ceiling after finishing its work; kept as
-  done` and the round goes on to review. A dirty tree alone is not enough (that is a round
-  cut short; its checkpoint keeps it). Implementer only, like the recovery turn.
+  done` and the round goes on to review. A dirty tree alone, or commits the recovery turn
+  could not keep, is committed as partial work instead of failing the round: a
+  `WIP: implementer cut short at hard ceiling (round N, partial work)` commit lands on the
+  run branch and the suite and the panel judge it like any round, with the reviewers and
+  the next round told the previous pass was cut short. Only a ceiling kill with no work at
+  all fails the round. Implementer only, like the recovery turn.
 - Delivery is per-adapter and you never choose it. **claude** takes nudges through its
   inbox, which its `Stop` hook drains at the turn boundary. **grok** takes them through
   the same `Stop`-hook injection that **claude** uses: spar writes a project hook file
