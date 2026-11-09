@@ -393,8 +393,10 @@ pub fn nudge(
             (action, Some(path))
         }
         // `None` is an adapter with no channel at all (unknown provider / bare
-        // agent). The poll file is still the best available drop: worst case the
-        // agent never reads it, which is where it started.
+        // agent); the poll file is still the best available nudge drop. This is
+        // deliberately looser than `deliver`, which leaves a `None` inbox
+        // untouched for the agent to claim itself: a nudge names one file the
+        // agent already polls, while a deliver is the whole drain.
         DeliveryStrategy::PollFile | DeliveryStrategy::None => (
             DeliveryAction::PolledFile,
             Some(append_poll_file(paths, run, agent, text, dry_run)?),
@@ -490,6 +492,38 @@ mod tests {
         assert_eq!(d.pending, 2);
         // The agent must still be able to claim them itself.
         assert_eq!(bus::inbox_claim(&paths, &ub, "test").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn poll_file_deliver_writes_the_body_where_the_agent_polls() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, Some("r1"), "p", Some("cli:pi"), Some("native-cli")).unwrap();
+        chat(
+            &paths,
+            Some("r1"),
+            "a",
+            "p",
+            "operator says go left",
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+
+        let agent = agent_ref(Some("r1"), "p");
+        let d = deliver(
+            &paths,
+            Some("r1"),
+            &agent,
+            DeliveryStrategy::PollFile,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(d.action, DeliveryAction::PolledFile);
+        assert_eq!(d.delivered, 1);
+        let body = std::fs::read_to_string(poll_file(&paths, Some("r1"), &agent)).unwrap();
+        assert!(body.contains("operator says go left"), "{body}");
+        assert_eq!(bus::inbox(&paths, &agent).unwrap().len(), 0);
     }
 
     #[test]

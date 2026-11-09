@@ -1267,11 +1267,14 @@ recipient acked it), `withdrawn` (superseded or expired). A poll file or codex q
  "superseded_by": "msg id" | null, "expired": false}
 ```
 
-Each time is the earliest of its kind. `delivery` rolls the receipts up to one word
-(O153): `queued` while any copy still waits in an inbox, `delivered` once it has landed
-in the recipient's channel (claimed, Stop-hook injected, or dropped in the poll file),
-`acknowledged` once an ack answers it. It is derived from the receipts plus the ack
-events at read time, never stored. `receipts.jsonl` rolls to `receipts.jsonl.1` at
+Each time is the earliest of its kind. `delivery` reads one word off disk per message
+(O153, O154): `queued` while any copy still waits in an inbox, `delivered` once a claimed
+copy sits on disk, `acknowledged` once an ack answers it (terminal, even with copies
+still waiting). It is derived at read time from the inbox directories plus the ack
+events — never stored, so a dropped receipt write or a rotated `receipts.jsonl` cannot
+desynchronise it. A `bus send` fans PollFile recipients (agy, pi) straight into their
+poll files, so the batch is there at the slot's next poll with no explicit `bus deliver`.
+`receipts.jsonl` rolls to `receipts.jsonl.1` at
 8 MiB (about the last 16 MiB are kept); `bus log` streams both. `bus send --json` returns the message with
 `schema_version` (and `withdrawal` under `--supersedes`). The human `bus log` shows the
 message id and `[queued|delivered|acknowledged; delivered n/m, read n/m; superseded by …; expired]`.

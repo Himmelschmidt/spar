@@ -7,7 +7,7 @@
 //!   - Grok    → `StopHookInject`       (same turn-boundary injection as Claude: grok's
 //!     Stop hook honors the same `{"decision":"block",…}` payload per docs ch. 10;
 //!     the end-to-end re-drive is not yet observed live, see O90)
-//!   - agy     → `PollFile`             (claimed, then appended to the poll file its
+//!   - agy     → `PollFile`             (fanned out on send into the poll file its
 //!     prompt tells it to read before any new major step)
 //!   - muse    → `StopHookInject`       (same turn-boundary injection as Claude: muse's
 //!     Stop hook honors the same `{"decision":"block",…}` payload, probed live)
@@ -316,30 +316,63 @@ fn muse_stop_hook_inject_claims_and_builds_block_payload() {
     );
 }
 
-/// agy: no push channel into the running process, so deliver claims the inbox and
-/// drops the batch in the slot's poll file — the file every role prompt (agy's
-/// included) tells the agent to read before starting any new major step. A second
+/// agy: no push channel into the running process, so a send fans the slot's inbox
+/// straight into its poll file — the file every role prompt (agy's included)
+/// tells the agent to read before starting any new major step. No explicit `bus
+/// deliver`: the body is in the file, the log reads delivered, and a later
 /// deliver drains nothing (exactly-once).
 #[test]
-fn agy_poll_file_claims_and_reports_polled() {
+fn agy_send_fans_out_to_the_poll_file() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
     let run_id = plan_and_approve(tmp.path());
     let agent = slot_for_provider(tmp.path(), &run_id, "cli:agy");
 
+    // Dry runs stub the poll-file write; flip the run live so this exercises the
+    // real fan-out path. Nothing else in this test dispatches, so nothing else
+    // can observe the flip.
+    set_dry_run(tmp.path(), &run_id, false);
+
     send(tmp.path(), &run_id, &agent, "write the acceptance test");
 
+    let poll = std::fs::read_to_string(
+        tmp.path()
+            .join(".spar/runs")
+            .join(&run_id)
+            .join("logs")
+            .join(format!("nudges-{agent}.md")),
+    )
+    .unwrap();
+    assert!(
+        poll.contains("write the acceptance test"),
+        "sent body is in the poll file with no explicit deliver"
+    );
+
+    let log = spar_cmd()
+        .current_dir(tmp.path())
+        .args(["bus", "log", "--run", &run_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let entries: Value = serde_json::from_slice(&log).unwrap();
+    assert!(
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["body"] == "write the acceptance test" && e["delivery"] == "delivered"),
+        "{entries}"
+    );
+
+    // Exactly-once: a later deliver drains nothing.
     let d = deliver_json(tmp.path(), &run_id, &agent);
     assert_eq!(d["strategy"], "poll_file");
-    assert_eq!(d["action"], "polled_file");
-    assert!(d["delivered"].as_u64().unwrap() >= 1, "{d}");
+    assert_eq!(d["action"], "empty");
+    assert_eq!(d["delivered"], 0);
 
-    // Exactly-once: nothing left to drain.
-    let again = deliver_json(tmp.path(), &run_id, &agent);
-    assert_eq!(again["action"], "empty");
-    assert_eq!(again["delivered"], 0);
-
-    // The slot's prompt names its poll file, so the claimed batch is where the
+    // The slot's prompt names its poll file, so the fanned-out batch is where the
     // agent is told to look before its next major step.
     let prompt = std::fs::read_to_string(
         tmp.path()
@@ -352,4 +385,14 @@ fn agy_poll_file_claims_and_reports_polled() {
         prompt.contains(&format!("nudges-{agent}.md")),
         "agy prompt names its poll file"
     );
+}
+
+/// Flip a run between dry-run and live by editing its state file. Only for tests
+/// that need the real write path (dry runs stub poll-file writes).
+fn set_dry_run(dir: &std::path::Path, run_id: &str, dry_run: bool) {
+    let path = dir.join(".spar/runs").join(run_id).join("state.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut state: Value = serde_json::from_str(&text).unwrap();
+    state["dry_run"] = Value::Bool(dry_run);
+    std::fs::write(&path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 }

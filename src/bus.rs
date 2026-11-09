@@ -545,25 +545,31 @@ pub fn broadcast(
     chat(paths, run, from, "broadcast", body, budget)
 }
 
-fn deliver_inbox(paths: &SparPaths, msg: &BusMessage) -> Result<()> {
-    let targets: Vec<String> = if msg.to == "broadcast" || msg.to == "*" {
+/// Who a message was filed to: the resolved inbox ids. Shared by the filing itself
+/// and any post-send fan-out, so the two can never disagree on the recipient set.
+pub fn message_targets(paths: &SparPaths, msg: &BusMessage) -> Result<Vec<String>> {
+    if msg.to == "broadcast" || msg.to == "*" {
         // A broadcast reaches the sender's own scope only: agents whose run tag matches
         // the message's exactly (a bare broadcast reaches other bare agents, never run
         // slots). Cross-scope fan-out is only ever explicit, addressed by id. Exclude the
         // sender by its unique presence id (presence is keyed by the qualified id).
         let self_id = resolve_addr(msg.run.as_deref(), &msg.from);
-        list_presence(paths, msg.run.as_deref())?
+        Ok(list_presence(paths, msg.run.as_deref())?
             .into_iter()
             .filter(|p| p.run.as_deref() == msg.run.as_deref())
             .map(|p| p.agent)
             .filter(|a| a != &self_id)
-            .collect()
+            .collect())
     } else {
         // Directed: resolve `to` to the unique inbox id. A reserved sink or an
         // already-qualified id passes through; a short slot id is qualified with the
         // message's run. No run-tag filter — the unique id alone routes the message.
-        vec![resolve_addr(msg.run.as_deref(), &msg.to)]
-    };
+        Ok(vec![resolve_addr(msg.run.as_deref(), &msg.to)])
+    }
+}
+
+fn deliver_inbox(paths: &SparPaths, msg: &BusMessage) -> Result<()> {
+    let targets = message_targets(paths, msg)?;
     for t in targets {
         let dir = inbox_dir(paths, &t);
         fs::create_dir_all(&dir)?;
@@ -1066,11 +1072,13 @@ pub struct RecipientReceipt {
 }
 
 /// Where one message stands for the operator: still waiting to be picked up,
-/// landed in the recipient's channel, or confirmed. Derived from the receipts
-/// plus the ack events every time it is read — never stored, so there is no
-/// second copy of the state to keep in step. Withdrawal and round expiry ride
-/// their own markers (`withdrawn_at`, `superseded_by`, `expired`) and do not
-/// change this: it answers only whether the message landed.
+/// landed in the recipient's channel, or confirmed. Read off the inbox
+/// directories plus the ack events every time a listing is built — never
+/// stored, so there is no second copy of the state to keep in step, and
+/// nothing a lossy record (a dropped receipt write, a rotated receipts file)
+/// can desynchronise. Withdrawal and round expiry ride their own markers
+/// (`withdrawn_at`, `superseded_by`, `expired`) and do not change this: it
+/// answers only whether the message landed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryState {
@@ -1089,19 +1097,66 @@ impl std::fmt::Display for DeliveryState {
     }
 }
 
-/// Roll one message's receipts up to a single state. `acked` is whether an
-/// `Ack` answering the message sits in the event log. Anything still waiting
-/// in any inbox reads `Queued`, even when another recipient already claimed
-/// its copy; a message with no delivery evidence at all reads `Queued` too.
-pub fn delivery_state(acked: bool, receipts: &[RecipientReceipt]) -> DeliveryState {
+/// Where every message copy sits on disk right now: ids with an unclaimed copy
+/// in some inbox, and ids with a claimed copy. Inbox files are named
+/// `{millis}-{id}.json`, so the listing maps filenames without opening any
+/// file. Built once per listing and shared by every entry — the one source the
+/// delivery word comes from.
+#[derive(Debug, Default)]
+pub struct DiskPositions {
+    pub queued: HashSet<String>,
+    pub delivered: HashSet<String>,
+}
+
+/// Scan every inbox's pending and claimed files into one [`DiskPositions`].
+/// A name that is not a message file is skipped, never an error: the listing
+/// must survive a stray file in the directory.
+pub fn disk_positions(paths: &SparPaths) -> DiskPositions {
+    fn file_id(name: &str) -> Option<&str> {
+        let stem = name.strip_suffix(".json")?;
+        let (_, id) = stem.split_once('-')?;
+        (!id.is_empty()).then_some(id)
+    }
+    let mut positions = DiskPositions::default();
+    let Ok(inboxes) = std::fs::read_dir(bus_root(paths).join("inbox")) else {
+        return positions;
+    };
+    for agent in inboxes.flatten() {
+        let dir = agent.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Ok(pending) = std::fs::read_dir(&dir) {
+            positions.queued.extend(
+                pending
+                    .flatten()
+                    .filter(|e| e.path().is_file())
+                    .filter_map(|e| file_id(&e.file_name().to_string_lossy()).map(str::to_string)),
+            );
+        }
+        if let Ok(claimed) = std::fs::read_dir(dir.join("claimed")) {
+            positions.delivered.extend(
+                claimed
+                    .flatten()
+                    .filter(|e| e.path().is_file())
+                    .filter_map(|e| file_id(&e.file_name().to_string_lossy()).map(str::to_string)),
+            );
+        }
+    }
+    positions
+}
+
+/// Roll one message's disk positions up to a single word. `acked` is whether an
+/// `Ack` answering the message sits in the event log, and wins: an ack is
+/// terminal (redelivery stops, escalation stops), while the per-recipient
+/// receipts beside it still show who never picked up a copy. Otherwise a copy
+/// still waiting in any inbox reads `Queued` — even a redelivery behind an
+/// older claim — and a message with no trace left on disk reads `Queued` too:
+/// it was never observed to land.
+pub fn delivery_state(acked: bool, positions: &DiskPositions, id: &str) -> DeliveryState {
     if acked {
         DeliveryState::Acknowledged
-    } else if receipts
-        .iter()
-        .any(|r| r.queued_at.is_some() && r.delivered_at.is_none() && r.withdrawn_at.is_none())
-    {
-        DeliveryState::Queued
-    } else if receipts.iter().any(|r| r.delivered_at.is_some()) {
+    } else if !positions.queued.contains(id) && positions.delivered.contains(id) {
         DeliveryState::Delivered
     } else {
         DeliveryState::Queued
@@ -1176,17 +1231,17 @@ pub fn log_entries(paths: &SparPaths, run: Option<&str>) -> Result<Vec<LogEntry>
         .filter_map(|m| m.refs.reply_to.clone())
         .collect();
     let mut receipts = receipts_by_message(paths);
+    let positions = disk_positions(paths);
     let mut rounds = RunRounds::default();
     Ok(all
         .into_iter()
         .filter(|m| run.is_none() || m.run.as_deref() == run)
         .map(|m| {
             let is_acked = acked.contains(&m.id);
-            let row = receipts.remove(&m.id).unwrap_or_default();
-            let delivery = delivery_state(is_acked, &row);
+            let delivery = delivery_state(is_acked, &positions, &m.id);
             LogEntry {
                 schema_version: LOG_SCHEMA,
-                receipts: row,
+                receipts: receipts.remove(&m.id).unwrap_or_default(),
                 delivery,
                 superseded_by: superseded.get(&m.id).cloned(),
                 expired: rounds.expired(paths, &m),
@@ -2294,37 +2349,69 @@ mod tests {
     }
 
     #[test]
-    fn delivery_state_rolls_receipts_up_to_one_word() {
-        let row = |queued: bool, delivered: bool, withdrawn: bool| RecipientReceipt {
-            recipient: "r1:impl".into(),
-            queued_at: queued.then(Utc::now),
-            delivered_at: delivered.then(Utc::now),
-            read_at: None,
-            withdrawn_at: withdrawn.then(Utc::now),
+    fn delivery_state_reads_disk_positions() {
+        let positions = DiskPositions {
+            queued: ["q1", "both", "redelivered"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            delivered: ["d1", "both", "redelivered", "old"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
         };
+        // `old` has no receipt rows at all (rotated out): the claimed file still lands it.
         assert_eq!(
-            delivery_state(false, &[row(true, false, false)]),
-            DeliveryState::Queued
-        );
-        assert_eq!(
-            delivery_state(false, &[row(true, true, false)]),
+            delivery_state(false, &positions, "old"),
             DeliveryState::Delivered
         );
         assert_eq!(
-            delivery_state(true, &[row(true, true, false)]),
-            DeliveryState::Acknowledged
+            delivery_state(false, &positions, "q1"),
+            DeliveryState::Queued
         );
         assert_eq!(
-            delivery_state(false, &[row(true, true, false), row(true, false, false)]),
+            delivery_state(false, &positions, "d1"),
+            DeliveryState::Delivered
+        );
+        assert_eq!(
+            delivery_state(false, &positions, "both"),
             DeliveryState::Queued,
             "one inbox still holding out keeps the message queued"
         );
         assert_eq!(
-            delivery_state(false, &[row(true, false, true)]),
+            delivery_state(false, &positions, "redelivered"),
             DeliveryState::Queued,
-            "withdrawn before delivery leaves no landing evidence"
+            "a redelivery behind an older claim reads queued again"
         );
-        assert_eq!(delivery_state(false, &[]), DeliveryState::Queued);
+        assert_eq!(
+            delivery_state(true, &positions, "both"),
+            DeliveryState::Acknowledged,
+            "an ack is terminal even with copies still waiting"
+        );
+        assert_eq!(
+            delivery_state(false, &positions, "withdrawn-before-claim"),
+            DeliveryState::Queued,
+            "no trace on disk means never observed to land"
+        );
+    }
+
+    /// The listing maps inbox filenames without opening them, and survives strays.
+    #[test]
+    fn disk_positions_scans_pending_and_claimed() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let agent = agent_ref(Some("r1"), "impl");
+        let dir = bus_root(&paths).join("inbox").join(&agent);
+        std::fs::create_dir_all(dir.join("claimed")).unwrap();
+        std::fs::write(dir.join("123-abc.json"), "{}").unwrap();
+        std::fs::write(dir.join("claimed").join("456-def.json"), "{}").unwrap();
+        std::fs::write(dir.join("notes.txt"), "not a message").unwrap();
+
+        let positions = disk_positions(&paths);
+        assert!(positions.queued.contains("abc"));
+        assert!(positions.delivered.contains("def"));
+        assert_eq!(positions.queued.len(), 1);
+        assert_eq!(positions.delivered.len(), 1);
     }
 
     /// Past the size limit the live file rolls to `.1`, and the log still reads both.
