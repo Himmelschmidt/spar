@@ -339,6 +339,180 @@ fn a_ceiling_killed_implementer_with_new_commits_is_recovered() {
     assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
 }
 
+/// A fake `muse` for the #228 tests. The implementer hangs past the hard ceiling
+/// like `install_ceiling_muse`, but leaves its work uncommitted (`dirty`) or leaves
+/// nothing at all. Reviewers approve whatever HEAD they are shown.
+fn install_ceiling_leftover_muse(bin: &Path, dirty: bool) {
+    std::fs::create_dir_all(bin).unwrap();
+    let p = bin.join("muse");
+    let leftover = if dirty {
+        "echo work > work.txt"
+    } else {
+        "true"
+    };
+    std::fs::write(
+        &p,
+        format!(
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "fake-muse 0"; exit 0; fi
+PROMPT_FILE=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--prompt-file" ]; then PROMPT_FILE="$a"; fi
+  prev="$a"
+done
+NAME=$(basename "$PROMPT_FILE" .md)
+NAME=${{NAME#prompt-}}
+ART="$(dirname "$PROMPT_FILE")/artifacts"
+mkdir -p "$ART"
+echo '{{"schema_version":1,"stream":{{"kind":"session","id":"sess-c"}},"record_type":"event","payload_type":"run.model.configured","payload":{{"kind":"run_model_configured","model_id":"m"}}}}'
+case "$NAME" in
+  impl)
+    echo ceiling >> "$SPAR_TEST_MUSE_STATE/calls"
+    {leftover}
+    sleep 60
+    ;;
+  *)
+    echo "review-$NAME" >> "$SPAR_TEST_MUSE_STATE/calls"
+    CWD=$(sed -n 's/.*Code under review (worktree): \([^ ]*\).*/\1/p' "$PROMPT_FILE" | head -n 1)
+    SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null)
+    printf '## Verdict\napprove\n\nReviewed-Commit: %s\n' "$SHA" > "$ART/review-$NAME.md"
+    ;;
+esac
+exit 0
+"#,
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn run_ceiling_leftover_implement(proj: &Path, bin: &Path, calls_dir: &Path) -> String {
+    let out = spar_cmd()
+        .current_dir(proj)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("SPAR_TEST_MUSE_STATE", calls_dir)
+        .args([
+            "implement",
+            "-t",
+            "add work",
+            "--providers",
+            "cli:muse",
+            "--fleet",
+            "small",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+        if let Some(run_id) = v.get("run_id").and_then(|r| r.as_str()) {
+            return run_id.to_string();
+        }
+    }
+    std::fs::read_dir(proj.join(".spar/runs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().join("state.json").is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .expect("run created")
+}
+
+/// #228: a ceiling kill with uncommitted edits commits them as a WIP round and the
+/// run goes to review, not Failed. No recovery turn runs; the panel judges the WIP
+/// commit in the same round.
+#[test]
+fn a_ceiling_kill_with_uncommitted_edits_becomes_a_wip_round() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    std::fs::write(
+        proj.join("spar.toml"),
+        "[suite]\nenabled = false\n[rounds]\nmax = 1\n[timeouts]\nslot_secs = 2\nhard_ceiling_multiple = 1.5\n",
+    )
+    .unwrap();
+    let bin = tmp.path().join("bin");
+    install_ceiling_leftover_muse(&bin, true);
+    let calls_dir = tmp.path().join("muse-state");
+    std::fs::create_dir_all(&calls_dir).unwrap();
+
+    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir);
+    let st = read_state(&proj, &run_id);
+    assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
+    assert_eq!(st["round"], 1, "same round goes on to review: {st}");
+    let branch = format!("spar/{run_id}/impl");
+    let log = git(&proj, &["log", &branch, "--format=%s"]);
+    assert!(
+        log.lines()
+            .any(|l| l.contains("WIP: implementer cut short at hard ceiling")),
+        "WIP commit missing on {branch}: {log}"
+    );
+    let shown = git(&proj, &["show", &format!("{branch}:work.txt")]);
+    assert_eq!(shown, "work", "the uncommitted edit is on the branch");
+    let run_dir = proj.join(".spar/runs").join(&run_id);
+    let told = std::fs::read_dir(&run_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("prompt-")
+                && n.ends_with(".md")
+                && n != "prompt-impl.md"
+                && n != "prompt-impl-artifact.md"
+        })
+        .any(|e| {
+            std::fs::read_to_string(e.path())
+                .unwrap()
+                .contains("cut short at its hard time ceiling")
+        });
+    assert!(told, "a reviewer prompt carries the cut-short notice");
+    let calls = std::fs::read_to_string(calls_dir.join("calls")).unwrap();
+    assert!(
+        calls.lines().next() == Some("ceiling") && !calls.contains("recovery"),
+        "implementer died at the ceiling, no recovery turn: {calls}"
+    );
+}
+
+/// #228: a ceiling kill with nothing left behind still fails the round.
+#[test]
+fn a_ceiling_kill_with_no_work_still_fails() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    std::fs::write(
+        proj.join("spar.toml"),
+        "[suite]\nenabled = false\n[rounds]\nmax = 1\n[timeouts]\nslot_secs = 2\nhard_ceiling_multiple = 1.5\n",
+    )
+    .unwrap();
+    let bin = tmp.path().join("bin");
+    install_ceiling_leftover_muse(&bin, false);
+    let calls_dir = tmp.path().join("muse-state");
+    std::fs::create_dir_all(&calls_dir).unwrap();
+
+    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir);
+    let st = read_state(&proj, &run_id);
+    assert_eq!(st["phase"], "failed", "{st}");
+    let calls = std::fs::read_to_string(calls_dir.join("calls")).unwrap();
+    assert_eq!(
+        calls.lines().collect::<Vec<_>>(),
+        ["ceiling"],
+        "no reviewer ran: {calls}"
+    );
+    let branch = format!("spar/{run_id}/impl");
+    let log = git(&proj, &["log", &branch, "--format=%s"]);
+    assert!(
+        !log.lines().any(|l| l.contains("cut short at hard ceiling")),
+        "no WIP commit without work: {log}"
+    );
+}
+
 fn set_phase(proj: &Path, run_id: &str, phase: &str) {
     let mut state = read_state(proj, run_id);
     state["phase"] = serde_json::Value::String(phase.into());
