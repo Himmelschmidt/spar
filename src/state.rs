@@ -635,13 +635,12 @@ pub enum SeatSource {
 }
 
 impl SeatSource {
-    /// Named by an explicit CLI pin (`--providers`, `--role`, `--backup`): the seat
+    /// Named by an explicit seat pin (`--providers`, `--role`): the seat
     /// dispatches despite probe-failed readiness and warns at launch instead.
+    /// A declared `--backup` is fallback, not a pin: rotation skips it while it
+    /// is `Unhealthy` and the run stays on the primary.
     pub fn is_explicit_pin(self) -> bool {
-        matches!(
-            self,
-            SeatSource::CliProviders | SeatSource::CliRole | SeatSource::Backup
-        )
+        matches!(self, SeatSource::CliProviders | SeatSource::CliRole)
     }
 }
 
@@ -902,19 +901,28 @@ impl RunState {
         if self.dry_run {
             return;
         }
-        for slot in &self.slots {
-            if !slot.source.is_some_and(SeatSource::is_explicit_pin) {
-                continue;
-            }
-            let Some(warning) = crate::providers::unhealthy_pin_warning(&slot.provider) else {
-                continue;
-            };
-            if self.warnings.iter().any(|w| w == &warning) {
-                continue;
-            }
-            eprintln!("warning: {warning}");
-            self.warnings.push(warning);
+        let providers: Vec<(String, Option<SeatSource>)> = self
+            .slots
+            .iter()
+            .map(|slot| (slot.provider.clone(), slot.source))
+            .collect();
+        for (provider, source) in providers {
+            self.warn_unhealthy_pin(&provider, source);
         }
+    }
+
+    pub fn warn_unhealthy_pin(&mut self, provider: &str, source: Option<SeatSource>) {
+        if self.dry_run || !source.is_some_and(SeatSource::is_explicit_pin) {
+            return;
+        }
+        let Some(warning) = crate::providers::unhealthy_pin_warning(provider) else {
+            return;
+        };
+        if self.warnings.iter().any(|w| w == &warning) {
+            return;
+        }
+        eprintln!("warning: {warning}");
+        self.warnings.push(warning);
     }
 
     /// Open a new round on this run (O45). Bumps the counter, un-archives, and hands

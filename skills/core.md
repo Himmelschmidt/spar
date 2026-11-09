@@ -71,7 +71,9 @@ failed, with the probe's own one-line message, e.g. pi with no OpenRouter key),
 `missing` (not on PATH). `--json` carries the same verdict as `readiness` with values
 `healthy` / `unhealthy` / `unknown`, plus `readiness_message` (ANSI-stripped, capped at
 300 chars) when unhealthy. `doctor` exits failure only when no usable provider remains,
-so one unhealthy provider alongside working ones does not block a run. Probes wired:
+so one unhealthy provider alongside working ones does not block a run. `available`
+(binary resolves) is display-only; auto-selection reads `usable()` (available and not
+`unhealthy`) instead, so the wrong check cannot be written at a selection site. Probes wired:
 `cli:pi` runs `pi auth check --provider openrouter --json --no-refresh` (or `--model
 <SPAR_PI_MODEL routed>` when that is set; detection is per adapter, so it cannot see a
 slot's own `@model`), which catches a missing key, not a dead one; (O107) `cli:claude` runs `claude auth status` with nonessential traffic off (logged out) and
@@ -80,9 +82,10 @@ login status` (logged out). grok, muse and agy have no local check that fails on
 login, so they report unknown; use `spar provider probe <ref>` for a real call. Limit:
 no local probe sees a token revoked server-side; that surfaces at dispatch as an auth
 fault. An `unhealthy` provider is skipped by auto-selection and backup rotation
-(`unknown` stays eligible); an explicit pin (`--providers`, `--role`, `--backup`)
-still dispatches, with a launch warning carried on the run as `warnings` (stderr
-and `--json`).
+(`unknown` stays eligible). An explicit pin (`--providers` naming it, or a `--role`
+seat) still dispatches, with a launch warning carried on the run as `warnings`
+(stderr and `--json`). A `--backup` naming an unhealthy provider is skipped like any
+rotation candidate: it is a fallback, not a pin, so the run stays on the primary.
 
 **A reviewer that cannot run is not a verdict (O103).** In the implement loop, a
 reviewer dispatch that fails because the provider could not serve it (rate limit, auth

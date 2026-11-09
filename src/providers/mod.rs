@@ -84,11 +84,11 @@ pub enum Readiness {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderReport {
     pub name: String,
-    /// The binary resolves on PATH. Serialization and `doctor` / `provider list`
-    /// display read this directly; every auto-selection, dispatch and backup
-    /// path goes through `usable()` instead, so a probe-failed provider is not
+    /// The binary resolves on PATH. Only `is_available` reads this outside
+    /// detection and display; every auto-selection, dispatch and backup path
+    /// goes through `usable()` instead, so a probe-failed provider is not
     /// rotated onto.
-    pub available: bool,
+    available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,6 +112,43 @@ impl ProviderReport {
     /// bypass this and warn at launch instead.
     pub fn usable(&self) -> bool {
         self.available && self.readiness != Readiness::Unhealthy
+    }
+
+    /// Whether the binary resolves on PATH, ignoring probe readiness. Display
+    /// only; selection paths use `usable()`.
+    pub fn is_available(&self) -> bool {
+        self.available
+    }
+}
+
+#[cfg(test)]
+pub fn test_report(name: &str, available: bool, readiness: Readiness) -> ProviderReport {
+    ProviderReport {
+        name: name.into(),
+        available,
+        path: Some("/bin/x".into()),
+        version: None,
+        readiness,
+        readiness_message: (readiness == Readiness::Unhealthy).then(|| "probe failed".into()),
+        capabilities: Capabilities::default(),
+        delivery: DeliveryStrategy::None,
+        presence: PresenceSource::None,
+    }
+}
+
+/// Usable native-CLI providers as `cli:name` keys, or `None` when no provider is
+/// usable. The one constructor for the availability sets the selection paths
+/// thread through, so workflow code never filters on the raw report fields.
+pub fn usable_set() -> Option<std::collections::HashSet<String>> {
+    let detected: std::collections::HashSet<String> = detect_all()
+        .into_iter()
+        .filter(|r| r.usable())
+        .map(|r| format!("cli:{}", r.name))
+        .collect();
+    if detected.is_empty() {
+        None
+    } else {
+        Some(detected)
     }
 }
 
@@ -749,6 +786,17 @@ pub fn adapter_named(name: &str) -> Option<Box<dyn ProviderAdapter>> {
     all_adapters().into_iter().find(|a| a.name() == bare)
 }
 
+/// The native-CLI adapter a ref names, if it names one. Bare ids (`claude`)
+/// and seat refs (`cli:claude`, `cli:claude@sonnet`) both resolve; api-sdk refs
+/// and unknown names yield `None` without probing.
+fn native_adapter(raw: &str) -> Option<Box<dyn ProviderAdapter>> {
+    let pref = ProviderRef::parse(raw).ok()?;
+    if pref.backend != ExecBackend::NativeCli {
+        return None;
+    }
+    adapter_named(&pref.storage_key()).or_else(|| adapter_named(&pref.name))
+}
+
 /// Whether a provider ref names something spar can dispatch: a known adapter whose
 /// binary resolves (or a supported api-sdk name). Says nothing about readiness;
 /// an explicitly pinned provider passes this while `Unhealthy` and warns at
@@ -761,9 +809,7 @@ pub fn is_provider_present(raw: &str, allow_missing: bool) -> bool {
         return false;
     };
     match pref.backend {
-        ExecBackend::NativeCli => adapter_named(&pref.storage_key())
-            .or_else(|| adapter_named(&pref.name))
-            .is_some_and(|a| a.resolve_binary().is_some()),
+        ExecBackend::NativeCli => native_adapter(raw).is_some_and(|a| a.resolve_binary().is_some()),
         ExecBackend::ApiSdk => api_provider_supported(&pref.name),
     }
 }
@@ -779,9 +825,7 @@ pub fn is_provider_usable(raw: &str, allow_missing: bool) -> bool {
         return false;
     };
     match pref.backend {
-        ExecBackend::NativeCli => adapter_named(&pref.storage_key())
-            .or_else(|| adapter_named(&pref.name))
-            .is_some_and(|a| a.detect().usable()),
+        ExecBackend::NativeCli => native_adapter(raw).is_some_and(|a| a.detect().usable()),
         ExecBackend::ApiSdk => api_provider_supported(&pref.name),
     }
 }
@@ -791,13 +835,9 @@ pub fn is_provider_usable(raw: &str, allow_missing: bool) -> bool {
 /// (missing, healthy, `Unknown`, api-sdk): only a present-but-`Unhealthy` CLI
 /// pin warns, and it still dispatches.
 pub fn unhealthy_pin_warning(provider: &str) -> Option<String> {
-    let pref = ProviderRef::parse(provider).ok()?;
-    if pref.backend != ExecBackend::NativeCli {
-        return None;
-    }
-    let adapter = adapter_named(&pref.storage_key()).or_else(|| adapter_named(&pref.name))?;
+    let adapter = native_adapter(provider)?;
     let report = adapter.detect();
-    if !report.available || report.readiness != Readiness::Unhealthy {
+    if !report.available || report.usable() {
         return None;
     }
     Some(format!(

@@ -1337,3 +1337,137 @@ fn explicitly_pinned_unhealthy_provider_still_dispatches_with_a_warning() {
         "the pin still dispatches despite the probe"
     );
 }
+
+#[test]
+fn unknown_backup_rotates_when_the_primary_fails() {
+    let fx = Fixture::new();
+    fx.cli(
+        "claude",
+        &counted("claude", &format!("echo '{CLAUDE_REVOKED}'\nexit 1")),
+    );
+    // grok has no readiness probe, so it stays `Unknown` no matter what the fake
+    // answers; rotation must still take it once the primary fails environmentally.
+    fx.cli("grok", "echo x >> \"$FAKE_COUNT_DIR/grok.count\"\nexit 1");
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:claude",
+            "--backup",
+            "implementer=cli:grok",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .failure();
+    let slot = fx.slot("implementer");
+    assert_eq!(slot["provider"], "cli:grok", "{slot}");
+    assert_eq!(slot["source"], "backup", "{slot}");
+    assert!(fx.count("grok") >= 1, "an Unknown backup still rotates");
+    assert!(
+        fx.state().get("warnings").is_none(),
+        "a healthy pin warns nothing"
+    );
+}
+
+#[test]
+fn explicitly_pinned_test_author_still_dispatches_with_a_warning() {
+    let fx = Fixture::new();
+    // The planner must succeed so the run reaches spec resolution. The agent is
+    // told to write its artifact under the run's artifacts dir, so the fake
+    // drops both files there for every run in the project (there is only one).
+    let succeed = "for d in \"$FAKE_PROJECT_ROOT\"/.spar/runs/*/artifacts; do echo ok > \"$d/plan.md\"; echo ok > \"$d/test-contract.md\"; done; exit 0";
+    fx.cli(
+        "claude",
+        &format!("case \"$1\" in auth) exit 0;; *) {succeed};; esac"),
+    );
+    fx.cli("codex", &unhealthy_cli("codex", "login", succeed));
+    let out = fx
+        .spar()
+        .args([
+            "plan",
+            "-t",
+            "work",
+            "--providers",
+            "cli:claude",
+            "--role",
+            "test_author=cli:codex",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+    let run: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let author = run["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "test_author")
+        .expect("a test-author slot");
+    assert_eq!(author["provider"], "cli:codex", "{author}");
+    let warnings = run["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("cli:codex")),
+        "the --json launch output carries the warning: {run}"
+    );
+}
+
+#[test]
+fn explicitly_pinned_tester_still_dispatches_with_a_warning() {
+    let fx = Fixture::new();
+    std::fs::write(fx.proj.join("spar.toml"), "[suite]\nenabled = true\n").unwrap();
+    fx.cli(
+        "claude",
+        &counted(
+            "claude",
+            "for d in \"$FAKE_PROJECT_ROOT\"/.spar/runs/*/artifacts; do echo ok > \"$d/summary-impl.md\"; done; exit 0",
+        ),
+    );
+    fx.cli("codex", &unhealthy_cli("codex", "login", "exit 0"));
+    let out = fx
+        .spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:claude",
+            "--role",
+            "tester=cli:codex",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("cli:codex") && stderr.contains("unhealthy"),
+        "{stderr}"
+    );
+    let run = fx.state();
+    let tester = run["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "tester")
+        .expect("a tester slot");
+    assert_eq!(tester["provider"], "cli:codex", "{tester}");
+    assert_eq!(tester["source"], "cli-role", "{tester}");
+    let warnings = run["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("cli:codex")),
+        "the run carries the pin warning: {run}"
+    );
+    assert!(
+        fx.count("codex") >= 1,
+        "the pinned tester dispatched despite the failed probe"
+    );
+}

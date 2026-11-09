@@ -3494,7 +3494,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                             .collect();
                         let mut v = serde_json::json!({
                             "name": p.name,
-                            "available": p.available,
+                            "available": p.is_available(),
                             "path": p.path,
                             "version": p.version,
                             "readiness": p.readiness,
@@ -3528,7 +3528,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                 println!("{}", serde_json::to_string_pretty(&enriched)?);
             } else {
                 for (p, u) in report.iter().zip(&usages) {
-                    let mark = if !p.available {
+                    let mark = if !p.is_available() {
                         "missing"
                     } else if p.readiness == providers::Readiness::Unhealthy {
                         "unhealthy"
@@ -3553,7 +3553,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                             println!("           {line}");
                         }
                     }
-                    if p.available {
+                    if p.is_available() {
                         println!(
                             "         headless={} interactive={} version={}",
                             p.capabilities.headless,

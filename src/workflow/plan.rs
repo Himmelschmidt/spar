@@ -150,16 +150,7 @@ pub fn run(
         let available: Option<std::collections::HashSet<String>> = if !has_backup {
             None
         } else {
-            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                .into_iter()
-                .filter(|r| r.usable())
-                .map(|r| format!("cli:{}", r.name))
-                .collect();
-            if detected.is_empty() {
-                None
-            } else {
-                Some(detected)
-            }
+            crate::providers::usable_set()
         };
         let mut still_paused: Vec<String> = Vec::new();
         for job in &jobs {
@@ -257,16 +248,7 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> Vec<PlanSeat> {
     let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
         None
     } else {
-        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-            .into_iter()
-            .filter(|r| r.usable())
-            .map(|r| format!("cli:{}", r.name))
-            .collect();
-        if detected.is_empty() {
-            None
-        } else {
-            Some(detected)
-        }
+        crate::providers::usable_set()
     };
     let mut out = Vec::with_capacity(specs.len());
     for (idx, (role, prefix, template)) in specs.into_iter().enumerate() {
@@ -347,22 +329,12 @@ pub fn execute_plan(
             let has_backup_global = cfg.backups.planner.is_some()
                 || cfg.backups.plan_critic.is_some()
                 || cfg.backups.test_author.is_some();
-            let available: Option<std::collections::HashSet<String>> = if state.dry_run
-                || !has_backup_global
-            {
-                None
-            } else {
-                let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                    .into_iter()
-                    .filter(|r| r.usable())
-                    .map(|r| format!("cli:{}", r.name))
-                    .collect();
-                if detected.is_empty() {
+            let available: Option<std::collections::HashSet<String>> =
+                if state.dry_run || !has_backup_global {
                     None
                 } else {
-                    Some(detected)
-                }
-            };
+                    crate::providers::usable_set()
+                };
             let mut handled_via_backup = false;
             if let Some(slot_state) = slot_state {
                 let cause =
@@ -604,16 +576,7 @@ fn resolve_test_author(
     let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
         None
     } else {
-        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-            .into_iter()
-            .filter(|r| r.usable())
-            .map(|r| format!("cli:{}", r.name))
-            .collect();
-        if detected.is_empty() {
-            None
-        } else {
-            Some(detected)
-        }
+        crate::providers::usable_set()
     };
     let seat_ref =
         crate::provider_ref::ProviderRef::for_seat(&provider, model.as_deref()).display();
@@ -678,6 +641,7 @@ fn run_test_author(
                     executor::init_slot_model(&id, &provider, SlotRole::TestAuthor, model.clone());
                 slot.source = Some(source);
                 state.slots.push(slot);
+                state.warn_unhealthy_pin(&provider, Some(source));
             }
             (provider, model, id)
         }
@@ -717,16 +681,7 @@ fn run_test_author(
         let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
             None
         } else {
-            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                .into_iter()
-                .filter(|r| r.usable())
-                .map(|r| format!("cli:{}", r.name))
-                .collect();
-            if detected.is_empty() {
-                None
-            } else {
-                Some(detected)
-            }
+            crate::providers::usable_set()
         };
         let mut handled = false;
         if let Some(slot_state) = slot_state {
@@ -911,17 +866,29 @@ pub(crate) fn resolve_spec_provider(
         if let Some(p) = &cfg.roles.test_author {
             crate::provider_ref::ProviderRef::parse(p)
                 .map_err(|e| anyhow::anyhow!("invalid [roles].test_author {p:?}: {e}"))?;
-            if dry || providers::is_provider_usable(p, false) {
+            if dry || providers::is_provider_present(p, false) {
                 return Ok((p.clone(), SeatSource::CliRole));
             }
         }
     }
-    let pool_explicit = matches!(pool_origin, PoolOrigin::CliProviders | PoolOrigin::Selected);
+    let pool_pinned = matches!(pool_origin, PoolOrigin::CliProviders);
+    let pool_explicit = pool_pinned || matches!(pool_origin, PoolOrigin::Selected);
     let pool_source = pool_origin.as_seat_source();
+    // A `--providers` pool is pinned member-by-member (kept on presence, warns at
+    // launch); a `--select` pool stays a constrained auto-pick, so an unhealthy
+    // member yields to the next usable one instead of benching the seat.
     if pool_explicit {
         if let Some(p) = fleet
             .iter()
-            .find(|p| !used.contains(p) && (dry || providers::is_provider_usable(p, false)))
+            .find(|p| {
+                !used.contains(p)
+                    && (dry
+                        || (if pool_pinned {
+                            providers::is_provider_present(p, false)
+                        } else {
+                            providers::is_provider_usable(p, false)
+                        }))
+            })
             .cloned()
         {
             return Ok((p, pool_source));

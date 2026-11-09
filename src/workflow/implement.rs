@@ -833,16 +833,7 @@ fn run_from_approved(
         let available: Option<std::collections::HashSet<String>> = if !has_backup {
             None
         } else {
-            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                .into_iter()
-                .filter(|r| r.usable())
-                .map(|r| format!("cli:{}", r.name))
-                .collect();
-            if detected.is_empty() {
-                None
-            } else {
-                Some(detected)
-            }
+            crate::providers::usable_set()
         };
         let mut still_paused: Vec<String> = Vec::new();
         for slot in &state.slots {
@@ -975,16 +966,7 @@ fn prepare_implement_slots(
     let available: Option<std::collections::HashSet<String>> = if dry || !has_backup {
         None
     } else {
-        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-            .into_iter()
-            .filter(|r| r.usable())
-            .map(|r| format!("cli:{}", r.name))
-            .collect();
-        if detected.is_empty() {
-            None
-        } else {
-            Some(detected)
-        }
+        crate::providers::usable_set()
     };
     for seat in seats {
         let mut provider = seat.provider.clone();
@@ -1166,8 +1148,15 @@ fn resolve_suite_provider(
     if let Some(p) = &cfg.roles.tester {
         crate::provider_ref::ProviderRef::parse(p)
             .map_err(|e| anyhow::anyhow!("invalid [roles].tester {p:?}: {e}"))?;
-        if dry || providers::is_provider_usable(p, false) {
-            let source = if cfg.cli_role_keys.contains(SlotRole::Tester.as_config_key()) {
+        let pinned = cfg.cli_role_keys.contains(SlotRole::Tester.as_config_key());
+        if dry
+            || (if pinned {
+                providers::is_provider_present(p, false)
+            } else {
+                providers::is_provider_usable(p, false)
+            })
+        {
+            let source = if pinned {
                 SeatSource::CliRole
             } else {
                 SeatSource::RolesFile
@@ -1175,7 +1164,8 @@ fn resolve_suite_provider(
             return Ok((p.clone(), None, source));
         }
         // Fall through to model-select / prefs / fleet if the override is unusable
-        // (missing CLI / paused).
+        // (missing CLI / paused). A `--role` pin falls through only when the binary
+        // is missing; probe-failed pins still dispatch, with a launch warning.
     }
     // Prefer model-select artifact / fresh pick with tester role (fast profile).
     if let (Some(paths), Some(run_id)) = (paths, run_id) {
@@ -1214,9 +1204,18 @@ fn resolve_suite_provider(
     {
         return Ok((p, None, SeatSource::SuitePreferences));
     }
+    // A `--providers` pool is pinned member-by-member; every other pool stays a
+    // constrained auto-pick, like the spec resolver's explicit pool.
+    let pool_pinned = matches!(pool_origin, PoolOrigin::CliProviders);
     if let Some(p) = fleet
         .iter()
-        .find(|p| providers::is_provider_usable(p, false))
+        .find(|p| {
+            if pool_pinned {
+                providers::is_provider_present(p, false)
+            } else {
+                providers::is_provider_usable(p, false)
+            }
+        })
         .cloned()
     {
         return Ok((p, None, pool_origin.as_seat_source()));
@@ -1903,16 +1902,7 @@ fn run_with_task(
         let available: Option<std::collections::HashSet<String>> = if !has_backup {
             None
         } else {
-            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                .into_iter()
-                .filter(|r| r.usable())
-                .map(|r| format!("cli:{}", r.name))
-                .collect();
-            if detected.is_empty() {
-                None
-            } else {
-                Some(detected)
-            }
+            crate::providers::usable_set()
         };
         let mut still_paused: Vec<String> = Vec::new();
         for slot in &state.slots {
@@ -2295,17 +2285,7 @@ pub fn execute_loop(
                         if state.dry_run || !has_backup {
                             None
                         } else {
-                            let detected: std::collections::HashSet<String> =
-                                crate::providers::detect_all()
-                                    .into_iter()
-                                    .filter(|r| r.usable())
-                                    .map(|r| format!("cli:{}", r.name))
-                                    .collect();
-                            if detected.is_empty() {
-                                None
-                            } else {
-                                Some(detected)
-                            }
+                            crate::providers::usable_set()
                         };
                     let slot_state = state
                         .slots
@@ -2381,17 +2361,7 @@ pub fn execute_loop(
                     if state.dry_run || !has_backup {
                         None
                     } else {
-                        let detected: std::collections::HashSet<String> =
-                            crate::providers::detect_all()
-                                .into_iter()
-                                .filter(|r| r.usable())
-                                .map(|r| format!("cli:{}", r.name))
-                                .collect();
-                        if detected.is_empty() {
-                            None
-                        } else {
-                            Some(detected)
-                        }
+                        crate::providers::usable_set()
                     };
                 let slot_state = state
                     .slots
@@ -3424,16 +3394,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
             if state.dry_run || !has_backup {
                 None
             } else {
-                let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                    .into_iter()
-                    .filter(|r| r.usable())
-                    .map(|r| format!("cli:{}", r.name))
-                    .collect();
-                if detected.is_empty() {
-                    None
-                } else {
-                    Some(detected)
-                }
+                crate::providers::usable_set()
             };
         let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, available_opt.as_ref());
         if has_backup {

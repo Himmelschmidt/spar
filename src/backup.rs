@@ -233,18 +233,10 @@ pub fn resolve_with_backup(
     );
     let (prov, src) = primary?;
     let seat = crate::provider_ref::ProviderRef::for_seat(&prov, primary_model).display();
-    // An auto-selected seat on a probe-failed provider yields to the backup;
-    // an explicit pin still dispatches (seat resolution keeps it and the launch
-    // warns) unless a healthy backup is declared. `dry` never probes.
-    if is_provider_eligible(&seat, store, available)
-        && (health_allows(&seat, dry)
-            || matches!(
-                src,
-                crate::state::SeatSource::CliProviders
-                    | crate::state::SeatSource::CliRole
-                    | crate::state::SeatSource::Backup
-            ))
-    {
+    // An auto-selected seat on a probe-failed provider yields to the backup; an
+    // explicit pin stays (quota and manual pauses still bench it) and the launch
+    // warns. `dry` never probes.
+    if seat_eligible(&seat, Some(src), store, available) {
         return Some((prov, src));
     }
     let backup_raw = backup_for_role(role, role_index, cfg)?;
@@ -339,6 +331,97 @@ mod tests {
         let mut s = crate::executor::init_slot("test", "cli:claude", SlotRole::Implementer);
         s.quota_hit = hit;
         s
+    }
+
+    fn launch_inputs() -> (
+        tempfile::TempDir,
+        crate::config::Config,
+        QuotaStore,
+        Option<std::collections::HashSet<String>>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        (
+            tmp,
+            cfg,
+            QuotaStore::default(),
+            Some(std::collections::HashSet::new()),
+        )
+    }
+
+    #[test]
+    fn an_explicit_pin_stays_when_nothing_is_usable() {
+        let (tmp, cfg, store, available) = launch_inputs();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let pool = vec!["cli:claude".to_string()];
+        assert_eq!(
+            resolve_with_backup(
+                SlotRole::Planner,
+                0,
+                0,
+                &pool,
+                crate::state::PoolOrigin::CliProviders,
+                &cfg,
+                None,
+                &store,
+                available.as_ref(),
+                &paths,
+                false,
+            ),
+            Some((
+                "cli:claude".to_string(),
+                crate::state::SeatSource::CliProviders
+            ))
+        );
+    }
+
+    #[test]
+    fn an_auto_seat_with_no_usable_provider_and_no_backup_resolves_nothing() {
+        let (tmp, cfg, store, available) = launch_inputs();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let pool = vec!["cli:claude".to_string()];
+        assert_eq!(
+            resolve_with_backup(
+                SlotRole::Planner,
+                0,
+                0,
+                &pool,
+                crate::state::PoolOrigin::Synth,
+                &cfg,
+                None,
+                &store,
+                available.as_ref(),
+                &paths,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_auto_seat_yields_to_the_declared_backup() {
+        let (tmp, mut cfg, store, _) = launch_inputs();
+        cfg.backups.planner = Some("cli:codex".to_string());
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let pool = vec!["cli:claude".to_string()];
+        let mut set = std::collections::HashSet::new();
+        set.insert("cli:codex".to_string());
+        assert_eq!(
+            resolve_with_backup(
+                SlotRole::Planner,
+                0,
+                0,
+                &pool,
+                crate::state::PoolOrigin::Synth,
+                &cfg,
+                None,
+                &store,
+                Some(&set),
+                &paths,
+                true,
+            ),
+            Some(("cli:codex".to_string(), crate::state::SeatSource::Backup))
+        );
     }
 
     #[test]

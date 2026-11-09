@@ -78,14 +78,14 @@ pub fn run(json: bool) -> Result<ExitCode> {
     }
 
     let providers = providers::detect_all();
-    if !providers.iter().any(|p| p.available) {
+    if !providers.iter().any(|p| p.is_available()) {
         notes.push(
             "no first-class providers found on PATH (claude, grok, agy, codex, pi, muse)".into(),
         );
     }
     for p in providers
         .iter()
-        .filter(|p| p.available && p.readiness == providers::Readiness::Unhealthy)
+        .filter(|p| p.is_available() && p.readiness == providers::Readiness::Unhealthy)
     {
         notes.push(format!(
             "{} is unhealthy: {} (binary present but its readiness probe failed)",
@@ -250,7 +250,7 @@ fn print_human(r: &DoctorReport) {
     );
     println!("  providers:");
     for p in &r.providers {
-        let mark = if !p.available {
+        let mark = if !p.is_available() {
             "missing"
         } else if p.readiness == providers::Readiness::Unhealthy {
             "unhealthy"
@@ -262,7 +262,7 @@ fn print_human(r: &DoctorReport) {
             p.name,
             p.path.as_deref().unwrap_or("not on PATH")
         );
-        if p.available {
+        if p.is_available() {
             println!(
                 "           headless={} skip_perms={} sandbox={} version={}",
                 p.capabilities.headless,
@@ -292,9 +292,7 @@ fn print_human(r: &DoctorReport) {
 /// readiness probe did not fail. `Unknown` (no probe, timeout, spawn failure)
 /// counts as usable; only `Unhealthy` is excluded.
 fn has_usable_provider(providers: &[providers::ProviderReport]) -> bool {
-    providers
-        .iter()
-        .any(|p| p.available && p.readiness != providers::Readiness::Unhealthy)
+    providers.iter().any(|p| p.usable())
 }
 
 /// Doctor's own exit rule, pinned here so the wiring (`git` gate plus the
@@ -393,26 +391,10 @@ mod tests {
         with_sink.notify.webhook = Some("https://example.invalid".into());
         assert!(gate_notify_hint(&paths, &with_sink, now).is_none());
     }
-    use crate::providers::{
-        Capabilities, DeliveryStrategy, PresenceSource, ProviderReport, Readiness,
-    };
+    use crate::providers::{ProviderReport, Readiness};
 
     fn report(name: &str, available: bool, readiness: Readiness) -> ProviderReport {
-        ProviderReport {
-            name: name.into(),
-            available,
-            path: Some("/bin/x".into()),
-            version: None,
-            readiness,
-            readiness_message: if readiness == Readiness::Unhealthy {
-                Some("probe failed".into())
-            } else {
-                None
-            },
-            capabilities: Capabilities::default(),
-            delivery: DeliveryStrategy::None,
-            presence: PresenceSource::None,
-        }
+        crate::providers::test_report(name, available, readiness)
     }
 
     #[test]
