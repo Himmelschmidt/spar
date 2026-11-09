@@ -1228,7 +1228,7 @@ spar bus presence [--run <id>]
 spar bus inbox <agent> [--claim] [--run <id>] [--json]
 spar bus reserve path/to/file --holder <agent> [--run <id>]
 spar bus release path/to/file --holder <agent> [--run <id>]
-spar bus deliver <agent> [--run <id>]              # drain inbox + inject at turn boundary (Stop-hook driven)
+spar bus deliver <agent> [--run <id>]              # drain inbox + dispatch to the agent's channel
 spar bus ack <msg_id> --from <agent> [--run <id>]  # stop a requires_ack redelivery
 ```
 
@@ -1263,13 +1263,18 @@ recipient acked it), `withdrawn` (superseded or expired). A poll file or codex q
  "persist": true, "expires_after_round": 3, "refs": {"supersedes": "..."},
  "receipts": [{"recipient": "ab12cd34:impl", "queued_at": "...", "delivered_at": "..." | null,
                "read_at": "..." | null, "withdrawn_at": "..." | null}],
+ "delivery": "queued" | "delivered" | "acknowledged",
  "superseded_by": "msg id" | null, "expired": false}
 ```
 
-Each time is the earliest of its kind. `receipts.jsonl` rolls to `receipts.jsonl.1` at
+Each time is the earliest of its kind. `delivery` rolls the receipts up to one word
+(O153): `queued` while any copy still waits in an inbox, `delivered` once it has landed
+in the recipient's channel (claimed, Stop-hook injected, or dropped in the poll file),
+`acknowledged` once an ack answers it. It is derived from the receipts plus the ack
+events at read time, never stored. `receipts.jsonl` rolls to `receipts.jsonl.1` at
 8 MiB (about the last 16 MiB are kept); `bus log` streams both. `bus send --json` returns the message with
 `schema_version` (and `withdrawal` under `--supersedes`). The human `bus log` shows the
-message id and `[delivered n/m, read n/m; superseded by …; expired]`.
+message id and `[queued|delivered|acknowledged; delivered n/m, read n/m; superseded by …; expired]`.
 
 A message to `@human` (or any `Blocked` agent) lands in the `@human` inbox
 (`spar bus inbox @human`) and,
