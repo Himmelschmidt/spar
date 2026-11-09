@@ -1182,6 +1182,7 @@ pub fn replan(
     state.contract_fingerprint = None;
     state.set_phase(Phase::Init);
     state.save(paths)?;
+    crate::providers::delivery::refresh_run_poll_files(paths, run_id);
     if !json {
         eprintln!("replanning run {run_id} (round {round})");
     }

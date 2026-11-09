@@ -1244,12 +1244,14 @@ spar bus ack <msg_id> --from <agent> [--run <id>]  # stop a requires_ack redeliv
   drop it. Use it for rulings, not chatter: it repeats every dispatch.
 - `--supersedes <msg_id>` withdraws an earlier message **you** sent: every inbox copy not
   yet taken is removed and its redelivery stops; a persisted one leaves the carry-forward.
-  A copy already delivered cannot be unread; `--json` reports
+  A copy already injected into a model's input cannot be unread, but a PollFile slot's
+  copy is taken back out of its poll file; `--json` reports
   `withdrawal: {msg_id, withdrawn_from: [...], already_delivered: [...]}`.
 - `--expires-after-round [N]` (with `--run`; `N` defaults to the round a slot is dispatching
   in, or the next round when the run waits at a gate, the first round anyone reads it in): once
   the run passes round `N` the message is never delivered. A claim withdraws it, `inbox`
-  hides it, redelivery stops, and a persisted one leaves the carry-forward.
+  hides it, the poll file drops it on its next render, redelivery stops, and a persisted
+  one leaves the carry-forward.
 
 **Receipts (O134).** `.spar/bus/receipts.jsonl` gets a line per recipient as a message
 moves: `queued` (written to the inbox), `delivered` (claimed into the agent's channel or
@@ -1275,10 +1277,13 @@ there), else `delivered` once anything landed — a claimed copy on disk, or a
 else `queued` while a copy still waits in an inbox, else `withdrawn` when no copy
 waits anywhere and nothing ever landed. It is derived at read time from the inbox
 directories, the receipts and the ack events — never stored, so there is no second
-copy of the state to drift. Every inbox filing fans PollFile recipients (agy, pi)
-straight into their poll files, so the batch is there at the slot's next poll with no
-explicit `bus deliver`, whoever filed it (a send, a broadcast, an ack, a redelivery);
-dry runs skip the fan-out and leave the inbox for the turn-boundary drain.
+copy of the state to drift. A slot's poll file (agy, pi) renders its inbox, not an
+append-only log (O156): every filing, withdrawal and round start rewrites it from
+the pending messages, so a withdrawn or expired message disappears from the file.
+Only messages addressed to the slot render — acks and broadcasts stay in the inbox
+and the bus log but never become action items. Posting into the live poll file
+counts as `delivered`. Dry-run runs skip the fan-out (nothing live polls their
+files); the inbox keeps the messages for the turn-boundary drain.
 `receipts.jsonl` rolls to `receipts.jsonl.1` at
 8 MiB (about the last 16 MiB are kept); `bus log` streams both. `bus send --json` returns the message with
 `schema_version` (and `withdrawal` under `--supersedes`). The human `bus log` shows the

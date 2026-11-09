@@ -880,6 +880,7 @@ fn run_from_approved(
         bail!("no implementer slot after provider pick");
     }
     state.save(paths)?;
+    crate::providers::delivery::refresh_run_poll_files(paths, run_id);
     if opts.detach {
         // The detached child takes the lock itself, and flock refuses a second holder.
         drop(lock);
@@ -3141,6 +3142,8 @@ pub fn execute_loop(
         state.begin_round();
         state.set_phase(Phase::Fix);
         state.save(paths)?;
+        let run_id = state.id.clone();
+        crate::providers::delivery::refresh_run_poll_files(paths, &run_id);
     }
 }
 

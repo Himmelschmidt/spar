@@ -1104,11 +1104,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                     if e.expired {
                         notes.push("expired".into());
                     }
-                    let notes = if notes.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", notes.join("; "))
-                    };
+                    let notes = format!(" [{}]", notes.join("; "));
                     println!(
                         "{} {} {} → {} ({:?}){notes} {}",
                         e.msg.ts.format("%H:%M:%S"),
@@ -1254,11 +1250,7 @@ fn bus_deliver(
                 .and_then(|s| s.log_path.as_deref())
                 .and_then(process::StreamStats::load)
                 .and_then(|s| s.session_id);
-            (
-                strat,
-                sid,
-                state.dry_run || util::env_truthy("SPAR_DRY_RUN"),
-            )
+            (strat, sid, state.dry_run)
         }
         None => (
             providers::DeliveryStrategy::None,

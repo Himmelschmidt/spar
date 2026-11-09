@@ -12,6 +12,7 @@ use crate::paths::SparPaths;
 use crate::state::RunState;
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -109,6 +110,12 @@ pub fn deliver(
     };
     let msgs = bus::inbox_claim(paths, agent, via)?;
     if msgs.is_empty() {
+        if strategy == DeliveryStrategy::PollFile
+            && !dry_run
+            && poll_file(paths, run, agent).exists()
+        {
+            render_poll_file(paths, run, agent)?;
+        }
         return Ok(Delivery {
             strategy,
             action: DeliveryAction::Empty,
@@ -133,7 +140,9 @@ pub fn deliver(
             (action, None)
         }
         DeliveryStrategy::PollFile => {
-            append_poll_file(paths, run, agent, &render_reason(&msgs), dry_run)?;
+            if !dry_run {
+                render_poll_file(paths, run, agent)?;
+            }
             (DeliveryAction::PolledFile, None)
         }
         DeliveryStrategy::None => unreachable!("None handled above"),
@@ -165,6 +174,85 @@ fn render_reason(msgs: &[BusMessage]) -> String {
         s.push_str(&format!("\n- [{:?}] from {}: {}", m.kind, m.from, m.body));
     }
     s
+}
+
+const POLL_SECTION_START: &str = "<!-- spar:poll:start -->";
+const POLL_SECTION_END: &str = "<!-- spar:poll:end -->";
+
+/// Rewrite the slot's poll file from its inbox: one line per pending message,
+/// oldest first. The inbox is the only source — a message withdrawn, expired or
+/// acked stops being listed, wherever its copies were.
+///
+/// Only action items render: messages addressed to the slot. Acks and
+/// broadcasts (join notices, orchestrator announcements) stay in the inbox and
+/// the bus log but never become poll-file action items. Text outside the
+/// section markers (budget and time nudges) is preserved.
+pub(crate) fn render_poll_file(
+    paths: &SparPaths,
+    run: Option<&str>,
+    agent: &str,
+) -> Result<PathBuf> {
+    let path = poll_file(paths, run, agent);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let acked = bus::acked_by(paths, agent);
+    let mut seen = HashSet::new();
+    let mut msgs: Vec<bus::BusMessage> = bus::filed_copies(paths, agent)
+        .into_iter()
+        .filter(|m| m.kind != bus::MsgKind::Ack)
+        .filter(|m| m.to != "broadcast" && m.to != "*")
+        .filter(|m| bus::resolve_addr(m.run.as_deref(), &m.to) == agent)
+        .filter(|m| !acked.contains(&m.id))
+        .filter(|m| !bus::expired_now(paths, m))
+        .filter(|m| seen.insert(m.id.clone()))
+        .collect();
+    msgs.sort_by_key(|m| m.ts);
+    let mut section = String::from("## Pending swarm messages (act on them, then continue)\n");
+    if msgs.is_empty() {
+        section.push_str("\n_Nothing waiting._\n");
+    } else {
+        for m in &msgs {
+            section.push_str(&format!(
+                "\n- [{:?}] from {} ({}): {}",
+                m.kind, m.from, m.id, m.body
+            ));
+        }
+        section.push('\n');
+    }
+    let block = format!("{POLL_SECTION_START}\n{section}{POLL_SECTION_END}\n");
+    let prev = fs::read_to_string(&path).unwrap_or_default();
+    let next = match prev.split_once(POLL_SECTION_START) {
+        Some((head, rest)) => match rest.split_once(POLL_SECTION_END) {
+            Some((_, tail)) => format!("{head}{block}{}", tail.trim_start_matches('\n')),
+            None => format!("{prev}\n{block}"),
+        },
+        None if prev.is_empty() => block,
+        None => format!("{}\n{block}", prev.trim_end()),
+    };
+    fs::write(&path, next)?;
+    Ok(path)
+}
+
+/// Re-render every PollFile slot's poll file on `run_id`: the round-start and
+/// turn-boundary sweep that drops expired messages with no new filing.
+/// Dry-run runs never get poll files, so there is nothing to sweep.
+pub fn refresh_run_poll_files(paths: &SparPaths, run_id: &str) {
+    let Ok(state) = RunState::load(paths, run_id) else {
+        return;
+    };
+    if state.dry_run {
+        return;
+    }
+    for s in &state.slots {
+        if strategy_for_slot(&state, &s.id) != DeliveryStrategy::PollFile {
+            continue;
+        }
+        let agent = bus::agent_ref(Some(run_id), &s.id);
+        if let Err(e) = render_poll_file(paths, Some(run_id), &agent) {
+            eprintln!("warning: poll-file refresh for {agent} failed: {e:#}");
+        }
+    }
 }
 
 /// Push `text` into the codex thread `session_id`. Best-effort and *not* a delivery
@@ -296,8 +384,12 @@ pub fn strategy_for_slot(state: &RunState, slot: &str) -> DeliveryStrategy {
 /// keep their own pulse; bare ids resolve to no slot and stay inbox-queued.
 /// Best effort with a stderr line, never an error: the filing already succeeded,
 /// the inbox stays the durable queue, and the next filing retries the drain.
-/// Skipped under dry runs: the write would be stubbed while the drain still
-/// claimed, stranding the batch where neither the inbox nor the poll file shows it.
+/// Skipped for dry-run runs: no live slot polls their files, so the inbox keeps
+/// the messages for inspection and the turn-boundary drain. Gated on the run's
+/// own `dry_run` flag, never the sender's `SPAR_DRY_RUN` env: an ambient export
+/// in the sender's shell must not silence delivery to a live run's slots. The
+/// drain writes for real here (`deliver` is called with dry-run off); the stub
+/// only applies to the explicit turn-boundary `bus deliver` under dry runs.
 pub fn drain_poll_files(paths: &SparPaths, targets: &[String]) {
     let mut by_run: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
     for t in targets {
@@ -309,7 +401,7 @@ pub fn drain_poll_files(paths: &SparPaths, targets: &[String]) {
         let Ok(state) = RunState::load(paths, run) else {
             continue;
         };
-        if state.dry_run || crate::util::env_truthy("SPAR_DRY_RUN") {
+        if state.dry_run {
             continue;
         }
         for agent in agents {

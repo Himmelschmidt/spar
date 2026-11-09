@@ -1317,13 +1317,51 @@ pub struct Withdrawal {
 }
 
 pub fn find_event(paths: &SparPaths, msg_id: &str) -> Result<Option<BusMessage>> {
-    Ok(list_events(paths, None)?
-        .into_iter()
-        .find(|m| m.id == msg_id))
+    let path = events_path(paths);
+    let mut f = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("open {}", path.display())),
+    };
+    let len = f.metadata()?.len();
+    let mut window: u64 = 64 * 1024;
+    loop {
+        let start = len.saturating_sub(window);
+        f.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes)?;
+        let slice: &[u8] = if start > 0 {
+            match bytes.iter().position(|&b| b == b'\n') {
+                Some(i) => &bytes[i + 1..],
+                None => &[],
+            }
+        } else {
+            &bytes[..]
+        };
+        let text = String::from_utf8_lossy(slice);
+        if let Some(m) = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .filter_map(|l| serde_json::from_str::<BusMessage>(l).ok())
+            .find(|m| m.id == msg_id)
+        {
+            return Ok(Some(m));
+        }
+        if start == 0 || window >= len {
+            return Ok(None);
+        }
+        window = window.saturating_mul(2);
+    }
 }
 
 /// Remove every undelivered copy of `msg_id` and stop its redelivery. A persisted
 /// message is dropped from carry-forward by `persisted_for` reading `supersedes`.
+///
+/// A PollFile slot's claimed copy sits in its poll file, still editable: the
+/// withdrawal takes it back too, and the slot reports `withdrawn_from`. Every
+/// other strategy keeps its claimed copy (a Stop hook already injected it into
+/// the model's input) and reports `already_delivered`.
 pub fn withdraw(paths: &SparPaths, msg_id: &str) -> Result<Withdrawal> {
     clear_pending_ack(paths, msg_id)?;
     let mut out = Withdrawal {
@@ -1336,6 +1374,8 @@ pub fn withdraw(paths: &SparPaths, msg_id: &str) -> Result<Withdrawal> {
     };
     let mut agents: Vec<PathBuf> = agents.flatten().map(|e| e.path()).collect();
     agents.sort();
+    let mut states: HashMap<String, Option<crate::state::RunState>> = HashMap::new();
+    let mut refresh: Vec<(Option<String>, String)> = Vec::new();
     for dir in agents {
         let agent = dir
             .file_name()
@@ -1354,7 +1394,33 @@ pub fn withdraw(paths: &SparPaths, msg_id: &str) -> Result<Withdrawal> {
                 .collect()
         };
         let pending = named(&dir);
-        if !named(&dir.join("claimed")).is_empty() {
+        let claimed = named(&dir.join("claimed"));
+        let is_poll = agent
+            .split_once(':')
+            .map(|(run, short)| {
+                let state = states
+                    .entry(run.to_string())
+                    .or_insert_with(|| crate::state::RunState::load(paths, run).ok());
+                state.as_ref().is_some_and(|s| {
+                    crate::providers::delivery::strategy_for_slot(s, short)
+                        == crate::providers::DeliveryStrategy::PollFile
+                })
+            })
+            .unwrap_or(false);
+        if is_poll {
+            if pending.is_empty() && claimed.is_empty() {
+                continue;
+            }
+            for p in pending.into_iter().chain(claimed) {
+                remove_file_if_present(&p)?;
+            }
+            record_receipt(paths, msg_id, &agent, ReceiptEvent::Withdrawn, "superseded");
+            out.withdrawn_from.push(agent.clone());
+            let run = agent.split_once(':').map(|(r, _)| r.to_string());
+            refresh.push((run, agent));
+            continue;
+        }
+        if !claimed.is_empty() {
             out.already_delivered.push(agent.clone());
         }
         if pending.is_empty() {
@@ -1366,7 +1432,70 @@ pub fn withdraw(paths: &SparPaths, msg_id: &str) -> Result<Withdrawal> {
         record_receipt(paths, msg_id, &agent, ReceiptEvent::Withdrawn, "superseded");
         out.withdrawn_from.push(agent);
     }
+    for (run, agent) in refresh {
+        if let Err(e) = crate::providers::delivery::render_poll_file(paths, run.as_deref(), &agent)
+        {
+            eprintln!("warning: poll-file refresh for {agent} failed: {e:#}");
+        }
+    }
     Ok(out)
+}
+
+/// Every filed body still on disk for `agent`: the waiting inbox copies plus the
+/// claimed ones. Best effort; an unreadable file is skipped.
+pub(crate) fn filed_copies(paths: &SparPaths, agent: &str) -> Vec<BusMessage> {
+    let dir = inbox_dir(paths, agent);
+    let mut out = Vec::new();
+    for d in [dir.clone(), dir.join("claimed")] {
+        let Ok(entries) = fs::read_dir(&d) else {
+            continue;
+        };
+        for p in entries.flatten().map(|e| e.path()) {
+            if p.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let Ok(body) = fs::read_to_string(&p) else {
+                continue;
+            };
+            if let Ok(m) = serde_json::from_str::<BusMessage>(&body) {
+                out.push(m);
+            }
+        }
+    }
+    out
+}
+
+/// Message ids the slot itself acked. A slot that acked a message is done with
+/// it, so the poll file stops listing it.
+pub(crate) fn acked_by(paths: &SparPaths, agent: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Ok(f) = File::open(events_path(paths)) else {
+        return out;
+    };
+    for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(m) = serde_json::from_str::<BusMessage>(&line) else {
+            continue;
+        };
+        if m.kind != MsgKind::Ack {
+            continue;
+        }
+        if resolve_addr(m.run.as_deref(), &m.from) != agent {
+            continue;
+        }
+        if let Some(t) = m.refs.reply_to {
+            out.insert(t);
+        }
+    }
+    out
+}
+
+/// Whether the message is past its round on a live read: a second expiry gate
+/// for copies claimed in their last valid round.
+pub(crate) fn expired_now(paths: &SparPaths, msg: &BusMessage) -> bool {
+    RunRounds::default().expired(paths, msg)
 }
 
 /// Persisted messages to `slot` in `run` that still stand: not superseded, not past
@@ -1614,6 +1743,105 @@ mod tests {
         assert!(is_human_alert(&msg("broadcast", MsgKind::Blocked)));
         assert!(is_human_alert(&msg(HUMAN, MsgKind::Chat)));
         assert!(!is_human_alert(&msg("broadcast", MsgKind::Chat)));
+    }
+
+    #[test]
+    fn poll_render_lists_directed_pending_and_keeps_nudges() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, Some("r1"), "p", Some("cli:pi"), Some("native-cli")).unwrap();
+        let agent = agent_ref(Some("r1"), "p");
+        let body = |id: &str, to: &str, kind: MsgKind, text: &str| BusMessage {
+            id: id.into(),
+            ts: Utc::now(),
+            from: "r1:planner".into(),
+            to: to.into(),
+            kind,
+            body: text.into(),
+            run: Some("r1".into()),
+            subject: None,
+            refs: MsgRefs::default(),
+            requires_ack: false,
+            persist: false,
+            expires_after_round: None,
+            meta: HashMap::new(),
+        };
+        let dir = inbox_dir(&paths, &agent);
+        fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, m: &BusMessage| {
+            fs::write(dir.join(name), serde_json::to_string(m).unwrap()).unwrap();
+        };
+        write(
+            "1-direct.json",
+            &body("m1", &agent, MsgKind::Chat, "act on this"),
+        );
+        write(
+            "2-redelivery.json",
+            &body("m1", &agent, MsgKind::Chat, "act on this"),
+        );
+        write(
+            "3-broadcast.json",
+            &body("m2", "broadcast", MsgKind::Chat, "all hands"),
+        );
+        write("4-ack.json", &body("m3", &agent, MsgKind::Ack, "ack m1"));
+        write(
+            "5-join.json",
+            &body("m4", "broadcast", MsgKind::System, "r1:x joined"),
+        );
+        let p = crate::providers::delivery::poll_file(&paths, Some("r1"), &agent);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, "spar time nudge (75%): wrap up\n").unwrap();
+
+        crate::providers::delivery::render_poll_file(&paths, Some("r1"), &agent).unwrap();
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains("spar time nudge"), "{text}");
+        assert_eq!(text.matches("act on this").count(), 1, "{text}");
+        for stray in ["all hands", "ack m1", "joined"] {
+            assert!(!text.contains(stray), "poll file lists no {stray}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn withdraw_takes_a_poll_file_copy_back() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, Some("r1"), "p", Some("cli:pi"), Some("native-cli")).unwrap();
+        let mut state = crate::state::RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.slots.push(crate::executor::init_slot(
+            "p",
+            "cli:pi",
+            crate::state::SlotRole::Implementer,
+        ));
+        state.save(&paths).unwrap();
+
+        let agent = agent_ref(Some("r1"), "p");
+        let sent = chat(
+            &paths,
+            Some("r1"),
+            "a",
+            "p",
+            "old instruction",
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        let poll = crate::providers::delivery::poll_file(&paths, Some("r1"), &agent);
+        assert!(fs::read_to_string(&poll)
+            .unwrap()
+            .contains("old instruction"));
+
+        let w = withdraw(&paths, &sent.id).unwrap();
+        assert_eq!(w.withdrawn_from, vec![agent.clone()]);
+        assert!(w.already_delivered.is_empty());
+        assert!(
+            !fs::read_to_string(&poll)
+                .unwrap()
+                .contains("old instruction"),
+            "the withdrawn body leaves the poll file"
+        );
     }
 
     #[test]

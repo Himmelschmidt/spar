@@ -447,12 +447,13 @@ fn agy_redelivery_reaches_the_poll_file() {
     std::fs::write(&pending, serde_json::to_string_pretty(&record).unwrap()).unwrap();
 
     // `bus deliver` ticks acks before draining: the due redelivery re-files and
-    // fans straight out to the poll file.
+    // fans straight out to the poll file. The poll file renders the inbox, so the
+    // same message still lists once — redelivery refreshes, never duplicates.
     deliver_json(tmp.path(), &run_id, &agent);
     assert_eq!(
         poll().matches("confirm the migration plan").count(),
-        2,
-        "the redelivered copy lands in the poll file with no explicit drain"
+        1,
+        "the redelivered copy refreshes the poll file with no explicit drain"
     );
 
     let log = spar_cmd()
@@ -482,4 +483,234 @@ fn set_dry_run(dir: &std::path::Path, run_id: &str, dry_run: bool) {
     let mut state: Value = serde_json::from_str(&text).unwrap();
     state["dry_run"] = Value::Bool(dry_run);
     std::fs::write(&path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+}
+
+/// A live run with one PollFile slot for `provider` (`cli:agy` or `cli:pi`).
+fn live_poll_run(dir: &std::path::Path, provider: &str) -> (String, String) {
+    let run_id = plan_and_approve_with_providers(dir, &format!("cli:claude,cli:grok,{provider}"));
+    let agent = slot_for_provider(dir, &run_id, provider);
+    set_dry_run(dir, &run_id, false);
+    (run_id, agent)
+}
+
+fn poll_body(dir: &std::path::Path, run_id: &str, agent: &str) -> String {
+    std::fs::read_to_string(
+        dir.join(".spar/runs")
+            .join(run_id)
+            .join("logs")
+            .join(format!("nudges-{agent}.md")),
+    )
+    .unwrap()
+}
+
+fn send_json(dir: &std::path::Path, run_id: &str, extra: &[&str]) -> Value {
+    let mut args = vec!["bus", "send", "--run", run_id, "--json"];
+    args.extend(extra);
+    let out = spar_cmd()
+        .current_dir(dir)
+        .args(&args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&out).unwrap()
+}
+
+fn log_entries(dir: &std::path::Path, run_id: &str) -> Value {
+    let out = spar_cmd()
+        .current_dir(dir)
+        .args(["bus", "log", "--run", run_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&out).unwrap()
+}
+
+fn log_entry(entries: &Value, id: &str) -> Value {
+    entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == id)
+        .unwrap_or_else(|| panic!("{id} in {entries}"))
+        .clone()
+}
+
+/// Withdrawing a superseded message takes it back from a PollFile slot: the
+/// withdrawal reports the slot as withdrawn (not already delivered) and the
+/// old body disappears from the poll file, leaving only the superseding one.
+fn poll_file_supersede_withdraws(provider: &str) {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), provider);
+    let dir = tmp.path();
+
+    let old = send_json(
+        dir,
+        &run_id,
+        &["--to", &agent, "-m", "old instruction alpha"],
+    );
+    let old_id = old["id"].as_str().unwrap().to_string();
+    assert!(
+        poll_body(dir, &run_id, &agent).contains("old instruction alpha"),
+        "the send itself fans out to the poll file"
+    );
+
+    let new = send_json(
+        dir,
+        &run_id,
+        &[
+            "--to",
+            &agent,
+            "--supersedes",
+            &old_id,
+            "-m",
+            "new instruction beta",
+        ],
+    );
+    let new_id = new["id"].as_str().unwrap().to_string();
+    let withdrawal = &new["withdrawal"];
+    assert_eq!(
+        withdrawal["withdrawn_from"],
+        serde_json::json!([format!("{run_id}:{agent}")]),
+        "{withdrawal}"
+    );
+    assert_eq!(
+        withdrawal["already_delivered"],
+        serde_json::json!([]),
+        "{withdrawal}"
+    );
+
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        !poll.contains("old instruction alpha"),
+        "withdrawn body leaves the file:\n{poll}"
+    );
+    assert!(poll.contains("new instruction beta"), "{poll}");
+
+    let entries = log_entries(dir, &run_id);
+    let old_entry = log_entry(&entries, &old_id);
+    assert_eq!(old_entry["superseded_by"], new_id, "{old_entry}");
+    assert_eq!(
+        old_entry["delivery"], "delivered",
+        "it landed in the poll file before the withdrawal took it back: {old_entry}"
+    );
+}
+
+#[test]
+fn poll_file_supersede_withdraws_for_agy() {
+    poll_file_supersede_withdraws("cli:agy");
+}
+
+#[test]
+fn poll_file_supersede_withdraws_for_pi() {
+    poll_file_supersede_withdraws("cli:pi");
+}
+
+/// A message filed in its last valid round leaves the poll file once the run
+/// moves past it: the next filing re-renders, and the expired body is gone.
+fn poll_file_expiry_drops(provider: &str) {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), provider);
+    let dir = tmp.path();
+
+    let expiring = send_json(
+        dir,
+        &run_id,
+        &[
+            "--to",
+            &agent,
+            "--expires-after-round",
+            "-m",
+            "limited-time ruling",
+        ],
+    );
+    let expiring_id = expiring["id"].as_str().unwrap().to_string();
+    let last_round = expiring["expires_after_round"].as_u64().unwrap();
+    assert!(
+        poll_body(dir, &run_id, &agent).contains("limited-time ruling"),
+        "filed in its last valid round, so it lists"
+    );
+
+    let state_path = dir.join(".spar/runs").join(&run_id).join("state.json");
+    let text = std::fs::read_to_string(&state_path).unwrap();
+    let mut state: Value = serde_json::from_str(&text).unwrap();
+    state["round"] = serde_json::json!(last_round + 1);
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    send_json(dir, &run_id, &["--to", &agent, "-m", "later note"]);
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        !poll.contains("limited-time ruling"),
+        "expired body leaves the file:\n{poll}"
+    );
+    assert!(poll.contains("later note"), "{poll}");
+
+    let entries = log_entries(dir, &run_id);
+    let entry = log_entry(&entries, &expiring_id);
+    assert_eq!(entry["expired"], true, "{entry}");
+}
+
+#[test]
+fn poll_file_expiry_drops_for_agy() {
+    poll_file_expiry_drops("cli:agy");
+}
+
+#[test]
+fn poll_file_expiry_drops_for_pi() {
+    poll_file_expiry_drops("cli:pi");
+}
+
+/// Acks and broadcasts stay in the inbox and the bus log, but they never become
+/// poll-file action items; an acked message leaves the file too.
+#[test]
+fn poll_file_lists_only_directed_action_items() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), "cli:agy");
+    let dir = tmp.path();
+
+    let needy = send_json(
+        dir,
+        &run_id,
+        &[
+            "--to",
+            &agent,
+            "--requires-ack",
+            "-m",
+            "confirm the migration plan",
+        ],
+    );
+    let needy_id = needy["id"].as_str().unwrap().to_string();
+    assert!(poll_body(dir, &run_id, &agent).contains("confirm the migration plan"));
+
+    send_json(
+        dir,
+        &run_id,
+        &["--to", "broadcast", "-m", "all hands notice"],
+    );
+    spar_cmd()
+        .current_dir(dir)
+        .args(["bus", "ack", &needy_id, "--from", &agent, "--run", &run_id])
+        .assert()
+        .success();
+    deliver_json(dir, &run_id, &agent);
+
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        !poll.contains("all hands notice"),
+        "broadcasts are not action items:\n{poll}"
+    );
+    assert!(
+        !poll.contains("[Ack]"),
+        "acks are not action items:\n{poll}"
+    );
+    assert!(
+        !poll.contains("confirm the migration plan"),
+        "an acked message leaves the file:\n{poll}"
+    );
 }
