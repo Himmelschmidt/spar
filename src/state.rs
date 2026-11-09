@@ -201,6 +201,13 @@ pub struct RunState {
     /// Every `spar amend --contract` applied to this run, oldest first (O137).
     #[serde(default)]
     pub contract_amendments: Vec<ContractAmendment>,
+    /// Rounds whose implementer was cut short at its hard ceiling with work left
+    /// behind, oldest first. The leftovers were committed as a partial WIP round,
+    /// so a fresh process entering the next round — past the round-ceiling gate,
+    /// a stop, a quota park, a crashed orchestrator — still tells its implementer
+    /// the previous pass never finished (`blockers_from_disk` rebuilds the note).
+    #[serde(default)]
+    pub ceiling_partial_rounds: Vec<u32>,
     /// Set while `spar amend` has the test author out, cleared when it settles. Found
     /// set by a later `amend`, `resume` or `approve`, it means the amend was killed: the
     /// run is put back exactly as this records (O137).
@@ -875,6 +882,7 @@ impl RunState {
             ship_override: None,
             seat_reassignments: Vec::new(),
             contract_amendments: Vec::new(),
+            ceiling_partial_rounds: Vec::new(),
             amend_in_progress: None,
             pr_state: None,
         }
