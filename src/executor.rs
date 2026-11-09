@@ -4679,8 +4679,11 @@ fn run_tmux(
                         return Ok(outcome);
                     }
                     // Never success-on-timeout-alone (plan completion contract).
+                    // Past the refusal check above the budget is genuinely spent:
+                    // the hard ceiling killed it, typed like every other ceiling.
                     return Ok(SlotOutcome {
                         usage: tmux_recovered_usage(replays_stream, job, log_path),
+                        timeout_cause: Some(TimeoutCause::HardCeiling),
                         ..SlotOutcome::err("tmux marker wait timed out")
                     });
                 }
