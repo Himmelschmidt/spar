@@ -1534,6 +1534,25 @@ enum ReviewedCommitDecision {
     Mismatch,
 }
 
+/// The recorded verdict a stood-down reviewer carries into the gate: only a seat
+/// that never dispatched this round (`stood_down`) and whose last recorded
+/// verdict rejects this head. A veto about an older head was superseded by the
+/// fix round; a seat that never judged has nothing to carry; a failure stub
+/// names no commit, so only a real judgment about this head carries.
+fn carried_rejection<'a>(
+    slot: &'a SlotState,
+    panel_head: Option<&str>,
+) -> Option<&'a ReviewResult> {
+    slot.stood_down.as_ref()?;
+    let head = panel_head?;
+    let res = slot.review.as_ref()?;
+    if res.verdict != Some(review_result::Verdict::RequestChanges) {
+        return None;
+    }
+    let sha = res.reviewed_commit.as_deref()?;
+    review_result::reviewed_commit_matches(head, sha).then_some(res)
+}
+
 fn decide_reviewed_commit(panel_head: Option<&str>, res: &ReviewResult) -> ReviewedCommitDecision {
     let Some(head) = panel_head else {
         return ReviewedCommitDecision::Skipped;
@@ -2751,6 +2770,9 @@ pub fn execute_loop(
                     eprintln!("warning: {note}");
                     let _ =
                         crate::events::append(paths, &state.id, &crate::events::Event::info(note));
+                    if let Some(s) = state.slot_mut(&rev.id) {
+                        s.stood_down = Some(msg.clone());
+                    }
                     state.save(paths)?;
                     stood_down.push(msg);
                     continue;
@@ -3037,6 +3059,24 @@ pub fn execute_loop(
         if !reviewers.is_empty() && stood_down.len() == reviewers.len() {
             return fail(state, paths, anyhow::anyhow!(stood_down.join("; ")), true);
         }
+        // A stood-down seat's recorded veto still blocks when it rejects the
+        // head about to ship: judged, unanswered, and unable to re-judge. The
+        // same verdict and acceptance predicates judge it as a fresh artifact.
+        let mut carried: Vec<(String, review_result::ReviewResult)> = Vec::new();
+        for s in state.slots.iter().filter(|s| s.role == SlotRole::Reviewer) {
+            if let Some(res) = carried_rejection(s, panel_head.as_deref()) {
+                carried.push((s.id.clone(), res.clone()));
+            }
+        }
+        for (id, res) in &carried {
+            if res.blocks(cfg.review.block_on) || acceptance_blocks_ship(&criteria, res, cfg) {
+                any_request_changes = true;
+                blockers.push(format!(
+                    "review `{id}` stood down on quota; its recorded request_changes on {} still blocks this head",
+                    res.reviewed_commit.as_deref().unwrap_or("unknown")
+                ));
+            }
+        }
         if !any_request_changes {
             write_impl_summary(state, paths)?;
             if state.big {
@@ -3322,7 +3362,46 @@ fn gate_implementer_seat(
     match impl_id {
         None => Ok(None),
         Some(id) => match recheck_seat(state, paths, cfg, &id, true)? {
-            SeatCheck::Ready(_) => Ok(None),
+            SeatCheck::Ready(id) => {
+                // Quota-clean but the CLI may still be missing: the old run-start
+                // gate parked then too, once backups exist to detect against.
+                let has_backup = cfg.backups.implementer.is_some()
+                    || !cfg.backups.reviewer.is_empty()
+                    || cfg.backups.tester.is_some();
+                if !has_backup {
+                    return Ok(None);
+                }
+                let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                    .into_iter()
+                    .filter(|r| r.available)
+                    .map(|r| format!("cli:{}", r.name))
+                    .collect();
+                let available = if detected.is_empty() {
+                    None
+                } else {
+                    Some(detected)
+                };
+                let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+                let missing = state
+                    .slots
+                    .iter()
+                    .find(|s| s.id == id)
+                    .filter(|s| {
+                        !crate::backup::is_provider_eligible(
+                            &s.provider_ref().display(),
+                            &store,
+                            available.as_ref(),
+                        )
+                    })
+                    .map(|s| s.provider.clone());
+                match missing {
+                    Some(provider) => Ok(Some(format!(
+                        "provider for `{id}` not available ({provider}). \
+                         install the CLI or set `--select`/`--providers` to a usable one"
+                    ))),
+                    None => Ok(None),
+                }
+            }
             SeatCheck::Park(msg) => Ok(Some(msg)),
         },
     }
@@ -3906,6 +3985,63 @@ mod recheck_seat_tests {
         assert_eq!(reviewer_ordinal("review-12-cli-codex"), Some(12));
         assert_eq!(reviewer_ordinal("review-cli-grok-wide"), None);
         assert_eq!(reviewer_ordinal("impl"), None);
+    }
+}
+
+#[cfg(test)]
+mod carried_rejection_tests {
+    use super::*;
+
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+    const OTHER: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    fn stood_down(body: &str) -> SlotState {
+        let mut s = executor::init_slot("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        s.stood_down = Some("provider cli:grok is paused".into());
+        s.review = Some(crate::workflow::review_result::parse_review(body));
+        s
+    }
+
+    fn verdict_on(verdict: &str, sha: &str) -> String {
+        format!("## Verdict\n{verdict}\n\nReviewed-Commit: {sha}\n\n## Findings\n- severity: major — x\n")
+    }
+
+    #[test]
+    fn request_changes_on_this_head_carries() {
+        let s = stood_down(&verdict_on("request_changes", HEAD));
+        assert!(carried_rejection(&s, Some(HEAD)).is_some());
+    }
+
+    #[test]
+    fn request_changes_on_an_older_head_does_not_carry() {
+        let s = stood_down(&verdict_on("request_changes", OTHER));
+        assert!(carried_rejection(&s, Some(HEAD)).is_none());
+    }
+
+    #[test]
+    fn approve_on_this_head_does_not_carry() {
+        let s = stood_down(&verdict_on("approve", HEAD));
+        assert!(carried_rejection(&s, Some(HEAD)).is_none());
+    }
+
+    #[test]
+    fn a_dispatched_seat_carries_nothing() {
+        let mut s = stood_down(&verdict_on("request_changes", HEAD));
+        s.stood_down = None;
+        assert!(carried_rejection(&s, Some(HEAD)).is_none());
+    }
+
+    #[test]
+    fn a_seat_that_never_judged_carries_nothing() {
+        let mut s = executor::init_slot("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        s.stood_down = Some("provider cli:grok is paused".into());
+        assert!(carried_rejection(&s, Some(HEAD)).is_none());
+    }
+
+    #[test]
+    fn a_failure_stub_names_no_commit_so_it_carries_nothing() {
+        let s = stood_down("## Verdict\nrequest_changes\n\n## Findings\n- severity: major — x\n");
+        assert!(carried_rejection(&s, Some(HEAD)).is_none());
     }
 }
 

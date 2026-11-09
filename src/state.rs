@@ -531,6 +531,12 @@ pub struct SlotState {
     /// Reset at dispatch alongside the other per-dispatch fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_commit: Option<String>,
+    /// Why a reviewer slot never dispatched this round: the quota pause that stood
+    /// it down. Recorded at stand-down so the ship gate can mark the seat as
+    /// unjudged instead of presenting its stale artifact as current, and cleared
+    /// at dispatch alongside the other per-dispatch fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stood_down: Option<String>,
     /// What the gate parsed from this reviewer's artifact: verdict, the commit it
     /// names (whether or not it matched), per-AC status and findings. `null` until the
     /// gate reads a review; reset at dispatch.

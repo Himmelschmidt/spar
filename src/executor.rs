@@ -384,6 +384,7 @@ fn prepare_slot_execution(
         s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
+        s.stood_down = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -2469,6 +2470,7 @@ pub fn run_slot(
         s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
+        s.stood_down = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -4741,6 +4743,7 @@ pub fn init_slot_model(
         quota_hit: false,
         reviewed_commit: None,
         review: None,
+        stood_down: None,
         source: None,
         auth_fault: false,
         build_cache: None,
