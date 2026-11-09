@@ -4681,6 +4681,12 @@ fn run_tmux(
                     // Never success-on-timeout-alone (plan completion contract).
                     // Past the refusal check above the budget is genuinely spent:
                     // the hard ceiling killed it, typed like every other ceiling.
+                    // The agent is still alive in its pane: terminate its process
+                    // group before reporting, so the WIP snapshot and the suite
+                    // judge a tree that cannot keep changing under them.
+                    if let Some(token) = pane_pid {
+                        process::terminate_tree(token.pid, true);
+                    }
                     return Ok(SlotOutcome {
                         usage: tmux_recovered_usage(replays_stream, job, log_path),
                         timeout_cause: Some(TimeoutCause::HardCeiling),
