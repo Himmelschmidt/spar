@@ -73,7 +73,7 @@ pub fn run(
     ) {
         state.pool_intent = requested.clone();
     }
-    state.providers = providers::pick_providers(&requested, n_slots, Some(&requested), dry);
+    state.providers = providers::pick_providers(&requested, n_slots, Some(&requested), dry, pool_origin);
     // `state.providers` is positional, but CLI `--role` pins outrank it (O79). A
     // preflight quota gate that checks the pool before seat resolution sees the
     // *pool* entry as paused and parks, even though the seat's own provider (from
@@ -279,11 +279,12 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> Vec<PlanSeat> {
                 &state.providers,
                 state.pool_origin,
                 cfg,
+                state.dry_run,
             )
         }) else {
             continue;
         };
-        let model = (source != SeatSource::Backup).then_some(selected).flatten();
+        let model = (!source.is_backup()).then_some(selected).flatten();
         let id = format!("{prefix}-{}", sanitize_slot(&prov));
         out.push(PlanSeat {
             id,
@@ -339,10 +340,14 @@ pub fn execute_plan(
             if let Some(slot_state) = slot_state {
                 let cause =
                     crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
-                if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
+                if cause.engages_backup()
+                    && !slot_state.source.is_some_and(SeatSource::is_backup)
+                {
                     if let Some(raw) = crate::backup::backup_for_role(job.role, 0, cfg) {
-                        if crate::backup::backup_eligible(
+                        if let Some(source) = crate::backup::takeover(
                             &raw,
+                            job.role,
+                            cfg,
                             &store,
                             available.as_ref(),
                             paths,
@@ -374,11 +379,12 @@ pub fn execute_plan(
                                     if let Some(s) = state.slot_mut(&new_id) {
                                         new_slot_id = s.id.clone();
                                         s.point_at(&pin.display());
-                                        s.source = Some(SeatSource::Backup);
+                                        s.source = Some(source);
                                     } else if let Some(s) = state.slot_mut(&job.slot_id) {
                                         s.point_at(&pin.display());
-                                        s.source = Some(SeatSource::Backup);
+                                        s.source = Some(source);
                                     }
+                                    state.warn_unhealthy_pin(&pin.display(), Some(source));
                                     state.save(paths)?;
                                     let retry_job = SlotJob {
                                         slot_id: new_slot_id,
@@ -582,8 +588,10 @@ fn resolve_test_author(
         crate::provider_ref::ProviderRef::for_seat(&provider, model.as_deref()).display();
     if !crate::backup::seat_eligible(&seat_ref, Some(source), &store, available.as_ref()) {
         if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg) {
-            if crate::backup::backup_eligible(
+            if let Some(takeover) = crate::backup::takeover(
                 &backup_raw,
+                SlotRole::TestAuthor,
+                cfg,
                 &store,
                 available.as_ref(),
                 paths,
@@ -591,7 +599,7 @@ fn resolve_test_author(
             ) {
                 if let Ok(pin) = crate::provider_ref::Pin::parse(&backup_raw) {
                     provider = pin.display();
-                    source = crate::state::SeatSource::Backup;
+                    source = takeover;
                     model = pin.model;
                 }
             }
@@ -686,11 +694,16 @@ fn run_test_author(
         let mut handled = false;
         if let Some(slot_state) = slot_state {
             let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
-            if cause.engages_backup() && slot_state.source != Some(crate::state::SeatSource::Backup)
+            if cause.engages_backup()
+                && !slot_state
+                    .source
+                    .is_some_and(crate::state::SeatSource::is_backup)
             {
                 if let Some(raw) = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg) {
-                    if crate::backup::backup_eligible(
+                    if let Some(source) = crate::backup::takeover(
                         &raw,
+                        SlotRole::TestAuthor,
+                        cfg,
                         &store,
                         available.as_ref(),
                         paths,
@@ -704,11 +717,7 @@ fn run_test_author(
                             .unwrap_or_else(|_| raw.clone());
                         if cur_key != backup_key {
                             if let Ok(pin) = crate::provider_ref::Pin::parse(&raw) {
-                                if let Some(s) = state.slot_mut(&id) {
-                                    s.point_at(&pin.display());
-                                    s.source = Some(crate::state::SeatSource::Backup);
-                                }
-                                state.save(paths)?;
+                                crate::backup::engage(state, paths, &id, &raw, source)?;
                                 let retry_job = SlotJob {
                                     slot_id: id.clone(),
                                     provider: pin.display(),
@@ -1246,8 +1255,11 @@ fn amend_author_seat(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> R
     let sub = crate::quota::sub_key(&seat.provider);
     let backup = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg)
         .filter(|b| crate::quota::sub_key(b) != sub)
-        .filter(|b| crate::backup::backup_eligible(b, &store, None, paths, false));
-    let Some(raw) = backup else {
+        .and_then(|b| {
+            crate::backup::takeover(&b, SlotRole::TestAuthor, cfg, &store, None, paths, false)
+                .map(|source| (b, source))
+        });
+    let Some((raw, source)) = backup else {
         anyhow::bail!(
             "test-author seat {} is on {key}, which is paused, and has no eligible backup; \
              resume it with `spar provider resume {key}` or declare `[backups].test_author`",
@@ -1266,8 +1278,9 @@ fn amend_author_seat(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> R
     if let Some(s) = state.slot_mut(&new_id) {
         s.point_at(&pin.display());
         s.effort = None;
-        s.source = Some(SeatSource::Backup);
+        s.source = Some(source);
     }
+    state.warn_unhealthy_pin(&pin.display(), Some(source));
     let msg = format!(
         "{key} is paused; test-author seat {} moved to its backup {raw} as {new_id}",
         seat.id

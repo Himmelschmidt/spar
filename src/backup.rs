@@ -141,16 +141,19 @@ pub fn is_provider_eligible(
 /// is probed before it is skipped (#153, O106): that pause is a failure recorded at some
 /// point in the past, and a week-old one benched a working backup while its primary
 /// died. A manual pause is the operator's decision and is never probed past, and
-/// `dry` never spawns. A backup whose readiness probe failed is never eligible:
-/// rotation skips it while the run stays on (or falls back to) the primary.
-pub fn backup_eligible(
+/// `dry` never spawns. A `[backups]` file backup whose readiness probe failed is
+/// never eligible: rotation skips it while the run stays on (or falls back to)
+/// the primary. A CLI `--backup` entry is an explicit pin and dispatches despite
+/// `Unhealthy` readiness (warning instead): see `takeover`.
+fn backup_eligible(
     backup: &str,
     store: &QuotaStore,
     available: Option<&std::collections::HashSet<String>>,
     paths: &crate::paths::SparPaths,
     dry: bool,
+    cli: bool,
 ) -> bool {
-    if is_provider_eligible(backup, store, available) && health_allows(backup, dry) {
+    if is_provider_eligible(backup, store, available) && (cli || health_allows(backup, dry)) {
         return true;
     }
     let key = crate::quota::quota_key(backup);
@@ -165,7 +168,52 @@ pub fn backup_eligible(
         );
     }
     let fresh = QuotaStore::load(paths).unwrap_or_default();
-    is_provider_eligible(backup, &fresh, available) && health_allows(backup, dry)
+    is_provider_eligible(backup, &fresh, available) && (cli || health_allows(backup, dry))
+}
+
+/// Whether `backup` may take `role`'s seat, and the source the winning seat records.
+/// A CLI `--backup` entry (`cfg.cli_backup_keys`) dispatches even while `Unhealthy`
+/// and warns like any other pin; a `[backups]` file entry still skips `Unhealthy`
+/// providers. `None` when the backup cannot take the seat.
+pub fn takeover(
+    backup: &str,
+    role: crate::state::SlotRole,
+    cfg: &crate::config::Config,
+    store: &QuotaStore,
+    available: Option<&std::collections::HashSet<String>>,
+    paths: &crate::paths::SparPaths,
+    dry: bool,
+) -> Option<crate::state::SeatSource> {
+    let cli = cfg.cli_backup_keys.contains(role.as_config_key());
+    backup_eligible(backup, store, available, paths, dry, cli).then(|| {
+        if cli {
+            crate::state::SeatSource::CliBackup
+        } else {
+            crate::state::SeatSource::Backup
+        }
+    })
+}
+
+/// Point `slot_id` at an engaged backup: re-point, record the takeover source, warn
+/// when the backup is an `Unhealthy` pin, and save. One call site per engagement
+/// so the warning cannot be forgotten on one path.
+pub fn engage(
+    state: &mut crate::state::RunState,
+    paths: &crate::paths::SparPaths,
+    slot_id: &str,
+    backup_raw: &str,
+    source: crate::state::SeatSource,
+) -> anyhow::Result<()> {
+    let pin = crate::provider_ref::Pin::parse(backup_raw)
+        .map(|p| p.display())
+        .unwrap_or_else(|_| backup_raw.to_string());
+    if let Some(s) = state.slot_mut(slot_id) {
+        s.point_at(&pin);
+        s.source = Some(source);
+    }
+    state.warn_unhealthy_pin(&pin, Some(source));
+    state.save(paths)?;
+    Ok(())
 }
 
 /// Rotation-target readiness gate. `dry` never spawns: without a probe there is
@@ -230,6 +278,7 @@ pub fn resolve_with_backup(
         pool,
         pool_origin,
         cfg,
+        dry,
     );
     let (prov, src) = primary?;
     let seat = crate::provider_ref::ProviderRef::for_seat(&prov, primary_model).display();
@@ -240,11 +289,11 @@ pub fn resolve_with_backup(
         return Some((prov, src));
     }
     let backup_raw = backup_for_role(role, role_index, cfg)?;
-    if !backup_eligible(&backup_raw, store, available, paths, dry) {
+    let Some(source) = takeover(&backup_raw, role, cfg, store, available, paths, dry) else {
         return Some((prov, src));
-    }
+    };
     let parsed = crate::provider_ref::Pin::parse(&backup_raw).ok()?;
-    Some((parsed.display(), crate::state::SeatSource::Backup))
+    Some((parsed.display(), source))
 }
 
 pub fn dispatch_stop_cause(
@@ -746,21 +795,25 @@ mod tests {
     }
 
     #[test]
-    fn backup_eligible_never_probes_under_dry_run_or_past_a_manual_pause() {
+    fn backup_takeover_never_probes_under_dry_run_or_past_a_manual_pause() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = crate::paths::SparPaths::new(tmp.path());
+        let cfg = crate::config::Config::default();
+        let role = crate::state::SlotRole::Implementer;
         let mut store = QuotaStore::default();
-        assert!(backup_eligible("cli:codex", &store, None, &paths, false));
+        assert!(
+            takeover("cli:codex", role, &cfg, &store, None, &paths, false).is_some()
+        );
 
         store.pause_quota("cli:codex", "possible quota signal: quota");
         assert!(
-            !backup_eligible("cli:codex", &store, None, &paths, true),
+            takeover("cli:codex", role, &cfg, &store, None, &paths, true).is_none(),
             "dry-run decides on the file alone"
         );
 
         store.pause_manual("cli:grok", None);
         assert!(
-            !backup_eligible("cli:grok", &store, None, &paths, false),
+            takeover("cli:grok", role, &cfg, &store, None, &paths, false).is_none(),
             "a manual pause is never probed past"
         );
         assert!(

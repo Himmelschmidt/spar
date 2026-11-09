@@ -50,7 +50,8 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     state.autonomy = cfg.autonomy;
     let roles: Vec<&str> = (0..n).map(|_| "reviewer").collect();
     let requested = opts.resolve_pool(n, &roles, paths, cfg, &state.id)?;
-    state.providers = providers::pick_providers(&requested, n, Some(&requested), dry);
+    let pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
+    state.providers = providers::pick_providers(&requested, n, Some(&requested), dry, pool_origin);
     if state.providers.is_empty() {
         state.error = Some("no usable providers".into());
         state.set_phase(Phase::Failed);
@@ -82,6 +83,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         &requested,
         pool_origin,
         cfg,
+        dry,
     );
     for (i, prov) in state.providers.iter().enumerate() {
         let mut provider = prov.clone();
@@ -93,8 +95,10 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             if !crate::backup::seat_eligible(&provider, source, &store, available.as_ref()) {
                 if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Reviewer, i, cfg)
                 {
-                    if crate::backup::backup_eligible(
+                    if let Some(takeover) = crate::backup::takeover(
                         &backup_raw,
+                        SlotRole::Reviewer,
+                        cfg,
                         &store,
                         available.as_ref(),
                         paths,
@@ -102,7 +106,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
                     ) {
                         if let Ok(bpin) = crate::provider_ref::Pin::parse(&backup_raw) {
                             provider = bpin.display();
-                            source = Some(crate::state::SeatSource::Backup);
+                            source = Some(takeover);
                             model = bpin.model.clone();
                             Some(bpin)
                         } else {
@@ -117,7 +121,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             } else {
                 None
             };
-        let id = if source == Some(crate::state::SeatSource::Backup) {
+        let id = if source.is_some_and(crate::state::SeatSource::is_backup) {
             if let Some(bpin) = backup_pin {
                 format!("review-{}-{}", i, sanitize_slot(&bpin.provider))
             } else {
@@ -231,22 +235,29 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             continue;
         }
         let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
-        if !cause.engages_backup() || slot_state.source == Some(crate::state::SeatSource::Backup) {
+        if !cause.engages_backup()
+            || slot_state
+                .source
+                .is_some_and(crate::state::SeatSource::is_backup)
+        {
             continue;
         }
         let backup_raw = match crate::backup::backup_for_role(SlotRole::Reviewer, idx, cfg) {
             Some(b) => b,
             None => continue,
         };
-        if !crate::backup::backup_eligible(
+        let source = match crate::backup::takeover(
             &backup_raw,
+            SlotRole::Reviewer,
+            cfg,
             &store,
             available.as_ref(),
             paths,
             state.dry_run,
         ) {
-            continue;
-        }
+            Some(source) => source,
+            None => continue,
+        };
         let cur_key = crate::provider_ref::ProviderRef::parse(&job.provider)
             .map(|r| r.storage_key())
             .unwrap_or_else(|_| job.provider.clone());
@@ -275,11 +286,12 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         if let Some(s) = state.slot_mut(&new_id) {
             new_slot_id = s.id.clone();
             s.point_at(&pin.display());
-            s.source = Some(crate::state::SeatSource::Backup);
+            s.source = Some(source);
         } else if let Some(s) = state.slot_mut(&job.slot_id) {
             s.point_at(&pin.display());
-            s.source = Some(crate::state::SeatSource::Backup);
+            s.source = Some(source);
         }
+        state.warn_unhealthy_pin(&pin.display(), Some(source));
         state.save(paths)?;
         let retry_job = SlotJob {
             slot_id: new_slot_id,

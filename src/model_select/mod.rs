@@ -47,7 +47,7 @@ pub fn resolve_providers(
     // No explicit `--providers`: a populated `[roles]` block satisfies the requirement,
     // synthesizing the fleet per role (precedence [roles] > [providers].order).
     if select.is_none() && !cfg.roles.is_empty() {
-        return synthesize_from_roles(n, roles, cfg);
+        return synthesize_from_roles(n, roles, cfg, dry);
     }
     let Some(select) = select else {
         bail!("--providers is required (or set a [roles] block, or pass --select <profile>, e.g. --select value)");
@@ -104,7 +104,12 @@ pub fn resolve_providers(
 /// provider per requested slot label, resolved through `provider_for` (the same
 /// precedence used everywhere else), so a populated `[roles]` satisfies the
 /// "`--providers` or `--select` is required" invariant.
-fn synthesize_from_roles(n: usize, roles: &[&str], cfg: &Config) -> Result<ResolvedProviders> {
+fn synthesize_from_roles(
+    n: usize,
+    roles: &[&str],
+    cfg: &Config,
+    dry: bool,
+) -> Result<ResolvedProviders> {
     if n == 0 {
         bail!("need at least one slot to select");
     }
@@ -130,6 +135,7 @@ fn synthesize_from_roles(n: usize, roles: &[&str], cfg: &Config) -> Result<Resol
             &[],
             crate::state::PoolOrigin::Synth,
             cfg,
+            dry,
         )
         .with_context(|| {
             format!(

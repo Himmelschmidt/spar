@@ -113,6 +113,7 @@ pub fn resolve_seat(
     pool: &[String],
     pool_origin: PoolOrigin,
     cfg: &Config,
+    dry: bool,
 ) -> Option<(String, SeatSource)> {
     // 1. CLI --role for this role always wins, even under an explicit pool (Bug B).
     if cfg.cli_role_keys.contains(role.as_config_key()) {
@@ -155,7 +156,9 @@ pub fn resolve_seat(
     }
     // 4. [providers].order last resort: reviewer keys by its own ordinal (so an unpinned
     // panel reads order[0], order[1], … regardless of pool width); singles key by pool
-    // position.
+    // position. Either way the rung scans forward for the first usable provider, so
+    // one Unhealthy entry yields to the next instead of refusing the whole launch.
+    // `dry` stays unprobed: `is_provider_usable` allows everything unprobed.
     let order_idx = if role == SlotRole::Reviewer {
         role_index
     } else {
@@ -163,7 +166,9 @@ pub fn resolve_seat(
     };
     cfg.providers
         .order
-        .get(order_idx)
+        .iter()
+        .skip(order_idx)
+        .find(|p| crate::providers::is_provider_usable(p, dry))
         .cloned()
         .map(|p| (p, SeatSource::ProvidersOrder))
 }
@@ -186,10 +191,13 @@ pub fn build_implement_seats(
     pool: &[String],
     pool_origin: PoolOrigin,
     projected: bool,
+    dry: bool,
     model_for: &dyn Fn(usize) -> Option<String>,
 ) -> Vec<FleetSeat> {
     let mut out = Vec::new();
-    if let Some((raw, source)) = resolve_seat(SlotRole::Implementer, 0, 0, pool, pool_origin, cfg) {
+    if let Some((raw, source)) =
+        resolve_seat(SlotRole::Implementer, 0, 0, pool, pool_origin, cfg, dry)
+    {
         let (provider, model) = split_model(&raw, model_for(0));
         out.push(FleetSeat {
             seat: "impl".into(),
@@ -203,7 +211,7 @@ pub fn build_implement_seats(
     for r in 0..panel_size(cfg) {
         let pool_index = r + 1;
         let Some((raw, source)) =
-            resolve_seat(SlotRole::Reviewer, pool_index, r, pool, pool_origin, cfg)
+            resolve_seat(SlotRole::Reviewer, pool_index, r, pool, pool_origin, cfg, dry)
         else {
             continue;
         };
@@ -232,10 +240,11 @@ pub fn resolve_seat_sources(
     pool: &[String],
     pool_origin: PoolOrigin,
     cfg: &Config,
+    dry: bool,
 ) -> Vec<SeatSource> {
     (0..count)
         .map(|i| {
-            resolve_seat(role, i, i, pool, pool_origin, cfg)
+            resolve_seat(role, i, i, pool, pool_origin, cfg, dry)
                 .map(|(_, s)| s)
                 .unwrap_or(SeatSource::Unknown)
         })
@@ -272,7 +281,8 @@ pub fn project_implement_fleet(
     run_id: Option<&str>,
 ) -> Vec<FleetSeat> {
     let width = pool_width(cfg);
-    let expanded = crate::providers::pick_providers(pool, width, Some(pool), dry);
+    let expanded =
+        crate::providers::pick_providers(pool, width, Some(pool), dry, pool_origin);
     let pool = if expanded.is_empty() { pool } else { &expanded };
     let art = match (paths, run_id) {
         (Some(paths), Some(run_id)) => crate::model_select::load_select_artifact(paths, run_id)
@@ -288,7 +298,7 @@ pub fn project_implement_fleet(
                 .and_then(|c| c.model.clone())
         })
     };
-    build_implement_seats(cfg, pool, pool_origin, true, &model_for)
+    build_implement_seats(cfg, pool, pool_origin, true, dry, &model_for)
 }
 
 /// The seats a NEW launch of `kind` would fill, for `--validate-only` (O147): the pool the
@@ -352,11 +362,17 @@ pub fn launch_fleet(
                 roles.push(SlotRole::TestAuthor.as_config_key());
             }
             let requested = resolve(roles.len(), &roles)?;
-            let pool =
-                crate::providers::pick_providers(&requested, roles.len(), Some(&requested), true);
+            let pool = crate::providers::pick_providers(
+                &requested,
+                roles.len(),
+                Some(&requested),
+                true,
+                origin,
+            );
             let mut out = Vec::new();
             for (idx, (role, prefix)) in specs.into_iter().enumerate() {
-                if let Some((raw, source)) = resolve_seat(role, idx, idx, &pool, origin, cfg) {
+                if let Some((raw, source)) = resolve_seat(role, idx, idx, &pool, origin, cfg, true)
+                {
                     let id = format!("{prefix}-{}", sanitize_slot(&raw));
                     out.push(seat(role, id, raw, source, false));
                 }
@@ -387,9 +403,16 @@ pub fn launch_fleet(
             };
             let roles: Vec<&str> = (0..n).map(|_| SlotRole::Reviewer.as_config_key()).collect();
             let requested = resolve(n, &roles)?;
-            let pool = crate::providers::pick_providers(&requested, n, Some(&requested), true);
-            let sources =
-                resolve_seat_sources(SlotRole::Reviewer, pool.len(), &requested, origin, cfg);
+            let pool =
+                crate::providers::pick_providers(&requested, n, Some(&requested), true, origin);
+            let sources = resolve_seat_sources(
+                SlotRole::Reviewer,
+                pool.len(),
+                &requested,
+                origin,
+                cfg,
+                true,
+            );
             let out = pool
                 .iter()
                 .enumerate()
@@ -414,12 +437,13 @@ mod tests {
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:codex".into()];
         assert_eq!(
-            resolve_seat(SlotRole::Reviewer, 1, 0, &[], PoolOrigin::Synth, &cfg).map(|(p, _)| p),
+            resolve_seat(SlotRole::Reviewer, 1, 0, &[], PoolOrigin::Synth, &cfg, true)
+                .map(|(p, _)| p),
             Some("cli:codex".into())
         );
         // Past the one-entry list: None, never [providers].order[1].
         assert_eq!(
-            resolve_seat(SlotRole::Reviewer, 2, 1, &[], PoolOrigin::Synth, &cfg),
+            resolve_seat(SlotRole::Reviewer, 2, 1, &[], PoolOrigin::Synth, &cfg, true),
             None
         );
     }
@@ -428,11 +452,11 @@ mod tests {
     fn unpinned_reviewer_uses_order_by_ordinal() {
         let cfg = Config::default();
         assert_eq!(
-            resolve_seat(SlotRole::Reviewer, 1, 0, &[], PoolOrigin::Synth, &cfg),
+            resolve_seat(SlotRole::Reviewer, 1, 0, &[], PoolOrigin::Synth, &cfg, true),
             Some(("cli:claude".into(), SeatSource::ProvidersOrder))
         );
         assert_eq!(
-            resolve_seat(SlotRole::Reviewer, 2, 1, &[], PoolOrigin::Synth, &cfg),
+            resolve_seat(SlotRole::Reviewer, 2, 1, &[], PoolOrigin::Synth, &cfg, true),
             Some(("cli:grok".into(), SeatSource::ProvidersOrder))
         );
     }
@@ -450,7 +474,8 @@ mod tests {
                 0,
                 &pool,
                 PoolOrigin::CliProviders,
-                &cfg
+                &cfg,
+                true
             ),
             Some(("cli:codex".into(), SeatSource::CliRole))
         );
@@ -468,7 +493,8 @@ mod tests {
                 0,
                 &pool,
                 PoolOrigin::CliProviders,
-                &cfg
+                &cfg,
+                true
             )
             .map(|(p, _)| p),
             Some("cli:explicit".into())

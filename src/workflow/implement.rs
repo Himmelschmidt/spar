@@ -260,6 +260,7 @@ fn repoint_existing_seats(state: &mut RunState, cfg: &Config) -> Result<()> {
         &pool,
         state.pool_origin,
         false,
+        false,
         &|_| None,
     );
     for seat in seats {
@@ -777,7 +778,13 @@ fn run_from_approved(
                 Vec::new()
             };
     }
-    state.providers = providers::pick_providers(&requested, n, Some(&requested), state.dry_run);
+    state.providers = providers::pick_providers(
+        &requested,
+        n,
+        Some(&requested),
+        state.dry_run,
+        state.pool_origin,
+    );
     // Quota gate is now backup-aware; it runs after seats are materialized.
     // A bare pool gate before prepare_implement_slots would see the pool entry as paused
     // and park, even though the seat's CLI pin would be covered by its backup.
@@ -928,7 +935,7 @@ fn prepare_implement_slots(
 
     let req = requested.unwrap_or_default();
     let n = crate::workflow::roles_resolve::pool_width(cfg);
-    state.providers = providers::pick_providers(req, n, Some(req), dry);
+    state.providers = providers::pick_providers(req, n, Some(req), dry, state.pool_origin);
     if state.providers.is_empty() {
         bail!("no usable providers (pass --providers, set a [roles] block, or --select)");
     }
@@ -954,6 +961,7 @@ fn prepare_implement_slots(
         &pool,
         pool_origin,
         false,
+        dry,
         &model_for,
     );
     if seats.iter().all(|s| s.role != SlotRole::Implementer) {
@@ -982,8 +990,10 @@ fn prepare_implement_slots(
                 0
             };
             if let Some(backup_raw) = crate::backup::backup_for_role(seat.role, ordinal, cfg) {
-                if crate::backup::backup_eligible(
+                if let Some(takeover) = crate::backup::takeover(
                     &backup_raw,
+                    seat.role,
+                    cfg,
                     &store,
                     available.as_ref(),
                     paths,
@@ -991,7 +1001,7 @@ fn prepare_implement_slots(
                 ) {
                     if let Ok(pin) = crate::provider_ref::Pin::parse(&backup_raw) {
                         provider = pin.display();
-                        source = crate::state::SeatSource::Backup;
+                        source = takeover;
                         model = pin.model.clone();
                         if seat.role == SlotRole::Reviewer {
                             seat_id = format!(
@@ -1879,7 +1889,8 @@ fn run_with_task(
     // via `run_from_approved`'s frozen-pool reuse, so it has to be recorded here too, not
     // just at the plan phase.
     state.pool_origin = pool_origin;
-    state.providers = providers::pick_providers(&requested, n, Some(&requested), dry);
+    state.providers =
+        providers::pick_providers(&requested, n, Some(&requested), dry, pool_origin);
     // Quota gate is now backup-aware and runs after seat resolution: a paused primary
     // with an eligible backup must not park the run.
     prepare_implement_slots(
@@ -2295,31 +2306,33 @@ pub fn execute_loop(
                         .unwrap();
                     let cause =
                         crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
-                    if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
+                    if cause.engages_backup()
+                        && !slot_state.source.is_some_and(SeatSource::is_backup)
+                    {
                         let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
                             .map(|r| r.storage_key())
                             .unwrap_or_else(|_| backup_raw.clone());
                         let cur_key = crate::provider_ref::ProviderRef::parse(&impl_slot.provider)
                             .map(|r| r.storage_key())
                             .unwrap_or_else(|_| impl_slot.provider.clone());
-                        if backup_key != cur_key
-                            && crate::backup::backup_eligible(
+                        if backup_key != cur_key {
+                            if let Some(source) = crate::backup::takeover(
                                 &backup_raw,
+                                SlotRole::Implementer,
+                                cfg,
                                 &store,
                                 available.as_ref(),
                                 paths,
                                 state.dry_run,
-                            )
-                        {
-                            if let Some(s) = state.slot_mut(&impl_job.slot_id) {
-                                let pin = crate::provider_ref::Pin::parse(&backup_raw)
-                                    .map(|p| p.display())
-                                    .unwrap_or(backup_raw.clone());
-                                s.point_at(&pin);
-                                s.source = Some(SeatSource::Backup);
-                            }
-                            state.save(paths)?;
-                            // Retry the implementer with backup in the same round
+                            ) {
+                                crate::backup::engage(
+                                    state,
+                                    paths,
+                                    &impl_job.slot_id,
+                                    &backup_raw,
+                                    source,
+                                )?;
+                                // Retry the implementer with backup in the same round
                             let retry_impl_slot = state
                                 .slots
                                 .iter()
@@ -2344,7 +2357,10 @@ pub fn execute_loop(
                                     executor::slot_parks_on_quota(state, &retry_job.slot_id);
                                 return fail(state, paths, e2, quota_hit2);
                             }
-                            // Retry succeeded, continue to review phase
+                                // Retry succeeded, continue to review phase
+                            } else {
+                                return fail(state, paths, e, quota_hit);
+                            }
                         } else {
                             return fail(state, paths, e, quota_hit);
                         }
@@ -2371,18 +2387,21 @@ pub fn execute_loop(
                     .unwrap();
                 let cause =
                     crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
-                if cause.engages_backup() {
+                if cause.engages_backup()
+                    && !slot_state.source.is_some_and(SeatSource::is_backup)
+                {
                     if let Some(backup_raw) =
                         crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
                     {
-                        if crate::backup::backup_eligible(
+                        if let Some(source) = crate::backup::takeover(
                             &backup_raw,
+                            SlotRole::Implementer,
+                            cfg,
                             &store,
                             available.as_ref(),
                             paths,
                             state.dry_run,
-                        ) && slot_state.source != Some(SeatSource::Backup)
-                        {
+                        ) {
                             let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
                                 .map(|r| r.storage_key())
                                 .unwrap_or_else(|_| backup_raw.clone());
@@ -2391,14 +2410,13 @@ pub fn execute_loop(
                                     .map(|r| r.storage_key())
                                     .unwrap_or_else(|_| impl_slot.provider.clone());
                             if backup_key != cur_key {
-                                if let Some(s) = state.slot_mut(&impl_job.slot_id) {
-                                    let pin = crate::provider_ref::Pin::parse(&backup_raw)
-                                        .map(|p| p.display())
-                                        .unwrap_or(backup_raw);
-                                    s.point_at(&pin);
-                                    s.source = Some(SeatSource::Backup);
-                                }
-                                state.save(paths)?;
+                                crate::backup::engage(
+                                    state,
+                                    paths,
+                                    &impl_job.slot_id,
+                                    &backup_raw,
+                                    source,
+                                )?;
                                 let retry_impl_slot = state
                                     .slots
                                     .iter()
@@ -3267,9 +3285,11 @@ fn move_seat_to_backup(
     paths: &SparPaths,
     slot_id: &str,
     backup_raw: &str,
+    source: SeatSource,
 ) -> Result<String> {
     let pin = crate::provider_ref::Pin::parse(backup_raw)?;
-    let id = move_seat(state, paths, slot_id, &pin, SeatSource::Backup)?;
+    let id = move_seat(state, paths, slot_id, &pin, source)?;
+    state.warn_unhealthy_pin(&pin.display(), Some(source));
     state.save(paths)?;
     Ok(id)
 }
@@ -3352,14 +3372,17 @@ fn recheck_seat(
     let backup = ordinal
         .and_then(|o| crate::backup::backup_for_role(slot.role, o, cfg))
         .filter(|b| crate::quota::sub_key(b) != sub)
-        .filter(|b| crate::backup::backup_eligible(b, &store, None, paths, state.dry_run));
-    let Some(backup_raw) = backup else {
+        .and_then(|b| {
+            crate::backup::takeover(&b, slot.role, cfg, &store, None, paths, state.dry_run)
+                .map(|source| (b, source))
+        });
+    let Some((backup_raw, source)) = backup else {
         return Ok(SeatCheck::Park(format!(
             "provider {key} is paused or on cooldown and `{slot_id}` has no eligible backup. \
              resume with `spar provider resume {key}` or reassign the role"
         )));
     };
-    let new_id = move_seat_to_backup(state, paths, slot_id, &backup_raw)?;
+    let new_id = move_seat_to_backup(state, paths, slot_id, &backup_raw, source)?;
     let note = format!("{key} is paused; `{new_id}` moved to its backup {backup_raw}");
     eprintln!("note: {note}");
     let _ = crate::events::append(
@@ -3412,25 +3435,21 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                             == backup_key
                     });
                     if !used_contains_backup
-                        && crate::backup::backup_eligible(
+                        && !slot_state.source.is_some_and(SeatSource::is_backup)
+                    {
+                        if let Some(source) = crate::backup::takeover(
                             &backup_raw,
+                            SlotRole::Implementer,
+                            cfg,
                             &store,
                             available_opt.as_ref(),
                             paths,
                             state.dry_run,
-                        )
-                        && slot_state.source != Some(SeatSource::Backup)
-                    {
-                        let backup_pin = crate::provider_ref::Pin::parse(&backup_raw)
-                            .map(|p| p.display())
-                            .unwrap_or(backup_raw.clone());
-                        let impl_id = slot_state.id.clone();
-                        if let Some(s) = state.slot_mut(&impl_id) {
-                            s.point_at(&backup_pin);
-                            s.source = Some(SeatSource::Backup);
+                        ) {
+                            let impl_id = slot_state.id.clone();
+                            crate::backup::engage(state, paths, &impl_id, &backup_raw, source)?;
+                            return Ok(true);
                         }
-                        state.save(paths)?;
-                        return Ok(true);
                     }
                 }
                 return Ok(false);
@@ -3460,6 +3479,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
         &state.providers,
         state.pool_origin,
         cfg,
+        state.dry_run,
     );
     let next = cfg
         .roles
@@ -3559,6 +3579,7 @@ fn try_widen_reviewers(
         &state.providers,
         state.pool_origin,
         cfg,
+        state.dry_run,
     );
     let candidate = state
         .providers
@@ -3624,13 +3645,24 @@ fn try_rotate_reviewer_provider(
     };
     let cur = slot.provider.clone();
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-    if infra && slot.source != Some(SeatSource::Backup) {
+    if infra && !slot.source.is_some_and(SeatSource::is_backup) {
         let backup = reviewer_ordinal(rev_id)
             .and_then(|o| crate::backup::backup_for_role(SlotRole::Reviewer, o, cfg))
             .filter(|b| crate::quota::sub_key(b) != crate::quota::sub_key(&cur))
-            .filter(|b| crate::backup::backup_eligible(b, &store, None, paths, state.dry_run));
-        if let Some(raw) = backup {
-            let id = move_seat_to_backup(state, paths, rev_id, &raw)?;
+            .and_then(|b| {
+                crate::backup::takeover(
+                    &b,
+                    SlotRole::Reviewer,
+                    cfg,
+                    &store,
+                    None,
+                    paths,
+                    state.dry_run,
+                )
+                .map(|source| (b, source))
+            });
+        if let Some((raw, source)) = backup {
+            let id = move_seat_to_backup(state, paths, rev_id, &raw, source)?;
             if let Some(s) = state.slot_mut(&id) {
                 s.cwd = Some(review_cwd.to_path_buf());
             }

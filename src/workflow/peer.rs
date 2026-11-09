@@ -38,7 +38,8 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     }
     let requested = opts.resolve_pool(2, &["implementer", "implementer"], paths, cfg, &state.id)?;
     state.pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
-    state.providers = providers::pick_providers(&requested, 2, Some(&requested), dry);
+    state.providers =
+        providers::pick_providers(&requested, 2, Some(&requested), dry, state.pool_origin);
     if state.providers.is_empty() {
         state.error = Some("no usable providers".into());
         state.set_phase(Phase::Failed);
@@ -68,6 +69,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         &state.providers,
         state.pool_origin,
         cfg,
+        dry,
     );
     let mut slot_a = executor::init_slot(&id_a, &a, SlotRole::Peer);
     slot_a.source = sources.first().copied();

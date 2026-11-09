@@ -625,6 +625,10 @@ pub enum SeatSource {
     ModelSelect,
     SuitePreferences,
     Backup,
+    /// A `--backup` CLI entry that took the seat. Unlike a `[backups]` file entry,
+    /// naming it is an explicit pin: it dispatches despite `Unhealthy` readiness
+    /// and warns at launch, the same contract as `--providers` / `--role`.
+    CliBackup,
     /// The operator moved this seat to another provider with `implement --reassign`
     /// (O136). A `--reload-config` re-point leaves it alone.
     Reassigned,
@@ -635,12 +639,19 @@ pub enum SeatSource {
 }
 
 impl SeatSource {
-    /// Named by an explicit seat pin (`--providers`, `--role`): the seat
-    /// dispatches despite probe-failed readiness and warns at launch instead.
-    /// A declared `--backup` is fallback, not a pin: rotation skips it while it
-    /// is `Unhealthy` and the run stays on the primary.
+    /// Named by an explicit seat pin (`--providers`, `--role`, `--backup` on the
+    /// CLI): the seat dispatches despite probe-failed readiness and warns at
+    /// launch instead. A `[backups]` file entry is fallback, not a pin: rotation
+    /// skips it while it is `Unhealthy` and the run stays on the primary.
     pub fn is_explicit_pin(self) -> bool {
-        matches!(self, SeatSource::CliProviders | SeatSource::CliRole)
+        matches!(
+            self,
+            SeatSource::CliProviders | SeatSource::CliRole | SeatSource::CliBackup
+        )
+    }
+
+    pub fn is_backup(self) -> bool {
+        matches!(self, SeatSource::Backup | SeatSource::CliBackup)
     }
 }
 

@@ -12,6 +12,7 @@ pub mod presence;
 pub mod usage;
 
 use crate::provider_ref::{ExecBackend, ProviderRef};
+use crate::state::PoolOrigin;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -907,17 +908,22 @@ pub fn pick_providers(
     n: usize,
     requested: Option<&[String]>,
     allow_missing: bool,
+    pool_origin: PoolOrigin,
 ) -> Vec<String> {
     let allow_missing = allow_missing || crate::util::env_truthy("SPAR_DRY_RUN");
     let base = if let Some(req) = requested {
-        // Explicit pins survive a failed readiness probe: they still dispatch,
-        // with a launch warning. Only unknown names and (live) missing binaries
-        // are dropped here; auto-selection health-gating lives in
-        // `available_providers` / `is_provider_usable`.
-        req.iter()
-            .filter(|n| is_provider_present(n, allow_missing))
-            .filter_map(|n| ProviderRef::parse(n).ok().map(|p| p.display()))
-            .collect::<Vec<_>>()
+        // Only a real `--providers` pin survives a failed readiness probe here:
+        // it still dispatches, with a launch warning. A `--select` pool or a
+        // synthesized pool is a constrained auto-pick, health-gated like any
+        // other. Dry runs stay unprobed and allow everything.
+        if matches!(pool_origin, PoolOrigin::CliProviders) || allow_missing {
+            req.iter()
+                .filter(|n| is_provider_present(n, allow_missing))
+                .filter_map(|n| ProviderRef::parse(n).ok().map(|p| p.display()))
+                .collect::<Vec<_>>()
+        } else {
+            available_providers(req)
+        }
     } else if allow_missing {
         if order.is_empty() {
             vec!["cli:claude".into(), "cli:grok".into(), "cli:agy".into()]
@@ -993,6 +999,7 @@ mod tests {
             2,
             Some(&["api:openai".into(), "cli:grok".into()]),
             true,
+            PoolOrigin::CliProviders,
         );
         assert_eq!(picked.len(), 2);
         assert_eq!(picked[0], "api:openai");
@@ -1009,6 +1016,7 @@ mod tests {
                 "api:openai@gpt-5".into(),
             ]),
             true,
+            PoolOrigin::CliProviders,
         );
         assert_eq!(picked.len(), 2);
         assert_eq!(picked[0], "cli:codex@openai/gpt-4o-mini");
