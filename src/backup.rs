@@ -89,12 +89,22 @@ pub fn scrape_auth_signal(text: &str) -> Option<String> {
         .map(|l| l.trim().chars().take(300).collect())
 }
 
+/// The quota key a seat on `provider` reads: the seat's own bucket when the
+/// ref names one (`cli:codex@openrouter`, `api:openai@gpt-5`), else the login.
+/// Eligibility, backup probing and rotation all resolve through this one
+/// function so a paused bucket benches only its own seats (O153).
+fn seat_quota_key(provider: &str) -> String {
+    crate::provider_ref::ProviderRef::parse(provider)
+        .map(|pref| pref.quota_key())
+        .unwrap_or_else(|_| crate::quota::quota_key(provider))
+}
+
 pub fn is_provider_eligible(
     provider: &str,
     store: &QuotaStore,
     available: Option<&std::collections::HashSet<String>>,
 ) -> bool {
-    let key = crate::quota::quota_key(provider);
+    let key = seat_quota_key(provider);
     if !store.is_usable(&key) {
         return false;
     }
@@ -129,7 +139,7 @@ pub fn backup_eligible(
     if is_provider_eligible(backup, store, available) {
         return true;
     }
-    let key = crate::quota::quota_key(backup);
+    let key = seat_quota_key(backup);
     if dry || !store.is_quota_paused(&key) {
         return false;
     }
@@ -321,6 +331,39 @@ mod tests {
         assert_eq!(
             dispatch_stop_cause(&slot, &store, None),
             StopCause::Environmental
+        );
+    }
+
+    #[test]
+    fn bucket_pause_benches_only_its_own_route() {
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:codex@openrouter", "test");
+        assert!(
+            !is_provider_eligible("cli:codex@openai/gpt-5", &store, None),
+            "the OpenRouter route is benched"
+        );
+        assert!(
+            is_provider_eligible("cli:codex@gpt-5.2-codex", &store, None),
+            "a native seat keeps running while the OpenRouter bucket is paused"
+        );
+        assert!(
+            is_provider_eligible("cli:grok@grok-4-1-fast", &store, None),
+            "another login is unaffected"
+        );
+    }
+
+    #[test]
+    fn api_pause_benches_only_its_own_model() {
+        let mut store = QuotaStore::default();
+        store.pause_quota("api:openai@gpt-5", "test");
+        assert!(!is_provider_eligible("api:openai@gpt-5", &store, None));
+        assert!(
+            is_provider_eligible("api:openai@gpt-4o", &store, None),
+            "another model on the same api login keeps running"
+        );
+        assert!(
+            is_provider_eligible("api:openai", &store, None),
+            "a model-less api seat keys the login, not the paused model"
         );
     }
 
