@@ -2381,13 +2381,15 @@ pub fn execute_loop(
                                     effort: None,
                                 };
                                 if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
-                                    handle_retry_err(
+                                    if !handle_retry_err(
                                         state,
                                         paths,
                                         &retry_job.slot_id,
                                         e2,
                                         &mut ceiling_partial_note,
-                                    )?;
+                                    )? {
+                                        return Ok(());
+                                    }
                                 }
                                 // Retry succeeded, continue to review phase
                             } else {
@@ -2477,13 +2479,15 @@ pub fn execute_loop(
                                     if let Err(e2) =
                                         executor::run_slot(state, paths, cfg, &retry_job)
                                     {
-                                        handle_retry_err(
+                                        if !handle_retry_err(
                                             state,
                                             paths,
                                             &retry_job.slot_id,
                                             e2,
                                             &mut ceiling_partial_note,
-                                        )?;
+                                        )? {
+                                            return Ok(());
+                                        }
                                     }
                                 } else {
                                     return fail(state, paths, e, quota_hit);
@@ -3340,18 +3344,24 @@ fn try_commit_ceiling_partial(
 
 /// A backup-retry implementer dispatch failed. A ceiling-cut partial round goes on
 /// like the primary dispatch's; anything else fails the run with its quota routing.
+/// Returns whether the loop falls through to the review phase: a recorded ceiling
+/// partial continues, while a park or hard failure already ended the loop inside
+/// `fail` and the caller must return from the loop function (the pre-factor code
+/// did that with a bare `return`, which `?` alone cannot reproduce).
 fn handle_retry_err(
     state: &mut RunState,
     paths: &SparPaths,
     slot_id: &str,
     err: anyhow::Error,
     note_out: &mut Option<String>,
-) -> Result<()> {
+) -> Result<bool> {
     if let Some(note) = try_commit_ceiling_partial(state, paths, slot_id) {
-        record_ceiling_partial(state, paths, slot_id, note, note_out)
+        record_ceiling_partial(state, paths, slot_id, note, note_out)?;
+        Ok(true)
     } else {
         let quota_hit = executor::slot_parks_on_quota(state, slot_id);
-        fail(state, paths, err, quota_hit)
+        fail(state, paths, err, quota_hit)?;
+        Ok(false)
     }
 }
 
