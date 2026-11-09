@@ -3231,13 +3231,109 @@ fn reviewer_cwd(
 
 /// The panel position a reviewer seat id encodes (`review-1-cli-codex` is 1), which is
 /// the index into `[backups].reviewer`. `None` for ids that carry none (`review-cli-grok-wide`).
-fn reviewer_ordinal(slot_id: &str) -> Option<usize> {
+pub(crate) fn reviewer_ordinal(slot_id: &str) -> Option<usize> {
     slot_id
         .strip_prefix("review-")?
         .split('-')
         .next()?
         .parse()
         .ok()
+}
+
+/// A panel seat id (never a widened extra) with this panel ordinal.
+fn panel_seat_with_ordinal(state: &RunState, ordinal: usize) -> Option<String> {
+    state
+        .slots
+        .iter()
+        .filter(|s| s.role == SlotRole::Reviewer && !s.id.ends_with("-wide"))
+        .find(|s| reviewer_ordinal(&s.id) == Some(ordinal))
+        .map(|s| s.id.clone())
+}
+
+/// Drop reviewer seats by panel ordinal (`--without reviewer[N]`): remove the
+/// matching state slots, prune their review history so the ship gate and review
+/// history stop counting that seat's open findings, delete the seats' verdict
+/// artifacts, and renumber the higher remaining seats down so ordinals (and the
+/// per-ordinal backups behind them) stay contiguous. Returns the removed slot ids.
+pub(crate) fn drop_reviewer_seats(
+    state: &mut RunState,
+    paths: &SparPaths,
+    ordinals: &[usize],
+) -> Result<Vec<String>> {
+    let mut removed: Vec<String> = Vec::new();
+    let mut gone: Vec<usize> = ordinals.to_vec();
+    gone.sort_unstable();
+    gone.dedup();
+    for ordinal in gone.iter().rev() {
+        let Some(slot_id) = panel_seat_with_ordinal(state, *ordinal) else {
+            continue;
+        };
+        crate::markers::clear_pid(paths, &state.id, &slot_id);
+        for name in [
+            format!("review-{slot_id}.md"),
+            format!("review-{slot_id}.json"),
+        ] {
+            let path = paths.artifact(&state.id, &name);
+            if path.is_file() {
+                std::fs::remove_file(&path)?;
+            }
+        }
+        state.review_history.retain(|e| e.slot_id != slot_id);
+        state.slots.retain(|s| s.id != slot_id);
+        removed.push(slot_id);
+    }
+    if removed.is_empty() {
+        return Ok(removed);
+    }
+    // Close ranks: rename higher remaining seats down over the gaps.
+    let mut renames: Vec<(String, String)> = Vec::new();
+    for slot in state
+        .slots
+        .iter()
+        .filter(|s| s.role == SlotRole::Reviewer && !s.id.ends_with("-wide"))
+    {
+        let Some(current) = reviewer_ordinal(&slot.id) else {
+            continue;
+        };
+        let target = current - gone.iter().filter(|g| **g < current).count();
+        if target != current {
+            let prefix = format!("review-{current}-");
+            let Some(rest) = slot.id.strip_prefix(&prefix) else {
+                continue;
+            };
+            let new_id = format!("review-{target}-{rest}");
+            if state.slots.iter().any(|s| s.id == new_id) {
+                anyhow::bail!(
+                    "cannot drop reviewer seat: rename {} to {new_id} collides with an existing seat",
+                    slot.id
+                );
+            }
+            renames.push((slot.id.clone(), new_id));
+        }
+    }
+    renames.sort_by(|a, b| {
+        reviewer_ordinal(&a.0)
+            .unwrap_or(0)
+            .cmp(&reviewer_ordinal(&b.0).unwrap_or(0))
+    });
+    for (old, new) in renames {
+        state.rename_slot(paths, &old, &new);
+        // History entries name seats by id: point them at the new id too, so a
+        // later drop prunes them and the gate stops counting them either way.
+        for e in state.review_history.iter_mut() {
+            if e.slot_id == old {
+                e.slot_id = new.clone();
+            }
+        }
+        for ext in ["md", "json"] {
+            let from = paths.artifact(&state.id, &format!("review-{old}.{ext}"));
+            let to = paths.artifact(&state.id, &format!("review-{new}.{ext}"));
+            if from.is_file() && !to.exists() {
+                std::fs::rename(&from, &to)?;
+            }
+        }
+    }
+    Ok(removed)
 }
 
 /// Put another provider in a seat. A reviewer seat is renamed to name its new vendor

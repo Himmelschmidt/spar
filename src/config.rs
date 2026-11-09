@@ -58,6 +58,15 @@ pub struct Config {
     /// Role config keys assigned via CLI `--backup` for this run. Parallel to `cli_role_keys`.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub cli_backup_keys: std::collections::BTreeSet<String>,
+    /// CLI `--effort` keys by role name, mirroring `cli_role_keys`, so a later
+    /// `--reload-config` keeps launch levels instead of re-reading `[effort]`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub cli_effort_keys: std::collections::BTreeSet<String>,
+    /// Channels dropped by CLI `--without critic|spec|suite` (or by the `--fleet small`
+    /// preset's own shutdowns), so a later `--reload-config` re-applies the drops
+    /// instead of resurrecting the seats from the file.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub cli_without: std::collections::BTreeSet<String>,
     /// `--fleet small`'s reviewer panel width override (feature 011). `None` leaves
     /// panel sizing to `[roles].reviewer` / `DEFAULT_REVIEWERS` as usual. A CLI `--role
     /// reviewer=…` panel always outranks this — see `roles_resolve::panel_size`.
@@ -1004,6 +1013,27 @@ impl FleetPreset {
     }
 }
 
+/// Parse a reviewer-seat `--without` item into its panel ordinal: `reviewer[N]`
+/// (0-based). Anything else starting with `review-` is an existing run's seat id,
+/// which the caller resolves first; anything else is not a seat at all.
+pub fn parse_reviewer_without(item: &str) -> Result<usize> {
+    const VALID: &str = "critic, spec, suite, reviewer[N]";
+    if let Some(inner) = item
+        .strip_prefix("reviewer[")
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        return inner.parse::<usize>().map_err(|_| {
+            anyhow::anyhow!("--without {item:?}: bad reviewer ordinal (valid: {VALID})")
+        });
+    }
+    if item.starts_with("review-") {
+        anyhow::bail!(
+            "--without {item:?}: seat ids name slots of an existing run; pass --run <id> (or drop the seat by ordinal as reviewer[N])"
+        );
+    }
+    anyhow::bail!("--without {item:?}: unknown seat (valid: {VALID})")
+}
+
 /// Acceptance gate policy. Review *timeouts* stay at `[timeouts].review_secs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewConfig {
@@ -1188,6 +1218,8 @@ impl Default for Config {
             backups: BackupsConfig::default(),
             effort: EffortConfig::default(),
             cli_backup_keys: std::collections::BTreeSet::new(),
+            cli_effort_keys: std::collections::BTreeSet::new(),
+            cli_without: std::collections::BTreeSet::new(),
             review: ReviewConfig::default(),
             spec: SpecConfig::default(),
             critic: CriticConfig::default(),
@@ -1603,6 +1635,8 @@ impl Config {
                 .parse()
                 .with_context(|| format!("invalid effort in --effort {role}: {level:?}"))?;
             let canonical = parsed.as_str().to_string();
+            self.cli_effort_keys
+                .insert(slot.as_config_key().to_string());
             match slot {
                 crate::state::SlotRole::Planner => self.effort.planner = Some(canonical),
                 crate::state::SlotRole::PlanCritic => self.effort.plan_critic = Some(canonical),
@@ -1812,20 +1846,146 @@ impl Config {
     /// `spar.toml`. Unlike `[roles]` overrides, dropping the plan critic has no config
     /// knob before feature 011 (an absent `[roles].plan_critic` still falls back to
     /// `[providers].order`), which is why `[critic].enabled` exists at all.
-    pub fn apply_without(&mut self, names: &[String]) -> Result<()> {
-        const VALID: [&str; 3] = ["critic", "spec", "suite"];
+    /// `--without` drops seats from the fleet. `critic`, `spec` and `suite` drop whole
+    /// channels; `reviewer[N]` drops the Nth seat (0-based) of the reviewer panel, and
+    /// any other `review-*` id is an existing run's seat, resolved to its ordinal by
+    /// the caller (seat ids name slots of a run, so a fresh run cannot take them).
+    /// Returns the dropped reviewer ordinals, descending, so the caller can reap the
+    /// matching state slots.
+    pub fn apply_without(&mut self, names: &[String]) -> Result<Vec<usize>> {
+        let mut ordinals: Vec<(String, usize)> = Vec::new();
         for raw in names {
-            match raw.trim() {
+            let item = raw.trim();
+            match item {
+                "critic" => {
+                    self.critic.enabled = false;
+                    self.cli_without.insert("critic".to_string());
+                }
+                "spec" => {
+                    self.spec.enabled = false;
+                    self.cli_without.insert("spec".to_string());
+                }
+                "suite" => {
+                    self.suite.enabled = false;
+                    self.cli_without.insert("suite".to_string());
+                }
+                other => {
+                    ordinals.push((raw.trim().to_string(), parse_reviewer_without(other)?));
+                }
+            }
+        }
+        ordinals.sort_by_key(|(_, n)| *n);
+        ordinals.dedup_by_key(|(_, n)| *n);
+        if !ordinals.is_empty() {
+            self.materialize_reviewer_panel()?;
+            for (item, ordinal) in &ordinals {
+                if *ordinal >= self.roles.reviewer.len() {
+                    anyhow::bail!(
+                        "--without {item}: only {} reviewer seat(s) on the panel (0-based, so the last is reviewer[{}])",
+                        self.roles.reviewer.len(),
+                        self.roles.reviewer.len().saturating_sub(1)
+                    );
+                }
+            }
+            // Descending, so each removal names a seat of the panel the operator saw.
+            for (_, ordinal) in ordinals.iter().rev() {
+                self.roles.reviewer.remove(*ordinal);
+                if *ordinal < self.backups.reviewer.len() {
+                    self.backups.reviewer.remove(*ordinal);
+                }
+            }
+            self.cli_role_keys.insert("reviewer".to_string());
+        }
+        Ok(ordinals.into_iter().map(|(_, n)| n).rev().collect())
+    }
+
+    /// Pin the operator-visible reviewer panel onto `roles.reviewer` when it is not
+    /// pinned yet, so an ordinal drop has a list to index. Mirrors panel sizing for
+    /// the unpinned case (the `--fleet small` width, else the default width, off the
+    /// provider order).
+    fn materialize_reviewer_panel(&mut self) -> Result<()> {
+        if !self.roles.reviewer.is_empty() || self.cli_role_keys.contains("reviewer") {
+            return Ok(());
+        }
+        let width = self
+            .fleet_reviewer_override
+            .unwrap_or(crate::workflow::roles_resolve::DEFAULT_REVIEWERS);
+        self.roles.reviewer = self
+            .providers
+            .order
+            .iter()
+            .take(width.min(self.providers.order.len()))
+            .cloned()
+            .collect();
+        if self.roles.reviewer.is_empty() {
+            anyhow::bail!(
+                "--without reviewer[N]: the run has no reviewer panel to index (pin one with --role reviewer=... first)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Re-apply the overrides the run was launched or amended with onto a freshly
+    /// loaded file config, so `--reload-config` picks up file edits without losing
+    /// anything given on the command line. Composition mirrors launch order
+    /// (preset, without, role): role pins land first, the suite pin next, and the
+    /// recorded channel drops last, so a recorded `--without suite` still wins over
+    /// a carried suite command.
+    pub fn reapply_cli_overrides(&mut self, frozen: &Config) {
+        for key in &frozen.cli_role_keys {
+            match key.as_str() {
+                "planner" => self.roles.planner = frozen.roles.planner.clone(),
+                "plan_critic" => self.roles.plan_critic = frozen.roles.plan_critic.clone(),
+                "implementer" => self.roles.implementer = frozen.roles.implementer.clone(),
+                "reviewer" => self.roles.reviewer.clone_from(&frozen.roles.reviewer),
+                "tester" => self.roles.tester = frozen.roles.tester.clone(),
+                "test_author" => self.roles.test_author = frozen.roles.test_author.clone(),
+                _ => {}
+            }
+        }
+        self.cli_role_keys
+            .extend(frozen.cli_role_keys.iter().cloned());
+        for key in &frozen.cli_backup_keys {
+            match key.as_str() {
+                "planner" => self.backups.planner = frozen.backups.planner.clone(),
+                "plan_critic" => self.backups.plan_critic = frozen.backups.plan_critic.clone(),
+                "implementer" => {
+                    self.backups.implementer = frozen.backups.implementer.clone();
+                }
+                "reviewer" => self.backups.reviewer.clone_from(&frozen.backups.reviewer),
+                "tester" => self.backups.tester = frozen.backups.tester.clone(),
+                "test_author" => {
+                    self.backups.test_author = frozen.backups.test_author.clone();
+                }
+                _ => {}
+            }
+        }
+        self.cli_backup_keys
+            .extend(frozen.cli_backup_keys.iter().cloned());
+        for key in &frozen.cli_effort_keys {
+            match key.as_str() {
+                "planner" => self.effort.planner = frozen.effort.planner.clone(),
+                "plan_critic" => self.effort.plan_critic = frozen.effort.plan_critic.clone(),
+                "implementer" => self.effort.implementer = frozen.effort.implementer.clone(),
+                "reviewer" => self.effort.reviewer = frozen.effort.reviewer.clone(),
+                "tester" => self.effort.tester = frozen.effort.tester.clone(),
+                "test_author" => self.effort.test_author = frozen.effort.test_author.clone(),
+                _ => {}
+            }
+        }
+        self.cli_effort_keys
+            .extend(frozen.cli_effort_keys.iter().cloned());
+        self.fleet_reviewer_override = frozen.fleet_reviewer_override;
+        self.carry_cli_suite_command(frozen);
+        for channel in &frozen.cli_without {
+            match channel.as_str() {
                 "critic" => self.critic.enabled = false,
                 "spec" => self.spec.enabled = false,
                 "suite" => self.suite.enabled = false,
-                other => anyhow::bail!(
-                    "--without {other:?}: unknown seat (valid: {})",
-                    VALID.join(", ")
-                ),
+                _ => {}
             }
         }
-        Ok(())
+        self.cli_without.extend(frozen.cli_without.iter().cloned());
     }
 
     /// `--suite-command <cmd>` (repeatable): this run's deterministic suite, replacing
@@ -1874,13 +2034,16 @@ impl Config {
             FleetPreset::Standard => {}
             FleetPreset::Small => {
                 self.critic.enabled = false;
+                self.cli_without.insert("critic".to_string());
                 self.spec.enabled = false;
+                self.cli_without.insert("spec".to_string());
                 self.fleet_reviewer_override = Some(1);
                 // A configured deterministic `[suite].command` is free and stays on —
                 // `SuiteConfig::is_builtin` already never spawns a tester slot for it.
                 // Only the agent tester (no command configured) is worth dropping.
                 if self.suite.command.is_empty() {
                     self.suite.enabled = false;
+                    self.cli_without.insert("suite".to_string());
                 }
             }
         }

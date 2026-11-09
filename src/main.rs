@@ -1336,88 +1336,189 @@ fn implement_ctx(
         cfg.apply_suite_command(suite_command, without)?;
         return Ok((paths, cfg));
     };
-    if !reload_config {
-        if !role.is_empty() {
-            anyhow::bail!(
-                "run {run_id} is bound to the config it was created with; \
-                 pass --reload-config to apply --role to it"
-            );
-        }
-        if !backup.is_empty() {
-            anyhow::bail!(
-                "run {run_id} is bound to the config it was created with; \
-                 pass --reload-config to apply --backup to it"
-            );
-        }
-        if !effort.is_empty() {
-            anyhow::bail!(
-                "run {run_id} is bound to the config it was created with; \
-                 pass --reload-config to apply --effort to it"
-            );
-        }
-        if !without.is_empty() {
-            anyhow::bail!(
-                "run {run_id} is bound to the config it was created with; \
-                 pass --reload-config to apply --without to it"
-            );
-        }
-        if !suite_command.is_empty() {
-            anyhow::bail!(
-                "run {run_id} is bound to the config it was created with; \
-                 pass --reload-config to apply --suite-command to it"
-            );
-        }
-        if let Some(preset) = fleet {
-            // Validate before refusing: an unknown preset name is its own error, not
-            // one the `--reload-config` refusal should swallow. `standard` is a
-            // documented no-op over the file (never re-enables a channel the file
-            // already disabled), so it never needs to change a bound run's frozen
-            // config and must not be refused just for being spelled out.
-            if config::FleetPreset::parse(preset)? != config::FleetPreset::Standard {
-                anyhow::bail!(
-                    "run {run_id} is bound to the config it was created with; \
-                     pass --reload-config to apply --fleet to it"
-                );
-            }
-        }
-        let cfg = Config::for_run(&paths, run_id)?;
-        return Ok((paths, cfg));
+    // `--suite-command` still needs `--reload-config`: it replaces the run's
+    // deterministic suite, a file-shaped change rather than an amendment. The seat
+    // shapers (`--role`, `--backup`, `--effort`, `--without`, `--fleet`) amend the
+    // frozen config in place.
+    if !suite_command.is_empty() && !reload_config {
+        anyhow::bail!(
+            "run {run_id} is bound to the config it was created with; \
+             pass --reload-config to apply --suite-command to it"
+        );
     }
-    // Before the flags, so this invocation's `--without suite` or `--suite-command`
-    // still wins over the carried pin.
+    if recapture_env && !reload_config {
+        anyhow::bail!("--recapture-env needs --reload-config");
+    }
     let frozen = Config::for_run(&paths, run_id)?;
-    cfg.carry_cli_suite_command(&frozen);
-    // A reload re-reads the file, not the shell: the environment stays the one the run
-    // was created in, and only a name newly added to `[env].capture` is taken from now.
-    // `--recapture-env` is the deliberate exception: this shell's values replace them.
-    if !recapture_env {
-        for (k, v) in frozen.env.captured {
-            if cfg.env.capture.contains(&k) {
-                cfg.env.captured.insert(k, v);
+    // `--fleet standard` is a documented no-op (never re-enables a channel the
+    // file disabled), so spelling it out neither amends nor needs the
+    // orchestrator check. An unknown preset name stays a hard error here, not
+    // something a later refusal swallows.
+    let fleet_amends = match fleet {
+        Some(preset) => config::FleetPreset::parse(preset)? != config::FleetPreset::Standard,
+        None => false,
+    };
+    if !reload_config
+        && role.is_empty()
+        && backup.is_empty()
+        && effort.is_empty()
+        && without.is_empty()
+        && !fleet_amends
+    {
+        return Ok((paths, frozen));
+    }
+    // Seat-id `--without` items name slots of this run; resolve them to panel
+    // ordinals against the run's state before the config layer sees them.
+    let without_owned: Vec<String>;
+    let without: &[String] = if without.iter().any(|w| {
+        let item = w.trim();
+        !matches!(item, "critic" | "spec" | "suite")
+            && config::parse_reviewer_without(item).is_err()
+    }) {
+        let st = state::RunState::load(&paths, run_id)?;
+        without_owned = resolve_without_seat_ids(&st, without, run_id)?;
+        &without_owned
+    } else {
+        without
+    };
+    // `cfg` holds the live file config. A reload carries the overrides the run was
+    // launched or amended with, so nothing given then is lost unless this
+    // invocation restates it differently; an amend starts from the snapshot itself.
+    // Before the flags either way, so this invocation's `--without suite` or
+    // `--suite-command` still wins over the carried pin.
+    let mut cfg = if reload_config {
+        cfg.reapply_cli_overrides(&frozen);
+        // A reload re-reads the file, not the shell: the environment stays the one
+        // the run was created in, and only a name newly added to `[env].capture` is
+        // taken from now. `--recapture-env` is the deliberate exception: this
+        // shell's values replace them.
+        if !recapture_env {
+            for (k, v) in frozen.env.captured {
+                if cfg.env.capture.contains(&k) {
+                    cfg.env.captured.insert(k, v);
+                }
             }
         }
+        cfg
+    } else {
+        frozen
+    };
+    if !reload_config
+        && cfg.roles.reviewer.is_empty()
+        && without
+            .iter()
+            .any(|w| config::parse_reviewer_without(w.trim()).is_ok())
+    {
+        // An ordinal drop indexes the run's own panel, not a fresh draw from the
+        // provider order: the implementer seat already consumed the head of the
+        // order at launch. Pre-pin from the live slots so the config drop and
+        // the seat surgery below index the same panel.
+        let st = state::RunState::load(&paths, run_id)?;
+        let mut panel: Vec<(usize, String)> = st
+            .slots
+            .iter()
+            .filter(|s| s.role == state::SlotRole::Reviewer)
+            .filter_map(|s| {
+                workflow::implement::reviewer_ordinal(&s.id)
+                    .map(|o| (o, s.provider_ref().display()))
+            })
+            .collect();
+        panel.sort_by_key(|(o, _)| *o);
+        cfg.roles.reviewer = panel.into_iter().map(|(_, p)| p).collect();
     }
     if let Some(preset) = fleet {
         cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
     }
-    cfg.apply_without(without)?;
+    let dropped_reviewers = cfg.apply_without(without)?;
     cfg.apply_role_overrides(role)?;
     cfg.apply_backup_overrides(backup)?;
     cfg.apply_effort_overrides(effort)?;
     if let Some(owner) = runlock::RunLock::owner(&paths, run_id).filter(|o| o.alive()) {
-        return Err(runlock::OrchestratorBusy {
-            run_id: run_id.to_string(),
-            owner_pid: owner.pid,
+        if reload_config {
+            return Err(runlock::OrchestratorBusy {
+                run_id: run_id.to_string(),
+                owner_pid: owner.pid,
+            }
+            .into());
         }
-        .into());
+        anyhow::bail!(
+            "refusing to amend run {run_id}'s config while its orchestrator (pid {}) is alive; \
+             stop it first (spar stop {run_id})",
+            owner.pid
+        );
     }
     cfg.apply_suite_command(suite_command, without)?;
     if !persist {
         return Ok((paths, cfg));
     }
+    if !dropped_reviewers.is_empty() {
+        let mut st = state::RunState::load(&paths, run_id)?;
+        let removed =
+            workflow::implement::drop_reviewer_seats(&mut st, &paths, &dropped_reviewers)?;
+        if !removed.is_empty() {
+            let _ = events::append(
+                &paths,
+                run_id,
+                &events::Event::info(format!(
+                    "--without dropped reviewer seat(s): {}",
+                    removed.join(", ")
+                )),
+            );
+            st.save(&paths)?;
+            eprintln!("config: dropped reviewer seat(s) {}", removed.join(", "));
+        }
+    }
     cfg.save_snapshot(&paths, run_id)?;
-    eprintln!("config: re-read spar.toml for run {run_id}");
+    if reload_config {
+        eprintln!("config: re-read spar.toml for run {run_id}");
+    } else {
+        eprintln!("config: amended frozen config for run {run_id}");
+    }
     Ok((paths, cfg))
+}
+
+/// Resolve seat-id `--without` items (`review-1-cli-claude`) against the run's
+/// slots into `reviewer[N]` ordinals. Channels and ordinals pass through; anything
+/// else is refused naming the run's own seats.
+fn resolve_without_seat_ids(
+    st: &state::RunState,
+    without: &[String],
+    run_id: &str,
+) -> Result<Vec<String>> {
+    without
+        .iter()
+        .map(|w| {
+            let item = w.trim();
+            if matches!(item, "critic" | "spec" | "suite")
+                || config::parse_reviewer_without(item).is_ok()
+            {
+                return Ok(w.clone());
+            }
+            let slot = st.slots.iter().find(|s| s.id == item).ok_or_else(|| {
+                let mut seats: Vec<&str> = st
+                    .slots
+                    .iter()
+                    .filter(|s| s.role == state::SlotRole::Reviewer)
+                    .map(|s| s.id.as_str())
+                    .collect();
+                seats.sort();
+                anyhow::anyhow!(
+                    "--without {item:?}: no such seat on run {run_id} (valid: critic, spec, suite, reviewer[N], or one of: {})",
+                    seats.join(", ")
+                )
+            })?;
+            if slot.role != state::SlotRole::Reviewer {
+                anyhow::bail!("--without {item:?}: only reviewer seats can be dropped by seat id");
+            }
+            let ordinal =
+                workflow::implement::reviewer_ordinal(&slot.id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--without {item:?}: extra seats from widening cannot be dropped; drop a panel seat as reviewer[N]"
+                    )
+                })?;
+            Ok(format!("reviewer[{ordinal}]"))
+        })
+        .collect()
 }
 
 fn project_ctx() -> Result<(paths::SparPaths, Config)> {

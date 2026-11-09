@@ -57,7 +57,11 @@ caught, which is what the sweep is for.
 - **Each run freezes its config** at creation into `.spar/runs/<id>/config.json`. Every later
   phase of that run reads the snapshot, so another agent's edit cannot change its fleet,
   timeouts, spec/suite channels, or ship gate. `spar implement --run <id> --reload-config`
-  re-reads the file and re-freezes; `--role` on a resume without it exits `1`.
+  re-reads the file, re-freezes, and then re-applies the overrides the run was launched
+  or amended with. `--role`, `--backup`, `--effort`, `--without` and `--fleet` amend a
+  resume's frozen config directly (only `--suite-command` still needs `--reload-config`).
+  `--without reviewer[N]` (or an existing seat id) drops a reviewer seat outright: the
+  seat, its review history, and its verdicts stop gating the ship.
 - **`--reassign <role|seat>=<provider>`** on `implement --run <id>` moves a seat that already
   exists to another provider on the same worktree and branch (a reload only changes a
   seat's model). Operator-only; refused while the run's orchestrator is alive and onto a

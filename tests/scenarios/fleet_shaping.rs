@@ -157,6 +157,33 @@ fn implement_json(dir: &std::path::Path, extra: &[&str]) -> Value {
     run_json(dir, &args, 2)
 }
 
+/// `spar brief --json`: the ship gate reads `open_findings` off the review history.
+fn status_json(dir: &std::path::Path, run_id: &str) -> Value {
+    run_json(dir, &["brief", run_id, "--json"], 0)
+}
+
+/// Model live reviewer findings: the dry-run backend marks its own findings
+/// synthetic (left out of `open_findings`); a live reviewer's would be live.
+fn liven_findings(dir: &std::path::Path, run_id: &str) {
+    let p = dir.join(".spar/runs").join(run_id).join("state.json");
+    let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    for e in v["review_history"].as_array_mut().unwrap() {
+        for f in e["review"]["findings"].as_array_mut().unwrap() {
+            f["synthetic"] = serde_json::json!(false);
+        }
+    }
+    std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+}
+
+fn open_finding_slots(v: &Value) -> Vec<String> {
+    v["open_findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["slot_id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
 /// `spar run --workflow review --dry-run --json`, which completes synchronously (exit 0).
 fn review_json(dir: &std::path::Path, extra: &[&str]) -> Value {
     let mut args = vec![
@@ -1039,8 +1066,9 @@ fn ac22_without_accepts_a_comma_list() {
     assert!(has_role(&state, "planner"));
 }
 
-/// AC-23: an unknown name is rejected, and the message names all three valid values so
-/// the operator can fix the flag without opening the docs.
+/// AC-23: an unknown name is rejected, and the message names all valid values so
+/// the operator can fix the flag without opening the docs. A bare `reviewer` is not
+/// a seat: reviewer drops spell the ordinal (`reviewer[1]`).
 #[test]
 fn ac23_without_rejects_unknown_names() {
     let tmp = project("");
@@ -1063,6 +1091,7 @@ fn ac23_without_rejects_unknown_names() {
             predicate::str::contains("critic")
                 .and(predicate::str::contains("spec"))
                 .and(predicate::str::contains("suite"))
+                .and(predicate::str::contains("reviewer[N]"))
                 .and(predicate::str::contains("panic").not()),
         );
 }
@@ -1100,10 +1129,10 @@ fn ac24_without_survives_into_the_next_round() {
     );
 }
 
-/// AC-25: `--without` on an existing run without `--reload-config` is refused, exactly as
-/// `--role` is. A run is bound to the config it was created with (O27).
+/// AC-25: `--without` on a bound run amends the frozen config without
+/// `--reload-config`, exactly as `--role` does.
 #[test]
-fn ac25_without_is_refused_on_a_bound_run() {
+fn ac25_without_amends_a_bound_run() {
     let tmp = project("");
     let v = plan_json(tmp.path(), &["--providers", "cli:claude,cli:grok,cli:agy"]);
     let run_id = v["run_id"].as_str().unwrap().to_string();
@@ -1124,8 +1153,189 @@ fn ac25_without_is_refused_on_a_bound_run() {
             "--json",
         ])
         .assert()
-        .code(1)
-        .stdout(predicate::str::contains("--reload-config"));
+        .code(2);
+    let suite = read_run_config(tmp.path(), &run_id)["suite"].clone();
+    assert_eq!(
+        suite["enabled"],
+        serde_json::json!(false),
+        "the amend drops the suite: {suite}"
+    );
+}
+
+/// #234: `--without reviewer[1]` amends a bound run. The seat leaves the state, its
+/// history entries and verdict artifacts go with it so the ship gate stops
+/// counting its findings, and the frozen pin keeps the surviving seat.
+#[test]
+fn without_reviewer_ordinal_drops_seat_and_its_findings() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(tmp.path(), &["--providers", "cli:claude,cli:grok"]);
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    let _ = spar_cmd()
+        .current_dir(tmp.path())
+        .env("SPAR_FORCE_REQUEST_CHANGES", "1")
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert();
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        vec!["review-0-cli-grok", "review-1-cli-claude"],
+        "the panel under test: {state:?}"
+    );
+    liven_findings(tmp.path(), &run_id);
+    let before = open_finding_slots(&status_json(tmp.path(), &run_id));
+    assert_eq!(
+        before,
+        vec!["review-0-cli-grok", "review-1-cli-claude"],
+        "the gate counts both seats' findings: {before:?}"
+    );
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--without",
+            "reviewer[1]",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "dropped reviewer seat(s) review-1-cli-claude",
+        ));
+
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        vec!["review-0-cli-grok"],
+        "the seat is gone: {:?}",
+        state["slots"]
+    );
+    let history: Vec<&str> = state["review_history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["slot_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        !history.contains(&"review-1-cli-claude"),
+        "the seat's history goes with it: {history:?}"
+    );
+    for ext in ["md", "json"] {
+        assert!(
+            !tmp.path()
+                .join(".spar/runs")
+                .join(&run_id)
+                .join(format!("artifacts/review-review-1-cli-claude.{ext}"))
+                .exists(),
+            "the seat's verdict artifacts go with it"
+        );
+    }
+    let pin = read_run_config(tmp.path(), &run_id)["roles"]["reviewer"].clone();
+    assert_eq!(
+        pin,
+        serde_json::json!(["cli:grok"]),
+        "the frozen pin keeps the surviving seat: {pin}"
+    );
+    let after = open_finding_slots(&status_json(tmp.path(), &run_id));
+    assert_eq!(
+        after,
+        vec!["review-0-cli-grok"],
+        "the dropped seat's findings no longer gate: {after:?}"
+    );
+}
+
+/// #234: the same drop by seat id. Dropping `reviewer[0]` renumbers the survivor
+/// down, rewrites its history entries to the new id, and renames its artifacts.
+#[test]
+fn without_reviewer_seat_id_drops_and_renumbers() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(tmp.path(), &["--providers", "cli:claude,cli:grok"]);
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    let _ = spar_cmd()
+        .current_dir(tmp.path())
+        .env("SPAR_FORCE_REQUEST_CHANGES", "1")
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert();
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--without",
+            "review-0-cli-grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "dropped reviewer seat(s) review-0-cli-grok",
+        ));
+
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        vec!["review-0-cli-claude"],
+        "the survivor renumbers down: {:?}",
+        state["slots"]
+    );
+    let history: Vec<&str> = state["review_history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["slot_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        history.iter().all(|s| *s == "review-0-cli-claude"),
+        "history follows the rename: {history:?}"
+    );
+    for ext in ["md", "json"] {
+        assert!(
+            tmp.path()
+                .join(".spar/runs")
+                .join(&run_id)
+                .join(format!("artifacts/review-review-0-cli-claude.{ext}"))
+                .is_file(),
+            "the survivor's artifacts follow the rename"
+        );
+    }
+    let pin = read_run_config(tmp.path(), &run_id)["roles"]["reviewer"].clone();
+    assert_eq!(
+        pin,
+        serde_json::json!(["cli:claude"]),
+        "the frozen pin keeps the surviving seat: {pin}"
+    );
 }
 
 // ---------------------------------------------------------------------------
