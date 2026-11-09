@@ -603,8 +603,13 @@ fn deliver_inbox(paths: &SparPaths, msg: &BusMessage) -> Result<()> {
         record_receipt(paths, &msg.id, t, ReceiptEvent::Queued, "inbox");
     }
     // The one filing choke point: `send` and `tick_acks` both land here, so every
-    // producer's PollFile copies reach the poll file at file time.
-    crate::providers::delivery::drain_poll_files(paths, &targets);
+    // producer's PollFile copies reach the poll file at file time. A superseding
+    // send skips this drain: its withdrawal renders right after, moving the poll
+    // file from the old instruction to the new one in a single render, and a
+    // failed send must leave the old instruction untouched.
+    if msg.refs.supersedes.is_none() {
+        crate::providers::delivery::drain_poll_files(paths, &targets);
+    }
     Ok(())
 }
 
@@ -1878,7 +1883,7 @@ mod tests {
         write(
             "6-orchestrator.json",
             &BusMessage {
-                from: "orchestrator".into(),
+                from: ORCHESTRATOR_SEAT.into(),
                 ..body("m5", "broadcast", MsgKind::Chat, "orchestrator says hi")
             },
         );

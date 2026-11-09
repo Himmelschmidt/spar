@@ -107,7 +107,7 @@ pub fn run(
         Some(crate::runlock::RunLock::acquire(paths, &state.id)?)
     };
     let _ = bus::ensure_bus(paths);
-    let _ = bus::join(paths, Some(&state.id), "orchestrator", None, None);
+    let _ = bus::join(paths, Some(&state.id), bus::ORCHESTRATOR_SEAT, None, None);
     state.save(paths)?;
 
     let mut jobs = Vec::new();
@@ -549,7 +549,7 @@ pub fn execute_plan(
         let _ = bus::broadcast(
             paths,
             Some(&state.id),
-            "orchestrator",
+            bus::ORCHESTRATOR_SEAT,
             "plan auto-approved (autonomy)",
             state.message_budget,
         );
@@ -812,7 +812,7 @@ fn run_test_author(
     let _ = bus::broadcast(
         paths,
         Some(&state.id),
-        "orchestrator",
+        bus::ORCHESTRATOR_SEAT,
         "test-author finished; acceptance contract ready for plan approval",
         state.message_budget,
     );
@@ -835,7 +835,13 @@ fn seed_spec_bus(
          Planner `{planner_slot}`{critic_clause}: reply on bus if still available; \
          otherwise the author uses plan + critique artifacts."
     );
-    let _ = bus::broadcast(paths, Some(&state.id), "orchestrator", &body, budget);
+    let _ = bus::broadcast(
+        paths,
+        Some(&state.id),
+        bus::ORCHESTRATOR_SEAT,
+        &body,
+        budget,
+    );
 
     let coordinate_with = critic_slot
         .map(|c| format!(" and `{c}`"))

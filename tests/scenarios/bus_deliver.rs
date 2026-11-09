@@ -610,6 +610,77 @@ fn poll_file_supersede_withdraws_for_pi() {
     poll_file_supersede_withdraws("cli:pi");
 }
 
+/// A superseding send that fails leaves the old instruction untouched: the send
+/// runs before the withdrawal, so a rejected replacement never takes the
+/// original out of the inbox, the poll file or the log.
+fn failed_superseding_send_keeps_old(provider: &str) {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), provider);
+    let dir = tmp.path();
+
+    let old = send_json(
+        dir,
+        &run_id,
+        &["--to", &agent, "-m", "standing instruction"],
+    );
+    let old_id = old["id"].as_str().unwrap().to_string();
+    assert!(
+        poll_body(dir, &run_id, &agent).contains("standing instruction"),
+        "the send itself fans out to the poll file"
+    );
+
+    let big = "x".repeat(70_000);
+    let err = spar_cmd()
+        .current_dir(dir)
+        .args([
+            "bus",
+            "send",
+            "--run",
+            &run_id,
+            "--to",
+            &agent,
+            "--supersedes",
+            &old_id,
+            "-m",
+            &big,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&err).contains("too large"),
+        "the oversized replacement is rejected: {}",
+        String::from_utf8_lossy(&err)
+    );
+
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        poll.contains("standing instruction"),
+        "the old instruction survives the failed supersede:\n{poll}"
+    );
+
+    let entries = log_entries(dir, &run_id);
+    let old_entry = log_entry(&entries, &old_id);
+    assert_eq!(old_entry["delivery"], "delivered", "{old_entry}");
+    assert!(
+        old_entry["superseded_by"].is_null(),
+        "no replacement took it: {old_entry}"
+    );
+}
+
+#[test]
+fn failed_superseding_send_keeps_old_for_agy() {
+    failed_superseding_send_keeps_old("cli:agy");
+}
+
+#[test]
+fn failed_superseding_send_keeps_old_for_pi() {
+    failed_superseding_send_keeps_old("cli:pi");
+}
+
 /// A message filed in its last valid round leaves the poll file once the run
 /// moves past it: the next filing re-renders, and the expired body is gone.
 fn poll_file_expiry_drops(provider: &str) {

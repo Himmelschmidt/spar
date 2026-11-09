@@ -194,7 +194,7 @@ pub fn seed_from_plan(paths: &SparPaths, run_id: &str, plan_md: &str) -> Result<
     let _ = bus::broadcast(
         paths,
         Some(run_id),
-        "orchestrator",
+        bus::ORCHESTRATOR_SEAT,
         format!("task graph seeded: {} tasks", g.tasks.len()),
         bus::MessageBudget::Normal,
     );
@@ -217,7 +217,7 @@ pub fn claim(paths: &SparPaths, run_id: &str, task_id: &str, agent: &str) -> Res
             id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
             ts: Utc::now(),
             from: agent.into(),
-            to: "orchestrator".into(),
+            to: bus::ORCHESTRATOR_SEAT.into(),
             kind: bus::MsgKind::TaskClaim,
             body: format!("claimed {task_id}"),
             run: Some(run_id.into()),

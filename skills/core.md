@@ -1242,10 +1242,11 @@ spar bus ack <msg_id> --from <agent> [--run <id>]  # stop a requires_ack redeliv
   implementer's carry-forward on **every** dispatch, under "Operator messages", until it
   is superseded, acked by the implementer, or expired. A relaunch or a new round cannot
   drop it. Use it for rulings, not chatter: it repeats every dispatch.
-- `--supersedes <msg_id>` withdraws an earlier message **you** sent: every inbox copy not
-  yet taken is removed and its redelivery stops; a persisted one leaves the carry-forward.
-  A copy already injected into a model's input cannot be unread, but a PollFile slot's
-  copy is taken back out of its poll file; `--json` reports
+- `--supersedes <msg_id>` withdraws an earlier message **you** sent: the replacement
+  sends first, then every inbox copy not yet taken is removed and its redelivery stops,
+  so a rejected replacement leaves the original filed, listed and logged; a persisted one
+  leaves the carry-forward. A copy already injected into a model's input cannot be unread,
+  but a PollFile slot's copy is taken back out of its poll file; `--json` reports
   `withdrawal: {msg_id, withdrawn_from: [...], already_delivered: [...]}`.
 - `--expires-after-round [N]` (with `--run`; `N` defaults to the round a slot is dispatching
   in, or the next round when the run waits at a gate, the first round anyone reads it in): once
@@ -1270,7 +1271,7 @@ recipient acked it), `withdrawn` (superseded or expired). A poll file or codex q
 ```
 
 Each time is the earliest of its kind. `delivery` reads one word off disk per message
-(O155, O157): `acknowledged` once a recipient's ack answers it (terminal, even with
+(O156, O157): `acknowledged` once a recipient's ack answers it (terminal, even with
 copies still waiting; a broadcast's send-time recipients are unknowable, so any acker
 counts there), else `delivered` while a claimed copy sits on disk — a withdrawal that
 arrives after the claim cannot unread a message already in the model's input — or a
@@ -1279,13 +1280,17 @@ else `withdrawn` once a withdrawal postdates every landing, no copy remains, and
 message was never read (the poll-file case: a claim records no `Read`, and the
 claimed copy is deleted on withdrawal), else `queued` while a copy still waits in
 an inbox, else `withdrawn` when no copy waits anywhere and nothing ever landed.
+For poll-file slots `withdrawn` means taken back out of the file, not never seen:
+reading the file leaves no receipt, so the slot may have read it before the withdrawal.
 A landing the model already saw — any `Read` receipt, from a prompt inclusion,
 a Stop-hook injection, an inbox claim or an ack — stays `delivered` under a
 later withdrawal. It is derived at read time from the inbox directories, the receipts and the
 ack events — never stored, so there is no second copy of the state to drift. A slot's
-poll file (agy, pi) renders its inbox, not an append-only log (O156): every filing,
+poll file (agy, pi) renders its inbox, not an append-only log (O156, O157): every filing,
 withdrawal and round start rewrites it from the pending messages, so a withdrawn or
-expired message disappears from the file. Messages addressed to the slot render, plus
+expired message disappears from the file. A superseding send skips its own filing
+render; the withdrawal renders once, moving the file from the old instruction to the
+new one in a single step. Messages addressed to the slot render, plus
 chat broadcasts from humans and peer slots — the default `--to broadcast` reaches every
 poll-file slot — while acks, system prompts and orchestrator broadcasts stay in the
 inbox and the bus log but never become action items. Posting into the live poll file

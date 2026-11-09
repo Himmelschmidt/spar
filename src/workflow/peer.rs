@@ -78,7 +78,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
 
     paths.ensure_run_dirs(&state.id)?;
     bus::ensure_bus(paths)?;
-    bus::join(paths, Some(&state.id), "orchestrator", None, None)?;
+    bus::join(paths, Some(&state.id), bus::ORCHESTRATOR_SEAT, None, None)?;
     bus::join(paths, Some(&state.id), &id_a, Some(&a), Some("native-cli"))?;
     bus::join(paths, Some(&state.id), &id_b, Some(&b), Some("native-cli"))?;
     bus::send(

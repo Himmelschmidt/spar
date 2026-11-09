@@ -223,7 +223,9 @@ pub(crate) fn render_poll_file(
         .filter(|m| seen.insert(m.id.clone()))
         .collect();
     msgs.sort_by_key(|m| m.ts);
-    let mut section = String::from("## Pending swarm messages (act on them, then continue)\n");
+    let mut section = String::from(
+        "## Pending swarm messages (ack handled items so they leave the file; act on the rest, then continue)\n",
+    );
     if msgs.is_empty() {
         section.push_str("\n_Nothing waiting._\n");
     } else {
