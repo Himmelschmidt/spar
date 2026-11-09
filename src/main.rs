@@ -248,10 +248,17 @@ fn run() -> Result<ExitCode> {
                 if let Some(preset) = &fleet {
                     cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
                 }
-                let (pool, origin) =
-                    cfg.fresh_reviewer_pool(&providers, &select, &urgency, dry_run)?;
-                cfg.apply_without(&pool, origin, dry_run, &without)?;
+                // A reviewer ordinal is the only `--without` item that indexes a
+                // panel; without one the pool (and any `--select` benchmark) is
+                // skipped and the channels apply clean.
+                let (pool, origin) = if config::without_has_reviewer_item(&without) {
+                    cfg.fresh_reviewer_pool(&providers, &select, &urgency, dry_run)?
+                } else {
+                    (Vec::new(), state::PoolOrigin::Synth)
+                };
+                let dropped = cfg.apply_without(&pool, origin, dry_run, &without)?;
                 cfg.apply_role_overrides(&role)?;
+                config::warn_if_role_discards_reviewer_drop(&role, &dropped);
                 cfg.apply_backup_overrides(&backup)?;
                 cfg.apply_effort_overrides(&effort)?;
                 cfg.apply_suite_command(&suite_command, &without)?;
@@ -614,10 +621,17 @@ fn run() -> Result<ExitCode> {
                 if let Some(preset) = &fleet {
                     cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
                 }
-                let (pool, origin) =
-                    cfg.fresh_reviewer_pool(&providers, &select, &urgency, dry_run)?;
-                cfg.apply_without(&pool, origin, dry_run, &without)?;
+                // A reviewer ordinal is the only `--without` item that indexes a
+                // panel; without one the pool (and any `--select` benchmark) is
+                // skipped and the channels apply clean.
+                let (pool, origin) = if config::without_has_reviewer_item(&without) {
+                    cfg.fresh_reviewer_pool(&providers, &select, &urgency, dry_run)?
+                } else {
+                    (Vec::new(), state::PoolOrigin::Synth)
+                };
+                let dropped = cfg.apply_without(&pool, origin, dry_run, &without)?;
                 cfg.apply_role_overrides(&role)?;
+                config::warn_if_role_discards_reviewer_drop(&role, &dropped);
                 cfg.apply_backup_overrides(&backup)?;
                 cfg.apply_effort_overrides(&effort)?;
                 let opts = CommonOpts {
@@ -1341,9 +1355,17 @@ fn implement_ctx(
         if let Some(preset) = fleet {
             cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
         }
-        let (pool, origin) = cfg.fresh_reviewer_pool(providers, select, urgency, dry_run)?;
-        cfg.apply_without(&pool, origin, dry_run, without)?;
+        // A reviewer ordinal is the only `--without` item that indexes a panel;
+        // without one the pool (and any `--select` benchmark) is skipped and
+        // the channels apply clean.
+        let (pool, origin) = if config::without_has_reviewer_item(without) {
+            cfg.fresh_reviewer_pool(providers, select, urgency, dry_run)?
+        } else {
+            (Vec::new(), state::PoolOrigin::Synth)
+        };
+        let dropped = cfg.apply_without(&pool, origin, dry_run, without)?;
         cfg.apply_role_overrides(role)?;
+        config::warn_if_role_discards_reviewer_drop(role, &dropped);
         cfg.apply_backup_overrides(backup)?;
         cfg.apply_effort_overrides(effort)?;
         cfg.apply_suite_command(suite_command, without)?;
@@ -1421,9 +1443,23 @@ fn implement_ctx(
     // beaten (rung 2 outranks `[roles]`), and never a fresh draw from the provider
     // order. With no slots yet (a plan continuation not yet dispatched) the panel
     // is materialized from the run's recorded pool, the same seats the dispatch builds.
-    let panel_state = without
-        .iter()
-        .any(|w| config::parse_reviewer_without(w.trim()).is_ok())
+    // Amending while the orchestrator is alive is refused with the same busy type
+    // as the live path. When persisting, the guard is bound here so it covers the
+    // state load, the surgery and the snapshot write: no second CLI can interleave
+    // between the liveness check and the save. It drops on return, before the
+    // dispatch re-acquires for its round.
+    let _lock = if persist {
+        Some(runlock::RunLock::acquire(&paths, run_id)?)
+    } else if let Some(owner) = runlock::RunLock::owner(&paths, run_id).filter(|o| o.alive()) {
+        return Err(runlock::OrchestratorBusy {
+            run_id: run_id.to_string(),
+            owner_pid: owner.pid,
+        }
+        .into());
+    } else {
+        None
+    };
+    let panel_state = config::without_has_reviewer_item(without)
         .then(|| state::RunState::load(&paths, run_id))
         .transpose()?;
     if let Some(st) = &panel_state {
@@ -1450,21 +1486,9 @@ fn implement_ctx(
     };
     let dropped_reviewers = cfg.apply_without(&pool, pool_origin, dry, without)?;
     cfg.apply_role_overrides(role)?;
+    config::warn_if_role_discards_reviewer_drop(role, &dropped_reviewers);
     cfg.apply_backup_overrides(backup)?;
     cfg.apply_effort_overrides(effort)?;
-    // Amending while the orchestrator is alive is refused with the same busy type
-    // as the live path; when persisting, the lock is held across the surgery and
-    // the snapshot write so no second CLI can interleave between the check and the
-    // save. The guard drops on return, before the dispatch re-acquires for its round.
-    if persist {
-        let _lock = runlock::RunLock::acquire(&paths, run_id)?;
-    } else if let Some(owner) = runlock::RunLock::owner(&paths, run_id).filter(|o| o.alive()) {
-        return Err(runlock::OrchestratorBusy {
-            run_id: run_id.to_string(),
-            owner_pid: owner.pid,
-        }
-        .into());
-    }
     cfg.apply_suite_command(suite_command, without)?;
     if !persist {
         return Ok((paths, cfg));
@@ -1484,6 +1508,13 @@ fn implement_ctx(
             );
             st.save(&paths)?;
             eprintln!("config: dropped reviewer seat(s) {}", removed.join(", "));
+        }
+        // A surviving seat that rotated to its backup serves the fallback as its
+        // primary; its same-ordinal backup entry is spent and would fail
+        // backup-against-primary validation on reload, so drop it and carry the
+        // shortened list like any other backup shift.
+        if workflow::implement::disengage_spent_reviewer_backups(&st, &mut cfg.backups.reviewer) {
+            cfg.cli_backup_keys.insert(state::SlotRole::Reviewer);
         }
     }
     cfg.save_snapshot(&paths, run_id)?;

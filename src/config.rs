@@ -1059,6 +1059,38 @@ pub fn parse_reviewer_without(item: &str) -> Result<usize> {
     anyhow::bail!("--without {item:?}: unknown seat (valid: {VALID})")
 }
 
+/// Whether `--without` holds a reviewer seat ordinal (`reviewer[N]`), the only
+/// item that indexes a panel. Channels resolve without one, and seat ids refuse
+/// on a fresh run before any pool is drawn, so callers use this to skip the
+/// provider resolution (including any `--select` benchmark) when no panel
+/// lookup can happen.
+pub fn without_has_reviewer_item(without: &[String]) -> bool {
+    without
+        .iter()
+        .any(|w| parse_reviewer_without(w.trim()).is_ok())
+}
+
+/// Warn when an explicit `--role reviewer=...` replaces a panel a `--without
+/// reviewer[N]` just cut: the pin wins and the dropped seats are lost. Every
+/// amend path applies `--without` before `--role`, so each one calls this after
+/// both have run.
+pub fn warn_if_role_discards_reviewer_drop(role: &[String], dropped: &[usize]) {
+    use crate::state::SlotRole;
+    if dropped.is_empty() {
+        return;
+    }
+    let pins_reviewer = role.iter().any(|r| {
+        r.split('=')
+            .next()
+            .is_some_and(|k| SlotRole::from_config_key(k.trim()) == Some(SlotRole::Reviewer))
+    });
+    if pins_reviewer {
+        eprintln!(
+            "warning: --role reviewer=... replaces the reviewer panel, discarding the --without reviewer seat drop"
+        );
+    }
+}
+
 /// Acceptance gate policy. Review *timeouts* stay at `[timeouts].review_secs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewConfig {
@@ -1901,10 +1933,6 @@ impl Config {
         Ok((self.providers.order.clone(), PoolOrigin::Synth))
     }
 
-    /// `--without <critic,spec,suite>`: drop seats for this run only, without touching
-    /// `spar.toml`. Unlike `[roles]` overrides, dropping the plan critic has no config
-    /// knob before feature 011 (an absent `[roles].plan_critic` still falls back to
-    /// `[providers].order`), which is why `[critic].enabled` exists at all.
     /// `--without` drops seats from the fleet. `critic`, `spec` and `suite` drop whole
     /// channels; `reviewer[N]` drops the Nth seat (0-based) of the reviewer panel, and
     /// any other `review-*` id is an existing run's seat, resolved to its ordinal by

@@ -164,10 +164,14 @@ fn status_json(dir: &std::path::Path, run_id: &str) -> Value {
 
 /// Model live reviewer findings: the dry-run backend marks its own findings
 /// synthetic (left out of `open_findings`); a live reviewer's would be live.
-fn liven_findings(dir: &std::path::Path, run_id: &str) {
+/// Only the named seat's entries liven, so the gate counts that seat alone.
+fn liven_seat_findings(dir: &std::path::Path, run_id: &str, slot_id: &str) {
     let p = dir.join(".spar/runs").join(run_id).join("state.json");
     let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
     for e in v["review_history"].as_array_mut().unwrap() {
+        if e["slot_id"] != slot_id {
+            continue;
+        }
         for f in e["review"]["findings"].as_array_mut().unwrap() {
             f["synthetic"] = serde_json::json!(false);
         }
@@ -1163,8 +1167,8 @@ fn ac25_without_amends_a_bound_run() {
 }
 
 /// #234: `--without reviewer[1]` amends a bound run. The seat leaves the state, its
-/// history entries and verdict artifacts go with it so the ship gate stops
-/// counting its findings, and the frozen pin keeps the surviving seat.
+/// history entries and verdict artifacts go with it, and the next round parks
+/// at ship confirm: the dropped seat alone held the gate, and now nothing does.
 #[test]
 fn without_reviewer_ordinal_drops_seat_and_its_findings() {
     let tmp = project("[suite]\nenabled = false\n");
@@ -1194,12 +1198,12 @@ fn without_reviewer_ordinal_drops_seat_and_its_findings() {
         vec!["review-0-cli-grok", "review-1-cli-claude"],
         "the panel under test: {state:?}"
     );
-    liven_findings(tmp.path(), &run_id);
+    liven_seat_findings(tmp.path(), &run_id, "review-1-cli-claude");
     let before = open_finding_slots(&status_json(tmp.path(), &run_id));
     assert_eq!(
         before,
-        vec!["review-0-cli-grok", "review-1-cli-claude"],
-        "the gate counts both seats' findings: {before:?}"
+        vec!["review-1-cli-claude"],
+        "the gate counts the doomed seat's findings: {before:?}"
     );
 
     spar_cmd()
@@ -1253,15 +1257,37 @@ fn without_reviewer_ordinal_drops_seat_and_its_findings() {
         "the frozen pin keeps the surviving seat: {pin}"
     );
     let after = open_finding_slots(&status_json(tmp.path(), &run_id));
-    assert_eq!(
-        after,
-        vec!["review-0-cli-grok"],
+    assert!(
+        after.is_empty(),
         "the dropped seat's findings no longer gate: {after:?}"
+    );
+    // With the lone blocking seat gone, the next round clears the review gate
+    // and parks at ship confirm: the dropped seat held the ship, and now
+    // nothing does. The ceiling lifts past the rounds the forced-RC loop spent
+    // hitting it.
+    let _ = spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--max-rounds",
+            "10",
+            "--dry-run",
+            "--json",
+        ])
+        .assert();
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        state["phase"], "awaiting_ship_confirm",
+        "the gate clears once the dropped seat is gone: {:?}",
+        state["phase"]
     );
 }
 
 /// #234: the same drop by seat id. Dropping `reviewer[0]` renumbers the survivor
-/// down, rewrites its history entries to the new id, and renames its artifacts.
+/// down; its history entries keep the writing id (mapped in `former_ids`), and
+/// its artifacts are renamed to the new id.
 #[test]
 fn without_reviewer_seat_id_drops_and_renumbers() {
     let tmp = project("[suite]\nenabled = false\n");
@@ -1659,6 +1685,147 @@ fn without_reviewer_middle_ordinal_drops_and_renumbers_above_only() {
         pin,
         serde_json::json!(["cli:codex", "cli:agy"]),
         "the frozen pin keeps the survivors in order: {pin}"
+    );
+}
+
+/// #234: an explicit `--role reviewer=...` replaces the panel, so when it lands
+/// after a `--without reviewer[N]` drop the operator is warned the drop is lost.
+#[test]
+fn role_reviewer_pin_warns_when_it_discards_a_without_drop() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let a = spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "plan",
+            "--task",
+            "warn the drop",
+            "--dry-run",
+            "--json",
+            "--providers",
+            "cli:claude,cli:grok",
+            "--role",
+            "reviewer=cli:grok",
+            "--without",
+            "reviewer[1]",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "discarding the --without reviewer seat drop",
+        ));
+    let v: Value = serde_json::from_slice(&a.get_output().stdout).unwrap();
+    let run_id = v["run_id"].as_str().unwrap();
+    let pin = read_run_config(tmp.path(), run_id)["roles"]["reviewer"].clone();
+    assert_eq!(
+        pin,
+        serde_json::json!(["cli:grok"]),
+        "the explicit pin still wins: {pin}"
+    );
+}
+
+/// #234: a survivor serving its engaged backup must not keep that backup entry.
+/// The amend drops the spent same-ordinal backup (and records the backup key),
+/// so the reload's backup-against-primary validation passes.
+#[test]
+fn reload_after_amend_disengages_a_spent_reviewer_backup() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(
+        tmp.path(),
+        &[
+            "--providers",
+            "cli:claude,cli:grok,cli:agy",
+            "--backup",
+            "reviewer[0]=cli:codex@b0",
+            "--backup",
+            "reviewer[1]=cli:codex@b1",
+        ],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    let _ = spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok,cli:agy",
+            "--dry-run",
+            "--json",
+        ])
+        .assert();
+    // Fabricate the failover the dispatch would do when agy's seat dies: the
+    // seat serves its backup under a backup source. The ordinal still reads
+    // off the id, so the pin and the backup shift index it as before.
+    let p = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("state.json");
+    let mut state: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    let seat = state["slots"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["id"] == "review-1-cli-agy")
+        .unwrap();
+    seat["provider"] = serde_json::json!("cli:codex");
+    seat["source"] = serde_json::json!("backup");
+    std::fs::write(&p, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--without",
+            "reviewer[0]",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        vec!["review-0-cli-agy"],
+        "the rotated survivor renumbers down keeping its id: {:?}",
+        state["slots"]
+    );
+    let cfg = read_run_config(tmp.path(), &run_id);
+    assert_eq!(
+        cfg["roles"]["reviewer"],
+        serde_json::json!(["cli:codex"]),
+        "the pin names the serving provider: {:?}",
+        cfg["roles"]["reviewer"]
+    );
+    assert!(
+        cfg["backups"]["reviewer"].is_null(),
+        "the spent backup is gone: {:?}",
+        cfg["backups"]["reviewer"]
+    );
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--reload-config",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let cfg = read_run_config(tmp.path(), &run_id);
+    assert!(
+        cfg["backups"]["reviewer"].is_null(),
+        "the reload carries the disengaged list: {:?}",
+        cfg["backups"]["reviewer"]
     );
 }
 
