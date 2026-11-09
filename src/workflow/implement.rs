@@ -2289,6 +2289,9 @@ pub fn execute_loop(
             // matched from the error prose. With work left behind the round goes on:
             // the leftovers are committed as WIP below and judged like any round.
             // With no work at all the round fails as before.
+            // The ceiling check runs before the quota park: a dispatch that hit both
+            // still goes to review on its partial work, costing one extra panel, and
+            // the next round's seat recheck parks it.
             if let Some(note) = try_commit_ceiling_partial(state, paths, &impl_job.slot_id) {
                 record_ceiling_partial(
                     state,
@@ -2378,23 +2381,13 @@ pub fn execute_loop(
                                     effort: None,
                                 };
                                 if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
-                                    if let Some(note) =
-                                        try_commit_ceiling_partial(state, paths, &retry_job.slot_id)
-                                    {
-                                        record_ceiling_partial(
-                                            state,
-                                            paths,
-                                            &retry_job.slot_id,
-                                            note,
-                                            &mut ceiling_partial_note,
-                                        )?;
-                                    } else {
-                                        let quota_hit2 = executor::slot_parks_on_quota(
-                                            state,
-                                            &retry_job.slot_id,
-                                        );
-                                        return fail(state, paths, e2, quota_hit2);
-                                    }
+                                    handle_retry_err(
+                                        state,
+                                        paths,
+                                        &retry_job.slot_id,
+                                        e2,
+                                        &mut ceiling_partial_note,
+                                    )?;
                                 }
                                 // Retry succeeded, continue to review phase
                             } else {
@@ -2484,25 +2477,13 @@ pub fn execute_loop(
                                     if let Err(e2) =
                                         executor::run_slot(state, paths, cfg, &retry_job)
                                     {
-                                        if let Some(note) = try_commit_ceiling_partial(
+                                        handle_retry_err(
                                             state,
                                             paths,
                                             &retry_job.slot_id,
-                                        ) {
-                                            record_ceiling_partial(
-                                                state,
-                                                paths,
-                                                &retry_job.slot_id,
-                                                note,
-                                                &mut ceiling_partial_note,
-                                            )?;
-                                        } else {
-                                            let quota_hit2 = executor::slot_parks_on_quota(
-                                                state,
-                                                &retry_job.slot_id,
-                                            );
-                                            return fail(state, paths, e2, quota_hit2);
-                                        }
+                                            e2,
+                                            &mut ceiling_partial_note,
+                                        )?;
                                     }
                                 } else {
                                     return fail(state, paths, e, quota_hit);
@@ -3345,11 +3326,33 @@ fn try_commit_ceiling_partial(
                  the panel judges HEAD without it"
             );
             eprintln!("warning: {msg}");
-            msg
+            let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+            return Some(format!(
+                "NOTE: the implementer pass for round {round} was cut short at its hard time \
+                 ceiling before it could finish, and its partial work could not be committed \
+                 ({e}); judge the HEAD commit and continue the task from there."
+            ));
         }
     };
     let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
     Some(ceiling_partial_notice(round))
+}
+
+/// A backup-retry implementer dispatch failed. A ceiling-cut partial round goes on
+/// like the primary dispatch's; anything else fails the run with its quota routing.
+fn handle_retry_err(
+    state: &mut RunState,
+    paths: &SparPaths,
+    slot_id: &str,
+    err: anyhow::Error,
+    note_out: &mut Option<String>,
+) -> Result<()> {
+    if let Some(note) = try_commit_ceiling_partial(state, paths, slot_id) {
+        record_ceiling_partial(state, paths, slot_id, note, note_out)
+    } else {
+        let quota_hit = executor::slot_parks_on_quota(state, slot_id);
+        fail(state, paths, err, quota_hit)
+    }
 }
 
 /// Record a ceiling-cut WIP round: the killed slot reads done — the kill stays
@@ -3364,6 +3367,10 @@ fn record_ceiling_partial(
     out: &mut Option<String>,
 ) -> Result<()> {
     eprintln!("note: {note}");
+    // The slot reads done now, so the executor's failed dispatch verdict for it is
+    // stale: verdict markers only steer running slots, and anything else reading
+    // them must not see a failed implementer for a round that went on.
+    crate::markers::clear_slot(paths, &state.id, slot_id);
     if let Some(s) = state.slot_mut(slot_id) {
         s.status = SlotStatus::Done;
         s.error = None;
