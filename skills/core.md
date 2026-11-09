@@ -1270,18 +1270,22 @@ recipient acked it), `withdrawn` (superseded or expired). A poll file or codex q
 ```
 
 Each time is the earliest of its kind. `delivery` reads one word off disk per message
-(O155): `acknowledged` once a recipient's ack answers it (terminal, even with copies
-still waiting; a broadcast's send-time recipients are unknowable, so any acker counts
-there), else `delivered` once anything landed — a claimed copy on disk, or a
-`Delivered`/`Read` receipt from a prompt inclusion that left the inbox copy behind —
-else `queued` while a copy still waits in an inbox, else `withdrawn` when no copy
-waits anywhere and nothing ever landed. It is derived at read time from the inbox
-directories, the receipts and the ack events — never stored, so there is no second
-copy of the state to drift. A slot's poll file (agy, pi) renders its inbox, not an
-append-only log (O156): every filing, withdrawal and round start rewrites it from
-the pending messages, so a withdrawn or expired message disappears from the file.
-Only messages addressed to the slot render — acks and broadcasts stay in the inbox
-and the bus log but never become action items. Posting into the live poll file
+(O155, O157): `acknowledged` once a recipient's ack answers it (terminal, even with
+copies still waiting; a broadcast's send-time recipients are unknowable, so any acker
+counts there), else `delivered` while a claimed copy sits on disk — a withdrawal that
+arrives after the claim cannot unread a message already in the model's input — or a
+`Delivered`/`Read` receipt from a prompt inclusion that left the inbox copy behind,
+else `withdrawn` once a withdrawal postdates every landing and no copy remains (the
+poll-file case: the claimed copy is deleted on withdrawal), else `queued` while a copy
+still waits in an inbox, else `withdrawn` when no copy waits anywhere and nothing ever
+landed. It is derived at read time from the inbox directories, the receipts and the
+ack events — never stored, so there is no second copy of the state to drift. A slot's
+poll file (agy, pi) renders its inbox, not an append-only log (O156): every filing,
+withdrawal and round start rewrites it from the pending messages, so a withdrawn or
+expired message disappears from the file. Messages addressed to the slot render, plus
+chat broadcasts from humans and peer slots — the default `--to broadcast` reaches every
+poll-file slot — while acks, system prompts and orchestrator broadcasts stay in the
+inbox and the bus log but never become action items. Posting into the live poll file
 counts as `delivered`. Dry-run runs skip the fan-out (nothing live polls their
 files); the inbox keeps the messages for the turn-boundary drain.
 `receipts.jsonl` rolls to `receipts.jsonl.1` at

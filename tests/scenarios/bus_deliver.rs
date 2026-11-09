@@ -595,8 +595,8 @@ fn poll_file_supersede_withdraws(provider: &str) {
     let old_entry = log_entry(&entries, &old_id);
     assert_eq!(old_entry["superseded_by"], new_id, "{old_entry}");
     assert_eq!(
-        old_entry["delivery"], "delivered",
-        "it landed in the poll file before the withdrawal took it back: {old_entry}"
+        old_entry["delivery"], "withdrawn",
+        "the withdrawal postdates the only landing and no copy remains: {old_entry}"
     );
 }
 
@@ -665,13 +665,15 @@ fn poll_file_expiry_drops_for_pi() {
     poll_file_expiry_drops("cli:pi");
 }
 
-/// Acks and broadcasts stay in the inbox and the bus log, but they never become
-/// poll-file action items; an acked message leaves the file too.
-#[test]
-fn poll_file_lists_only_directed_action_items() {
+/// What becomes a poll-file action item: messages addressed to the slot, plus
+/// chat broadcasts from humans and peer slots (the default `--to` reaches every
+/// slot through here). Acks, system prompts and orchestrator broadcasts stay in
+/// the inbox and the bus log but never render; an acked message leaves the file
+/// too.
+fn poll_file_lists_directed_and_human_broadcasts(provider: &str) {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
-    let (run_id, agent) = live_poll_run(tmp.path(), "cli:agy");
+    let (run_id, agent) = live_poll_run(tmp.path(), provider);
     let dir = tmp.path();
 
     let needy = send_json(
@@ -688,11 +690,27 @@ fn poll_file_lists_only_directed_action_items() {
     let needy_id = needy["id"].as_str().unwrap().to_string();
     assert!(poll_body(dir, &run_id, &agent).contains("confirm the migration plan"));
 
-    send_json(
+    // No `--to`: the send default is broadcast, and a human broadcast lists.
+    send_json(dir, &run_id, &["-m", "all hands notice"]);
+    assert!(
+        poll_body(dir, &run_id, &agent).contains("all hands notice"),
+        "a human broadcast is a poll-file action item"
+    );
+
+    let orch = send_json(
         dir,
         &run_id,
-        &["--to", "broadcast", "-m", "all hands notice"],
+        &[
+            "--from",
+            "orchestrator",
+            "--to",
+            "broadcast",
+            "-m",
+            "orchestrator says hi",
+        ],
     );
+    let orch_id = orch["id"].as_str().unwrap().to_string();
+
     spar_cmd()
         .current_dir(dir)
         .args(["bus", "ack", &needy_id, "--from", &agent, "--run", &run_id])
@@ -702,8 +720,12 @@ fn poll_file_lists_only_directed_action_items() {
 
     let poll = poll_body(dir, &run_id, &agent);
     assert!(
-        !poll.contains("all hands notice"),
-        "broadcasts are not action items:\n{poll}"
+        poll.contains("all hands notice"),
+        "the human broadcast stays:\n{poll}"
+    );
+    assert!(
+        !poll.contains("orchestrator says hi"),
+        "orchestrator broadcasts are not action items:\n{poll}"
     );
     assert!(
         !poll.contains("[Ack]"),
@@ -713,4 +735,84 @@ fn poll_file_lists_only_directed_action_items() {
         !poll.contains("confirm the migration plan"),
         "an acked message leaves the file:\n{poll}"
     );
+
+    let entries = log_entries(dir, &run_id);
+    assert!(
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "ack" && e["refs"]["reply_to"] == needy_id),
+        "the ack stays in the bus log even though it never renders: {entries}"
+    );
+    let orch_entry = log_entry(&entries, &orch_id);
+    assert_eq!(
+        orch_entry["delivery"], "delivered",
+        "the slot claimed a copy, so the log reads delivered even though the render filters it: {orch_entry}"
+    );
+}
+
+#[test]
+fn poll_file_lists_directed_and_human_broadcasts_for_agy() {
+    poll_file_lists_directed_and_human_broadcasts("cli:agy");
+}
+
+#[test]
+fn poll_file_lists_directed_and_human_broadcasts_for_pi() {
+    poll_file_lists_directed_and_human_broadcasts("cli:pi");
+}
+
+/// The round-start sweep drops an expired message with no new filing: bumping
+/// the round then running the turn-boundary `bus deliver` re-renders, and the
+/// expired body is gone.
+fn poll_file_round_start_refresh_drops_expired(provider: &str) {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), provider);
+    let dir = tmp.path();
+
+    let expiring = send_json(
+        dir,
+        &run_id,
+        &[
+            "--to",
+            &agent,
+            "--expires-after-round",
+            "-m",
+            "limited-time ruling",
+        ],
+    );
+    let expiring_id = expiring["id"].as_str().unwrap().to_string();
+    let last_round = expiring["expires_after_round"].as_u64().unwrap();
+    assert!(
+        poll_body(dir, &run_id, &agent).contains("limited-time ruling"),
+        "filed in its last valid round, so it lists"
+    );
+
+    let state_path = dir.join(".spar/runs").join(&run_id).join("state.json");
+    let text = std::fs::read_to_string(&state_path).unwrap();
+    let mut state: Value = serde_json::from_str(&text).unwrap();
+    state["round"] = serde_json::json!(last_round + 1);
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    deliver_json(dir, &run_id, &agent);
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        !poll.contains("limited-time ruling"),
+        "expired body leaves the file on the round-start sweep:\n{poll}"
+    );
+
+    let entries = log_entries(dir, &run_id);
+    let entry = log_entry(&entries, &expiring_id);
+    assert_eq!(entry["expired"], true, "{entry}");
+}
+
+#[test]
+fn poll_file_round_start_refresh_drops_expired_for_agy() {
+    poll_file_round_start_refresh_drops_expired("cli:agy");
+}
+
+#[test]
+fn poll_file_round_start_refresh_drops_expired_for_pi() {
+    poll_file_round_start_refresh_drops_expired("cli:pi");
 }

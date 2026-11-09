@@ -1271,6 +1271,7 @@ fn bus_deliver(
         strategy,
         session_id.as_deref(),
         dry_run,
+        &bus::acked_by(paths, &unique),
     )?;
     if json {
         println!("{}", serde_json::to_string_pretty(&d)?);

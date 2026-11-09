@@ -1174,26 +1174,44 @@ pub fn disk_positions(paths: &SparPaths) -> DiskPositions {
 /// Roll one message's disk positions up to a single word. `acked` is whether a
 /// recipient's `Ack` answering the message sits in the event log, and wins: an
 /// ack is terminal (redelivery stops, escalation stops), while the per-recipient
-/// receipts beside it still show who never picked up a copy. Otherwise any
-/// landing wins — a claimed copy, or a `Delivered`/`Read` receipt from a prompt
-/// inclusion that left the inbox copy behind — even with other copies still
-/// waiting. A message with no copy and no landing reads `Withdrawn`: superseded
-/// or expired before claim, or fanned out to nobody.
+/// receipts beside it still show who never picked up a copy. Otherwise a claimed
+/// copy still on disk wins: it sits in the slot's next prompt, so a withdrawal
+/// that arrived after the claim reads `Delivered` (a message cannot be unread).
+/// With no copy on disk a withdrawal that postdates every landing takes the word
+/// back to `Withdrawn` — the poll-file case, where the claimed copy is deleted
+/// on withdrawal. A landing with no later withdrawal still reads `Delivered`:
+/// prompt inclusion records a `Delivered` receipt with no copy behind. A message
+/// with no copy, no landing and no withdrawal reads `Withdrawn`: superseded or
+/// expired before claim, or fanned out to nobody.
 pub fn delivery_state(
     acked: bool,
     positions: &DiskPositions,
     id: &str,
-    receipt_delivered: bool,
+    receipts: &[RecipientReceipt],
 ) -> DeliveryState {
     if acked {
         DeliveryState::Acknowledged
-    } else if positions.delivered.contains(id) || receipt_delivered {
+    } else if positions.delivered.contains(id) {
+        DeliveryState::Delivered
+    } else if taken_back(receipts) {
+        DeliveryState::Withdrawn
+    } else if receipts.iter().any(|r| r.delivered_at.is_some()) {
         DeliveryState::Delivered
     } else if positions.queued.contains(id) {
         DeliveryState::Queued
     } else {
         DeliveryState::Withdrawn
     }
+}
+
+/// Whether some recipient's withdrawal postdates every landing: the message was
+/// taken back everywhere it had reached. A `Read` lands like a `Delivered` (the
+/// receipts fold already backfills `delivered_at` from `read_at`), so a
+/// withdrawal only takes the word back when it is strictly later.
+fn taken_back(receipts: &[RecipientReceipt]) -> bool {
+    let landed = receipts.iter().filter_map(|r| r.delivered_at).max();
+    let withdrawn = receipts.iter().filter_map(|r| r.withdrawn_at).max();
+    withdrawn.is_some_and(|w| landed.is_none_or(|d| w > d))
 }
 
 /// Whether an `Ack` answers its target for the log word. A directed message is
@@ -1292,8 +1310,7 @@ pub fn log_entries(paths: &SparPaths, run: Option<&str>) -> Result<Vec<LogEntry>
         .map(|m| {
             let is_acked = acked.contains(&m.id);
             let list = receipts.remove(&m.id).unwrap_or_default();
-            let receipt_delivered = list.iter().any(|r| r.delivered_at.is_some());
-            let delivery = delivery_state(is_acked, &positions, &m.id, receipt_delivered);
+            let delivery = delivery_state(is_acked, &positions, &m.id, &list);
             LogEntry {
                 schema_version: LOG_SCHEMA,
                 receipts: list,
@@ -1432,9 +1449,19 @@ pub fn withdraw(paths: &SparPaths, msg_id: &str) -> Result<Withdrawal> {
         record_receipt(paths, msg_id, &agent, ReceiptEvent::Withdrawn, "superseded");
         out.withdrawn_from.push(agent);
     }
+    let agents: HashSet<String> = refresh.iter().map(|(_, a)| a.clone()).collect();
+    let acked = acked_by_map(paths, &agents);
+    let mut gate = ExpiryGate::new();
     for (run, agent) in refresh {
-        if let Err(e) = crate::providers::delivery::render_poll_file(paths, run.as_deref(), &agent)
-        {
+        let empty = HashSet::new();
+        let slot_acked = acked.get(&agent).unwrap_or(&empty);
+        if let Err(e) = crate::providers::delivery::render_poll_file(
+            paths,
+            run.as_deref(),
+            &agent,
+            slot_acked,
+            &mut gate,
+        ) {
             eprintln!("warning: poll-file refresh for {agent} failed: {e:#}");
         }
     }
@@ -1465,10 +1492,14 @@ pub(crate) fn filed_copies(paths: &SparPaths, agent: &str) -> Vec<BusMessage> {
     out
 }
 
-/// Message ids the slot itself acked. A slot that acked a message is done with
-/// it, so the poll file stops listing it.
-pub(crate) fn acked_by(paths: &SparPaths, agent: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
+/// Message ids each listed slot acked, in one streaming pass over the workspace
+/// log. A slot that acked a message is done with it, so its poll file stops
+/// listing it.
+pub(crate) fn acked_by_map(
+    paths: &SparPaths,
+    agents: &HashSet<String>,
+) -> HashMap<String, HashSet<String>> {
+    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
     let Ok(f) = File::open(events_path(paths)) else {
         return out;
     };
@@ -1482,20 +1513,39 @@ pub(crate) fn acked_by(paths: &SparPaths, agent: &str) -> HashSet<String> {
         if m.kind != MsgKind::Ack {
             continue;
         }
-        if resolve_addr(m.run.as_deref(), &m.from) != agent {
+        let from = resolve_addr(m.run.as_deref(), &m.from);
+        if !agents.contains(&from) {
             continue;
         }
         if let Some(t) = m.refs.reply_to {
-            out.insert(t);
+            out.entry(from).or_default().insert(t);
         }
     }
     out
 }
 
-/// Whether the message is past its round on a live read: a second expiry gate
-/// for copies claimed in their last valid round.
-pub(crate) fn expired_now(paths: &SparPaths, msg: &BusMessage) -> bool {
-    RunRounds::default().expired(paths, msg)
+pub(crate) fn acked_by(paths: &SparPaths, agent: &str) -> HashSet<String> {
+    acked_by_map(paths, &HashSet::from([agent.to_string()]))
+        .remove(agent)
+        .unwrap_or_default()
+}
+
+/// One state load reused across a render's messages: the expiry gate for copies
+/// claimed in their last valid round.
+pub(crate) struct ExpiryGate {
+    rounds: RunRounds,
+}
+
+impl ExpiryGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            rounds: RunRounds::default(),
+        }
+    }
+
+    pub(crate) fn expired(&mut self, paths: &SparPaths, msg: &BusMessage) -> bool {
+        self.rounds.expired(paths, msg)
+    }
 }
 
 /// Persisted messages to `slot` in `run` that still stand: not superseded, not past
@@ -1626,7 +1676,7 @@ fn open_for_append(path: &PathBuf) -> Result<File> {
 
 /// Open (creating if absent) a lockfile whose only purpose is to hold an
 /// advisory `flock`. The file's contents are never read or written.
-fn open_lockfile(path: &PathBuf) -> Result<File> {
+pub(crate) fn open_lockfile(path: &PathBuf) -> Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1652,7 +1702,7 @@ fn remove_file_if_present(path: &PathBuf) -> Result<()> {
 /// until `f` is dropped (fd close), serializing writers across threads and
 /// processes so a record and its trailing newline can never interleave with
 /// another writer's bytes.
-fn lock_exclusive(f: &File) -> Result<()> {
+pub(crate) fn lock_exclusive(f: &File) -> Result<()> {
     rustix::fs::flock(f, rustix::fs::FlockOperation::LockExclusive).context("flock exclusive")?;
     Ok(())
 }
@@ -1746,7 +1796,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_render_lists_directed_pending_and_keeps_nudges() {
+    fn poll_render_lists_directed_and_peer_chat_but_not_acks_or_orchestrator() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         join(&paths, Some("r1"), "p", Some("cli:pi"), Some("native-cli")).unwrap();
@@ -1788,15 +1838,39 @@ mod tests {
             "5-join.json",
             &body("m4", "broadcast", MsgKind::System, "r1:x joined"),
         );
+        write(
+            "6-orchestrator.json",
+            &BusMessage {
+                from: "orchestrator".into(),
+                ..body("m5", "broadcast", MsgKind::Chat, "orchestrator says hi")
+            },
+        );
+        write(
+            "7-peer-blocked.json",
+            &BusMessage {
+                from: "r1:peer".into(),
+                ..body("m6", "broadcast", MsgKind::Blocked, "peer is stuck")
+            },
+        );
         let p = crate::providers::delivery::poll_file(&paths, Some("r1"), &agent);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(&p, "spar time nudge (75%): wrap up\n").unwrap();
 
-        crate::providers::delivery::render_poll_file(&paths, Some("r1"), &agent).unwrap();
+        let mut gate = ExpiryGate::new();
+        let listed = crate::providers::delivery::render_poll_file(
+            &paths,
+            Some("r1"),
+            &agent,
+            &HashSet::new(),
+            &mut gate,
+        )
+        .unwrap();
+        assert_eq!(listed, 2);
         let text = fs::read_to_string(&p).unwrap();
         assert!(text.contains("spar time nudge"), "{text}");
         assert_eq!(text.matches("act on this").count(), 1, "{text}");
-        for stray in ["all hands", "ack m1", "joined"] {
+        assert!(text.contains("all hands"), "{text}");
+        for stray in ["ack m1", "joined", "orchestrator says hi", "peer is stuck"] {
             assert!(!text.contains(stray), "poll file lists no {stray}:\n{text}");
         }
     }
@@ -2643,48 +2717,82 @@ mod tests {
                 .map(str::to_string)
                 .collect(),
         };
+        let landed = |ago_secs: i64| RecipientReceipt {
+            recipient: "r1:impl".into(),
+            delivered_at: Some(Utc::now() - Duration::seconds(ago_secs)),
+            ..Default::default()
+        };
+        let taken_back = |landed_ago_secs: i64| RecipientReceipt {
+            recipient: "r1:impl".into(),
+            delivered_at: Some(Utc::now() - Duration::seconds(landed_ago_secs)),
+            withdrawn_at: Some(Utc::now()),
+            ..Default::default()
+        };
         // `old` has no receipt rows at all (rotated out): the claimed file still lands it.
         assert_eq!(
-            delivery_state(false, &positions, "old", false),
+            delivery_state(false, &positions, "old", &[]),
             DeliveryState::Delivered
         );
         assert_eq!(
-            delivery_state(false, &positions, "q1", false),
+            delivery_state(false, &positions, "q1", &[]),
             DeliveryState::Queued
         );
         assert_eq!(
-            delivery_state(false, &positions, "d1", false),
+            delivery_state(false, &positions, "d1", &[]),
             DeliveryState::Delivered
         );
         assert_eq!(
-            delivery_state(false, &positions, "both", false),
+            delivery_state(false, &positions, "both", &[]),
             DeliveryState::Delivered,
             "any landing wins even with a copy still waiting"
         );
         assert_eq!(
-            delivery_state(false, &positions, "redelivered", false),
+            delivery_state(false, &positions, "redelivered", &[]),
             DeliveryState::Delivered,
             "a redelivery behind an older claim stays landed"
         );
         assert_eq!(
-            delivery_state(true, &positions, "both", false),
+            delivery_state(true, &positions, "both", &[]),
             DeliveryState::Acknowledged,
             "an ack is terminal even with copies still waiting"
         );
         assert_eq!(
-            delivery_state(false, &positions, "withdrawn-before-claim", false),
+            delivery_state(false, &positions, "withdrawn-before-claim", &[]),
             DeliveryState::Withdrawn,
             "no copy and no landing means gone, not waiting"
         );
         assert_eq!(
-            delivery_state(false, &DiskPositions::default(), "prompted", true),
+            delivery_state(false, &DiskPositions::default(), "prompted", &[landed(60)]),
             DeliveryState::Delivered,
             "a prompt inclusion lands without claiming the inbox copy"
         );
         assert_eq!(
-            delivery_state(false, &positions, "q1", true),
+            delivery_state(false, &positions, "q1", &[landed(60)]),
             DeliveryState::Delivered,
             "a delivered receipt beats the waiting inbox copy"
+        );
+        assert_eq!(
+            delivery_state(
+                false,
+                &DiskPositions::default(),
+                "taken-back",
+                &[taken_back(60)]
+            ),
+            DeliveryState::Withdrawn,
+            "a withdrawal after the landing takes the word back once no copy remains"
+        );
+        assert_eq!(
+            delivery_state(
+                false,
+                &DiskPositions {
+                    delivered: ["unread".into()].into_iter().collect(),
+                    ..Default::default()
+                },
+                "unread",
+                &[taken_back(60)]
+            ),
+            DeliveryState::Delivered,
+            "a claimed copy still on disk wins: it sits in the slot's next prompt"
         );
     }
 

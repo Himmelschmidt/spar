@@ -90,6 +90,7 @@ pub fn deliver(
     strategy: DeliveryStrategy,
     session_id: Option<&str>,
     dry_run: bool,
+    acked: &HashSet<String>,
 ) -> Result<Delivery> {
     if strategy == DeliveryStrategy::None {
         let pending = bus::inbox(paths, agent)?.len();
@@ -114,7 +115,7 @@ pub fn deliver(
             && !dry_run
             && poll_file(paths, run, agent).exists()
         {
-            render_poll_file(paths, run, agent)?;
+            render_poll_file(paths, run, agent, acked, &mut bus::ExpiryGate::new())?;
         }
         return Ok(Delivery {
             strategy,
@@ -124,7 +125,7 @@ pub fn deliver(
             payload: None,
         });
     }
-    let delivered = msgs.len();
+    let mut delivered = msgs.len();
 
     let (action, payload) = match strategy {
         DeliveryStrategy::StopHookInject => {
@@ -141,7 +142,8 @@ pub fn deliver(
         }
         DeliveryStrategy::PollFile => {
             if !dry_run {
-                render_poll_file(paths, run, agent)?;
+                delivered =
+                    render_poll_file(paths, run, agent, acked, &mut bus::ExpiryGate::new())?;
             }
             (DeliveryAction::PolledFile, None)
         }
@@ -183,28 +185,41 @@ const POLL_SECTION_END: &str = "<!-- spar:poll:end -->";
 /// oldest first. The inbox is the only source — a message withdrawn, expired or
 /// acked stops being listed, wherever its copies were.
 ///
-/// Only action items render: messages addressed to the slot. Acks and
-/// broadcasts (join notices, orchestrator announcements) stay in the inbox and
-/// the bus log but never become poll-file action items. Text outside the
-/// section markers (budget and time nudges) is preserved.
+/// Only action items render: messages addressed to the slot, plus chat
+/// broadcasts from humans and peer slots (agent-to-agent coordination and the
+/// default `--to` reach every slot through here). Acks, system prompts, and
+/// orchestrator broadcasts stay in the inbox and the bus log but never become
+/// poll-file action items. Text outside the section markers (budget and time
+/// nudges) is preserved.
+///
+/// Returns how many messages are listed, so delivery counts what the slot can
+/// actually read rather than what was claimed.
 pub(crate) fn render_poll_file(
     paths: &SparPaths,
     run: Option<&str>,
     agent: &str,
-) -> Result<PathBuf> {
+    acked: &HashSet<String>,
+    gate: &mut bus::ExpiryGate,
+) -> Result<usize> {
+    let _lock = lock_poll_file(paths, run, agent)?;
     let path = poll_file(paths, run, agent);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let acked = bus::acked_by(paths, agent);
     let mut seen = HashSet::new();
     let mut msgs: Vec<bus::BusMessage> = bus::filed_copies(paths, agent)
         .into_iter()
-        .filter(|m| m.kind != bus::MsgKind::Ack)
-        .filter(|m| m.to != "broadcast" && m.to != "*")
-        .filter(|m| bus::resolve_addr(m.run.as_deref(), &m.to) == agent)
+        .filter(|m| {
+            if bus::resolve_addr(m.run.as_deref(), &m.to) == agent {
+                return m.kind != bus::MsgKind::Ack;
+            }
+            (m.to == "broadcast" || m.to == "*")
+                && m.kind == bus::MsgKind::Chat
+                && m.from != "orchestrator"
+                && m.from != ORCHESTRATOR
+        })
         .filter(|m| !acked.contains(&m.id))
-        .filter(|m| !bus::expired_now(paths, m))
+        .filter(|m| !gate.expired(paths, m))
         .filter(|m| seen.insert(m.id.clone()))
         .collect();
     msgs.sort_by_key(|m| m.ts);
@@ -230,8 +245,23 @@ pub(crate) fn render_poll_file(
         None if prev.is_empty() => block,
         None => format!("{}\n{block}", prev.trim_end()),
     };
-    fs::write(&path, next)?;
-    Ok(path)
+    fs::write(path.with_extension("tmp"), &next)?;
+    fs::rename(path.with_extension("tmp"), &path)?;
+    Ok(msgs.len())
+}
+
+/// The lock serializing poll-file writers: the render's read-modify-rename and
+/// the nudge appender hold it, so a render never splices its section into a
+/// half-appended nudge and two renders never interleave. Held until dropped.
+pub(crate) fn lock_poll_file(
+    paths: &SparPaths,
+    run: Option<&str>,
+    agent: &str,
+) -> Result<std::fs::File> {
+    let lock_path = poll_file(paths, run, agent).with_extension("lock");
+    let f = bus::open_lockfile(&lock_path)?;
+    bus::lock_exclusive(&f)?;
+    Ok(f)
 }
 
 /// Re-render every PollFile slot's poll file on `run_id`: the round-start and
@@ -244,12 +274,18 @@ pub fn refresh_run_poll_files(paths: &SparPaths, run_id: &str) {
     if state.dry_run {
         return;
     }
-    for s in &state.slots {
-        if strategy_for_slot(&state, &s.id) != DeliveryStrategy::PollFile {
-            continue;
-        }
-        let agent = bus::agent_ref(Some(run_id), &s.id);
-        if let Err(e) = render_poll_file(paths, Some(run_id), &agent) {
+    let agents: HashSet<String> = state
+        .slots
+        .iter()
+        .filter(|s| strategy_for_slot(&state, &s.id) == DeliveryStrategy::PollFile)
+        .map(|s| bus::agent_ref(Some(run_id), &s.id))
+        .collect();
+    let acked = bus::acked_by_map(paths, &agents);
+    let mut gate = bus::ExpiryGate::new();
+    let empty = HashSet::new();
+    for agent in &agents {
+        let slot_acked = acked.get(agent).unwrap_or(&empty);
+        if let Err(e) = render_poll_file(paths, Some(run_id), agent, slot_acked, &mut gate) {
             eprintln!("warning: poll-file refresh for {agent} failed: {e:#}");
         }
     }
@@ -404,11 +440,17 @@ pub fn drain_poll_files(paths: &SparPaths, targets: &[String]) {
         if state.dry_run {
             continue;
         }
-        for agent in agents {
-            let short = agent.strip_prefix(&format!("{run}:")).unwrap_or(agent);
-            if strategy_for_slot(&state, short) != DeliveryStrategy::PollFile {
-                continue;
-            }
+        let poll_agents: Vec<&str> = agents
+            .into_iter()
+            .filter(|agent| {
+                let short = agent.strip_prefix(&format!("{run}:")).unwrap_or(agent);
+                strategy_for_slot(&state, short) == DeliveryStrategy::PollFile
+            })
+            .collect();
+        let acked = bus::acked_by_map(paths, &poll_agents.iter().map(|a| a.to_string()).collect());
+        let empty = HashSet::new();
+        for agent in poll_agents {
+            let slot_acked = acked.get(agent).unwrap_or(&empty);
             if let Err(e) = deliver(
                 paths,
                 Some(run),
@@ -416,6 +458,7 @@ pub fn drain_poll_files(paths: &SparPaths, targets: &[String]) {
                 DeliveryStrategy::PollFile,
                 None,
                 false,
+                slot_acked,
             ) {
                 eprintln!("warning: poll-file fan-out to {agent} failed: {e:#}");
             }
@@ -458,6 +501,7 @@ fn append_poll_file(
     if dry_run {
         return Ok(path);
     }
+    let _lock = lock_poll_file(paths, run, agent)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -600,6 +644,7 @@ mod tests {
             DeliveryStrategy::StopHookInject,
             None,
             false,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(d.action, DeliveryAction::StopHookBlock);
@@ -621,6 +666,7 @@ mod tests {
             DeliveryStrategy::StopHookInject,
             None,
             false,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(again.action, DeliveryAction::Empty);
@@ -634,7 +680,16 @@ mod tests {
         seed(&paths, 2);
 
         let ub = agent_ref(Some("r1"), "b");
-        let d = deliver(&paths, Some("r1"), &ub, DeliveryStrategy::None, None, false).unwrap();
+        let d = deliver(
+            &paths,
+            Some("r1"),
+            &ub,
+            DeliveryStrategy::None,
+            None,
+            false,
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(d.action, DeliveryAction::LeftForInbox);
         assert_eq!(d.delivered, 0);
         assert_eq!(d.pending, 2);
@@ -665,6 +720,7 @@ mod tests {
             DeliveryStrategy::PollFile,
             None,
             false,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(d.action, DeliveryAction::PolledFile);
@@ -688,6 +744,7 @@ mod tests {
             DeliveryStrategy::PollFile,
             None,
             true,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(d.action, DeliveryAction::PolledFile);
@@ -713,6 +770,7 @@ mod tests {
             DeliveryStrategy::NativeQueuePollFallback,
             Some("thread-abc"),
             true,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(d.action, DeliveryAction::PolledFile);
@@ -740,6 +798,7 @@ mod tests {
             DeliveryStrategy::NativeQueuePollFallback,
             None,
             false,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(d.action, DeliveryAction::PolledFile);
@@ -837,6 +896,7 @@ mod tests {
             DeliveryStrategy::StopHookInject,
             None,
             false,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(to_slot.delivered, 1);
@@ -850,6 +910,7 @@ mod tests {
             DeliveryStrategy::StopHookInject,
             None,
             false,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(to_bare.delivered, 1);
