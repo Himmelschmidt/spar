@@ -1282,7 +1282,7 @@ dry runs skip the fan-out and leave the inbox for the turn-boundary drain.
 `receipts.jsonl` rolls to `receipts.jsonl.1` at
 8 MiB (about the last 16 MiB are kept); `bus log` streams both. `bus send --json` returns the message with
 `schema_version` (and `withdrawal` under `--supersedes`). The human `bus log` shows the
-message id and `[queued|delivered|acknowledged|withdrawn; delivered n/m, read n/m; superseded by …; expired]`.
+message id and `[queued|delivered|acknowledged|withdrawn; landed n/m, read n/m; superseded by …; expired]`.
 
 A message to `@human` (or any `Blocked` agent) lands in the `@human` inbox
 (`spar bus inbox @human`) and,

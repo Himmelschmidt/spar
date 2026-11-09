@@ -1093,7 +1093,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                     let mut notes = vec![e.delivery.to_string()];
                     if total > 0 {
                         notes.push(format!(
-                            "delivered {}/{total}, read {}/{total}",
+                            "landed {}/{total}, read {}/{total}",
                             count(|r| r.delivered_at.is_some()),
                             count(|r| r.read_at.is_some())
                         ));

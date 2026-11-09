@@ -67,6 +67,20 @@ pub fn resolve_addr(run: Option<&str>, id: &str) -> String {
     }
 }
 
+/// Whether two addresses name the same recipient. `human` (the CLI `--from`
+/// default) and `@human` (prompts, docs, the notifier) are one role, so every
+/// equality check goes through here instead of comparing spellings.
+fn same_addr(a: &str, b: &str) -> bool {
+    fn canon(id: &str) -> &str {
+        if id == "human" {
+            HUMAN
+        } else {
+            id
+        }
+    }
+    canon(a) == canon(b)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MsgKind {
@@ -363,7 +377,7 @@ fn guarded_pair(msg: &BusMessage) -> Option<(&str, &str)> {
         return None;
     }
     let (from, to) = (msg.from.as_str(), msg.to.as_str());
-    if to == "broadcast" || to == "*" || to == HUMAN || from == to {
+    if to == "broadcast" || to == "*" || same_addr(to, HUMAN) || same_addr(from, to) {
         return None;
     }
     Some(if from <= to { (from, to) } else { (to, from) })
@@ -482,7 +496,7 @@ pub fn send(paths: &SparPaths, msg: BusMessage, budget: MessageBudget) -> Result
 /// A message the human needs to see: addressed to [`HUMAN`], or any `Blocked`
 /// report (an agent that stalled is a human-relevant event even when broadcast).
 pub fn is_human_alert(msg: &BusMessage) -> bool {
-    msg.to == HUMAN || msg.kind == MsgKind::Blocked
+    same_addr(&msg.to, HUMAN) || msg.kind == MsgKind::Blocked
 }
 
 /// Send an `Ack` clearing the redelivery of `msg_id`. Broadcast so any watcher sees
@@ -1189,7 +1203,10 @@ fn ack_counts(ack: &BusMessage, target: &BusMessage) -> bool {
     if target.to == "broadcast" || target.to == "*" {
         return true;
     }
-    resolve_addr(ack.run.as_deref(), &ack.from) == resolve_addr(target.run.as_deref(), &target.to)
+    same_addr(
+        &resolve_addr(ack.run.as_deref(), &ack.from),
+        &resolve_addr(target.run.as_deref(), &target.to),
+    )
 }
 
 pub const LOG_SCHEMA: u32 = 1;
@@ -2456,6 +2473,13 @@ mod tests {
         assert!(
             !ack_counts(&ack, &target),
             "a stranger's ack never confirms a directed message"
+        );
+        let mut spelled = target.clone();
+        spelled.to = "@human".into();
+        ack.from = "human".into();
+        assert!(
+            ack_counts(&ack, &spelled),
+            "the CLI default --from and the @human sink name the same role"
         );
         let mut wide = target.clone();
         wide.to = "broadcast".into();

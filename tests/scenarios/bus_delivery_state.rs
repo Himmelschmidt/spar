@@ -254,6 +254,33 @@ fn bus_log_ignores_a_strangers_ack() {
     );
 }
 
+/// The operator acks a `@human` message with the CLI default `--from human`:
+/// the two spellings name one role, so the message reads `acknowledged`.
+#[test]
+fn bus_log_counts_a_default_from_ack_for_human() {
+    let env = env();
+    let tmp = tempdir().unwrap();
+    init_repo(tmp.path());
+    let run = implemented_run(&env, tmp.path());
+    let dir = tmp.path();
+
+    let msg = send(
+        &env,
+        dir,
+        &["--run", &run, "--to", "@human", "-m", "over to you"],
+    );
+    let id = msg["id"].as_str().unwrap().to_string();
+
+    spar(&env, dir)
+        .args(["bus", "ack", &id, "--run", &run])
+        .assert()
+        .success();
+    let entries = log_json(&env, dir, &run);
+    assert_eq!(entry(&entries, &id)["delivery"], "acknowledged");
+    let text = log_text(&env, dir, &run);
+    assert!(line_for(&text, &id).contains("[acknowledged"), "{text}");
+}
+
 /// A message superseded before claim reads `withdrawn` — no copy waits anywhere
 /// and nothing ever landed — while the superseding message itself reads `queued`.
 #[test]
