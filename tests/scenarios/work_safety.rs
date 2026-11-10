@@ -396,7 +396,7 @@ fn run_ceiling_leftover_implement(
     bin: &Path,
     calls_dir: &Path,
     backend: Option<&str>,
-) -> String {
+) -> (String, std::process::ExitStatus) {
     let mut cmd = spar_cmd();
     cmd.current_dir(proj)
         .env(
@@ -424,15 +424,18 @@ fn run_ceiling_leftover_implement(
     let out = cmd.output().unwrap();
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
         if let Some(run_id) = v.get("run_id").and_then(|r| r.as_str()) {
-            return run_id.to_string();
+            return (run_id.to_string(), out.status);
         }
     }
-    std::fs::read_dir(proj.join(".spar/runs"))
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .find(|e| e.path().join("state.json").is_file())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .expect("run created")
+    (
+        std::fs::read_dir(proj.join(".spar/runs"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().join("state.json").is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .expect("run created"),
+        out.status,
+    )
 }
 
 /// A ceiling kill with uncommitted edits commits them as a WIP round and the
@@ -453,7 +456,7 @@ fn a_ceiling_kill_with_uncommitted_edits_becomes_a_wip_round() {
     let calls_dir = tmp.path().join("muse-state");
     std::fs::create_dir_all(&calls_dir).unwrap();
 
-    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
+    let (run_id, _status) = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
     assert_eq!(st["round"], 1, "same round goes on to review: {st}");
@@ -535,7 +538,7 @@ fn a_ceiling_kill_with_no_work_still_fails() {
     let calls_dir = tmp.path().join("muse-state");
     std::fs::create_dir_all(&calls_dir).unwrap();
 
-    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
+    let (run_id, _status) = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "failed", "{st}");
     let calls = std::fs::read_to_string(calls_dir.join("calls")).unwrap();
@@ -584,7 +587,12 @@ fn a_ceiling_kill_with_a_refused_wip_commit_fails_the_round() {
     let calls_dir = tmp.path().join("muse-state");
     std::fs::create_dir_all(&calls_dir).unwrap();
 
-    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
+    let (run_id, status) = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a refused partial fails the round with exit 1"
+    );
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "failed", "{st}");
     assert_eq!(st["round"], 1, "the refused round fails the run: {st}");
@@ -626,7 +634,7 @@ fn a_ceiling_kill_on_tmux_kills_the_agent_before_the_wip_snapshot() {
     let calls_dir = tmp.path().join("muse-state");
     std::fs::create_dir_all(&calls_dir).unwrap();
 
-    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, Some("tmux"));
+    let (run_id, _status) = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, Some("tmux"));
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
     let branch = format!("spar/{run_id}/impl");
@@ -720,7 +728,7 @@ fn run_requesting_ceiling_implement(proj: &Path, bin: &Path, calls_dir: &Path, m
     .unwrap();
     install_ceiling_requesting_muse(bin);
     std::fs::create_dir_all(calls_dir).unwrap();
-    run_ceiling_leftover_implement(proj, bin, calls_dir, None)
+    run_ceiling_leftover_implement(proj, bin, calls_dir, None).0
 }
 
 /// The round after a ceiling-cut WIP round is told the previous
@@ -880,7 +888,7 @@ fn a_second_round_ceiling_kill_with_no_new_edits_fails_the_run() {
     let calls_dir = tmp.path().join("muse-state");
     std::fs::create_dir_all(&calls_dir).unwrap();
 
-    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
+    let (run_id, _status) = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "failed", "{st}");
     assert_eq!(st["round"], 2, "{st}");
@@ -1687,7 +1695,7 @@ fn status_names_the_partial_round_after_a_failed_fix_round() {
     let calls_dir = tmp.path().join("muse-state");
     std::fs::create_dir_all(&calls_dir).unwrap();
 
-    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
+    let (run_id, _status) = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "failed", "{st}");
 
