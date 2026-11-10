@@ -1328,14 +1328,26 @@ pub mod tests {
         );
     }
 
-    /// The classifier POST holds the SIGCHLD mask for the whole call: child
-    /// churn on the other threads must not fail it with an EINTR read.
+    /// The classifier POST holds the SIGCHLD mask for the whole call: signals
+    /// directed at the reading thread must not fail it with an EINTR read.
     /// Removing the mask fails this test.
     #[test]
     fn live_post_survives_sigchld_churn() {
+        let _serial = crate::util::sigchld_test::serialize();
         let _handler = crate::util::sigchld_test::InstalledHandler::install();
-        let churn = crate::util::sigchld_test::Churn::spawn(4);
-        // The delayed response keeps the read in flight while the storm runs.
+        // Directed signals, not a reaping storm: the kernel delivers a child's
+        // SIGCHLD to the thread that forked it, so the reader wins a lottery
+        // and sometimes observes none of the storm. `pthread_kill` at this
+        // thread lands every time while the delayed response holds the read.
+        let tid = unsafe { libc::pthread_self() };
+        let killer = std::thread::spawn(move || {
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(100));
+                let rc = unsafe { libc::pthread_kill(tid, libc::SIGCHLD) };
+                assert_eq!(rc, 0, "directing SIGCHLD at the reading thread");
+            }
+        });
+        // The delayed response keeps the read in flight while the signals land.
         let server = loopback(200, &answer_body("auth", 0.99), Duration::from_millis(800));
         let (status, text) = live_post(
             &format!("{}/systemone", server.base_url),
@@ -1343,15 +1355,10 @@ pub mod tests {
             "{}",
             Duration::from_secs(30),
         )
-        .expect("masked POST survives child churn");
+        .expect("masked POST survives directed SIGCHLD");
         assert_eq!(status, 200);
         assert!(text.contains("\"auth\""), "{text}");
-        let reaped = churn.reaped();
-        churn.stop();
-        assert!(
-            reaped > 200,
-            "the storm must be real during the POST, else the guard proves nothing: {reaped}"
-        );
+        killer.join().unwrap();
     }
 
     #[test]

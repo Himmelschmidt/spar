@@ -129,17 +129,22 @@ pub fn fmt_elapsed(d: Duration) -> String {
     }
 }
 
-/// Test-only SIGCHLD churn and handler helpers, shared by the mask mechanism
-/// test here and the HTTP call-site tests. Installing a handler is what makes
-/// `SIGCHLD` interrupt a read at all; the handler is process-global while
-/// installed, so every user restores it (via `InstalledHandler`'s drop) before
-/// asserting.
+/// Test-only SIGCHLD handler helpers, shared by the mask mechanism test here
+/// and the HTTP call-site tests. Installing a handler is what makes `SIGCHLD`
+/// interrupt a read at all; the disposition is process-global while installed,
+/// so the three handler-installing tests serialize on one mutex held for the
+/// whole test body: without it one test's drop restores the default while
+/// another's unmasked phase still runs, and that phase never sees the
+/// interrupt it must observe.
 #[cfg(test)]
 pub(crate) mod sigchld_test {
-    use std::sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
-    };
+    use std::sync::{Mutex, MutexGuard};
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn serialize() -> MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     extern "C" fn noop(_: libc::c_int) {}
 
@@ -168,52 +173,6 @@ pub(crate) mod sigchld_test {
             unsafe {
                 let rc = libc::sigaction(libc::SIGCHLD, &self.old, std::ptr::null_mut());
                 assert_eq!(rc, 0, "restoring the SIGCHLD disposition");
-            }
-        }
-    }
-
-    /// Short-lived child churn on unmasked threads: every reap delivers
-    /// `SIGCHLD` to some thread that leaves it unblocked.
-    pub(crate) struct Churn {
-        running: Arc<AtomicBool>,
-        reaped: Arc<AtomicU64>,
-        handles: Vec<std::thread::JoinHandle<()>>,
-    }
-
-    impl Churn {
-        pub(crate) fn spawn(threads: usize) -> Self {
-            let running = Arc::new(AtomicBool::new(true));
-            let reaped = Arc::new(AtomicU64::new(0));
-            let handles = (0..threads)
-                .map(|_| {
-                    let (flag, count) = (running.clone(), reaped.clone());
-                    std::thread::spawn(move || {
-                        while flag.load(Ordering::Relaxed) {
-                            let _ = std::process::Command::new("/bin/true").status();
-                            count.fetch_add(1, Ordering::Relaxed);
-                        }
-                    })
-                })
-                .collect();
-            Self {
-                running,
-                reaped,
-                handles,
-            }
-        }
-
-        pub(crate) fn reaped(&self) -> u64 {
-            self.reaped.load(Ordering::Relaxed)
-        }
-
-        pub(crate) fn counter(&self) -> Arc<AtomicU64> {
-            self.reaped.clone()
-        }
-
-        pub(crate) fn stop(self) {
-            self.running.store(false, Ordering::Relaxed);
-            for handle in self.handles {
-                handle.join().unwrap();
             }
         }
     }
@@ -290,6 +249,7 @@ mod tests {
             (got, interrupted)
         }
 
+        let _serial = sigchld_test::serialize();
         let _handler = sigchld_test::InstalledHandler::install();
         assert!(!sigchld_blocked(), "test thread starts unmasked");
         for i in 0..2 {

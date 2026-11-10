@@ -470,15 +470,34 @@ mod tests {
     }
 
     /// The api-sdk dispatch holds the SIGCHLD mask for the whole HTTP call:
-    /// child churn on the other threads must not fail it with an EINTR read.
-    /// Removing the mask fails this test.
+    /// signals directed at the reading thread must not fail it with an EINTR
+    /// read. Removing the mask fails this test.
     #[test]
     fn api_slot_survives_sigchld_churn() {
         use std::io::{Read as _, Write as _};
+        use std::sync::mpsc;
 
+        let _serial = crate::util::sigchld_test::serialize();
         let _handler = crate::util::sigchld_test::InstalledHandler::install();
-        let churn = crate::util::sigchld_test::Churn::spawn(4);
-        let count = churn.counter();
+        // Directed signals, not a reaping storm: the kernel delivers a child's
+        // SIGCHLD to the thread that forked it, so the reader wins a lottery
+        // and sometimes observes none of the storm. The killer starts on the
+        // server's go (the request is in, the client blocks on the response)
+        // and the server answers once the signals are out.
+        let tid = unsafe { libc::pthread_self() };
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let killer = std::thread::spawn(move || {
+            go_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the request reaches the loopback");
+            for _ in 0..5 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let rc = unsafe { libc::pthread_kill(tid, libc::SIGCHLD) };
+                assert_eq!(rc, 0, "directing SIGCHLD at the reading thread");
+            }
+            done_tx.send(()).unwrap();
+        });
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
@@ -506,11 +525,11 @@ mod tests {
                 .unwrap_or(0usize);
             let mut body = vec![0u8; len];
             let _ = stream.read_exact(&mut body);
-            // Answer only once the storm has run through the POST's read.
-            let target = count.load(std::sync::atomic::Ordering::Relaxed) + 300;
-            while count.load(std::sync::atomic::Ordering::Relaxed) < target {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+            // Hold the response until the signals are out on the reader.
+            go_tx.send(()).unwrap();
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the signals go out before the response");
             let body = r#"{"choices":[{"message":{"content":"FINAL: done"}}]}"#;
             write!(
                 stream,
@@ -535,18 +554,13 @@ mod tests {
                 base_url: Some(format!("http://127.0.0.1:{port}")),
             },
         })
-        .expect("masked api slot survives child churn");
+        .expect("masked api slot survives directed SIGCHLD");
         server.join().unwrap();
-        let reaped = churn.reaped();
-        churn.stop();
+        killer.join().unwrap();
         assert!(
             outcome.ok,
-            "the churned POST is a success: {}",
+            "the signaled POST is a success: {}",
             outcome.error.as_deref().unwrap_or("no error")
-        );
-        assert!(
-            reaped > 200,
-            "the storm must be real during the POST, else the guard proves nothing: {reaped}"
         );
     }
 
