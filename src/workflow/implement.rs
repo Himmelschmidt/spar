@@ -2248,6 +2248,9 @@ pub fn execute_loop(
             model: impl_model,
             effort: None,
         };
+        // Set when the pass below records a ceiling partial for this round, so
+        // the normal-finish clear after the dispatch does not erase it.
+        let mut partial_recorded = false;
         if let Err(e) = executor::run_slot(state, paths, cfg, &impl_job) {
             // A hard-ceiling kill is reported as a typed cause on the slot, never
             // matched from the error prose. With work left behind the round goes on:
@@ -2268,6 +2271,7 @@ pub fn execute_loop(
                     commit,
                     &mut ceiling_partial_note,
                 )?;
+                partial_recorded = true;
             } else {
                 let quota_hit = executor::slot_parks_on_quota(state, &impl_job.slot_id);
                 if quota_hit {
@@ -2360,6 +2364,7 @@ pub fn execute_loop(
                                     )? {
                                         return Ok(());
                                     }
+                                    partial_recorded = true;
                                 }
                                 // Retry succeeded, continue to review phase
                             } else {
@@ -2463,6 +2468,7 @@ pub fn execute_loop(
                                         )? {
                                             return Ok(());
                                         }
+                                        partial_recorded = true;
                                     }
                                 } else {
                                     return fail(state, paths, e, quota_hit);
@@ -2478,6 +2484,13 @@ pub fn execute_loop(
                     }
                 }
             }
+        }
+
+        // The implementer finished without a ceiling kill, so this round is not
+        // cut short even if an earlier same-round attempt was: drop its mark
+        // before review. A just-recorded partial sets the flag below instead.
+        if !partial_recorded {
+            clear_finished_round_partial_mark(state, paths)?;
         }
 
         // Refresh implementer cwd after run (worktree may have been set at prepare).
@@ -3150,6 +3163,7 @@ pub fn execute_loop(
                     res.reviewed_commit.as_deref().unwrap_or("unknown")
                 ));
             }
+        }
         // The next round continues from the partial WIP commit, so its
         // implementer prompt carries the cut-short notice as a blocker: without
         // this the fix round would start from partial work with no idea it is.
@@ -3157,7 +3171,6 @@ pub fn execute_loop(
             blockers.push(note);
         }
         if !any_request_changes {
-            clear_finished_round_partial_mark(state);
             write_impl_summary(state, paths)?;
             if state.big {
                 if let Ok(mut g) = crate::tasks::TaskGraph::load(paths, &state.id) {
@@ -3423,7 +3436,7 @@ fn try_commit_ceiling_partial(
             Some(sha),
         ),
         LeftoverCommit::Clean => {
-let head = worktree::git_out(&wt_path, &["rev-parse", "HEAD"]);
+            let head = worktree::git_out(&wt_path, &["rev-parse", "HEAD"]);
             if banked
                 .as_deref()
                 .is_some_and(|sha| head.as_deref() == Some(sha))
@@ -3436,7 +3449,7 @@ let head = worktree::git_out(&wt_path, &["rev-parse", "HEAD"]);
                 ),
                 ceiling_partial_clean_notice(round),
                 CeilingPartialKind::Clean,
-                None,
+                head,
             )
         }
         LeftoverCommit::Refused(e) => {
@@ -3485,13 +3498,20 @@ fn handle_retry_err(
 /// remembered on the run so a fresh process rebuilds the cut-short notice from
 /// disk for the next round's implementer. The kind records how the work was left
 /// so the rebuilt notice words the WIP commit honestly.
-/// A round the panel approved finished normally: drop its ceiling-cut mark so
-/// ship judges the real summary instead of the cut-short notice. Older rounds
-/// keep their marks for the PR's Partial work section.
-fn clear_finished_round_partial_mark(state: &mut RunState) {
+/// Drop this round's ceiling-cut mark when its implementer finishes without a
+/// ceiling kill: the round is no longer cut short, so ship judges the real
+/// summary and the next round gets no stale notice. Keyed on the dispatch, not
+/// the verdict — a finished round the panel rejects still finished. Older
+/// rounds keep their marks for the PR's Partial work section.
+fn clear_finished_round_partial_mark(state: &mut RunState, paths: &SparPaths) -> Result<()> {
+    let before = state.ceiling_partial_rounds.len();
     state
         .ceiling_partial_rounds
         .retain(|e| e.round != state.round);
+    if state.ceiling_partial_rounds.len() != before {
+        state.save(paths)?;
+    }
+    Ok(())
 }
 
 fn record_ceiling_partial(
@@ -6927,8 +6947,9 @@ mod ceiling_partial_notice_tests {
     }
 
     #[test]
-    fn approving_a_round_clears_only_its_own_partial_mark() {
+    fn finishing_a_round_clears_only_its_own_partial_mark() {
         let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
         let mut state = RunState::new(
             "r1",
             crate::cli::WorkflowKind::Loop,
@@ -6947,7 +6968,7 @@ mod ceiling_partial_notice_tests {
                 commit: None,
             },
         ];
-        clear_finished_round_partial_mark(&mut state);
+        clear_finished_round_partial_mark(&mut state, &paths).unwrap();
         assert_eq!(state.ceiling_partial_rounds.len(), 1);
         assert_eq!(state.ceiling_partial_rounds[0].round, 1);
     }

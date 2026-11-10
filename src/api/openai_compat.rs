@@ -96,14 +96,26 @@ struct UsageJson {
     completion_tokens: u64,
 }
 
-pub fn chat_completion(cfg: &ApiProviderConfig, messages: &[ChatMessage]) -> Result<ChatResult> {
+pub fn chat_completion(
+    cfg: &ApiProviderConfig,
+    messages: &[ChatMessage],
+    timeout: std::time::Duration,
+) -> Result<ChatResult> {
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let body = json!({
         "model": cfg.model,
         "messages": messages,
         "temperature": 0.2,
     });
-    let resp = ureq::post(&url)
+    // Bound the whole request by the slot's remaining ceiling: the step loop
+    // only checks between calls, so one hung call would otherwise overrun it.
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .build(),
+    );
+    let resp = agent
+        .post(&url)
         .header("Authorization", &format!("Bearer {}", cfg.api_key))
         .header("Content-Type", "application/json")
         .send_json(&body)

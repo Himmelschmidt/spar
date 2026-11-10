@@ -130,19 +130,23 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<ApiSlotOutcome> {
     let start = std::time::Instant::now();
     let max_steps = 12u32;
     for step in 0..max_steps {
-        if start.elapsed() > req.timeout {
-            return Ok(ApiSlotOutcome {
-                ok: false,
-                error: Some("api slot timeout".into()),
-                usage,
-                timeout_cause: Some(crate::executor::TimeoutCause::HardCeiling),
-            });
+        let remaining = req
+            .timeout
+            .checked_sub(start.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            return Ok(ceiling_outcome(usage));
         }
         append_log(
             req.log_path,
             &format!("\n--- api step {step} model={} ---\n", cfg.model),
         )?;
-        let result = openai_compat::chat_completion(&cfg, &messages)?;
+        let result = match openai_compat::chat_completion(&cfg, &messages, remaining) {
+            Err(e) if is_timeout(&e) || start.elapsed() >= req.timeout => {
+                return Ok(ceiling_outcome(usage));
+            }
+            result => result?,
+        };
         usage.input_tokens += result.input_tokens;
         usage.output_tokens += result.output_tokens;
         usage.peak_input_tokens = usage.peak_input_tokens.max(result.input_tokens);
@@ -198,6 +202,24 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<ApiSlotOutcome> {
         ));
     }
     Ok(ApiSlotOutcome::done(usage))
+}
+
+fn ceiling_outcome(usage: Usage) -> ApiSlotOutcome {
+    ApiSlotOutcome {
+        ok: false,
+        error: Some("api slot timeout".into()),
+        usage,
+        timeout_cause: Some(crate::executor::TimeoutCause::HardCeiling),
+    }
+}
+
+/// Whether the chat call failed on its own deadline rather than the API: the
+/// transport error then reads as the hard ceiling, like the step-loop check.
+fn is_timeout(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<ureq::Error>(),
+        Some(ureq::Error::Timeout(..))
+    )
 }
 
 fn artifact_ok(req: &ApiSlotRequest<'_>) -> bool {
@@ -406,6 +428,8 @@ mod tests {
     fn hard_ceiling_reports_a_typed_cause() {
         // Resolve reads the key from the environment but the zero timeout
         // trips before any network call; no other test resolves a provider.
+        // Restored after, so later children never inherit the fake key.
+        let prior_key = std::env::var_os("OPENAI_API_KEY");
         std::env::set_var("OPENAI_API_KEY", "test-key");
         let tmp = tempdir().unwrap();
         let outcome = run_api_slot(&ApiSlotRequest {
@@ -419,6 +443,10 @@ mod tests {
             model_override: None,
         })
         .unwrap();
+        match prior_key {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
         assert!(!outcome.ok, "a ceiling kill is not a success");
         assert_eq!(
             outcome.timeout_cause,

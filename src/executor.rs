@@ -161,6 +161,10 @@ struct PreparedSlot {
     /// Content digest of the slot's worktree when this round started, stamped
     /// alongside `dispatch_head`. Uncommitted changes count only past it.
     dispatch_tree: Option<String>,
+    /// The round's own banked WIP commit, if the ceiling already banked this
+    /// round's leftovers: the kept-work gate must not read the bank back as
+    /// fresh work on a same-round resume.
+    banked_head: Option<String>,
     round: u32,
     /// The native session/thread id an earlier round of this same slot captured
     /// (`markers::read_session_id`), if any. `execute_prepared` passes it to the
@@ -465,6 +469,7 @@ fn prepare_slot_execution(
         run_id: state.id.clone(),
         dispatch_head,
         dispatch_tree,
+        banked_head: banked_partial_commit(state, round),
         owns_cwd,
         round,
         prior_session_id,
@@ -1125,6 +1130,7 @@ fn execute_prepared(
     let soft = timeout_for_role(&prep.cfg, prep.job.role);
     let timeout = hard_ceiling_for_role(&prep.cfg, prep.job.role);
     if prep.pref.is_api() {
+        let dispatch_start = SystemTime::now();
         let expected = prep.job.expected_artifact.as_ref().map(|n| {
             // artifact path reconstructed from log path parent layout
             prep.log_path
@@ -1180,6 +1186,54 @@ fn execute_prepared(
                 timeout_cause: None,
             }
         } else {
+            // An api implementer that finished and committed its work before the
+            // ceiling earns the same kept-read as a native-cli one: without it
+            // the typed cause above would fail a finished round as a partial.
+            let kept = timeout_cause == Some(TimeoutCause::HardCeiling)
+                && prep.job.expected_artifact.as_ref().is_some_and(|name| {
+                    ceiling_kill_kept_work(
+                        &ArtifactRecovery {
+                            paths: &prep.paths,
+                            run_id: &prep.run_id,
+                            slot_id: &prep.job.slot_id,
+                            round: prep.round,
+                            role: prep.job.role,
+                            codex_profile: prep.codex_profile.clone(),
+                            owns_cwd: prep.owns_cwd,
+                            provider: &prep.job.provider,
+                            model: prep.job.model.clone(),
+                            effort: prep.job.effort,
+                            cwd: &prep.cwd,
+                            log_path: &prep.log_path,
+                            prompt_path: &recovery_prompt_path(
+                                &prep.prompt_path,
+                                &prep.job.slot_id,
+                            ),
+                            env: &prep.env,
+                            isolation,
+                            dispatch_head: prep.dispatch_head.as_deref(),
+                            dispatch_tree: prep.dispatch_tree.as_deref(),
+                            banked_head: prep.banked_head.as_deref(),
+                            artifact: &prep.paths.artifact(&prep.run_id, name),
+                        },
+                        dispatch_start,
+                    )
+                });
+            if kept {
+                return Ok(SlotOutcome {
+                    ok: true,
+                    pid: None,
+                    exit_code: Some(0),
+                    signal: None,
+                    error: None,
+                    usage: Some(slot_usage),
+                    agy_quota_hit: false,
+                    quota_rejected: None,
+                    quota_resets_at: None,
+                    quota_recovered: false,
+                    timeout_cause: None,
+                });
+            }
             SlotOutcome {
                 ok: false,
                 pid: None,
@@ -1379,6 +1433,7 @@ fn execute_prepared(
                     isolation,
                     dispatch_head: prep.dispatch_head.as_deref(),
                     dispatch_tree: prep.dispatch_tree.as_deref(),
+                    banked_head: prep.banked_head.as_deref(),
                     artifact: &prep.paths.artifact(&prep.run_id, name),
                 },
                 dispatch_start,
@@ -1560,6 +1615,7 @@ fn execute_prepared(
                 isolation,
                 dispatch_head: prep.dispatch_head.as_deref(),
                 dispatch_tree: prep.dispatch_tree.as_deref(),
+                banked_head: prep.banked_head.as_deref(),
                 artifact: &path,
             });
             if !recovered {
@@ -1635,6 +1691,10 @@ struct ArtifactRecovery<'a> {
     /// changes count only past this snapshot: the tree can be dirty at round
     /// start already, and that dirt is not the round's work.
     dispatch_tree: Option<&'a str>,
+    /// The round's own banked WIP commit, if the ceiling already banked this
+    /// round's leftovers on an earlier attempt: the kept-work gate must not
+    /// read the bank back as fresh work on a same-round resume.
+    banked_head: Option<&'a str>,
     artifact: &'a Path,
 }
 
@@ -1672,7 +1732,7 @@ fn ceiling_kill_kept_work(r: &ArtifactRecovery, since: SystemTime) -> bool {
     let kept = if artifact_fresh_since(r.artifact, since) {
         true
     } else {
-        slot_has_work(r.cwd, r.dispatch_head, r.dispatch_tree) && recover_artifact(r)
+        committed_since_dispatch(r) && recover_artifact(r)
     };
     if kept {
         let _ = crate::events::append(
@@ -1687,13 +1747,37 @@ fn ceiling_kill_kept_work(r: &ArtifactRecovery, since: SystemTime) -> bool {
     kept
 }
 
+/// Commits the slot left behind since the round started, excluding the round's
+/// own banked WIP commit: the bank is spar's doing on an earlier attempt this
+/// round, not the slot's fresh work. A dirty tree alone never counts here: a
+/// ceiling kill with only uncommitted edits is a round cut short, which commits
+/// as a partial WIP round instead of passing.
+fn committed_since_dispatch(r: &ArtifactRecovery) -> bool {
+    let now = git_output(r.cwd, &["rev-parse", "HEAD"]);
+    match (r.dispatch_head, now) {
+        (Some(before), Some(head)) => head != before && r.banked_head != Some(head.as_str()),
+        _ => false,
+    }
+}
+
+/// The round's own banked WIP commit, if the ceiling already recorded one.
+fn banked_partial_commit(state: &RunState, round: u32) -> Option<String> {
+    state
+        .ceiling_partial_rounds
+        .iter()
+        .find(|e| e.round == round)
+        .and_then(|e| e.commit.clone())
+}
+
 /// Content digest of everything `HEAD` does not carry: the tracked diff plus
-/// every untracked file's bytes, hashed through git itself. `None` when `cwd`
+/// every untracked file's hash, folded through git itself. `None` when `cwd`
 /// is not a readable worktree. Two snapshots compare equal only for identical
 /// trees, so dirt that predates the snapshot (the test-author overlay, a
 /// refused round's leftovers) does not read as new work, while any edit —
-/// even to an already-dirty file — does.
+/// even to an already-dirty file — does. `--binary` keeps an edited tracked
+/// binary distinct from its identical `Binary files ... differ` line.
 pub(crate) fn worktree_snapshot(cwd: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
     let bytes = |args: &[&str]| {
         std::process::Command::new("git")
             .args(args)
@@ -1703,7 +1787,7 @@ pub(crate) fn worktree_snapshot(cwd: &Path) -> Option<String> {
             .filter(|o| o.status.success())
             .map(|o| o.stdout)
     };
-    let mut combo = bytes(&["diff", "HEAD", "--no-color", "--no-ext-diff"])?;
+    let mut combo = bytes(&["diff", "HEAD", "--no-color", "--no-ext-diff", "--binary"])?;
     combo.push(0);
     let others = bytes(&["ls-files", "--others", "--exclude-standard", "-z"])?;
     let mut paths: Vec<&[u8]> = others
@@ -1711,18 +1795,48 @@ pub(crate) fn worktree_snapshot(cwd: &Path) -> Option<String> {
         .filter(|p| !p.is_empty())
         .collect();
     paths.sort_unstable();
+    // Regular files are hashed by git in one batch so large artifacts never
+    // pass through this process's memory; anything else keeps the old read.
+    let mut files: Vec<&[u8]> = Vec::new();
     for rel in paths {
-        combo.extend_from_slice(rel);
-        combo.push(0);
-        let full = cwd.join(String::from_utf8_lossy(rel).as_ref());
-        let content = match std::fs::symlink_metadata(&full) {
-            Ok(md) if md.file_type().is_symlink() => std::fs::read_link(&full)
-                .map(|t| t.to_string_lossy().into_owned().into_bytes())
-                .unwrap_or_default(),
-            _ => std::fs::read(&full).unwrap_or_default(),
-        };
-        combo.extend_from_slice(&content);
-        combo.push(0);
+        let full = cwd.join(std::ffi::OsStr::from_bytes(rel));
+        match std::fs::symlink_metadata(&full) {
+            Ok(md) if md.file_type().is_file() => files.push(rel),
+            Ok(md) if md.file_type().is_symlink() => {
+                combo.extend_from_slice(rel);
+                combo.push(0);
+                let target = std::fs::read_link(&full)
+                    .map(|t| t.into_os_string().into_encoded_bytes())
+                    .unwrap_or_default();
+                combo.extend_from_slice(&target);
+                combo.push(0);
+            }
+            _ => {
+                combo.extend_from_slice(rel);
+                combo.push(0);
+                combo.extend_from_slice(&std::fs::read(&full).unwrap_or_default());
+                combo.push(0);
+            }
+        }
+    }
+    if !files.is_empty() {
+        let out = std::process::Command::new("git")
+            .arg("hash-object")
+            .arg("--")
+            .args(files.iter().map(|r| std::ffi::OsStr::from_bytes(r)))
+            .current_dir(cwd)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        for (rel, sha) in files.iter().zip(out.stdout.split(|b| *b == b'\n')) {
+            if sha.is_empty() {
+                return None;
+            }
+            combo.extend_from_slice(rel);
+            combo.push(0);
+            combo.extend_from_slice(sha);
+            combo.push(0);
+        }
     }
     let mut hash = std::process::Command::new("git");
     hash.args(["hash-object", "--stdin"]).current_dir(cwd);
@@ -2715,7 +2829,17 @@ pub fn run_slot(
         }
     };
     let result = if pref.is_api() {
-        match run_api(state, paths, job, &pref, &cwd, &log_path, &prompt, timeout) {
+        match run_api(
+            state,
+            paths,
+            job,
+            &pref,
+            &cwd,
+            &log_path,
+            &prompt_path,
+            &prompt,
+            timeout,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 salvage_expected_artifact(
@@ -4062,6 +4186,7 @@ fn run_api(
     pref: &ProviderRef,
     cwd: &Path,
     log_path: &Path,
+    prompt_path: &Path,
     prompt: &str,
     timeout: Duration,
 ) -> Result<SlotOutcome> {
@@ -4086,6 +4211,68 @@ fn run_api(
         outcome.usage,
         outcome.timeout_cause,
     );
+    // Same kept-read as the native-cli dispatch: an api implementer that
+    // finished its work before the ceiling stays done. Carried from the slot's
+    // dispatch record, never re-derived here. Runs before `slot_usage`, which
+    // moves `usage` and `model` below.
+    let slot = state.slots.iter().find(|s| s.id == job.slot_id);
+    let kept = !ok
+        && timeout_cause == Some(TimeoutCause::HardCeiling)
+        && job.expected_artifact.as_ref().is_some_and(|name| {
+            ceiling_kill_kept_work(
+                &ArtifactRecovery {
+                    paths,
+                    run_id: &state.id,
+                    slot_id: &job.slot_id,
+                    round: state.round,
+                    role: job.role,
+                    codex_profile: state.codex_profile.clone(),
+                    owns_cwd: owns_cwd(state, &job.slot_id, cwd),
+                    provider: &job.provider,
+                    model: model.clone(),
+                    effort: job.effort,
+                    cwd,
+                    log_path,
+                    prompt_path: &recovery_prompt_path(prompt_path, &job.slot_id),
+                    env: &[],
+                    isolation: state.isolation,
+                    dispatch_head: slot.and_then(|s| s.dispatch_head.clone()).as_deref(),
+                    dispatch_tree: slot.and_then(|s| s.dispatch_tree.clone()).as_deref(),
+                    banked_head: banked_partial_commit(state, state.round).as_deref(),
+                    artifact: &paths.artifact(&state.id, name),
+                },
+                SystemTime::now(),
+            )
+        });
+    if kept {
+        return Ok(SlotOutcome {
+            ok: true,
+            pid: None,
+            exit_code: Some(0),
+            signal: None,
+            error: None,
+            usage: Some(SlotUsage {
+                slot_id: job.slot_id.clone(),
+                provider: pref.storage_key(),
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cache_read_tokens: 0,
+                context_tokens: usage.peak_input_tokens,
+                context_semantics: ContextSemantics::Peak,
+                billed_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+                tools: 0,
+                model: usage.model.or(model),
+                cost_usd: None,
+                subagent_stats: None,
+                model_usage: Default::default(),
+            }),
+            agy_quota_hit: false,
+            quota_rejected: None,
+            quota_resets_at: None,
+            quota_recovered: false,
+            timeout_cause: None,
+        });
+    }
     let slot_usage = SlotUsage {
         slot_id: job.slot_id.clone(),
         provider: pref.storage_key(),
@@ -4256,6 +4443,7 @@ fn run_headless(
     let slot = state.slots.iter().find(|s| s.id == job.slot_id);
     let dispatch_head = slot.and_then(|s| s.dispatch_head.clone());
     let dispatch_tree = slot.and_then(|s| s.dispatch_tree.clone());
+    let banked_head = banked_partial_commit(state, state.round);
     let mut res = dispatch_with_resume_recovery(
         adapter.as_ref(),
         &bin,
@@ -4322,6 +4510,7 @@ fn run_headless(
                     isolation: state.isolation,
                     dispatch_head: dispatch_head.as_deref(),
                     dispatch_tree: dispatch_tree.as_deref(),
+                    banked_head: banked_head.as_deref(),
                     artifact: &paths.artifact(&state.id, name),
                 },
                 dispatch_start,
@@ -4483,6 +4672,7 @@ fn run_headless(
                 isolation: state.isolation,
                 dispatch_head: dispatch_head.as_deref(),
                 dispatch_tree: dispatch_tree.as_deref(),
+                banked_head: banked_head.as_deref(),
                 artifact: &path,
             });
             if !recovered {
