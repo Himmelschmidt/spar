@@ -33,11 +33,6 @@ pub struct ApiSlotRequest<'a> {
     pub dry_run: bool,
     /// Override model from env default (model-select).
     pub model_override: Option<String>,
-    /// Inject the credential instead of reading the process environment, so
-    /// tests never touch shared env vars.
-    pub api_key: Option<String>,
-    /// Inject the endpoint instead of reading the process environment.
-    pub base_url: Option<String>,
 }
 
 /// What one api-sdk dispatch produced. The hard ceiling is reported with the
@@ -99,14 +94,11 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<ApiSlotOutcome> {
         return Ok(ApiSlotOutcome::done(usage));
     }
 
-    let mut cfg = ApiProviderConfig::resolve(req.provider_name, req.api_key.as_deref())?;
+    let mut cfg = ApiProviderConfig::resolve(req.provider_name)?;
     if let Some(m) = &req.model_override {
         if !m.is_empty() {
             cfg.model = m.clone();
         }
-    }
-    if let Some(u) = &req.base_url {
-        cfg.base_url = u.clone();
     }
     usage.model = Some(cfg.model.clone());
 
@@ -430,12 +422,13 @@ mod tests {
     /// The api-sdk backend reports the typed hard-ceiling cause the same way
     /// the native-cli path does, so the workflow treats both backends
     /// identically. A zero timeout reaches the ceiling arm before any network
-    /// call. The credential is injected on the request: no test may mutate
-    /// the shared process environment. Fails on the old untyped timeout
-    /// error, which carried `timeout_cause: None` and failed the round empty.
+    /// call. The credential comes from the environment like every other
+    /// caller. Fails on the old untyped timeout error, which carried
+    /// `timeout_cause: None` and failed the round empty.
     #[test]
     fn hard_ceiling_reports_a_typed_cause() {
         let tmp = tempdir().unwrap();
+        let _key = crate::util::EnvRestore::set("OPENAI_API_KEY", "test-key");
         let outcome = run_api_slot(&ApiSlotRequest {
             provider_name: "openai",
             prompt: "hello",
@@ -445,8 +438,6 @@ mod tests {
             timeout: std::time::Duration::ZERO,
             dry_run: false,
             model_override: None,
-            api_key: Some("test-key".to_string()),
-            base_url: None,
         })
         .unwrap();
         assert!(!outcome.ok, "a ceiling kill is not a success");

@@ -96,6 +96,7 @@ pub fn run_slots_parallel(
                     s.auth_fault = false;
                     s.timeout_cause = None;
                     s.dispatch_head = None;
+                    s.dispatch_tree = None;
                     s.classifier = None;
                 }
                 let _ =
@@ -177,10 +178,6 @@ struct PreparedSlot {
     /// sizes its budgets and nudge cadence off the same document every other phase reads.
     cfg: Config,
     dry_run: bool,
-    /// The dispatch profile recorded in run state (`RunState::codex_profile`),
-    /// carried across the thread boundary so the spawn keys the seat this run
-    /// actually dispatched instead of this worker's ambient environment.
-    codex_profile: Option<String>,
     /// Held for the dispatch's lifetime; dropped (and the directory removed) once the
     /// outcome has been applied.
     _tmp: SlotTmp,
@@ -479,7 +476,6 @@ fn prepare_slot_execution(
         session_provider,
         cfg: cfg.clone(),
         dry_run: state.dry_run,
-        codex_profile: state.codex_profile.clone(),
         _tmp: tmp,
         _fleet_lease: fleet_lease,
         _build_cache: build_cache.and_then(|(lease, _)| lease),
@@ -1211,8 +1207,6 @@ fn execute_prepared(
             timeout,
             dry_run: false,
             model_override: model.clone(),
-            api_key: None,
-            base_url: None,
         })?;
         let (ok, err, usage, timeout_cause) = (
             outcome.ok,
@@ -1262,7 +1256,6 @@ fn execute_prepared(
                             slot_id: &prep.job.slot_id,
                             round: prep.round,
                             role: prep.job.role,
-                            codex_profile: prep.codex_profile.clone(),
                             owns_cwd: prep.owns_cwd,
                             provider: &prep.job.provider,
                             model: prep.job.model.clone(),
@@ -1337,7 +1330,6 @@ fn execute_prepared(
         effort: prep.job.effort,
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(prep.paths.sessions_dir(&prep.run_id, &prep.job.slot_id)),
-        codex_profile: prep.codex_profile.clone(),
     };
     let (mut cmd, used_resume) = build_dispatch_command(
         adapter.as_ref(),
@@ -1486,7 +1478,6 @@ fn execute_prepared(
                     slot_id: &prep.job.slot_id,
                     round: prep.round,
                     role: prep.job.role,
-                    codex_profile: prep.codex_profile.clone(),
                     owns_cwd: prep.owns_cwd,
                     provider: &prep.job.provider,
                     model: prep.job.model.clone(),
@@ -1668,7 +1659,6 @@ fn execute_prepared(
                 slot_id: &prep.job.slot_id,
                 round: prep.round,
                 role: prep.job.role,
-                codex_profile: prep.codex_profile.clone(),
                 owns_cwd: prep.owns_cwd,
                 provider: &prep.job.provider,
                 model: prep.job.model.clone(),
@@ -1737,7 +1727,6 @@ struct ArtifactRecovery<'a> {
     slot_id: &'a str,
     round: u32,
     role: SlotRole,
-    codex_profile: Option<String>,
     /// `cwd` is this slot's own worktree. See [`owns_cwd`].
     owns_cwd: bool,
     provider: &'a str,
@@ -1893,15 +1882,68 @@ fn snapshot_combo(cwd: &Path) -> Option<Vec<u8>> {
         }
     }
     if !files.is_empty() {
-        let out = std::process::Command::new("git")
-            .arg("hash-object")
-            .arg("--")
-            .args(files.iter().map(|r| std::ffi::OsStr::from_bytes(r)))
-            .current_dir(cwd)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())?;
-        for (rel, sha) in files.iter().zip(out.stdout.split(|b| *b == b'\n')) {
+        // Paths ride stdin (`--stdin-paths` reads one per line), never the
+        // command line, so a large set cannot fail to spawn and silently read
+        // as no work. A name with a newline cannot ride the line protocol, so
+        // it hashes alone through argv, which carries it whole.
+        let (lined, odd): (Vec<&[u8]>, Vec<&[u8]>) =
+            files.into_iter().partition(|rel| !rel.contains(&b'\n'));
+        if !lined.is_empty() {
+            use std::io::Write;
+            let mut input = Vec::new();
+            for rel in &lined {
+                input.extend_from_slice(rel);
+                input.push(b'\n');
+            }
+            let mut child = std::process::Command::new("git")
+                .args(["hash-object", "--stdin-paths"])
+                .current_dir(cwd)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .ok()?;
+            // The write overlaps the stdout drain on its own thread: the main
+            // thread's `wait_with_output` drains stdout while the writer
+            // feeds stdin, so a large set never fills both pipes with both
+            // sides blocked.
+            let stdin = child.stdin.take()?;
+            let writer = std::thread::spawn(move || {
+                let mut stdin = stdin;
+                stdin.write_all(&input).is_ok()
+            });
+            let out = child
+                .wait_with_output()
+                .ok()
+                .filter(|o| o.status.success())?;
+            if !writer.join().unwrap_or(false) {
+                return None;
+            }
+            let mut shas = out.stdout.split(|b| *b == b'\n');
+            for rel in &lined {
+                match shas.next() {
+                    Some(sha) if !sha.is_empty() => {
+                        combo.extend_from_slice(rel);
+                        combo.push(0);
+                        combo.extend_from_slice(sha);
+                        combo.push(0);
+                    }
+                    _ => return None,
+                }
+            }
+            if shas.next() != Some([].as_slice()) {
+                return None;
+            }
+        }
+        for rel in odd {
+            let sha = std::process::Command::new("git")
+                .arg("hash-object")
+                .arg(std::ffi::OsStr::from_bytes(rel))
+                .current_dir(cwd)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| o.stdout)?;
+            let sha = sha.strip_suffix(b"\n").unwrap_or(&sha);
             if sha.is_empty() {
                 return None;
             }
@@ -1918,8 +1960,8 @@ fn snapshot_combo(cwd: &Path) -> Option<Vec<u8>> {
 /// every untracked file's hash, folded through git itself. `None` when `cwd`
 /// is not a readable worktree. Two snapshots compare equal only for identical
 /// trees, so dirt that predates the snapshot (the test-author overlay, a
-/// refused round's leftovers) does not read as new work, while any edit —
-/// even to an already-dirty file — does. `--binary` keeps an edited tracked
+/// refused round's leftovers) does not read as new work, while any edit
+/// (even to an already-dirty file) does. `--binary` keeps an edited tracked
 /// binary distinct from its identical `Binary files ... differ` line.
 pub(crate) fn worktree_snapshot(cwd: &Path) -> Option<String> {
     let combo = snapshot_combo(cwd)?;
@@ -1939,9 +1981,6 @@ pub(crate) fn worktree_snapshot(cwd: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Work the slot left behind since the round started: uncommitted changes past
-/// `since_tree`, or commits past `since_head`.
-///
 /// Whether the tree changed since the round-start snapshot. `None` for the live
 /// digest falls back to the legacy read: any dirty tree.
 fn tree_differs_since(cwd: &Path, since_tree: Option<&str>) -> bool {
@@ -1973,6 +2012,9 @@ fn tree_differs_from_head(cwd: &Path) -> bool {
     }
 }
 
+/// Work the slot left behind since the round started: uncommitted changes past
+/// `since_tree`, or commits past `since_head`.
+///
 /// Pass the stamps taken when the slot joined the round: from round 2 on the
 /// run base predates earlier rounds' commits, so the base always reads as
 /// work, and the tree can already be dirty at round start (the test-author
@@ -2097,7 +2139,6 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
         effort: r.effort,
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(r.paths.sessions_dir(r.run_id, r.slot_id)),
-        codex_profile: r.codex_profile.clone(),
     };
     let cmd = adapter.build_headless(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
@@ -2197,7 +2238,7 @@ fn artifact_fresh_since(path: &Path, since: SystemTime) -> bool {
 }
 
 /// A dispatch starts with no artifact of its own. The previous attempt's file is
-/// still on disk — a salvage write from seconds ago included — and the freshness
+/// still on disk (a salvage write from seconds ago included), and the freshness
 /// gate above would otherwise credit it to this dispatch: a fix round killed at
 /// its ceiling reads kept on the round before's salvaged summary and the panel
 /// re-judges an already-rejected HEAD. The agent, the recovery turn, and the next
@@ -2377,7 +2418,7 @@ fn enrich_agy_stats(
     if let (Some(frac), Some(reset)) = (t.quota_remaining_fraction, t.quota_reset_secs) {
         if frac < 0.02 && reset > 0 {
             let until = chrono::Utc::now() + chrono::Duration::seconds(reset);
-            let key = pref.quota_key(None);
+            let key = pref.quota_key(crate::providers::RecordedRoute::ambient());
             let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
             store.pause_quota_until(
                 &key,
@@ -2478,7 +2519,7 @@ fn apply_parallel_outcome(
                 &pref,
                 result.quota_rejected,
                 &log_text,
-                state.codex_profile.as_deref(),
+                state.recorded_route(),
             );
             let witness = PauseWitness::before(paths, &state.id, &key);
             let quota_hit = quota_hit_for_outcome(paths, &pref, &key, &log_text, &result);
@@ -2558,7 +2599,7 @@ fn apply_parallel_outcome(
                 &pref,
                 &log_text,
                 &e.to_string(),
-                state.codex_profile.as_deref(),
+                state.recorded_route(),
             );
             let auth = auth_fault_for(&prep.log_path, &e.to_string(), quota_hit, None, None);
             if let Some(s) = state.slot_mut(slot_id) {
@@ -2940,7 +2981,7 @@ pub fn run_slot(
             pref,
             &log_text,
             err_text,
-            state.codex_profile.as_deref(),
+            state.recorded_route(),
         );
         let auth = auth_fault_for(log_path, err_text, quota_hit, None, None);
         if let Some(s) = state.slot_mut(slot_id) {
@@ -2959,8 +3000,6 @@ pub fn run_slot(
             &prompt_path,
             &prompt,
             timeout,
-            None,
-            None,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -3123,7 +3162,7 @@ pub fn run_slot(
             &seat,
             result.quota_rejected,
             &log_text,
-            state.codex_profile.as_deref(),
+            state.recorded_route(),
         );
         let witness = PauseWitness::before(paths, &state.id, &key);
         let quota_hit = quota_hit_for_outcome(paths, &seat, &key, &log_text, &result);
@@ -3446,11 +3485,15 @@ fn mark_pause_strong(paths: &SparPaths, key: &str) {
 }
 
 /// The log tail a failed dispatch is judged on. A dispatch that ended by signal is
-/// judged on its typed verdicts only, never on log text: something killed it, and a
-/// log that happens to mention "quota" or "429" must not pause the provider for every
-/// run in the project (#174).
+/// judged on its typed verdicts only, never on log text, with one exception: a hard
+/// ceiling kill ran its full budget, so its log is the provider's own record and a
+/// quota signal in it parks like any other. Any other kill (a stop, a nudge, the
+/// machine) says nothing about the provider, and a log that happens to mention
+/// "quota" or "429" must not pause the provider for every run in the project (#174).
 fn outcome_log_text(log_path: &Path, outcome: &SlotOutcome) -> String {
-    if process::ended_by_signal(outcome.signal, outcome.exit_code) {
+    if process::ended_by_signal(outcome.signal, outcome.exit_code)
+        && outcome.timeout_cause != Some(TimeoutCause::HardCeiling)
+    {
         String::new()
     } else {
         process::tail_log(log_path, 8000)
@@ -3466,14 +3509,14 @@ fn quota_write_key(
     pref: &ProviderRef,
     structured: Option<RateLimitWindow>,
     log_text: &str,
-    codex_profile: Option<&str>,
+    route: crate::providers::RecordedRoute<'_>,
 ) -> String {
     pref.rejection_key(
         QuotaSignal {
             window: structured,
             text: log_text,
         },
-        codex_profile,
+        route,
     )
 }
 
@@ -3509,17 +3552,17 @@ fn quota_hit_for_outcome(
 ///
 /// Takes no `structured`/`resets_at`/`quota_recovered`: both call sites are `Err` arms that
 /// by construction never produced a `SlotOutcome`, so a typed verdict cannot exist yet
-/// to thread through. Takes the recorded `codex_profile` for the same reason the
-/// `Ok` arms do: a model-less codex seat writes the bucket it dispatched under.
+/// to thread through. Takes the recorded route for the same reason the `Ok` arms
+/// do: a model-less codex seat writes the bucket it dispatched under.
 fn detect_and_pause_quota_with_err(
     paths: &SparPaths,
     pref: &ProviderRef,
     log_text: &str,
     extra: &str,
-    codex_profile: Option<&str>,
+    route: crate::providers::RecordedRoute<'_>,
 ) -> bool {
     let text = format!("{log_text}\n{extra}");
-    let key = quota_write_key(pref, None, &text, codex_profile);
+    let key = quota_write_key(pref, None, &text, route);
     detect_and_pause_quota(paths, pref, &key, &text, None, None, false)
 }
 
@@ -4314,8 +4357,6 @@ fn run_api(
     prompt_path: &Path,
     prompt: &str,
     timeout: Duration,
-    api_key: Option<&str>,
-    base_url: Option<&str>,
 ) -> Result<SlotOutcome> {
     let expected = job
         .expected_artifact
@@ -4334,8 +4375,6 @@ fn run_api(
         timeout,
         dry_run: false,
         model_override: model.clone(),
-        api_key: api_key.map(str::to_owned),
-        base_url: base_url.map(str::to_owned),
     })?;
     let (ok, err, usage, timeout_cause) = (
         outcome.ok,
@@ -4358,7 +4397,6 @@ fn run_api(
                     slot_id: &job.slot_id,
                     round: state.round,
                     role: job.role,
-                    codex_profile: state.codex_profile.clone(),
                     owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                     provider: &job.provider,
                     model: model.clone(),
@@ -4488,7 +4526,6 @@ fn run_headless(
         effort: slot_effort_for(cfg, Some(state), job),
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(paths.sessions_dir(&state.id, &job.slot_id)),
-        codex_profile: state.codex_profile.clone(),
     };
     let prior_session_id =
         prior_session_for_role(paths, &state.id, &job.slot_id, cli_name, job.role);
@@ -4631,7 +4668,6 @@ fn run_headless(
                     slot_id: &job.slot_id,
                     round: state.round,
                     role: job.role,
-                    codex_profile: state.codex_profile.clone(),
                     owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                     provider: &job.provider,
                     model: slot_model_for(Some(state), job),
@@ -4793,7 +4829,6 @@ fn run_headless(
                 slot_id: &job.slot_id,
                 round: state.round,
                 role: job.role,
-                codex_profile: state.codex_profile.clone(),
                 owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                 provider: &job.provider,
                 model: slot_model_for(Some(state), job),
@@ -5028,7 +5063,6 @@ fn run_tmux(
         effort,
         timeout_secs: None,
         session_dir: Some(paths.sessions_dir(&state.id, &job.slot_id)),
-        codex_profile: state.codex_profile.clone(),
     };
     // The pane is teed to a log, never run through `StreamCoalescer`, so no id is
     // ever captured here (O65). An adapter that accepts a caller-supplied id gets
@@ -5636,7 +5670,12 @@ mod tests {
     ) -> (bool, String) {
         let pref = seat_ref(seat);
         let log_text = outcome_log_text(log_path, outcome);
-        let key = quota_write_key(&pref, outcome.quota_rejected, &log_text, None);
+        let key = quota_write_key(
+            &pref,
+            outcome.quota_rejected,
+            &log_text,
+            crate::providers::RecordedRoute::ambient(),
+        );
         (
             quota_hit_for_outcome(paths, &pref, &key, &log_text, outcome),
             key,
@@ -5659,7 +5698,6 @@ mod tests {
 
     fn dispatch_opts(prompt: &str) -> SpawnOpts {
         SpawnOpts {
-            codex_profile: None,
             prompt: prompt.into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
@@ -5676,10 +5714,10 @@ mod tests {
     #[test]
     fn build_dispatch_command_resumes_codex_when_a_prior_session_id_is_known() {
         // build_resume (opts.model: None) falls through to profile_model_args, which
-        // reads $CODEX_HOME/<profile>.config.toml — lock and isolate CODEX_HOME so this
+        // reads $CODEX_HOME/<profile>.config.toml: pin and isolate CODEX_HOME so this
         // doesn't read the machine's real ~/.codex or race codex.rs's own env-mutating
         // tests, matching neither of which this test's assertions depend on.
-        let _guard = providers::codex::ENV_LOCK.lock().unwrap();
+        let _pin = providers::codex::pin_codex_env();
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("CODEX_HOME", home.path());
         let mut opts = dispatch_opts("go");
@@ -7842,7 +7880,12 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let until = chrono::Utc::now() + chrono::Duration::hours(2);
         let log = "! rate limit  seven_day_sonnet  rejected\n";
         let seat = seat_ref("cli:claude@opus");
-        let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDaySonnet), log, None);
+        let key = quota_write_key(
+            &seat,
+            Some(RateLimitWindow::SevenDaySonnet),
+            log,
+            crate::providers::RecordedRoute::ambient(),
+        );
         assert_eq!(key, "cli:claude");
         assert!(detect_and_pause_quota(
             &paths,
@@ -7872,7 +7915,12 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let until = chrono::Utc::now() + chrono::Duration::hours(2);
         let log = "! rate limit  seven_day_opus  rejected\nYou've hit your limit\n";
         let seat = seat_ref("cli:claude@opus");
-        let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDayOpus), log, None);
+        let key = quota_write_key(
+            &seat,
+            Some(RateLimitWindow::SevenDayOpus),
+            log,
+            crate::providers::RecordedRoute::ambient(),
+        );
         assert_eq!(key, "cli:claude");
         assert!(detect_and_pause_quota(
             &paths,
@@ -7898,7 +7946,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let paths = SparPaths::new(tmp.path());
         let log = "You've reached your Fable limit\n";
         let seat = seat_ref("cli:claude@fable");
-        let key = quota_write_key(&seat, None, log, None);
+        let key = quota_write_key(&seat, None, log, crate::providers::RecordedRoute::ambient());
         assert_eq!(key, "cli:claude@fable");
         {
             let mut store = crate::quota::QuotaStore::load(&paths).unwrap_or_default();
@@ -7983,7 +8031,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &seat,
             Some(RateLimitWindow::SevenDayOverageIncluded),
             "",
-            None,
+            crate::providers::RecordedRoute::ambient(),
         );
         assert_eq!(key, "cli:claude@opus");
         let haiku = seat_ref("cli:claude@haiku");
@@ -7991,7 +8039,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &haiku,
             Some(RateLimitWindow::SevenDayOverageIncluded),
             "",
-            None,
+            crate::providers::RecordedRoute::ambient(),
         );
         assert_eq!(key, "cli:claude");
     }
@@ -8252,13 +8300,13 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             "cli:agy@flash",
             &store,
             None,
-            None
+            crate::providers::RecordedRoute::ambient()
         ));
         assert!(crate::backup::is_provider_eligible(
             "cli:agy@pro",
             &store,
             None,
-            None
+            crate::providers::RecordedRoute::ambient()
         ));
     }
 
@@ -8293,7 +8341,10 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             effort: None,
         };
         let seat = seat_ref_for(Some(&st), &job);
-        assert_eq!(seat.quota_key(None), "cli:agy@gemini-flash");
+        assert_eq!(
+            seat.quota_key(crate::providers::RecordedRoute::ambient()),
+            "cli:agy@gemini-flash"
+        );
         let log = "error: Individual quota reached. Resets in 2h.\n";
         assert!(detect_and_pause_quota(
             &paths,
@@ -8306,19 +8357,25 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         let slot = &st.slots[0];
-        assert_eq!(slot.provider_ref().quota_key(None), "cli:agy@gemini-flash");
+        assert_eq!(
+            slot.provider_ref()
+                .quota_key(crate::providers::RecordedRoute::ambient()),
+            "cli:agy@gemini-flash"
+        );
         assert!(!crate::backup::is_provider_eligible(
             &slot.provider_ref().display(),
             &store,
             None,
-            None
+            crate::providers::RecordedRoute::ambient()
         ));
         let plan_job = SlotJob {
             model: slot.model.clone(),
             ..job
         };
         assert_eq!(
-            plan_job.provider_ref().quota_key(None),
+            plan_job
+                .provider_ref()
+                .quota_key(crate::providers::RecordedRoute::ambient()),
             "cli:agy@gemini-flash"
         );
     }
@@ -8605,7 +8662,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &seat_ref("api:openai"),
             log,
             err_text,
-            None,
+            crate::providers::RecordedRoute::ambient(),
         ));
     }
 
@@ -8615,18 +8672,29 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     /// seat dispatched natively writes and reads `cli:codex@native`.
     #[test]
     fn recorded_codex_profile_governs_writes_and_reads_under_a_foreign_env() {
-        let _guard = providers::codex::ENV_LOCK.lock().unwrap();
+        let _pin = providers::codex::pin_codex_env();
         std::env::set_var("SPAR_CODEX_PROFILE", "muse");
         let seat = seat_ref("cli:codex");
-        let write = quota_write_key(&seat, None, "error: 429 rate limit\n", Some(""));
+        let write = quota_write_key(
+            &seat,
+            None,
+            "error: 429 rate limit\n",
+            crate::providers::RecordedRoute {
+                profile: Some(""),
+                model: None,
+            },
+        );
         assert_eq!(write, "cli:codex@native", "write keys the recorded route");
         assert_eq!(
-            seat.quota_key(Some("")),
+            seat.quota_key(crate::providers::RecordedRoute {
+                profile: Some(""),
+                model: None
+            }),
             "cli:codex@native",
             "read keys the recorded route"
         );
         assert_eq!(
-            seat.quota_key(None),
+            seat.quota_key(crate::providers::RecordedRoute::ambient()),
             "cli:codex@openrouter",
             "no record keys this process's route"
         );
@@ -8797,6 +8865,73 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(
             !dispatch_left_work(&repo, None, None, None),
             "with no recorded base, only a dirty tree can be judged"
+        );
+    }
+
+    fn snapshot_repo(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let repo = tmp.path().join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        repo
+    }
+
+    /// Thousands of untracked files overflow both pipes at once (path list in,
+    /// sha list out). Writing everything before reading anything wedges git and
+    /// spar against each other with no timeout, so the write must overlap the
+    /// drain on its own thread. Fails by hanging on the old sequence.
+    #[test]
+    fn snapshot_combo_hashes_thousands_of_untracked_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = snapshot_repo(&tmp);
+        for i in 0..4000 {
+            std::fs::write(
+                repo.join(format!("untracked-{i:05}-with-a-longer-name.txt")),
+                "x\n",
+            )
+            .unwrap();
+        }
+        let before = snapshot_combo(&repo).expect("a large untracked set still snapshots");
+        std::fs::write(repo.join("one-more.txt"), "y\n").unwrap();
+        let after = snapshot_combo(&repo).expect("the set still snapshots after growing");
+        assert_ne!(before, after, "one added file changes the snapshot");
+    }
+
+    /// A newline in an untracked name cannot ride the `--stdin-paths` line
+    /// protocol, so it hashes alone through argv and still pairs with its own
+    /// sha. The pairing is checked byte for byte against an independent hash.
+    #[test]
+    fn snapshot_combo_pairs_a_newline_filename_with_its_own_sha() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = snapshot_repo(&tmp);
+        let odd = "weird\nname.txt";
+        std::fs::write(repo.join(odd), "odd\n").unwrap();
+        std::fs::write(repo.join("plain.txt"), "plain\n").unwrap();
+        let combo = snapshot_combo(&repo).expect("a newline name still snapshots");
+        let expected = std::process::Command::new("git")
+            .args(["hash-object", odd])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(expected.status.success());
+        let sha = String::from_utf8_lossy(&expected.stdout).trim().to_string();
+        let needle = [odd.as_bytes(), &[0], sha.as_bytes(), &[0]].concat();
+        assert!(
+            combo.windows(needle.len()).any(|w| w == needle),
+            "the newline name pairs with its own sha"
         );
     }
 
@@ -9632,7 +9767,9 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
                 std::thread::sleep(std::time::Duration::from_secs(5));
             }
         });
-        let base_url = format!("http://127.0.0.1:{port}/v1");
+        let _key = crate::util::EnvRestore::set("OPENAI_API_KEY", "test-key");
+        let _url =
+            crate::util::EnvRestore::set("OPENAI_BASE_URL", &format!("http://127.0.0.1:{port}/v1"));
         let mut st = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
         st.worktrees.push(crate::state::WorktreeRecord {
             slot_id: "impl".into(),
@@ -9665,12 +9802,10 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &prompt,
             "do it",
             std::time::Duration::from_secs(2),
-            Some("test-key"),
-            Some(base_url.as_str()),
         );
-        // The hang itself is what the test measures: `chat_completion` already
-        // remakes an EINTR-interrupted read at the source (`retry_interrupted`),
-        // so a transport failure here is a real finding, never retried.
+        // The hang itself is what the test measures: the masked call waits out
+        // the ceiling instead of failing on an EINTR from the test runner's own
+        // child churn, so a transport failure here is a real finding.
         let outcome = outcome.unwrap();
         assert!(
             outcome.ok,

@@ -142,6 +142,10 @@ pub struct HistoryRow {
     /// Times the run entered the `quota` phase.
     #[serde(default)]
     pub quota_parks: u32,
+    /// The route the run's last dispatch stamped.
+    /// Old lines predate it and key from the ambient environment instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<crate::providers::StoredRoute>,
     /// `[review] block_on` the `blocking` counts were taken at.
     #[serde(default)]
     pub block_on: Option<Severity>,
@@ -156,6 +160,16 @@ impl HistoryRow {
     /// No per-dispatch ledger: a schema 1 line or a compact one.
     pub fn run_level_only(&self) -> bool {
         self.schema_version < 2 || self.compact
+    }
+
+    /// The dispatch route this run recorded at stamp time, for quota keying.
+    /// No route on an old line means no record: key from this process's
+    /// environment, exactly as a reader without the run would.
+    pub fn recorded_route(&self) -> crate::providers::RecordedRoute<'_> {
+        self.route
+            .as_ref()
+            .map(crate::providers::StoredRoute::as_recorded)
+            .unwrap_or_else(crate::providers::RecordedRoute::ambient)
     }
 }
 
@@ -352,6 +366,13 @@ pub fn row(
             .iter()
             .filter(|e| e.kind == EventKind::Phase && e.phase == Some(Phase::Quota))
             .count() as u32,
+        route: {
+            let route = crate::providers::StoredRoute {
+                profile: state.codex_profile.clone(),
+                model: state.codex_model.clone(),
+            };
+            (route.profile.is_some() || route.model.is_some()).then_some(route)
+        },
         block_on: Some(block_on),
         compact: false,
     }
