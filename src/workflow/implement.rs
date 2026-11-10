@@ -274,12 +274,13 @@ mod preview_amend_tests {
         assert_eq!(amend.cfg.roles.reviewer, vec!["cli:grok".to_string()]);
     }
 
-    /// #234 follow-up: the bound pin is the run's panel in ordinal order, never
-    /// slot order, and widened extras (ids with no ordinal) are not panel seats.
-    /// Slots stored codex-first still pin claude-first, and the `-wide` extra
-    /// is neither pinned nor counted.
+    /// #234 follow-up: the bound pin is the run's panel in live slot order, the
+    /// same order `panel_position` and `panel_seat_with_ordinal` index, never a
+    /// second id-ordinal sort; widened extras are not panel seats. Slots stored
+    /// codex-first pin codex-first, and the `-wide` extra is neither pinned nor
+    /// counted.
     #[test]
-    fn bound_pin_sorts_by_ordinal_and_ignores_wide_extras() {
+    fn bound_pin_follows_slot_order_and_ignores_wide_extras() {
         let mut st = dry_stateless_run();
         for (id, provider) in [
             ("review-1-cli-codex", "cli:codex"),
@@ -295,7 +296,7 @@ mod preview_amend_tests {
         };
         let amend = preview_bound_amend(&Config::default(), None, &st, &inputs).unwrap();
         assert_eq!(amend.dropped, vec![1]);
-        assert_eq!(amend.cfg.roles.reviewer, vec!["cli:claude".to_string()]);
+        assert_eq!(amend.cfg.roles.reviewer, vec!["cli:codex".to_string()]);
     }
 
     /// The last-seat refusal judges the final panel: `--role reviewer=` re-seats
