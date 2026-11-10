@@ -232,6 +232,10 @@ name = "bus_urgent_resume"
 path = "tests/scenarios/bus_urgent_resume.rs"
 
 [[test]]
+name = "bus_urgent_pollfile"
+path = "tests/scenarios/bus_urgent_pollfile.rs"
+
+[[test]]
 name = "operator_surgery"
 path = "tests/scenarios/operator_surgery.rs"
 

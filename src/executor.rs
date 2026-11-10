@@ -2463,14 +2463,6 @@ fn interrupt_cause_for(
     Some(InterruptCause::UrgentMessage)
 }
 
-/// Re-dispatch the killed turn in place: the same session it ran in, else a
-/// cold dispatch under a fresh id with the urgent bodies first, the urgent
-/// bodies leading the prompt ahead of the normal continuation. Returns the
-/// resume dispatch's result plus the session it ran in, if it resumed one.
-/// The killed attempt's result is discarded by the caller: it never becomes
-/// an outcome, so no rotation, no round cost, no WIP salvage. Callers refresh
-/// their pid from the spawn sink afterwards.
-#[allow(clippy::too_many_arguments)]
 /// The named session the killed turn actually ran in: the id it captured
 /// mid-turn, else the id it resumed, else the assigned id when the turn did
 /// enough real work to prove the vendor created it. That third arm is for
@@ -2611,6 +2603,13 @@ fn resume_pending_urgents(
     })
 }
 
+/// Re-dispatch the killed turn in place: the same session it ran in, else a
+/// cold dispatch under a fresh id with the urgent bodies first, the urgent
+/// bodies leading the prompt ahead of the normal continuation. Returns the
+/// resume dispatch's result plus the session it ran in, if it resumed one.
+/// The killed attempt's result is discarded by the caller: it never becomes
+/// an outcome, so no rotation, no round cost, no WIP salvage. Callers refresh
+/// their pid from the spawn sink afterwards.
 #[allow(clippy::too_many_arguments)]
 fn resume_urgent_turn(
     adapter: &dyn providers::ProviderAdapter,
@@ -7277,6 +7276,20 @@ mod tests {
 
         // Session id captured, even on a clean exit: no retry.
         res.stats.session_id = Some("thread-123".into());
+        assert!(!resume_lost_its_session(true, &res));
+
+        // A dispatch killed by signal is a kill, never a lost rollout — even
+        // with no session captured. The urgent path relies on this (its kills
+        // land before any session exists); an OOM kill shares the treatment.
+        res.stats.session_id = None;
+        res.signal = Some(9);
+        res.exit_code = None;
+        assert!(!resume_lost_its_session(true, &res));
+
+        // A CLI that traps the signal and exits 137/143 instead of dying by
+        // it is the same kill, not a missing session either.
+        res.signal = None;
+        res.exit_code = Some(137);
         assert!(!resume_lost_its_session(true, &res));
     }
 

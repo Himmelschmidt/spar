@@ -296,14 +296,8 @@ pub fn urgent_deferred_msg_ids(paths: &SparPaths, run_id: &str, slot_id: &str) -
 
 /// Delete one filed request (an urgent send whose message failed to file, so no
 /// turn was ever killed for it).
-pub fn remove_urgent_interrupt(
-    paths: &SparPaths,
-    run_id: &str,
-    slot_id: &str,
-    msg_id: &str,
-) -> Result<()> {
+pub fn remove_urgent_interrupt(paths: &SparPaths, run_id: &str, slot_id: &str, msg_id: &str) {
     let _ = std::fs::remove_file(paths.marker(run_id, &urgent_name(slot_id, msg_id)));
-    Ok(())
 }
 
 pub fn read_session_id(
@@ -544,7 +538,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(urgent_deferred_msg_ids(&paths, "r1", "slot-a"), ["m-now"]);
-        remove_urgent_interrupt(&paths, "r1", "slot-a", "m-now").unwrap();
+        remove_urgent_interrupt(&paths, "r1", "slot-a", "m-now");
         assert!(urgent_deferred_msg_ids(&paths, "r1", "slot-a").is_empty());
         clear_pid(&paths, "r1", "slot-a");
         write_urgent_interrupt(

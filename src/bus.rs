@@ -1597,7 +1597,7 @@ pub fn withdraw(paths: &SparPaths, msg_id: &str) -> Result<Withdrawal> {
         // a superseding send skips the file-time fan-out, so for an urgent
         // replacement the marker may be all there is.
         if let Some((run, short)) = agent.split_once(':') {
-            let _ = crate::markers::remove_urgent_interrupt(paths, run, short, msg_id);
+            crate::markers::remove_urgent_interrupt(paths, run, short, msg_id);
         }
         let is_poll = agent
             .split_once(':')
