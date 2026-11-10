@@ -277,8 +277,9 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> anyhow::Result<Vec<PlanSea
             Some(detected)
         }
     };
-    let mut out = Vec::with_capacity(specs.len());
+    let mut out: Vec<PlanSeat> = Vec::with_capacity(specs.len());
     let mut skips: Vec<(String, String)> = Vec::new();
+    let mut planner_failed = false;
     for (idx, (role, prefix, template)) in specs.into_iter().enumerate() {
         let selected = art.as_ref().and_then(|a| {
             a.choices
@@ -286,6 +287,7 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> anyhow::Result<Vec<PlanSea
                 .find(|c| c.role.as_deref() == Some(role.as_config_key()) || c.slot == idx)
                 .and_then(|c| c.model.clone())
         });
+        let used: Vec<String> = out.iter().map(|s| s.provider.clone()).collect();
         let Some((prov, source)) = crate::backup::resolve_with_backup(
             role,
             idx,
@@ -300,6 +302,7 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> anyhow::Result<Vec<PlanSea
             state.dry_run,
             state.codex_profile.as_deref(),
             &health,
+            &used,
         )
         .or_else(|| {
             crate::workflow::roles_resolve::resolve_seat(
@@ -310,8 +313,12 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> anyhow::Result<Vec<PlanSea
                 state.pool_origin,
                 cfg,
                 &health,
+                &used,
             )
         }) else {
+            if idx == 0 {
+                planner_failed = true;
+            }
             skips.extend(crate::workflow::roles_resolve::health_skips_for_seat(
                 role,
                 idx,
@@ -333,7 +340,9 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> anyhow::Result<Vec<PlanSea
             source,
         });
     }
-    if out.is_empty() {
+    // The planner is the run's first seat: a missing planner fails even when a
+    // critic resolved, so a gate rejection never reads as a planner-less plan.
+    if planner_failed || out.is_empty() {
         if let Some(err) = crate::backup::readiness_error(&skips) {
             return Err(err);
         }
@@ -578,6 +587,7 @@ pub fn execute_plan(
         &store,
         paths,
         true,
+        state.dry_run,
         Some(&state.id),
     )
     .unwrap_or_default();

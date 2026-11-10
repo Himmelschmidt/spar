@@ -293,6 +293,7 @@ fn repoint_existing_seats(
             state.pool_origin,
             cfg,
             health,
+            &[],
         ) else {
             continue;
         };
@@ -3529,7 +3530,13 @@ fn recheck_seat(
         !store.is_usable(&key) && store.get(&key).updated_at.is_none_or(|at| at < horizon)
     };
     if !blocked {
-        return Ok(SeatCheck::Ready(slot_id.to_string()));
+        // A continued run re-checks an auto-selected seat's health through the
+        // same single resolution point as launch (O169): a provider that went
+        // unhealthy between dispatches is re-seated, never blindly dispatched.
+        // Pins only warn; quota already cleared above, so a seat with nothing
+        // healthy left fails readiness (exit 1), never parks (exit 4).
+        let health = providers::LiveHealth::for_dry(state.dry_run);
+        return recheck_seat_health(state, paths, cfg, &slot, &health);
     }
     let ordinal = match slot.role {
         SlotRole::Reviewer => reviewer_ordinal(slot_id),
@@ -3567,6 +3574,85 @@ fn recheck_seat(
         &state.id,
         &crate::events::Event::slot_note(&new_id, note),
     );
+    Ok(SeatCheck::Ready(new_id))
+}
+
+fn recheck_seat_health(
+    state: &mut RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+    slot: &SlotState,
+    health: &dyn crate::providers::HealthSource,
+) -> anyhow::Result<SeatCheck> {
+    let (role, pool_idx, role_idx): (SlotRole, usize, usize) = match slot.role {
+        SlotRole::Implementer => (SlotRole::Implementer, 0, 0),
+        SlotRole::Reviewer => match reviewer_ordinal(&slot.id) {
+            Some(r) => (SlotRole::Reviewer, r + 1, r),
+            None => return Ok(SeatCheck::Ready(slot.id.clone())),
+        },
+        SlotRole::Tester => (SlotRole::Tester, 0, 0),
+        _ => return Ok(SeatCheck::Ready(slot.id.clone())),
+    };
+    if matches!(slot.status, SlotStatus::Running)
+        || matches!(slot.source, Some(SeatSource::Reassigned))
+        || slot.source.is_some_and(|s| s.is_explicit_pin())
+    {
+        return Ok(SeatCheck::Ready(slot.id.clone()));
+    }
+    // A seat whose provider is still healthy keeps it: re-resolution is
+    // positional, so re-resolving a healthy seat would reshuffle a continuing
+    // run onto different providers every round. Only a provider that went
+    // unhealthy between dispatches goes back through the single point.
+    if health.check(&slot.provider).usable {
+        return Ok(SeatCheck::Ready(slot.id.clone()));
+    }
+    let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+    let fresh = match role {
+        SlotRole::Implementer => crate::backup::resolve_with_backup(
+            role,
+            pool_idx,
+            role_idx,
+            &state.providers,
+            state.pool_origin,
+            cfg,
+            slot.model.as_deref(),
+            &store,
+            None,
+            paths,
+            state.dry_run,
+            state.codex_profile.as_deref(),
+            health,
+            &[],
+        ),
+        _ => crate::workflow::roles_resolve::resolve_seat(
+            role,
+            pool_idx,
+            role_idx,
+            &state.providers,
+            state.pool_origin,
+            cfg,
+            health,
+            &[],
+        ),
+    };
+    let Some((fresh_raw, fresh_src)) = fresh else {
+        let skips = crate::workflow::roles_resolve::health_skips_for_seat(
+            role,
+            pool_idx,
+            &state.providers,
+            state.pool_origin,
+            cfg,
+            health,
+        );
+        if let Some(err) = crate::backup::readiness_error(&skips) {
+            return Err(err);
+        }
+        anyhow::bail!("no provider resolved for `{}`", slot.id);
+    };
+    if fresh_raw == slot.provider {
+        return Ok(SeatCheck::Ready(slot.id.clone()));
+    }
+    let new_id = move_seat_to_backup(state, paths, &slot.id, &fresh_raw, fresh_src)?;
     Ok(SeatCheck::Ready(new_id))
 }
 
@@ -4141,6 +4227,65 @@ mod recheck_seat_tests {
             matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-codex"),
             "a pre-existing weak pause steers onto the backup"
         );
+    }
+
+    /// A continued run re-resolves an auto-selected implementer through the same
+    /// point as launch: the sick provider is re-seated onto the healthy order
+    /// entry, never redispatched.
+    #[test]
+    fn a_continued_run_reseats_a_sick_auto_implementer() {
+        use crate::providers::StubHealth;
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with("impl", "cli:codex", SlotRole::Implementer);
+        st.providers = vec!["cli:codex".into(), "cli:claude".into()];
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["cli:codex".into(), "cli:claude".into()];
+        let health = StubHealth::refuse("cli:codex", "probe `codex login status` failed");
+        let slot = st.slots[0].clone();
+        let got = recheck_seat_health(&mut st, &paths, &cfg, &slot, &health).unwrap();
+        assert!(matches!(got, SeatCheck::Ready(id) if id == "impl"));
+        let slot = st.slots.iter().find(|s| s.id == "impl").unwrap();
+        assert_eq!(slot.provider, "cli:claude");
+        assert_eq!(slot.source, Some(SeatSource::ProvidersOrder));
+    }
+
+    /// Nothing healthy left on continuation is a readiness error naming the
+    /// probe, never a quota park.
+    #[test]
+    fn a_continued_run_with_no_healthy_provider_fails_readiness() {
+        use crate::providers::StubHealth;
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with("impl", "cli:codex", SlotRole::Implementer);
+        st.providers = vec!["cli:codex".into()];
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["cli:codex".into()];
+        let health = StubHealth::refuse("cli:codex", "probe `codex login status` failed");
+        let slot = st.slots[0].clone();
+        let err = recheck_seat_health(&mut st, &paths, &cfg, &slot, &health)
+            .err()
+            .expect("readiness error, not a seat");
+        assert!(err.to_string().contains("no healthy provider"), "{err}");
+        assert!(err.to_string().contains("cli:codex"), "{err}");
+    }
+
+    /// A sick pin keeps its seat on continuation, exactly as at launch.
+    #[test]
+    fn a_continued_run_keeps_a_sick_pin_on_its_seat() {
+        use crate::providers::StubHealth;
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with("impl", "cli:codex", SlotRole::Implementer);
+        st.providers = vec!["cli:codex".into(), "cli:claude".into()];
+        st.slots[0].source = Some(SeatSource::CliProviders);
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["cli:codex".into(), "cli:claude".into()];
+        let health = StubHealth::refuse("cli:codex", "probe `codex login status` failed");
+        let slot = st.slots[0].clone();
+        let got = recheck_seat_health(&mut st, &paths, &cfg, &slot, &health).unwrap();
+        assert!(matches!(got, SeatCheck::Ready(id) if id == "impl"));
+        assert_eq!(st.slots[0].provider, "cli:codex");
     }
 
     #[test]

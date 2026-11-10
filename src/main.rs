@@ -333,7 +333,7 @@ fn run() -> Result<ExitCode> {
                     crate::cli::WorkflowKind::Plan,
                     &opts,
                     &cfg,
-                    &crate::providers::LiveHealth::probing(),
+                    &crate::providers::LiveHealth::for_dry(opts.dry_run),
                     &paths,
                 ) {
                     Ok(f) => f,
@@ -515,7 +515,7 @@ fn run() -> Result<ExitCode> {
                                 crate::cli::WorkflowKind::Loop,
                                 &opts,
                                 &cfg,
-                                &crate::providers::LiveHealth::probing(),
+                                &crate::providers::LiveHealth::for_dry(opts.dry_run),
                                 &paths,
                             )?;
                         }
@@ -641,7 +641,7 @@ fn run() -> Result<ExitCode> {
                         workflow,
                         &opts,
                         &cfg,
-                        &crate::providers::LiveHealth::probing(),
+                        &crate::providers::LiveHealth::for_dry(opts.dry_run),
                         &paths,
                     )?
                 } else {
