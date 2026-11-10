@@ -9668,26 +9668,10 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             Some("test-key"),
             Some(base_url.as_str()),
         );
-        // A signal delivered to this thread under parallel load can interrupt
-        // the local socket read; the hang itself is what the test measures, so
-        // one retry only remakes a transport failure, never the verdict.
-        let outcome = match outcome {
-            Err(_) => run_api(
-                &st,
-                &paths,
-                &job,
-                &pref,
-                &cwd,
-                &log,
-                &prompt,
-                "do it",
-                std::time::Duration::from_secs(2),
-                Some("test-key"),
-                Some(base_url.as_str()),
-            )
-            .unwrap(),
-            ok => ok.unwrap(),
-        };
+        // The hang itself is what the test measures: `chat_completion` already
+        // remakes an EINTR-interrupted read at the source (`retry_interrupted`),
+        // so a transport failure here is a real finding, never retried.
+        let outcome = outcome.unwrap();
         assert!(
             outcome.ok,
             "a ceiling kill after finished work stays done: {:?}",

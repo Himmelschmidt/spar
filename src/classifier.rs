@@ -271,20 +271,18 @@ fn live_post(
         .http_status_as_error(false)
         .build()
         .into();
-    match agent
-        .post(url)
-        .header("Authorization", &format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .header("X-OpenRouter-Title", "spar")
-        .send(body)
-    {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let text = resp.into_body().read_to_string().unwrap_or_default();
-            Ok((status, text))
-        }
-        Err(e) => Err(e.to_string()),
-    }
+    crate::util::retry_interrupted(|| {
+        let resp = agent
+            .post(url)
+            .header("Authorization", &format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .header("X-OpenRouter-Title", "spar")
+            .send(body)?;
+        let status = resp.status().as_u16();
+        let text = resp.into_body().read_to_string().unwrap_or_default();
+        Ok((status, text))
+    })
+    .map_err(|e| e.to_string())
 }
 
 const BREAKER_OPEN: Duration = Duration::from_secs(300);

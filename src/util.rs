@@ -57,6 +57,27 @@ pub fn expand_home(raw: &str) -> std::path::PathBuf {
     }
 }
 
+/// Re-run a blocking HTTP call while the kernel reports it as interrupted.
+///
+/// Slot children are spawned and reaped on other threads of this process, so a
+/// blocked socket read can draw EINTR (SIGCHLD, default disposition: no handler
+/// runs, the syscall still fails) instead of the caller's timeout. ureq reports
+/// that as a typed `Error::Io`, never as `Error::Timeout`, so without a retry a
+/// slow server reads as a transport failure. An interruption carries no server
+/// answer, so the re-send is not an attempt against the endpoint; each attempt
+/// keeps the caller's own timeout, and two retries bound a signal storm.
+pub fn retry_interrupted<T>(
+    mut op: impl FnMut() -> Result<T, ureq::Error>,
+) -> Result<T, ureq::Error> {
+    for _ in 0..2 {
+        match op() {
+            Err(ureq::Error::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            done => return done,
+        }
+    }
+    op()
+}
+
 pub fn hostname() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))
@@ -91,6 +112,42 @@ pub fn fmt_elapsed(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn interrupted() -> ureq::Error {
+        ureq::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "interrupted",
+        ))
+    }
+
+    #[test]
+    fn retry_interrupted_reruns_only_an_interrupted_read() {
+        let mut calls = 0;
+        let ok = retry_interrupted(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(interrupted())
+            } else {
+                Ok("done")
+            }
+        });
+        assert_eq!(ok.unwrap(), "done");
+        assert_eq!(calls, 3, "two interruptions then a success");
+        let mut timeouts = 0;
+        let err = retry_interrupted::<()>(|| {
+            timeouts += 1;
+            Err(ureq::Error::HostNotFound)
+        });
+        assert!(err.is_err());
+        assert_eq!(timeouts, 1, "a non-interruption returns at once");
+        let mut storms = 0;
+        let err = retry_interrupted::<()>(|| {
+            storms += 1;
+            Err(interrupted())
+        });
+        assert!(err.is_err());
+        assert_eq!(storms, 3, "a signal storm still terminates");
+    }
 
     #[test]
     fn fmt_elapsed_scales_with_magnitude() {

@@ -125,17 +125,17 @@ pub fn chat_completion(
             .timeout_global(Some(timeout))
             .build(),
     );
-    let resp = agent
-        .post(&url)
-        .header("Authorization", &format!("Bearer {}", cfg.api_key))
-        .header("Content-Type", "application/json")
-        .send_json(&body)
-        .with_context(|| format!("POST {url}"))?;
-    let status = resp.status();
-    let text = resp
-        .into_body()
-        .read_to_string()
-        .context("read response body")?;
+    let (status, text) = crate::util::retry_interrupted(|| {
+        let resp = agent
+            .post(&url)
+            .header("Authorization", &format!("Bearer {}", cfg.api_key))
+            .header("Content-Type", "application/json")
+            .send_json(&body)?;
+        let status = resp.status();
+        let text = resp.into_body().read_to_string()?;
+        Ok((status, text))
+    })
+    .with_context(|| format!("POST {url}"))?;
     if !status.is_success() {
         bail!("api {} status {status}: {}", cfg.name, truncate(&text, 400));
     }
