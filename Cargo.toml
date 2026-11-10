@@ -262,3 +262,7 @@ path = "tests/scenarios/classifier_routing.rs"
 [[test]]
 name = "codex_route"
 path = "tests/scenarios/codex_route.rs"
+
+[[test]]
+name = "one_pass"
+path = "tests/scenarios/one_pass.rs"

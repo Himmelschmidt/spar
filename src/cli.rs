@@ -205,6 +205,16 @@ pub enum Command {
         /// file disabled). Composes with `--without` and `--role`: explicit flags win.
         #[arg(long, value_name = "PRESET")]
         fleet: Option<String>,
+        /// One pass and ship: imply `--fleet small`, cap the run at one round, and
+        /// ship at the end of a passed gate. A sub-threshold `request_changes`
+        /// counts as approve-with-notes and ships clean, with the findings
+        /// listed as follow-ups in the PR body; anything that fails the gate
+        /// (a finding at or above `[review] block_on`, a failed acceptance
+        /// line, a failing suite, a dead reviewer seat) parks at the existing
+        /// gate (exit 2). Frozen into the run's config; an explicit `--fleet`
+        /// or `--max-rounds` still wins over the implied preset and ceiling.
+        #[arg(long = "one-pass")]
+        one_pass: bool,
         /// Drop seats for THIS run only, comma-separated: `critic`, `spec`, `suite`,
         /// plus reviewer seats as `reviewer[N]` (0-based panel ordinal) or an existing
         /// seat id (`review-1-cli-claude`). Dropping a reviewer removes the seat and
@@ -336,6 +346,18 @@ pub enum Command {
         /// file disabled). Composes with `--without` and `--role`: explicit flags win.
         #[arg(long, value_name = "PRESET")]
         fleet: Option<String>,
+        /// One pass and ship, for the `loop` workflow: imply `--fleet small`, cap
+        /// the run at one round, and ship at the end of a passed gate. A
+        /// sub-threshold `request_changes` counts as approve-with-notes and
+        /// ships clean, with the findings listed as follow-ups in the PR body;
+        /// anything that fails the gate (a finding at or above `[review]
+        /// block_on`, a failed acceptance line, a failing suite, a dead
+        /// reviewer seat) parks at the existing gate (exit 2). Frozen into the
+        /// run's config; an explicit `--fleet` or `--max-rounds` still wins
+        /// over the implied preset and ceiling.
+        /// Refused for other workflows.
+        #[arg(long = "one-pass")]
+        one_pass: bool,
         /// Drop seats for THIS run only, comma-separated: `critic`, `spec`, `suite`,
         /// plus reviewer seats as `reviewer[N]` (0-based panel ordinal). Dropping a
         /// reviewer removes the seat and its verdicts stop gating the ship. A bound

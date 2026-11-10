@@ -28,6 +28,7 @@ pub struct BoundAmendInputs {
     pub fleet: Option<crate::config::FleetPreset>,
     pub suite_command: Vec<String>,
     pub recapture_env: bool,
+    pub one_pass: bool,
 }
 
 impl BoundAmendInputs {
@@ -41,6 +42,7 @@ impl BoundAmendInputs {
             && self.effort.is_empty()
             && self.without.is_empty()
             && self.suite_command.is_empty()
+            && !self.one_pass
             && matches!(
                 self.fleet,
                 None | Some(crate::config::FleetPreset::Standard)
@@ -147,6 +149,9 @@ pub fn preview_bound_amend(
     };
     if let Some(preset) = inputs.fleet {
         cfg.apply_fleet_preset(preset);
+    }
+    if inputs.one_pass {
+        cfg.one_pass = true;
     }
     let without = resolve_without_seat_ids(state, &inputs.without)?;
     let mut panel_pinned = false;
@@ -1913,6 +1918,18 @@ fn run_from_approved(
     // that exited, a quota park before dispatch) cost nothing, so re-entry reuses it,
     // and reusing it is not a step past the ceiling.
     let reuse_round = state.round > 0 && !round_dispatched;
+    // `--one-pass` on a bound run is one more round, then the ship-or-park
+    // verdict: the loop ends at the next ceiling either way. An explicit
+    // `--max-rounds` still wins over the implied one-round ceiling. A reused
+    // round never dispatched, so it is itself that one more round: the ceiling
+    // stays on it, and its gate failure parks instead of opening another.
+    if amend.one_pass && opts.max_rounds.is_none() {
+        state.max_rounds = if reuse_round {
+            state.round
+        } else {
+            state.round + 1
+        };
+    }
     if !reuse_round && state.round_ceiling_reached() && escalate_round_ceiling(&mut state, paths)? {
         finish_out(&state, opts.json)?;
         return Ok(state.exit_code());
@@ -2014,6 +2031,16 @@ fn run_from_approved(
     }
     execute_loop(&mut state, paths, cfg, opts.accept_contract)?;
     maybe_auto_ship_or_cleanup(&mut state, paths, cfg)?;
+    // The ship reports itself (one JSON document with `--json`); emitting
+    // again would print the run twice.
+    if one_pass_should_ship(&state, cfg) {
+        // The real ship takes its own lock and refuses a live orchestrator,
+        // so this dispatch releases the run before running it.
+        drop(lock);
+        let id = state.id.clone();
+        let ship_code = run_one_pass_ship(&mut state, paths, cfg, &id, opts.json)?;
+        return Ok(ship_code);
+    }
     finish_out(&state, opts.json)?;
     Ok(state.exit_code())
 }
@@ -3565,9 +3592,12 @@ fn run_with_task(
     state.message_budget = cfg.message_budget;
     state.big = opts.big;
     state.max_fix_rounds = 3;
-    state.max_rounds = opts
-        .max_rounds
-        .map_or(cfg.rounds.max, |mr| mr.resolve(state.round));
+    state.max_rounds = if cfg.one_pass && opts.max_rounds.is_none() {
+        1
+    } else {
+        opts.max_rounds
+            .map_or(cfg.rounds.max, |mr| mr.resolve(state.round))
+    };
     let (n, roles) = crate::workflow::roles_resolve::reviewer_select_question(cfg);
     let requested = opts.resolve_pool(n, &roles, paths, cfg, &state.id)?;
     let pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
@@ -3637,12 +3667,25 @@ fn run_with_task(
     let _lock = crate::runlock::RunLock::acquire(paths, &state.id)?;
     execute_loop(&mut state, paths, cfg, opts.accept_contract)?;
     maybe_auto_ship_or_cleanup(&mut state, paths, cfg)?;
+    // The ship reports itself (one JSON document with `--json`); emitting
+    // again would print the run twice.
+    if one_pass_should_ship(&state, cfg) {
+        // The real ship takes its own lock and refuses a live orchestrator,
+        // so this dispatch releases the run before running it.
+        drop(_lock);
+        let id = state.id.clone();
+        let ship_code = run_one_pass_ship(&mut state, paths, cfg, &id, opts.json)?;
+        return Ok(ship_code);
+    }
     finish_out(&state, opts.json)?;
     Ok(state.exit_code())
 }
 
 fn maybe_auto_ship_or_cleanup(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<()> {
-    if state.phase == Phase::AwaitingShipConfirm && cfg.auto_ship() {
+    // A one-pass entry ships through its own verdict below, which must see the
+    // gate outcome to run the real ship; an early auto-ship would mark the run
+    // done before that verdict ever fires.
+    if state.phase == Phase::AwaitingShipConfirm && cfg.auto_ship() && !cfg.one_pass {
         state.gates.ship_confirmed = true;
         // leave at AwaitingShipConfirm with gate set — ship command still does push
         // unless we call ship; for dry-run mark Done
@@ -3719,6 +3762,49 @@ fn panel_stop(
         .collect::<Vec<_>>()
         .join("; ");
     Some((cause, messages))
+}
+
+/// The one-pass ship verdict (O200): a run whose frozen config carries
+/// `one_pass` ships only off a passed gate. The loop gate already counts a
+/// sub-threshold `request_changes` as approve-with-notes (O118), so a round
+/// that fails the gate always fails it on something that must park: a finding
+/// at or above `[review] block_on`, a failed acceptance line, a failing suite,
+/// or a dead reviewer seat. There is no failed-gate-with-only-minor-findings
+/// state to override, so the verdict reads the gate's phase instead of
+/// re-deriving its predicates.
+pub fn one_pass_should_ship(state: &RunState, cfg: &Config) -> bool {
+    cfg.one_pass && state.phase == Phase::AwaitingShipConfirm
+}
+
+/// Run the real ship path for a passed one-pass gate: push and open a draft PR
+/// via the same code `spar ship` uses. One-pass ships are always drafts, never
+/// overrides: a round that fails its gate parks at it (exit 2). The caller
+/// holds no lock here; `ship()` acquires its own. The ship reports itself (one
+/// JSON document with `json`, human lines otherwise); the caller must not emit
+/// again.
+pub fn run_one_pass_ship(
+    state: &mut RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+    run_id: &str,
+    json: bool,
+) -> Result<ExitCode> {
+    // The passed gate confirmed itself, so the loop records that.
+    state.gates.ship_confirmed = true;
+    state.save(paths)?;
+    let mut owned = cfg.clone();
+    owned.ship.draft = true;
+    crate::ship::ship(
+        paths,
+        &owned,
+        run_id,
+        json,
+        &crate::ship::ShipOpts {
+            base: None,
+            override_reason: None,
+            adopt_remote: false,
+        },
+    )
 }
 
 pub fn execute_loop(
@@ -10385,6 +10471,17 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
             // A daemon/`continue` resume is nobody's deliberate amendment, so it never
             // adopts a contract that moved under the previous round.
             execute_loop(&mut state, paths, cfg, false)?;
+            if one_pass_should_ship(&state, cfg) {
+                // The real ship takes its own lock, so this dispatch releases
+                // the run before running it, then re-reads the shipped state.
+                drop(_lock);
+                let id = state.id.clone();
+                let ship_code = run_one_pass_ship(&mut state, paths, cfg, &id, false)?;
+                state = RunState::load(paths, &id)?;
+                if ship_code != ExitCode::Success {
+                    return Ok(ship_code);
+                }
+            }
         }
         crate::cli::WorkflowKind::Arena => {
             crate::workflow::arena::execute(&mut state, paths, cfg)?;
@@ -12925,5 +13022,71 @@ mod frozen_reread_tests {
             .map(|s| s.provider.as_str())
             .collect();
         assert_eq!(implementers, vec!["cli:grok"]);
+    }
+}
+
+#[cfg(test)]
+mod one_pass_tests {
+    use super::*;
+
+    fn state_with(phase: Phase) -> RunState {
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            std::path::PathBuf::from("/x"),
+        );
+        state.phase = phase;
+        state
+    }
+
+    fn one_pass_cfg() -> Config {
+        Config {
+            one_pass: true,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn flag_off_never_ships() {
+        let cfg = Config::default();
+        for phase in [
+            Phase::AwaitingShipConfirm,
+            Phase::AwaitingRoundExtension,
+            Phase::Stuck,
+            Phase::Done,
+        ] {
+            let state = state_with(phase);
+            assert!(
+                !one_pass_should_ship(&state, &cfg),
+                "{phase:?} ships without --one-pass"
+            );
+        }
+    }
+
+    #[test]
+    fn passed_gate_ships() {
+        let cfg = one_pass_cfg();
+        let state = state_with(Phase::AwaitingShipConfirm);
+        assert!(one_pass_should_ship(&state, &cfg));
+    }
+
+    #[test]
+    fn failed_gate_parks() {
+        let cfg = one_pass_cfg();
+        // Whatever failed the gate (blocking findings, acceptance, suite, a
+        // dead seat, the ceiling) parks: only a passed gate ships.
+        for phase in [
+            Phase::AwaitingRoundExtension,
+            Phase::Stuck,
+            Phase::Failed,
+            Phase::Quota,
+            Phase::Done,
+        ] {
+            let state = state_with(phase);
+            assert!(
+                !one_pass_should_ship(&state, &cfg),
+                "{phase:?} is not a one-pass ship"
+            );
+        }
     }
 }

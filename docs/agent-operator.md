@@ -58,7 +58,8 @@ caught, which is what the sweep is for.
   phase of that run reads the snapshot, so another agent's edit cannot change its fleet,
   timeouts, spec/suite channels, or ship gate. `spar implement --run <id> --reload-config`
   re-reads the file, re-freezes, and then re-applies the overrides the run was launched
-  or amended with. `--role`, `--backup`, `--effort`, `--without` and `--fleet` amend a
+  or amended with. `--role`, `--backup`, `--effort`, `--without`, `--fleet` and
+  `--one-pass` amend a
   resume's frozen config directly (only `--suite-command` still needs `--reload-config`).
   `--without reviewer[N]` (or an existing seat id) drops a reviewer seat outright: the
   seat, its review history, and its verdicts stop gating the ship. The ordinal indexes
@@ -153,6 +154,25 @@ adopt a `test-contract.md` that drifted mid-round exits `1` until you pass
 `--accept-contract`. Between rounds the implementer's
 `artifacts/carry-forward-<slot>.md` is seeded into the next round's prompt, capped by
 `[rounds] carry_forward_chars`.
+
+**One-pass runs (O200).** `spar implement -t ... --one-pass` (or `run --workflow
+loop --one-pass`) implies `--fleet small` and caps a fresh run at one round: at
+the end of it a passed gate ships through the real ship path. A sub-threshold
+`request_changes` counts as approve-with-notes, so minor findings ship clean
+with no override, listed as follow-ups under the standing non-blocking list in
+the PR body; anything that fails the gate (a finding at or above `[review]
+block_on`, a failed or missing acceptance line, a failing suite, a
+missing/synthetic/verdict-less review, a dead reviewer seat) parks at the
+round-ceiling gate (exit 2) exactly as without the flag. On an existing run,
+`implement --run <id> --one-pass` resets the ceiling to one more round (a
+never-dispatched reused round counts as that round, so the ceiling stays on
+it) and then applies the same verdict. The mode is
+frozen into the run's `config.json`; an explicit `--fleet` or `--max-rounds`
+still wins over the implied preset and ceiling. If the ship itself fails (or
+the orchestrator dies after the gate passed), the run sits at
+`awaiting_ship_confirm`; resume and `__internal_continue` do not re-run the
+ship, so retry it with a plain `spar ship <id>` (the passed gate already
+recorded its confirm; draft stays the frozen default).
 
 `--providers` is **required** for plan / implement / run (no implicit fleet).
 

@@ -429,7 +429,8 @@ re-based after creation (O26), but it merges its base forward every round (O195)
 "make PR #N mergeable" runs converge unless the base conflicts — then the round's
 implementer resolves it, or the run parks at the ship gate. Pass
 `--max-rounds 1 --fleet small` to bound such a run to a single small round (with
-`[rounds] merge_base = false` to skip the forward merge).
+`[rounds] merge_base = false` to skip the forward merge), or `--one-pass` to
+also ship at the end of that round (see "Fleet shaping").
 `spar reconcile <id>` is an arena continuation, not a workflow: it adds a `reconciler` plus
 two more `reviewer` slots on the reconciled tree.
 
@@ -2095,11 +2096,30 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
   passes, so a refused launch (`not resumable`, round ceiling, busy run) changes nothing,
   and the overrides a run
   was launched or amended with (`--role`, `--backup`, `--effort`, without-channel drops,
-  the `--fleet small` reviewer-width override, and any pinned suite command) are recorded in the frozen
+  the `--fleet small` reviewer-width override, `--one-pass`, and any pinned suite command)
+  are recorded in the frozen
   `config.json`, so a later `--reload-config` re-reads `spar.toml` and then re-applies
   them in composition order, so nothing given before is lost unless restated differently
   (O183). A run's later round with no flags at all still picks the snapshot up unchanged
   (O27).
+
+**`--one-pass`** (on `implement` and `run --workflow loop`) is the small-change mode:
+it implies `--fleet small` (an explicit `--fleet` still wins), caps a fresh run at one
+round (on a bound `--run <id>` it resets the ceiling to one more round instead
+(a never-dispatched reused round counts as that round, so the ceiling stays
+on it), unless `--max-rounds` is passed), and ships
+at the end of a passed gate through the real ship path (push plus draft PR,
+including the base forward merge). Only a passed gate ships: a sub-threshold
+`request_changes` already counts as approve-with-notes, so minor findings ship
+clean with no override, listed as follow-ups under the standing non-blocking
+list in the PR body. Anything that fails the gate (a finding at or above
+`[review] block_on`, a failed acceptance line, a failing suite, a dead reviewer
+seat) parks at the existing gate (exit 2), as without the flag. If the ship
+itself fails (or the orchestrator dies after the gate passed), the run sits at
+`awaiting_ship_confirm`; resume and `__internal_continue` do not re-run the
+ship, so retry it with a plain `spar ship <id>` (the passed gate already
+recorded its confirm). Frozen into the run's
+`config.json`; nothing changes for runs launched without it (O200).
 
 **`--suite-command "<cmd>"`** (repeatable, on `plan` and `implement`) sets this run's
 deterministic suite, replacing `[suite].command` and turning the suite channel on even under
