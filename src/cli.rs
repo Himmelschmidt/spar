@@ -808,8 +808,9 @@ pub enum BusCmd {
     Send {
         #[arg(long)]
         run: Option<String>,
-        #[arg(long, default_value = "human")]
-        from: String,
+        /// Defaults to `$SPAR_AGENT_ID` inside a slot, else `human`.
+        #[arg(long)]
+        from: Option<String>,
         /// An agent id, `broadcast`, `@human`, or `impl` (needs `--run`: that run's
         /// implementer)
         #[arg(long, default_value = "broadcast")]
@@ -885,8 +886,10 @@ pub enum BusCmd {
     Ack {
         /// Id of the message being acknowledged
         msg_id: String,
-        #[arg(long, default_value = "human")]
-        from: String,
+        /// Defaults to `$SPAR_AGENT_ID` inside a slot, else `human`.
+        #[arg(long)]
+        from: Option<String>,
+        /// Defaults to `$SPAR_RUN_ID` inside a run.
         #[arg(long)]
         run: Option<String>,
         #[arg(long)]
@@ -895,16 +898,18 @@ pub enum BusCmd {
     /// Reserve a path
     Reserve {
         path: String,
-        #[arg(long, default_value = "human")]
-        holder: String,
+        /// Defaults to `$SPAR_AGENT_ID` inside a slot, else `human`.
+        #[arg(long)]
+        holder: Option<String>,
         #[arg(long)]
         run: Option<String>,
     },
     /// Release a path reserve
     Release {
         path: String,
-        #[arg(long, default_value = "human")]
-        holder: String,
+        /// Defaults to `$SPAR_AGENT_ID` inside a slot, else `human`.
+        #[arg(long)]
+        holder: Option<String>,
         #[arg(long)]
         run: Option<String>,
     },

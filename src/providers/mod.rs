@@ -19,7 +19,7 @@ use std::process::Command;
 
 pub use agy::AgyAdapter;
 pub use claude::{ClaudeAdapter, ClaudeFamily};
-pub use codex::CodexAdapter;
+pub use codex::{default_bucket_for_profile, CodexAdapter};
 pub use grok::GrokAdapter;
 pub use muse::MuseAdapter;
 pub use pi::PiAdapter;
@@ -233,6 +233,10 @@ pub struct SpawnOpts {
     /// in the user's home. Stable across rounds, so a resume finds what the cold
     /// dispatch wrote. `None` outside a run.
     pub session_dir: Option<PathBuf>,
+    /// Recorded `SPAR_CODEX_PROFILE` from run state (`RunState::codex_profile`).
+    /// `None` means no recorded dispatch, so the adapter reads this process's
+    /// ambient value. Only codex reads this field.
+    pub codex_profile: Option<String>,
 }
 
 pub trait ProviderAdapter: Send + Sync {
@@ -242,6 +246,12 @@ pub trait ProviderAdapter: Send + Sync {
     /// meters families (claude), `None` when every seat bills login-wide. The quota
     /// key derives from this, never from a name list.
     fn quota_bucket<'m>(&self, _model: &'m str) -> Option<Cow<'m, str>> {
+        None
+    }
+    /// The bucket a model-less seat bills to (`None` for the whole login).
+    /// Only adapters whose no-model dispatch routes somewhere other than the
+    /// login override this: codex's default profile layers OpenRouter.
+    fn default_bucket(&self) -> Option<&'static str> {
         None
     }
     /// The quota bucket a rejection covers, `None` for the whole login: the
@@ -872,6 +882,7 @@ mod tests {
         assert!(!GrokAdapter.step_budget_exhausted("max-model-steps"));
         // Grok dispatches carry run-scoped folder trust (never operator state).
         let env = GrokAdapter.extra_env(&SpawnOpts {
+            codex_profile: None,
             prompt: String::new(),
             prompt_file: None,
             cwd: std::path::PathBuf::from("/tmp"),
@@ -1073,6 +1084,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("CODEX_HOME", home.path());
         let opts = SpawnOpts {
+            codex_profile: None,
             prompt: "go".into(),
             prompt_file: None,
             cwd: std::path::PathBuf::from("/tmp"),

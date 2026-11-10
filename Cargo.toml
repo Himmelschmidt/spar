@@ -159,6 +159,10 @@ name = "provider_health"
 path = "tests/scenarios/provider_health.rs"
 
 [[test]]
+name = "quota_buckets"
+path = "tests/scenarios/quota_buckets.rs"
+
+[[test]]
 name = "claude_family_quota"
 path = "tests/scenarios/claude_family_quota.rs"
 
@@ -197,6 +201,10 @@ path = "tests/scenarios/provider_usage.rs"
 [[test]]
 name = "bus_receipts"
 path = "tests/scenarios/bus_receipts.rs"
+
+[[test]]
+name = "bus_delivery_state"
+path = "tests/scenarios/bus_delivery_state.rs"
 
 [[test]]
 name = "operator_surgery"

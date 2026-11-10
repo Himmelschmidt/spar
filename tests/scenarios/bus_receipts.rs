@@ -251,7 +251,7 @@ fn receipts_ack_and_supersede_through_the_cli() {
         .success();
     let text = String::from_utf8_lossy(&human.get_output().stdout).to_string();
     assert!(text.contains("superseded by"), "{text}");
-    assert!(text.contains("delivered 1/1, read 1/1"), "{text}");
+    assert!(text.contains("landed 1/1, read 1/1"), "{text}");
 }
 
 #[test]

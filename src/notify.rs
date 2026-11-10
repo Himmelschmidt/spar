@@ -190,6 +190,7 @@ fn lifecycle_message(
         requires_ack: false,
         persist: false,
         expires_after_round: None,
+        filed_round: None,
         meta,
     })
 }
@@ -250,6 +251,7 @@ pub fn route_abandoned(paths: &SparPaths, state: &crate::state::RunState) {
         requires_ack: false,
         persist: false,
         expires_after_round: None,
+        filed_round: None,
         meta,
     };
     fire(paths, CfgSource::Run(state.id.clone()), msg);

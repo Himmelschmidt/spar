@@ -439,7 +439,7 @@ fn run() -> Result<ExitCode> {
                     None => task,
                 };
                 // Seat shapers ride along into the dispatch: a bound run amends under
-                // its own lock, after the preconditions below pass (O154). The
+                // its own lock, after the preconditions below pass (O165). The
                 // preset parses here, so a `--fleet` typo fails at the pre-check
                 // instead of after the dispatch acquired its lock.
                 let amend = workflow::implement::BoundAmendInputs {
@@ -611,7 +611,7 @@ fn run() -> Result<ExitCode> {
             // A round extension refused or found busy after the pre-check is still a
             // refusal: nothing was dispatched, so `--json` gets the same shape. An
             // amend refusal is one too: the frozen config and run state were left
-            // untouched under the dispatch's lock (O154).
+            // untouched under the dispatch's lock (O165).
             workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg, amend)
                 .or_else(|e| {
                     if e.is::<workflow::implement::RoundExtensionRefused>()
@@ -1069,6 +1069,11 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             if to == "impl" && run.is_none() {
                 anyhow::bail!("--to impl needs --run to know whose implementer");
             }
+            // Inside a slot the env names the sender, so a bare
+            // `spar bus send -m …` is filed as the slot, not the human.
+            let from = from
+                .or_else(|| bus::slot_caller().0)
+                .unwrap_or_else(|| "human".to_string());
             let run_state = match run.as_deref() {
                 Some(r) if needs_run || to == "impl" => Some(state::RunState::load(&paths, r)?),
                 _ => None,
@@ -1134,13 +1139,29 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                 requires_ack,
                 persist,
                 expires_after_round,
+                filed_round: None,
                 meta: std::collections::HashMap::new(),
             };
+            // Send first: a failed send leaves the old instruction untouched. The
+            // superseding send skips the file-time fan-out, so the withdrawal
+            // renders holders of the old message and the drain below renders the
+            // new message's own targets: a retargeted slot sees the replacement
+            // even though it never held the old one, and a poller never sees
+            // both instructions at once. The drain runs even when the
+            // withdrawal fails, so a filed replacement is never left unrendered.
+            let targets = supersedes
+                .is_some()
+                .then(|| bus::message_targets(&paths, &msg))
+                .transpose()?;
             let msg = bus::send(&paths, msg, bus::MessageBudget::Normal)?;
             let withdrawal = supersedes
                 .as_deref()
                 .map(|old| bus::withdraw(&paths, old))
-                .transpose()?;
+                .transpose();
+            if let Some(targets) = &targets {
+                providers::delivery::drain_poll_files(&paths, targets);
+            }
+            let withdrawal = withdrawal?;
             if json {
                 let mut v = serde_json::to_value(&msg)?;
                 v["schema_version"] = serde_json::json!(bus::LOG_SCHEMA);
@@ -1175,10 +1196,10 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                     let count = |f: fn(&bus::RecipientReceipt) -> bool| {
                         e.receipts.iter().filter(|r| f(r)).count()
                     };
-                    let mut notes = Vec::new();
+                    let mut notes = vec![e.delivery.to_string()];
                     if total > 0 {
                         notes.push(format!(
-                            "delivered {}/{total}, read {}/{total}",
+                            "landed {}/{total}, read {}/{total}",
                             count(|r| r.delivered_at.is_some()),
                             count(|r| r.read_at.is_some())
                         ));
@@ -1189,11 +1210,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                     if e.expired {
                         notes.push("expired".into());
                     }
-                    let notes = if notes.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", notes.join("; "))
-                    };
+                    let notes = format!(" [{}]", notes.join("; "));
                     println!(
                         "{} {} {} → {} ({:?}){notes} {}",
                         e.msg.ts.format("%H:%M:%S"),
@@ -1217,7 +1234,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             // (`$SPAR_AGENT_ID`); resolve to the unique inbox key either way.
             let unique = bus::resolve_addr(run.as_deref(), &agent);
             let msgs = if claim {
-                let msgs = bus::inbox_claim(&paths, &unique, "inbox_claim")?;
+                let msgs = bus::inbox_claim(&paths, &unique, "inbox_claim", |_| true)?;
                 for m in &msgs {
                     bus::record_receipt(
                         &paths,
@@ -1269,6 +1286,11 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             run,
             json,
         } => {
+            // Inside a slot the env names the caller, so a bare
+            // `spar bus ack <id>` records the slot, not the human.
+            let (env_agent, env_run) = bus::slot_caller();
+            let run = run.or(env_run);
+            let from = from.or(env_agent).unwrap_or_else(|| "human".to_string());
             let msg = bus::ack(&paths, run.as_deref(), &from, &msg_id)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&msg)?);
@@ -1278,11 +1300,17 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             Ok(ExitCode::Success)
         }
         BusCmd::Reserve { path, holder, run } => {
+            let holder = holder
+                .or_else(|| bus::slot_caller().0)
+                .unwrap_or_else(|| "human".to_string());
             bus::reserve(&paths, run.as_deref(), &path, &holder)?;
             println!("reserved {path} by {holder}");
             Ok(ExitCode::Success)
         }
         BusCmd::Release { path, holder, run } => {
+            let holder = holder
+                .or_else(|| bus::slot_caller().0)
+                .unwrap_or_else(|| "human".to_string());
             bus::release(&paths, run.as_deref(), &path, &holder)?;
             println!("released {path}");
             Ok(ExitCode::Success)
@@ -1310,18 +1338,6 @@ fn implementer_id(st: &state::RunState) -> Result<String> {
     }
 }
 
-/// Resolve `agent`'s delivery strategy from its run slot's provider adapter. An agent
-/// with no slot or no CLI adapter (bare agent / api slot) has no injection channel.
-fn agent_delivery_strategy(state: &state::RunState, agent: &str) -> providers::DeliveryStrategy {
-    state
-        .slots
-        .iter()
-        .find(|s| s.id == agent)
-        .and_then(|s| providers::adapter_named(&s.provider))
-        .map(|a| a.delivery_strategy())
-        .unwrap_or(providers::DeliveryStrategy::None)
-}
-
 fn bus_deliver(
     paths: &paths::SparPaths,
     run_id: Option<&str>,
@@ -1340,7 +1356,7 @@ fn bus_deliver(
     let (strategy, session_id, dry_run) = match run_id {
         Some(run) => {
             let state = state::RunState::load(paths, run)?;
-            let strat = agent_delivery_strategy(&state, short);
+            let strat = providers::delivery::strategy_for_slot(&state, short);
             // The slot's own live sidecar, not `state.usage` (only set once a dispatch
             // finishes): a mid-run codex thread id must be found while it is still
             // running, the exact moment a turn-boundary push needs it.
@@ -1351,11 +1367,7 @@ fn bus_deliver(
                 .and_then(|s| s.log_path.as_deref())
                 .and_then(process::StreamStats::load)
                 .and_then(|s| s.session_id);
-            (
-                strat,
-                sid,
-                state.dry_run || util::env_truthy("SPAR_DRY_RUN"),
-            )
+            (strat, sid, state.dry_run)
         }
         None => (
             providers::DeliveryStrategy::None,
@@ -1394,7 +1406,7 @@ fn bus_deliver(
 /// `--reload-config` is the deliberate way out: it re-reads the file and re-freezes the
 /// run against it. A bound run amends under the dispatch's own lock, after every
 /// launch precondition passes. Nothing here amends anything before those checks,
-/// so a refused launch changes nothing (O154); this context returns the frozen
+/// so a refused launch changes nothing (O165); this context returns the frozen
 /// config untouched.
 #[allow(clippy::too_many_arguments)]
 fn implement_ctx(
@@ -1886,11 +1898,8 @@ fn rule_cmd(action: RuleCmd) -> Result<ExitCode> {
     };
     // Rulings override reviewers and can waive criteria, so a slot must not issue its
     // own. spar exports these into every slot it dispatches (O121).
-    if !matches!(action, RuleCmd::List { .. })
-        && ["SPAR_AGENT_ID", "SPAR_RUN_ID"]
-            .iter()
-            .any(|k| std::env::var(k).is_ok_and(|v| !v.is_empty()))
-    {
+    let (slot_agent, slot_run) = bus::slot_caller();
+    if !matches!(action, RuleCmd::List { .. }) && (slot_agent.is_some() || slot_run.is_some()) {
         anyhow::bail!(
             "rulings are operator-only: `spar rule add` / `rm` refuse to run inside a spar slot"
         );
@@ -2833,9 +2842,10 @@ fn attach_cmd(run_id: &str) -> Result<ExitCode> {
 /// A slot (or anything it spawns) inherits `SPAR_AGENT_ID` / `SPAR_RUN_ID`; these
 /// commands decide a run's fate and belong to the operator.
 fn refuse_inside_slot(command: &str) -> Result<()> {
-    let set = ["SPAR_AGENT_ID", "SPAR_RUN_ID"]
-        .into_iter()
-        .find(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+    let (slot_agent, slot_run) = bus::slot_caller();
+    let set = slot_agent
+        .map(|_| "SPAR_AGENT_ID")
+        .or_else(|| slot_run.map(|_| "SPAR_RUN_ID"));
     match set {
         Some(var) => {
             anyhow::bail!(
@@ -3628,7 +3638,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
         }
         cli::ProviderAction::Pause { name, until, json } => {
             let (paths, _) = project_ctx()?;
-            let key = quota::quota_key(&name);
+            let key = quota::operator_key(&name);
             let mut store = quota::QuotaStore::load(&paths)?;
             let until_dt = if let Some(u) = until {
                 if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&u) {
@@ -3651,7 +3661,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
         }
         cli::ProviderAction::Resume { name, json } => {
             let (paths, _) = project_ctx()?;
-            let key = quota::quota_key(&name);
+            let key = quota::operator_key(&name);
             let mut store = quota::QuotaStore::load(&paths)?;
             store.resume(&key);
             store.save(&paths)?;
@@ -3690,7 +3700,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
             };
             let reports: Vec<probe::ProbeReport> = targets
                 .iter()
-                .map(|t| probe::probe(&paths, t, dry))
+                .map(|t| probe::probe(&paths, t, dry, None))
                 .collect();
             if json {
                 println!("{}", serde_json::to_string_pretty(&reports)?);
