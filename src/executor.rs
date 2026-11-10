@@ -1762,7 +1762,7 @@ struct ArtifactRecovery<'a> {
 /// role for which that inference is sound:
 ///
 /// - `tester` and `reviewer` are pointed at the *implementer's* worktree, so
-///   `slot_has_work` is true for them whether or not they did anything. A recovered
+///   `dispatch_left_work` is true for them whether or not they did anything. A recovered
 ///   `suite.md` reading `## Result: pass` sets the authoritative gate green with no suite
 ///   ever having run.
 /// - `test_author` writes the `AC-n` acceptance contract. Prose passes the non-empty
@@ -1805,17 +1805,29 @@ fn ceiling_kill_kept_work(r: &ArtifactRecovery, since: SystemTime) -> bool {
     kept
 }
 
+/// Whether HEAD moved past the stamped dispatch commit, ignoring the round's own
+/// banked partial commit: the round's WIP is the starting point, not new work.
+/// One predicate for every "did this dispatch do work" gate, so recovery and
+/// the ceiling-commit pre-check cannot drift apart.
+fn head_moved_since_dispatch(
+    cwd: &Path,
+    dispatch_head: Option<&str>,
+    banked_head: Option<&str>,
+) -> bool {
+    let now = git_output(cwd, &["rev-parse", "HEAD"]);
+    match (dispatch_head, now) {
+        (Some(before), Some(head)) => head != before && banked_head != Some(head.as_str()),
+        _ => false,
+    }
+}
+
 /// Commits the slot left behind since the round started, excluding the round's
 /// own banked WIP commit: the bank is spar's doing on an earlier attempt this
 /// round, not the slot's fresh work. A dirty tree alone never counts here: a
 /// ceiling kill with only uncommitted edits is a round cut short, which commits
 /// as a partial WIP round instead of passing.
 fn committed_since_dispatch(r: &ArtifactRecovery) -> bool {
-    let now = git_output(r.cwd, &["rev-parse", "HEAD"]);
-    match (r.dispatch_head, now) {
-        (Some(before), Some(head)) => head != before && r.banked_head != Some(head.as_str()),
-        _ => false,
-    }
+    head_moved_since_dispatch(r.cwd, r.dispatch_head, r.banked_head)
 }
 
 /// The round's own banked WIP commit, if the ceiling already recorded one.
@@ -1915,14 +1927,10 @@ pub(crate) fn worktree_snapshot(cwd: &Path) -> Option<String> {
 /// Work the slot left behind since the round started: uncommitted changes past
 /// `since_tree`, or commits past `since_head`.
 ///
-/// Pass the stamps taken when the slot joined the round: from round 2 on the
-/// run base predates earlier rounds' commits, so the base always reads as
-/// work, and the tree can already be dirty at round start (the test-author
-/// overlay lands before round 1, a refused round leaves leftovers), so any
-/// dirty tree always reads as work. `None` for either stamp falls back to the
-/// legacy read for that half: any dirty tree, or only HEAD movement.
-pub fn slot_has_work(cwd: &Path, since_head: Option<&str>, since_tree: Option<&str>) -> bool {
-    let tree_work = match (worktree_snapshot(cwd), since_tree) {
+/// Whether the tree changed since the round-start snapshot. `None` for the live
+/// digest falls back to the legacy read: any dirty tree.
+fn tree_differs_since(cwd: &Path, since_tree: Option<&str>) -> bool {
+    match (worktree_snapshot(cwd), since_tree) {
         (Some(now), Some(before)) => now != before,
         _ => std::process::Command::new("git")
             .args(["status", "--porcelain"])
@@ -1931,21 +1939,24 @@ pub fn slot_has_work(cwd: &Path, since_head: Option<&str>, since_tree: Option<&s
             .ok()
             .filter(|o| o.status.success())
             .is_some_and(|o| !o.stdout.iter().all(|b| b.is_ascii_whitespace())),
-    };
-    if tree_work {
-        return true;
     }
-    let head = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(cwd)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-    match (since_head, head) {
-        (Some(before), Some(head)) => head != before,
-        _ => false,
-    }
+}
+
+/// Pass the stamps taken when the slot joined the round: from round 2 on the
+/// run base predates earlier rounds' commits, so the base always reads as
+/// work, and the tree can already be dirty at round start (the test-author
+/// overlay lands before round 1, a refused round leaves leftovers), so any
+/// dirty tree always reads as work. `None` for either stamp falls back to the
+/// legacy read for that half: any dirty tree, or only HEAD movement. The
+/// banked partial commit counts as the starting point rather than new work.
+/// The one predicate behind both recovery and the ceiling-commit pre-check.
+pub fn dispatch_left_work(
+    cwd: &Path,
+    since_head: Option<&str>,
+    since_tree: Option<&str>,
+    banked_head: Option<&str>,
+) -> bool {
+    tree_differs_since(cwd, since_tree) || head_moved_since_dispatch(cwd, since_head, banked_head)
 }
 
 /// Re-prompt a clean-exiting slot for its artifact alone.
@@ -1960,7 +1971,7 @@ pub fn slot_has_work(cwd: &Path, since_head: Option<&str>, since_tree: Option<&s
 fn recover_artifact(r: &ArtifactRecovery) -> bool {
     if !role_is_recoverable(r.role)
         || !r.owns_cwd
-        || !slot_has_work(r.cwd, r.dispatch_head, r.dispatch_tree)
+        || !dispatch_left_work(r.cwd, r.dispatch_head, r.dispatch_tree, r.banked_head)
     {
         return false;
     }
@@ -8654,7 +8665,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     /// Recovery must fire only for a slot that actually produced something. A slot that
     /// exited clean having written nothing is a genuine failure and still fails.
     #[test]
-    fn slot_has_work_needs_a_dirty_tree_or_a_commit() {
+    fn dispatch_left_work_needs_a_dirty_tree_or_a_commit() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("wt");
         std::fs::create_dir_all(&repo).unwrap();
@@ -8686,25 +8697,82 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let tree = worktree_snapshot(&repo);
 
         assert!(
-            !slot_has_work(&repo, Some(&base), tree.as_deref()),
+            !dispatch_left_work(&repo, Some(&base), tree.as_deref(), None),
             "an untouched worktree is not recoverable work"
         );
 
         std::fs::write(repo.join("b.txt"), "new").unwrap();
         assert!(
-            slot_has_work(&repo, Some(&base), tree.as_deref()),
+            dispatch_left_work(&repo, Some(&base), tree.as_deref(), None),
             "untracked work counts"
         );
 
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "slot work"]);
         assert!(
-            slot_has_work(&repo, Some(&base), tree.as_deref()),
+            dispatch_left_work(&repo, Some(&base), tree.as_deref(), None),
             "committed work past the base counts"
         );
         assert!(
-            !slot_has_work(&repo, None, None),
+            !dispatch_left_work(&repo, None, None, None),
             "with no recorded base, only a dirty tree can be judged"
+        );
+    }
+
+    /// The round's own banked WIP commit is the starting point, not new work:
+    /// recovery and the ceiling-commit pre-check share `dispatch_left_work`, so
+    /// a resumed round that idles into another ceiling kill with HEAD on the
+    /// bank and a clean tree records nothing. The unbanked read still sees
+    /// the banked commit as work, which is exactly the hole.
+    #[test]
+    fn banked_wip_head_is_not_new_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        };
+        if std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        let tree = worktree_snapshot(&repo);
+        git(&["commit", "-q", "--allow-empty", "-m", "banked wip"]);
+        let banked = git(&["rev-parse", "HEAD"]);
+
+        assert!(
+            dispatch_left_work(&repo, Some(&base), tree.as_deref(), None),
+            "the legacy read mistakes the banked commit for new work"
+        );
+        assert!(
+            !dispatch_left_work(&repo, Some(&base), tree.as_deref(), Some(&banked)),
+            "HEAD on the bank with a clean tree is no new work"
+        );
+
+        std::fs::write(repo.join("b.txt"), "fresh").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "slot work"]);
+        assert!(
+            dispatch_left_work(&repo, Some(&base), tree.as_deref(), Some(&banked)),
+            "a commit past the bank is new work"
         );
     }
 
@@ -9888,7 +9956,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
 
 #[cfg(test)]
 mod round_start_work_tests {
-    use super::{slot_has_work, worktree_snapshot};
+    use super::{dispatch_left_work, worktree_snapshot};
 
     fn git(dir: &std::path::Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
@@ -9921,7 +9989,7 @@ mod round_start_work_tests {
         let start = git(dir, &["rev-parse", "HEAD"]);
         let tree = worktree_snapshot(dir);
         assert!(
-            !slot_has_work(dir, Some(&start), tree.as_deref()),
+            !dispatch_left_work(dir, Some(&start), tree.as_deref(), None),
             "pre-round dirt over an untouched HEAD is not recoverable work"
         );
         std::fs::write(
@@ -9930,7 +9998,7 @@ mod round_start_work_tests {
         )
         .unwrap();
         assert!(
-            slot_has_work(dir, Some(&start), tree.as_deref()),
+            dispatch_left_work(dir, Some(&start), tree.as_deref(), None),
             "an edit past the round-start snapshot counts, even in a dirty file"
         );
     }
@@ -9951,14 +10019,19 @@ mod round_start_work_tests {
         let start = git(dir, &["rev-parse", "HEAD"]);
         let tree = worktree_snapshot(dir);
 
-        assert!(!slot_has_work(dir, Some(&start), tree.as_deref()));
+        assert!(!dispatch_left_work(
+            dir,
+            Some(&start),
+            tree.as_deref(),
+            None
+        ));
         std::fs::write(dir.join("f"), "b\n").unwrap();
-        assert!(slot_has_work(dir, Some(&start), tree.as_deref()));
+        assert!(dispatch_left_work(dir, Some(&start), tree.as_deref(), None));
         git(dir, &["commit", "-qam", "primary seat work"]);
-        assert!(slot_has_work(dir, Some(&start), tree.as_deref()));
+        assert!(dispatch_left_work(dir, Some(&start), tree.as_deref(), None));
         let now = git(dir, &["rev-parse", "HEAD"]);
         let clean = worktree_snapshot(dir);
-        assert!(!slot_has_work(dir, Some(&now), clean.as_deref()));
-        assert!(!slot_has_work(dir, None, None));
+        assert!(!dispatch_left_work(dir, Some(&now), clean.as_deref(), None));
+        assert!(!dispatch_left_work(dir, None, None, None));
     }
 }

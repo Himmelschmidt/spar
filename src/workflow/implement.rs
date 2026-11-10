@@ -3417,18 +3417,7 @@ fn try_commit_ceiling_partial(
         .find(|s| s.id == impl_id)
         .map(|s| (s.dispatch_head.clone(), s.dispatch_tree.clone()))
         .unwrap_or_default();
-    if !executor::slot_has_work(&wt_path, since.as_deref(), since_tree.as_deref()) {
-        return None;
-    }
     let round = state.round;
-    let subject =
-        format!("chore(spar): partial work, implementer cut short at hard ceiling (round {round})");
-    let body = format!(
-        "spar: the round {round} implementer was killed at its hard time ceiling before it \
-         could finish. Its leftovers are committed here so the suite and the review panel \
-         judge what is on the branch, and the next round continues from this commit."
-    );
-    let (branch, outcome) = commit_branch_leftovers(state, paths, impl_id, &subject, &body)?;
     // The round's own banked WIP commit: a same-round resume that idles into a
     // second ceiling kill leaves HEAD exactly here with a clean tree, which must
     // read as no new work rather than re-record the round.
@@ -3437,6 +3426,22 @@ fn try_commit_ceiling_partial(
         .iter()
         .find(|e| e.round == round)
         .and_then(|e| e.commit.clone());
+    if !executor::dispatch_left_work(
+        &wt_path,
+        since.as_deref(),
+        since_tree.as_deref(),
+        banked.as_deref(),
+    ) {
+        return None;
+    }
+    let subject =
+        format!("chore(spar): partial work, implementer cut short at hard ceiling (round {round})");
+    let body = format!(
+        "spar: the round {round} implementer was killed at its hard time ceiling before it \
+         could finish. Its leftovers are committed here so the suite and the review panel \
+         judge what is on the branch, and the next round continues from this commit."
+    );
+    let (branch, outcome) = commit_branch_leftovers(state, paths, impl_id, &subject, &body)?;
     let (note, notice, kind, commit) = match outcome {
         LeftoverCommit::Committed(sha) => (
             format!(
