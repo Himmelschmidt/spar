@@ -99,14 +99,12 @@ shows the age and end of every pause, including ones on `api:` refs. `spar provi
 probe <ref>` (or `--all` for every installed CLI) makes one tiny real call through the
 adapter (`Reply with the single word OK`, the ref's `@model` if any, 120s cap) and
 writes the answer: `healthy` clears a quota pause, `quota` pauses (until the stated
-reset when claude states one), `auth` and `failed` leave the store alone. `provider
-probe --run <id>` keys the probe from that run's recorded dispatch route (replaying its
-recorded model) instead of the ambient environment (O154). A manual pause
+reset when claude states one), `auth` and `failed` leave the store alone. A manual pause
 is never cleared by a probe. A bare `provider probe cli:codex` keys the ambient route's
 bucket (an ambient model names its own bucket, so `SPAR_CODEX_MODEL=gpt-5` probes
 `cli:codex@native`; only a model-less seat under the default profile probes
 `cli:codex@openrouter`); `provider probe --run <id>` keys that run's recorded dispatch
-route instead. `--dry-run` (or `SPAR_DRY_RUN=1`) prints the call each
+route instead, replaying its recorded model (O154, O168). `--dry-run` (or `SPAR_DRY_RUN=1`) prints the call each
 probe would make and spawns nothing. Exit is `0` whatever the verdicts; read them from
 `--json`. A declared `--backup` held on a quota pause gets the same probe before a run
 skips it (O106): a stale pause no longer benches a working backup. A manually paused

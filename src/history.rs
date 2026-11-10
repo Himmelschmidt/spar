@@ -142,9 +142,9 @@ pub struct HistoryRow {
     /// Times the run entered the `quota` phase.
     #[serde(default)]
     pub quota_parks: u32,
-    /// The route the run's last dispatch stamped, in provider-neutral shape.
+    /// The route the run's last dispatch stamped.
     /// Old lines predate it and key from the ambient environment instead.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<crate::providers::StoredRoute>,
     /// `[review] block_on` the `blocking` counts were taken at.
     #[serde(default)]

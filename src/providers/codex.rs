@@ -438,11 +438,6 @@ impl ProviderAdapter for CodexAdapter {
         Some(Cow::Borrowed(codex_quota_bucket(model).as_str()))
     }
 
-    /// The model-less seat's bucket: the profile it dispatches under. `None`
-    /// (an emptied `SPAR_CODEX_PROFILE`) drops `-p`, running codex's own
-    /// default, the native login; only the `muse` profile is verified to
-    /// layer OpenRouter, and any other set profile keys at the login rather
-    /// than in a bucket it might not share.
     /// The ambient route resolved the same way the spawn resolves it: an
     /// ambient model names its own bucket, only a model-less seat falls back
     /// to the profile default.

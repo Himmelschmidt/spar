@@ -296,7 +296,6 @@ fn prepare_slot_execution(
     cfg: &Config,
     job: &SlotJob,
 ) -> Result<PreparedSlot> {
-    // No route stamp here: the dispatch entry stamps it; see `stamp_dispatch`.
     let slot = state
         .slots
         .iter()
@@ -2459,7 +2458,6 @@ pub fn run_slot(
     cfg: &Config,
     job: &SlotJob,
 ) -> Result<()> {
-    // No route stamp here: the dispatch entry stamps it; see `stamp_dispatch`.
     let slot = state
         .slots
         .iter()
@@ -5178,7 +5176,7 @@ mod tests {
     #[test]
     fn build_dispatch_command_resumes_codex_when_a_prior_session_id_is_known() {
         // build_resume (opts.model: None) falls through to profile_model_args, which
-        // reads $CODEX_HOME/<profile>.config.toml — pin and isolate CODEX_HOME so this
+        // reads $CODEX_HOME/<profile>.config.toml: pin and isolate CODEX_HOME so this
         // doesn't read the machine's real ~/.codex or race codex.rs's own env-mutating
         // tests, matching neither of which this test's assertions depend on.
         let _pin = providers::codex::pin_codex_env();

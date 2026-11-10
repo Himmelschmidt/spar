@@ -236,9 +236,8 @@ pub enum RecordedRouteBucket {
     Bucket(&'static str),
 }
 
-/// A dispatch route recorded to durable state (history rows), in
-/// provider-neutral shape: the profile and model the dispatch ran under,
-/// without naming whose. Rows that predate recording carry no route and key
+/// A dispatch route recorded to durable state (history rows): the codex
+/// profile and model the dispatch ran under. Rows that predate recording carry no route and key
 /// the ambient one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredRoute {

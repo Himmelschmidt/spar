@@ -939,11 +939,6 @@ impl RunState {
     /// inherits, so the record and the ambient route the spawn reads agree.
     pub fn stamp_dispatch(&mut self) {
         self.round_started_at = Some(chrono::Utc::now());
-        self.stamp_codex_route();
-    }
-
-    /// Re-record the codex route from this process's environment.
-    pub fn stamp_codex_route(&mut self) {
         let route = crate::providers::codex::dispatch_route();
         self.codex_profile = route.profile;
         self.codex_model = route.model;

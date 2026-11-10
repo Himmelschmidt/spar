@@ -98,16 +98,6 @@ impl ProviderRef {
         }
     }
 
-    /// Where this seat's quota pause lives. A model whose adapter declares a bucket
-    /// keys there (`cli:agy@flash`, `cli:claude@opus` for `claude-opus-5-5` too);
-    /// everything else keys per login, exactly `storage_key()`. The scope is declared
-    /// on the adapter type. Idempotent on its own output.
-    ///
-    /// `route` is the dispatch route recorded in run state (only the codex
-    /// adapter interprets it today). A model-less seat on a recorded route keys
-    /// under that route, not under whatever the keying process's environment
-    /// holds; `RecordedRoute::ambient()` keys from this process's environment
-    /// (operator tools, history readers). Every other ref ignores the route.
     /// Bucket for a model-less seat under its recorded dispatch route: the
     /// route's bucket, or the login when the route names no verified bucket.
     fn recorded_route_bucket(
@@ -122,6 +112,16 @@ impl ProviderRef {
         crate::providers::RecordedRouteBucket::Ambient
     }
 
+    /// Where this seat's quota pause lives. A model whose adapter declares a bucket
+    /// keys there (`cli:agy@flash`, `cli:claude@opus` for `claude-opus-5-5` too);
+    /// everything else keys per login, exactly `storage_key()`. The scope is declared
+    /// on the adapter type. Idempotent on its own output.
+    ///
+    /// `route` is the dispatch route recorded in run state (only the codex
+    /// adapter interprets it today). A model-less seat on a recorded route keys
+    /// under that route, not under whatever the keying process's environment
+    /// holds; `RecordedRoute::ambient()` keys from this process's environment
+    /// (operator tools, history readers). Every other ref ignores the route.
     pub fn quota_key(&self, route: crate::providers::RecordedRoute<'_>) -> String {
         // api providers have no adapter; every model bills separately, so the
         // model is its own bucket and a model-less seat keys at the login.
