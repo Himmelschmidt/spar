@@ -81,9 +81,17 @@ struct Fixture {
 
 impl Fixture {
     /// Temp repo with a bare origin and `main` pushed, `spar.toml` written when
-    /// `toml` is non-empty, then a dry-run plan off `main` (or off a detached
-    /// HEAD when `detached`) and an approve.
-    fn new(toml: &str, detached: bool) -> Self {
+    /// `toml` is non-empty (off a detached HEAD when `detached`), plus the bin
+    /// dir with the fake `gh` and its log.
+    fn repo(
+        toml: &str,
+        detached: bool,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
         let tmp = tempdir().unwrap();
         let root = tmp.path().join("repo");
         let origin = tmp.path().join("origin.git");
@@ -116,7 +124,12 @@ impl Fixture {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
         let log = tmp.path().join("gh.log");
+        (tmp, root, bin, log)
+    }
 
+    /// A dry-run plan off `main` (or off a detached HEAD) and an approve.
+    fn new(toml: &str, detached: bool) -> Self {
+        let (tmp, root, bin, log) = Self::repo(toml, detached);
         let out = spar_cmd()
             .current_dir(&root)
             .args([
@@ -137,6 +150,34 @@ impl Fixture {
             .args(["approve", &run_id, "--json"])
             .assert()
             .success();
+        Fixture {
+            _tmp: tmp,
+            root,
+            bin,
+            log,
+            run_id,
+        }
+    }
+
+    /// A dry-run loop run (`implement -t`): one synthetic round and an
+    /// approving review, ending at the ship gate.
+    fn new_loop(toml: &str) -> Self {
+        let (tmp, root, bin, log) = Self::repo(toml, false);
+        let out = spar_cmd()
+            .current_dir(&root)
+            .args([
+                "implement",
+                "-t",
+                "base forward merge change",
+                "--providers",
+                "cli:claude,cli:grok",
+                "--dry-run",
+                "--json",
+            ])
+            .assert()
+            .code(2);
+        let v: Value = serde_json::from_slice(out.get_output().stdout.as_slice()).unwrap();
+        let run_id = v["run_id"].as_str().unwrap().to_string();
         Fixture {
             _tmp: tmp,
             root,
@@ -246,6 +287,24 @@ impl Fixture {
         spar_cmd()
             .current_dir(&self.root)
             .env("SPAR_FORCE_REQUEST_CHANGES", "1")
+            .env("SPAR_MERGE_BASE_DRY_RUN", "1")
+            .args([
+                "implement",
+                "--run",
+                &self.run_id,
+                "--providers",
+                "cli:claude,cli:grok",
+                "--dry-run",
+                "--json",
+            ])
+            .assert()
+    }
+
+    /// A dry-run re-entry that runs the next round: the review approves by
+    /// default and the round-start merge is opted back in.
+    fn implement_remedy(&self) -> assert_cmd::assert::Assert {
+        spar_cmd()
+            .current_dir(&self.root)
             .env("SPAR_MERGE_BASE_DRY_RUN", "1")
             .args([
                 "implement",
@@ -410,6 +469,94 @@ fn ship_conflict_parks_the_run_with_the_remedy() {
         fx.events_text().contains("ship parked"),
         "{}",
         fx.events_text()
+    );
+}
+
+/// #229: a loop run parked by a conflicted pre-ship merge resumes through the
+/// remedy in the park message. The park records its flag and drops the spent
+/// ship confirm; the remedy round clears both flag and error.
+#[test]
+fn ship_parked_loop_run_resumes_through_the_remedy() {
+    let fx = Fixture::new_loop("[rounds]\nmax = 2\n");
+    let wt = fx.real_worktree();
+    let tip = fx.advance_main("feature.txt", "base side\n");
+
+    fx.ship(&[], &[]).code(2);
+    let st = fx.state();
+    assert_eq!(
+        st["gates"]["ship_parked"], true,
+        "the park flags itself: {st}"
+    );
+    assert_eq!(
+        st["gates"]["ship_confirmed"], false,
+        "the spent confirm must not survive the park: {st}"
+    );
+    assert!(
+        st["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("conflicts with the run branch")
+                && e.contains(&format!("spar implement --run {}", fx.run_id))),
+        "the park has to name the conflict and the way out: {st}"
+    );
+
+    // The implementer resolves: merge the moved base, resolve the conflict,
+    // commit. The remedy round then finds the base already current.
+    git(&wt, &["fetch", "-q", "origin", "main"]);
+    assert!(
+        !git_ok(&wt, &["merge", "-q", "origin/main"]),
+        "the base advance has to conflict with the run branch"
+    );
+    std::fs::write(wt.join("feature.txt"), "resolved\n").unwrap();
+    git(&wt, &["add", "feature.txt"]);
+    git(&wt, &["commit", "-q", "-m", "resolve the base conflict"]);
+
+    fx.implement_remedy().code(2);
+    let st = fx.state();
+    assert_eq!(
+        st["gates"]["ship_parked"], false,
+        "the remedy lifts the park: {st}"
+    );
+    assert!(
+        st["error"].is_null(),
+        "no stale park error may outlive the remedy: {st}"
+    );
+    assert_eq!(st["merged_base"].as_str(), Some(tip.as_str()), "{st}");
+}
+
+/// #229: shipping from a checkout that is not on the run branch skips the
+/// pre-ship merge (merging there would land the commit on the wrong checkout)
+/// and ships HEAD as before.
+#[test]
+fn ship_from_off_branch_checkout_skips_the_base_merge() {
+    let fx = Fixture::new("", false);
+    spar_cmd()
+        .current_dir(&fx.root)
+        .args([
+            "implement",
+            "--run",
+            &fx.run_id,
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let wt = fx.real_worktree();
+    let tip = fx.advance_main("base-feature.txt", "base work\n");
+    git(&wt, &["checkout", "-q", "--detach", "HEAD"]);
+
+    fx.ship(&[], &[]).success();
+
+    assert!(
+        fx.events_text().contains("skipping base forward merge"),
+        "{}",
+        fx.events_text()
+    );
+    let head = git(&wt, &["rev-parse", "HEAD"]);
+    assert!(
+        !git_ok(&wt, &["merge-base", "--is-ancestor", &tip, &head]),
+        "the base must not have been merged into the detached checkout"
     );
 }
 
