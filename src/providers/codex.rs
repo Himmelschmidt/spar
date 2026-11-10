@@ -1,6 +1,6 @@
 use super::{
-    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, QuotaSignal, SpawnOpts,
-    TrustPolicy,
+    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, QuotaSignal, RecordedRoute,
+    RecordedRouteBucket, SpawnOpts, TrustPolicy,
 };
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -21,43 +21,131 @@ pub(crate) fn codex_profile() -> Option<String> {
     }
 }
 
+/// The quota bucket a codex dispatch bills to. Billing follows the route, not
+/// the model name: an explicit model omits `-p`, so a `/` slug runs through
+/// the OpenRouter provider and a bare model through codex's own default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexBucket {
+    OpenRouter,
+    Native,
+}
+
+impl CodexBucket {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "openrouter",
+            Self::Native => "native",
+        }
+    }
+}
+
 /// Bucket for the profile a model-less codex seat dispatches under. `None`
 /// drops `-p`, running codex's own default, the native login; only the `muse`
 /// profile is known to layer OpenRouter. Any other profile's billing route is
 /// unverified, so it keys at the login rather than in a bucket it might not
 /// share.
-pub fn default_bucket_for_profile(profile: Option<&str>) -> Option<&'static str> {
+pub fn default_bucket_for_profile(profile: Option<&str>) -> Option<CodexBucket> {
     match profile {
-        None => Some("native"),
-        Some("muse") => Some("openrouter"),
+        None => Some(CodexBucket::Native),
+        Some("muse") => Some(CodexBucket::OpenRouter),
         Some(_) => None,
     }
 }
 
-/// Model override (`-m`). spar's per-slot model (`--select` or a `cli:codex@<model>` ref)
-/// wins; otherwise `SPAR_CODEX_MODEL`; otherwise none (the profile's default model applies).
-/// Empty/whitespace values are ignored so we never emit `-m ""`.
-fn codex_model(opts: &SpawnOpts) -> Option<String> {
-    opts.model
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            std::env::var("SPAR_CODEX_MODEL")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-        })
+/// `Some` only for a value worth passing on: empty means default.
+fn clean_model(raw: &str) -> Option<String> {
+    let t = raw.trim().to_string();
+    (!t.is_empty()).then_some(t)
 }
 
-/// The profile a codex spawn dispatches under: the run's recorded profile when
-/// the dispatch belongs to one, else this process's ambient
-/// `SPAR_CODEX_PROFILE`. A recorded empty string is the native route (drop
-/// `-p`); it never falls through to the ambient value.
-fn spawn_profile(opts: &SpawnOpts) -> Option<String> {
-    match opts.codex_profile.as_deref() {
-        Some(recorded) if !recorded.is_empty() => Some(recorded.into()),
-        Some(_) => None,
+/// The route a codex dispatch runs under: the effective model (the seat's
+/// model, else the recorded `SPAR_CODEX_MODEL`, else this process's ambient
+/// one) and the effective profile (recorded `SPAR_CODEX_PROFILE`, else
+/// ambient). One function resolves it for every caller: the spawn and every
+/// quota/rejection key derive from the same value, so a model-less seat keys
+/// the bucket it bills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexRoute {
+    pub model: Option<String>,
+    pub profile: Option<String>,
+}
+
+impl CodexRoute {
+    /// Borrow as a `RecordedRoute` for key derivation: a `None` half resolves
+    /// from the ambient environment, matching the spawn's own fallback.
+    pub fn as_recorded(&self) -> RecordedRoute<'_> {
+        RecordedRoute {
+            profile: self.profile.as_deref(),
+            model: self.model.as_deref(),
+        }
+    }
+}
+
+/// The route a dispatch starting in this process records: this process's
+/// environment, preserving set-but-empty as `Some("")` (empty means default;
+/// resolving it through `resolve_route` would drop the stamping shells can
+/// observe). Shared by `RunState::stamp_dispatch` and the `--reassign`
+/// pre-entry check, so the check keys the route the dispatch will stamp, not
+/// the previous record.
+pub fn dispatch_route() -> CodexRoute {
+    CodexRoute {
+        model: Some(codex_model_env().unwrap_or_default()),
+        profile: Some(codex_profile().unwrap_or_default()),
+    }
+}
+
+pub fn resolve_route(slot_model: Option<&str>, route: RecordedRoute<'_>) -> CodexRoute {
+    let model = slot_model
+        .and_then(clean_model)
+        .or_else(|| match route.model {
+            Some(recorded) => recorded_value(recorded),
+            None => codex_model_env(),
+        });
+    let profile = match route.profile {
+        Some(recorded) => recorded_value(recorded),
         None => codex_profile(),
+    };
+    CodexRoute { model, profile }
+}
+
+/// A recorded half arrives trimmed (stamped through the env readers below),
+/// so only an emptied value maps back to `None`.
+fn recorded_value(raw: &str) -> Option<String> {
+    (!raw.is_empty()).then(|| raw.to_string())
+}
+
+/// The bucket a slug bills to: a `/` slug always names an OpenRouter route, a
+/// bare model bills `native`. One helper so the trait bucket and the
+/// resolved-route bucket cannot disagree.
+pub fn codex_quota_bucket(model: &str) -> CodexBucket {
+    if model.contains('/') || model == "openrouter" {
+        CodexBucket::OpenRouter
+    } else {
+        CodexBucket::Native
     }
+}
+
+/// The bucket a resolved route bills to: an explicit model omits `-p`, so a
+/// `/` slug bills `openrouter` and a bare model bills `native`; only a
+/// model-less seat dispatches under the default profile.
+pub fn route_bucket(route: &CodexRoute) -> Option<CodexBucket> {
+    match route.model.as_deref() {
+        Some(m) => Some(codex_quota_bucket(m)),
+        None => default_bucket_for_profile(route.profile.as_deref()),
+    }
+}
+
+pub fn codex_model_env() -> Option<String> {
+    std::env::var("SPAR_CODEX_MODEL")
+        .ok()
+        .and_then(|m| clean_model(&m))
+}
+
+/// The route a spawn with these options dispatches under: this process's
+/// ambient route. Dispatch entries stamp it into run state before seats
+/// resolve, so the record and the spawn agree without a carried value.
+fn opts_route(opts: &SpawnOpts) -> CodexRoute {
+    resolve_route(opts.model.as_deref(), RecordedRoute::ambient())
 }
 
 /// Flags that select a model. A `/` marks an OpenRouter slug (`openai/gpt-4o-mini`,
@@ -212,6 +300,51 @@ fn resolved_prompt(opts: &SpawnOpts) -> String {
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Holds the shared env lock with both route vars (`SPAR_CODEX_PROFILE`,
+/// `SPAR_CODEX_MODEL`) pinned at unset, restoring whatever the process held
+/// on drop. Every test that asserts a bare `cli:codex` key must pin through
+/// this: the resolver reads the ambient model too, so pinning only the
+/// profile leaves the key at the mercy of the operator's shell.
+/// `into_inner` keeps one failure from cascading into every waiter as a
+/// poisoned lock.
+#[cfg(test)]
+pub(crate) struct PinnedCodexEnv {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    old_profile: Option<String>,
+    old_model: Option<String>,
+}
+
+/// See `PinnedCodexEnv`.
+#[cfg(test)]
+pub(crate) fn pin_codex_env() -> PinnedCodexEnv {
+    let guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let old_profile = std::env::var("SPAR_CODEX_PROFILE").ok();
+    let old_model = std::env::var("SPAR_CODEX_MODEL").ok();
+    std::env::remove_var("SPAR_CODEX_PROFILE");
+    std::env::remove_var("SPAR_CODEX_MODEL");
+    PinnedCodexEnv {
+        _guard: guard,
+        old_profile,
+        old_model,
+    }
+}
+
+#[cfg(test)]
+impl Drop for PinnedCodexEnv {
+    fn drop(&mut self) {
+        match self.old_profile.take() {
+            Some(v) => std::env::set_var("SPAR_CODEX_PROFILE", v),
+            None => std::env::remove_var("SPAR_CODEX_PROFILE"),
+        }
+        match self.old_model.take() {
+            Some(v) => std::env::set_var("SPAR_CODEX_MODEL", v),
+            None => std::env::remove_var("SPAR_CODEX_MODEL"),
+        }
+    }
+}
+
 pub struct CodexAdapter;
 
 impl CodexAdapter {
@@ -221,6 +354,17 @@ impl CodexAdapter {
     /// instructions are read from stdin"). A tmux pane's stdin is its terminal, so the
     /// interactive path always passes the text.
     fn exec_command(&self, bin: &Path, opts: &SpawnOpts, stdin_prompt: bool) -> Command {
+        let route = opts_route(opts);
+        self.exec_command_with_route(bin, opts, stdin_prompt, &route)
+    }
+
+    fn exec_command_with_route(
+        &self,
+        bin: &Path,
+        opts: &SpawnOpts,
+        stdin_prompt: bool,
+        route: &CodexRoute,
+    ) -> Command {
         let mut cmd = Command::new(bin);
         cmd.arg("exec");
         cmd.arg("--json");
@@ -230,14 +374,14 @@ impl CodexAdapter {
         }
         // An explicit model is self-describing (it names its own provider), so it
         // supersedes the profile; the profile is only the no-model default.
-        match codex_model(opts) {
+        match route.model.as_deref() {
             Some(m) => {
-                for a in model_args(&m) {
+                for a in model_args(m) {
                     cmd.arg(a);
                 }
             }
             None => {
-                if let Some(p) = spawn_profile(opts) {
+                if let Some(p) = route.profile.as_deref() {
                     cmd.arg("-p").arg(p);
                 }
             }
@@ -291,20 +435,14 @@ impl ProviderAdapter for CodexAdapter {
     /// bucket key re-resolves instead of collapsing; no codex model is called
     /// either, so no seat model collides.
     fn quota_bucket<'m>(&self, model: &'m str) -> Option<Cow<'m, str>> {
-        if model.contains('/') || model == "openrouter" {
-            Some(Cow::Borrowed("openrouter"))
-        } else {
-            Some(Cow::Borrowed("native"))
-        }
+        Some(Cow::Borrowed(codex_quota_bucket(model).as_str()))
     }
 
-    /// The model-less seat's bucket: the profile it dispatches under. `None`
-    /// (an emptied `SPAR_CODEX_PROFILE`) drops `-p`, running codex's own
-    /// default, the native login; only the `muse` profile is verified to
-    /// layer OpenRouter, and any other set profile keys at the login rather
-    /// than in a bucket it might not share.
+    /// The ambient route resolved the same way the spawn resolves it: an
+    /// ambient model names its own bucket, only a model-less seat falls back
+    /// to the profile default.
     fn default_bucket(&self) -> Option<&'static str> {
-        default_bucket_for_profile(codex_profile().as_deref())
+        route_bucket(&resolve_route(None, RecordedRoute::ambient())).map(CodexBucket::as_str)
     }
 
     /// Rejections carry no route of their own, so every rejection lands in the
@@ -318,6 +456,20 @@ impl ProviderAdapter for CodexAdapter {
         match seat {
             Some(model) => self.quota_bucket(model),
             None => self.default_bucket().map(Cow::Borrowed),
+        }
+    }
+
+    /// A model-less seat's bucket under the run's recorded route. Modeled
+    /// seats never reach here (generic key derivation only asks when the seat
+    /// names no model), and an unrecorded run keys the ambient route through
+    /// the normal path.
+    fn recorded_route_bucket(&self, route: RecordedRoute<'_>) -> RecordedRouteBucket {
+        if !route.is_recorded() {
+            return RecordedRouteBucket::Ambient;
+        }
+        match route_bucket(&resolve_route(None, route)) {
+            Some(bucket) => RecordedRouteBucket::Bucket(bucket.as_str()),
+            None => RecordedRouteBucket::Login,
         }
     }
 
@@ -402,6 +554,15 @@ impl ProviderAdapter for CodexAdapter {
         self.exec_command(bin, opts, opts.prompt_file.is_some())
     }
 
+    /// A `--run` probe replays the run's recorded route into the spawn, so the
+    /// call bills the keyed bucket: an explicit seat model still wins, the
+    /// recorded model fills a bare ref, and the recorded profile (not this
+    /// process's ambient one) selects `-p`.
+    fn build_probe(&self, bin: &Path, opts: &SpawnOpts, route: RecordedRoute<'_>) -> Command {
+        let resolved = resolve_route(opts.model.as_deref(), route);
+        self.exec_command_with_route(bin, opts, opts.prompt_file.is_some(), &resolved)
+    }
+
     /// Resume is implemented, so the derived `Capabilities.resume` reports true.
     fn supports_resume(&self) -> bool {
         true
@@ -426,15 +587,16 @@ impl ProviderAdapter for CodexAdapter {
         for a in self.permission_args(opts.trust) {
             cmd.arg(a);
         }
-        match codex_model(opts) {
+        let route = opts_route(opts);
+        match route.model.as_deref() {
             Some(m) => {
-                for a in model_args(&m) {
+                for a in model_args(m) {
                     cmd.arg(a);
                 }
             }
             None => {
-                if let Some(p) = spawn_profile(opts) {
-                    if let Some(args) = profile_model_args(&p) {
+                if let Some(p) = route.profile.as_deref() {
+                    if let Some(args) = profile_model_args(p) {
                         for a in args {
                             cmd.arg(a);
                         }
@@ -503,7 +665,6 @@ mod tests {
 
     fn opts(prompt: &str, model: Option<&str>) -> SpawnOpts {
         SpawnOpts {
-            codex_profile: None,
             prompt: prompt.into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
@@ -521,7 +682,7 @@ mod tests {
     fn capture_only_adapter_ignores_assigned_session_id() {
         // codex cannot name a new thread: the command line must be byte-identical
         // with and without the field set (the executor never sets it here either).
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _pin = pin_codex_env();
         let plain = opts("do the thing", None);
         let mut assigned = plain.clone();
         assigned.session_id = Some("123e4567-e89b-52d3-a456-426614174000".into());
@@ -534,7 +695,7 @@ mod tests {
     #[test]
     fn headless_shape_and_prompt_last() {
         // Lock: build_headless reads SPAR_CODEX_* env, which another test mutates.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _pin = pin_codex_env();
         // Structural flags are env-independent; profile value is covered separately.
         let cmd = CodexAdapter.build_headless(Path::new("codex"), &opts("do the thing", None));
         let (_, args) = command_to_parts(&cmd);
@@ -556,7 +717,7 @@ mod tests {
 
     #[test]
     fn model_from_opts_precedes_prompt() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _pin = pin_codex_env();
         // opts.model (from --select) wins regardless of ambient env.
         let cmd = CodexAdapter
             .build_headless(Path::new("codex"), &opts("go", Some("meta/muse-spark-1.1")));
@@ -572,7 +733,7 @@ mod tests {
 
     #[test]
     fn prompt_policy_omits_bypass() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _pin = pin_codex_env();
         let mut o = opts("x", None);
         o.trust = TrustPolicy::Prompt;
         let cmd = CodexAdapter.build_headless(Path::new("codex"), &o);
@@ -584,7 +745,7 @@ mod tests {
 
     #[test]
     fn profile_and_model_env_selection() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _pin = pin_codex_env();
         let dash_val = |args: &[String], flag: &str| {
             args.iter()
                 .position(|a| a == flag)
@@ -592,8 +753,6 @@ mod tests {
         };
 
         // Unset -> the `muse` default profile, no -m (profile's own model).
-        std::env::remove_var("SPAR_CODEX_PROFILE");
-        std::env::remove_var("SPAR_CODEX_MODEL");
         let (_, a) =
             command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &opts("x", None)));
         assert_eq!(dash_val(&a, "-p").as_deref(), Some("muse"));
@@ -616,16 +775,11 @@ mod tests {
                 .build_headless(Path::new("codex"), &opts("x", Some("meta/muse-spark-1.1"))),
         );
         assert_eq!(dash_val(&a, "-m").as_deref(), Some("meta/muse-spark-1.1"));
-
-        std::env::remove_var("SPAR_CODEX_PROFILE");
-        std::env::remove_var("SPAR_CODEX_MODEL");
     }
 
     #[test]
     fn slug_model_routes_to_openrouter_and_omits_profile() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
-        std::env::remove_var("SPAR_CODEX_MODEL");
+        let _pin = pin_codex_env();
         let (_, a) = command_to_parts(
             &CodexAdapter.build_headless(Path::new("codex"), &opts("x", Some("tencent/hy3:free"))),
         );
@@ -639,14 +793,11 @@ mod tests {
         assert_eq!(a.get(mi + 1).map(String::as_str), Some("tencent/hy3:free"));
         assert!(mi > ci, "-c must precede -m");
         assert!(!a.iter().any(|x| x == "-p"), "slug model omits the profile");
-        std::env::remove_var("SPAR_CODEX_PROFILE");
     }
 
     #[test]
     fn bare_model_omits_provider_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
-        std::env::remove_var("SPAR_CODEX_MODEL");
+        let _pin = pin_codex_env();
         let (_, a) = command_to_parts(
             &CodexAdapter.build_headless(Path::new("codex"), &opts("x", Some("gpt-5"))),
         );
@@ -656,14 +807,11 @@ mod tests {
             !a.iter().any(|x| x == "model_provider=openrouter"),
             "bare model must not force the openrouter provider"
         );
-        std::env::remove_var("SPAR_CODEX_PROFILE");
     }
 
     #[test]
     fn no_model_uses_default_profile() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
-        std::env::remove_var("SPAR_CODEX_MODEL");
+        let _pin = pin_codex_env();
         let (_, a) =
             command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &opts("x", None)));
         assert!(a.windows(2).any(|w| w[0] == "-p" && w[1] == "muse"));
@@ -671,28 +819,8 @@ mod tests {
     }
 
     #[test]
-    fn spawn_honours_the_recorded_profile_over_the_process_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_MODEL");
-        // Recorded OpenRouter profile wins over a natively-set process.
-        std::env::set_var("SPAR_CODEX_PROFILE", "");
-        let mut o = opts("x", None);
-        o.codex_profile = Some("muse".into());
-        let (_, a) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &o));
-        assert!(a.windows(2).any(|w| w[0] == "-p" && w[1] == "muse"));
-        // Recorded native route drops `-p` even when the process names a profile.
-        std::env::set_var("SPAR_CODEX_PROFILE", "muse");
-        let mut o = opts("x", None);
-        o.codex_profile = Some("".into());
-        let (_, a) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &o));
-        assert!(!a.iter().any(|x| x == "-p"));
-        std::env::remove_var("SPAR_CODEX_PROFILE");
-    }
-
-    #[test]
     fn default_bucket_follows_the_profile_route() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
+        let _pin = pin_codex_env();
         assert_eq!(CodexAdapter.default_bucket(), Some("openrouter"));
         std::env::set_var("SPAR_CODEX_PROFILE", "muse");
         assert_eq!(CodexAdapter.default_bucket(), Some("openrouter"));
@@ -708,13 +836,11 @@ mod tests {
             Some("native"),
             "an emptied profile drops -p, so the seat runs native"
         );
-        std::env::remove_var("SPAR_CODEX_PROFILE");
     }
 
     #[test]
     fn explicit_models_omit_the_profile() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
+        let _pin = pin_codex_env();
         assert_eq!(
             CodexAdapter.quota_bucket("gpt-5.2-codex").as_deref(),
             Some("native"),
@@ -731,7 +857,6 @@ mod tests {
             Some("openrouter"),
             "an explicit slug forces OpenRouter under any profile"
         );
-        std::env::remove_var("SPAR_CODEX_PROFILE");
     }
 
     #[test]
@@ -747,9 +872,7 @@ mod tests {
 
     #[test]
     fn build_resume_shape() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
-        std::env::remove_var("SPAR_CODEX_MODEL");
+        let _pin = pin_codex_env();
         // Point at an empty CODEX_HOME so the default `muse` profile resolves no
         // model override, keeping this test independent of the real machine's config.
         let home = tempdir().unwrap();
@@ -787,9 +910,7 @@ mod tests {
     #[test]
     fn effort_interactive_matches_headless() {
         use crate::effort::EffortLevel;
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
-        std::env::remove_var("SPAR_CODEX_MODEL");
+        let _pin = pin_codex_env();
         let home = tempdir().unwrap();
         std::env::set_var("CODEX_HOME", home.path());
         let mut o = opts("go", None);
@@ -810,7 +931,7 @@ mod tests {
 
     #[test]
     fn build_resume_carries_model_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _pin = pin_codex_env();
         let cmd = CodexAdapter.build_resume(
             Path::new("codex"),
             &opts("x", Some("meta/muse-spark-1.1")),
@@ -827,9 +948,7 @@ mod tests {
     #[test]
     fn effort_renders_config_override_when_set_and_nothing_when_unset() {
         use crate::effort::EffortLevel;
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
-        std::env::remove_var("SPAR_CODEX_MODEL");
+        let _pin = pin_codex_env();
         let home = tempdir().unwrap();
         std::env::set_var("CODEX_HOME", home.path());
         let (_, args) =
@@ -854,9 +973,7 @@ mod tests {
     #[test]
     fn effort_resume_matches_headless() {
         use crate::effort::EffortLevel;
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
-        std::env::remove_var("SPAR_CODEX_MODEL");
+        let _pin = pin_codex_env();
         let home = tempdir().unwrap();
         std::env::set_var("CODEX_HOME", home.path());
         let mut o = opts("go", None);
@@ -888,9 +1005,8 @@ mod tests {
         // `-p` cannot be passed to `resume` (codex rejects it), so with no explicit
         // model, build_resume must read the profile's own config file and emit the
         // equivalent -c/-m rather than silently falling onto config.toml's default.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _pin = pin_codex_env();
         std::env::set_var("SPAR_CODEX_PROFILE", "muse");
-        std::env::remove_var("SPAR_CODEX_MODEL");
         let home = tempdir().unwrap();
         std::fs::write(
             home.path().join("muse.config.toml"),
@@ -901,7 +1017,6 @@ mod tests {
         let cmd = CodexAdapter.build_resume(Path::new("codex"), &opts("go", None), "thread-1");
         let (_, args) = command_to_parts(&cmd.unwrap());
         std::env::remove_var("CODEX_HOME");
-        std::env::remove_var("SPAR_CODEX_PROFILE");
 
         let ci = args.iter().position(|a| a == "-c").expect("-c present");
         assert_eq!(
@@ -920,9 +1035,8 @@ mod tests {
     fn build_resume_omits_model_flag_but_carries_other_profile_keys() {
         // A profile with no `model` key must not fabricate a `-m`, but its other
         // settings (e.g. an approval policy) are still restored as `-c` overrides.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _pin = pin_codex_env();
         std::env::set_var("SPAR_CODEX_PROFILE", "plain");
-        std::env::remove_var("SPAR_CODEX_MODEL");
         let home = tempdir().unwrap();
         std::fs::write(
             home.path().join("plain.config.toml"),
@@ -933,7 +1047,6 @@ mod tests {
         let cmd = CodexAdapter.build_resume(Path::new("codex"), &opts("go", None), "thread-1");
         let (_, args) = command_to_parts(&cmd.unwrap());
         std::env::remove_var("CODEX_HOME");
-        std::env::remove_var("SPAR_CODEX_PROFILE");
 
         assert!(!args.iter().any(|a| a == "-m"));
         assert!(!args.iter().any(|a| a == "-p"));
@@ -953,9 +1066,8 @@ mod tests {
         // and codex exits `Model provider \`<name>\` not found` before `thread.started`
         // — a failure `resume_failure_is_missing_session` cannot recognise (it does not
         // carry "no rollout found"), so the slot would be wedged on every later round.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _pin = pin_codex_env();
         std::env::set_var("SPAR_CODEX_PROFILE", "myprof");
-        std::env::remove_var("SPAR_CODEX_MODEL");
         let home = tempdir().unwrap();
         std::fs::write(
             home.path().join("myprof.config.toml"),
@@ -973,7 +1085,6 @@ mod tests {
         let cmd = CodexAdapter.build_resume(Path::new("codex"), &opts("go", None), "thread-1");
         let (_, args) = command_to_parts(&cmd.unwrap());
         std::env::remove_var("CODEX_HOME");
-        std::env::remove_var("SPAR_CODEX_PROFILE");
 
         let has = |kv: &str| {
             args.iter().position(|a| a == "-c").map(|_| ()).is_some()
@@ -995,9 +1106,7 @@ mod tests {
 
     #[test]
     fn headless_and_resume_carry_output_last_message_under_run_logs() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
-        std::env::remove_var("SPAR_CODEX_MODEL");
+        let _pin = pin_codex_env();
         // Executor-shaped prompt file: `<run_dir>/prompt-<slot>.md`.
         let dir = tempdir().unwrap();
         let run = dir.path().join("runs").join("run1");
@@ -1054,7 +1163,7 @@ mod tests {
 
     #[test]
     fn no_last_message_flag_without_an_executor_shaped_prompt_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _pin = pin_codex_env();
         // No prompt file at all: old command line, salvage falls back to the log.
         let (_, a) =
             command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &opts("x", None)));
@@ -1074,7 +1183,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let run = dir.path().join("run1");
         let o = SpawnOpts {
-            codex_profile: None,
             prompt: "x".into(),
             prompt_file: Some(run.join("prompt-rev.md")),
             cwd: PathBuf::from("/tmp"),
@@ -1112,5 +1220,55 @@ mod tests {
             Some("thread-1"),
         ));
         assert!(!CodexAdapter.resume_failure_is_missing_session("", None));
+    }
+
+    #[test]
+    fn spawn_resolves_the_model_from_opts_then_the_ambient_env() {
+        let _pin = pin_codex_env();
+        std::env::set_var("SPAR_CODEX_MODEL", "gpt-5");
+        let (_, a) =
+            command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &opts("x", None)));
+        let mi = a.iter().position(|x| x == "-m").expect("-m present");
+        assert_eq!(a.get(mi + 1).map(String::as_str), Some("gpt-5"));
+        assert!(
+            !a.iter().any(|x| x == "-p"),
+            "explicit model omits the profile"
+        );
+    }
+
+    #[test]
+    fn recorded_route_bucket_follows_the_recorded_model() {
+        let _pin = pin_codex_env();
+        std::env::set_var("SPAR_CODEX_PROFILE", "muse");
+        std::env::set_var("SPAR_CODEX_MODEL", "gpt-5");
+        assert_eq!(
+            CodexAdapter.recorded_route_bucket(RecordedRoute {
+                profile: Some("muse"),
+                model: Some("x-ai/grok-4"),
+            }),
+            RecordedRouteBucket::Bucket("openrouter"),
+            "recorded slug bills openrouter under any ambient model"
+        );
+        assert_eq!(
+            CodexAdapter.recorded_route_bucket(RecordedRoute {
+                profile: Some("muse"),
+                model: Some("gpt-5"),
+            }),
+            RecordedRouteBucket::Bucket("native"),
+            "recorded bare model bills native under the recorded OpenRouter profile"
+        );
+        assert_eq!(
+            CodexAdapter.recorded_route_bucket(RecordedRoute {
+                profile: Some("gpt"),
+                model: Some(""),
+            }),
+            RecordedRouteBucket::Login,
+            "an unverified recorded profile keys the login"
+        );
+        assert_eq!(
+            CodexAdapter.recorded_route_bucket(RecordedRoute::ambient()),
+            RecordedRouteBucket::Ambient,
+            "unrecorded runs key the ambient route through the normal path"
+        );
     }
 }

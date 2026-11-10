@@ -166,10 +166,6 @@ struct PreparedSlot {
     /// sizes its budgets and nudge cadence off the same document every other phase reads.
     cfg: Config,
     dry_run: bool,
-    /// The dispatch profile recorded in run state (`RunState::codex_profile`),
-    /// carried across the thread boundary so the spawn keys the seat this run
-    /// actually dispatched instead of this worker's ambient environment.
-    codex_profile: Option<String>,
     /// Held for the dispatch's lifetime; dropped (and the directory removed) once the
     /// outcome has been applied.
     _tmp: SlotTmp,
@@ -446,7 +442,6 @@ fn prepare_slot_execution(
         session_provider,
         cfg: cfg.clone(),
         dry_run: state.dry_run,
-        codex_profile: state.codex_profile.clone(),
         _tmp: tmp,
         _fleet_lease: fleet_lease,
         _build_cache: build_cache.and_then(|(lease, _)| lease),
@@ -1245,7 +1240,6 @@ fn execute_prepared(
         effort: prep.job.effort,
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(prep.paths.sessions_dir(&prep.run_id, &prep.job.slot_id)),
-        codex_profile: prep.codex_profile.clone(),
     };
     let (mut cmd, used_resume) = build_dispatch_command(
         adapter.as_ref(),
@@ -1397,7 +1391,6 @@ fn execute_prepared(
                     slot_id: &prep.job.slot_id,
                     round: prep.round,
                     role: prep.job.role,
-                    codex_profile: prep.codex_profile.clone(),
                     owns_cwd: prep.owns_cwd,
                     provider: &prep.job.provider,
                     model: prep.job.model.clone(),
@@ -1572,7 +1565,6 @@ fn execute_prepared(
                 slot_id: &prep.job.slot_id,
                 round: prep.round,
                 role: prep.job.role,
-                codex_profile: prep.codex_profile.clone(),
                 owns_cwd: prep.owns_cwd,
                 provider: &prep.job.provider,
                 model: prep.job.model.clone(),
@@ -1637,7 +1629,6 @@ struct ArtifactRecovery<'a> {
     slot_id: &'a str,
     round: u32,
     role: SlotRole,
-    codex_profile: Option<String>,
     /// `cwd` is this slot's own worktree. See [`owns_cwd`].
     owns_cwd: bool,
     provider: &'a str,
@@ -1818,7 +1809,6 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
         effort: r.effort,
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(r.paths.sessions_dir(r.run_id, r.slot_id)),
-        codex_profile: r.codex_profile.clone(),
     };
     let cmd = adapter.build_headless(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
@@ -2079,7 +2069,7 @@ fn enrich_agy_stats(
     if let (Some(frac), Some(reset)) = (t.quota_remaining_fraction, t.quota_reset_secs) {
         if frac < 0.02 && reset > 0 {
             let until = chrono::Utc::now() + chrono::Duration::seconds(reset);
-            let key = pref.quota_key(None);
+            let key = pref.quota_key(crate::providers::RecordedRoute::ambient());
             let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
             store.pause_quota_until(
                 &key,
@@ -2179,7 +2169,7 @@ fn apply_parallel_outcome(
                 &pref,
                 result.quota_rejected,
                 &log_text,
-                state.codex_profile.as_deref(),
+                state.recorded_route(),
             );
             let witness = PauseWitness::before(paths, &state.id, &key);
             let quota_hit = quota_hit_for_outcome(paths, &pref, &key, &log_text, &result);
@@ -2258,7 +2248,7 @@ fn apply_parallel_outcome(
                 &pref,
                 &log_text,
                 &e.to_string(),
-                state.codex_profile.as_deref(),
+                state.recorded_route(),
             );
             let auth = auth_fault_for(&prep.log_path, &e.to_string(), quota_hit, None, None);
             if let Some(s) = state.slot_mut(slot_id) {
@@ -2623,7 +2613,7 @@ pub fn run_slot(
             pref,
             &log_text,
             err_text,
-            state.codex_profile.as_deref(),
+            state.recorded_route(),
         );
         let auth = auth_fault_for(log_path, err_text, quota_hit, None, None);
         if let Some(s) = state.slot_mut(slot_id) {
@@ -2793,7 +2783,7 @@ pub fn run_slot(
             &seat,
             result.quota_rejected,
             &log_text,
-            state.codex_profile.as_deref(),
+            state.recorded_route(),
         );
         let witness = PauseWitness::before(paths, &state.id, &key);
         let quota_hit = quota_hit_for_outcome(paths, &seat, &key, &log_text, &result);
@@ -3135,14 +3125,14 @@ fn quota_write_key(
     pref: &ProviderRef,
     structured: Option<RateLimitWindow>,
     log_text: &str,
-    codex_profile: Option<&str>,
+    route: crate::providers::RecordedRoute<'_>,
 ) -> String {
     pref.rejection_key(
         QuotaSignal {
             window: structured,
             text: log_text,
         },
-        codex_profile,
+        route,
     )
 }
 
@@ -3178,17 +3168,17 @@ fn quota_hit_for_outcome(
 ///
 /// Takes no `structured`/`resets_at`/`quota_recovered`: both call sites are `Err` arms that
 /// by construction never produced a `SlotOutcome`, so a typed verdict cannot exist yet
-/// to thread through. Takes the recorded `codex_profile` for the same reason the
-/// `Ok` arms do: a model-less codex seat writes the bucket it dispatched under.
+/// to thread through. Takes the recorded route for the same reason the `Ok` arms
+/// do: a model-less codex seat writes the bucket it dispatched under.
 fn detect_and_pause_quota_with_err(
     paths: &SparPaths,
     pref: &ProviderRef,
     log_text: &str,
     extra: &str,
-    codex_profile: Option<&str>,
+    route: crate::providers::RecordedRoute<'_>,
 ) -> bool {
     let text = format!("{log_text}\n{extra}");
-    let key = quota_write_key(pref, None, &text, codex_profile);
+    let key = quota_write_key(pref, None, &text, route);
     detect_and_pause_quota(paths, pref, &key, &text, None, None, false)
 }
 
@@ -4113,7 +4103,6 @@ fn run_headless(
         effort: slot_effort_for(cfg, Some(state), job),
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(paths.sessions_dir(&state.id, &job.slot_id)),
-        codex_profile: state.codex_profile.clone(),
     };
     let prior_session_id =
         prior_session_for_role(paths, &state.id, &job.slot_id, cli_name, job.role);
@@ -4254,7 +4243,6 @@ fn run_headless(
                     slot_id: &job.slot_id,
                     round: state.round,
                     role: job.role,
-                    codex_profile: state.codex_profile.clone(),
                     owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                     provider: &job.provider,
                     model: slot_model_for(Some(state), job),
@@ -4409,7 +4397,6 @@ fn run_headless(
                 slot_id: &job.slot_id,
                 round: state.round,
                 role: job.role,
-                codex_profile: state.codex_profile.clone(),
                 owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                 provider: &job.provider,
                 model: slot_model_for(Some(state), job),
@@ -4630,7 +4617,6 @@ fn run_tmux(
         effort,
         timeout_secs: None,
         session_dir: Some(paths.sessions_dir(&state.id, &job.slot_id)),
-        codex_profile: state.codex_profile.clone(),
     };
     // The pane is teed to a log, never run through `StreamCoalescer`, so no id is
     // ever captured here (O65). An adapter that accepts a caller-supplied id gets
@@ -5199,7 +5185,12 @@ mod tests {
     ) -> (bool, String) {
         let pref = seat_ref(seat);
         let log_text = outcome_log_text(log_path, outcome);
-        let key = quota_write_key(&pref, outcome.quota_rejected, &log_text, None);
+        let key = quota_write_key(
+            &pref,
+            outcome.quota_rejected,
+            &log_text,
+            crate::providers::RecordedRoute::ambient(),
+        );
         (
             quota_hit_for_outcome(paths, &pref, &key, &log_text, outcome),
             key,
@@ -5222,7 +5213,6 @@ mod tests {
 
     fn dispatch_opts(prompt: &str) -> SpawnOpts {
         SpawnOpts {
-            codex_profile: None,
             prompt: prompt.into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
@@ -5239,10 +5229,10 @@ mod tests {
     #[test]
     fn build_dispatch_command_resumes_codex_when_a_prior_session_id_is_known() {
         // build_resume (opts.model: None) falls through to profile_model_args, which
-        // reads $CODEX_HOME/<profile>.config.toml: lock and isolate CODEX_HOME so this
+        // reads $CODEX_HOME/<profile>.config.toml: pin and isolate CODEX_HOME so this
         // doesn't read the machine's real ~/.codex or race codex.rs's own env-mutating
         // tests, matching neither of which this test's assertions depend on.
-        let _guard = providers::codex::ENV_LOCK.lock().unwrap();
+        let _pin = providers::codex::pin_codex_env();
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("CODEX_HOME", home.path());
         let mut opts = dispatch_opts("go");
@@ -7405,7 +7395,12 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let until = chrono::Utc::now() + chrono::Duration::hours(2);
         let log = "! rate limit  seven_day_sonnet  rejected\n";
         let seat = seat_ref("cli:claude@opus");
-        let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDaySonnet), log, None);
+        let key = quota_write_key(
+            &seat,
+            Some(RateLimitWindow::SevenDaySonnet),
+            log,
+            crate::providers::RecordedRoute::ambient(),
+        );
         assert_eq!(key, "cli:claude");
         assert!(detect_and_pause_quota(
             &paths,
@@ -7435,7 +7430,12 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let until = chrono::Utc::now() + chrono::Duration::hours(2);
         let log = "! rate limit  seven_day_opus  rejected\nYou've hit your limit\n";
         let seat = seat_ref("cli:claude@opus");
-        let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDayOpus), log, None);
+        let key = quota_write_key(
+            &seat,
+            Some(RateLimitWindow::SevenDayOpus),
+            log,
+            crate::providers::RecordedRoute::ambient(),
+        );
         assert_eq!(key, "cli:claude");
         assert!(detect_and_pause_quota(
             &paths,
@@ -7461,7 +7461,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let paths = SparPaths::new(tmp.path());
         let log = "You've reached your Fable limit\n";
         let seat = seat_ref("cli:claude@fable");
-        let key = quota_write_key(&seat, None, log, None);
+        let key = quota_write_key(&seat, None, log, crate::providers::RecordedRoute::ambient());
         assert_eq!(key, "cli:claude@fable");
         {
             let mut store = crate::quota::QuotaStore::load(&paths).unwrap_or_default();
@@ -7546,7 +7546,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &seat,
             Some(RateLimitWindow::SevenDayOverageIncluded),
             "",
-            None,
+            crate::providers::RecordedRoute::ambient(),
         );
         assert_eq!(key, "cli:claude@opus");
         let haiku = seat_ref("cli:claude@haiku");
@@ -7554,7 +7554,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &haiku,
             Some(RateLimitWindow::SevenDayOverageIncluded),
             "",
-            None,
+            crate::providers::RecordedRoute::ambient(),
         );
         assert_eq!(key, "cli:claude");
     }
@@ -7815,13 +7815,13 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             "cli:agy@flash",
             &store,
             None,
-            None
+            crate::providers::RecordedRoute::ambient()
         ));
         assert!(crate::backup::is_provider_eligible(
             "cli:agy@pro",
             &store,
             None,
-            None
+            crate::providers::RecordedRoute::ambient()
         ));
     }
 
@@ -7856,7 +7856,10 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             effort: None,
         };
         let seat = seat_ref_for(Some(&st), &job);
-        assert_eq!(seat.quota_key(None), "cli:agy@gemini-flash");
+        assert_eq!(
+            seat.quota_key(crate::providers::RecordedRoute::ambient()),
+            "cli:agy@gemini-flash"
+        );
         let log = "error: Individual quota reached. Resets in 2h.\n";
         assert!(detect_and_pause_quota(
             &paths,
@@ -7869,19 +7872,25 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         let slot = &st.slots[0];
-        assert_eq!(slot.provider_ref().quota_key(None), "cli:agy@gemini-flash");
+        assert_eq!(
+            slot.provider_ref()
+                .quota_key(crate::providers::RecordedRoute::ambient()),
+            "cli:agy@gemini-flash"
+        );
         assert!(!crate::backup::is_provider_eligible(
             &slot.provider_ref().display(),
             &store,
             None,
-            None
+            crate::providers::RecordedRoute::ambient()
         ));
         let plan_job = SlotJob {
             model: slot.model.clone(),
             ..job
         };
         assert_eq!(
-            plan_job.provider_ref().quota_key(None),
+            plan_job
+                .provider_ref()
+                .quota_key(crate::providers::RecordedRoute::ambient()),
             "cli:agy@gemini-flash"
         );
     }
@@ -8167,7 +8176,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &seat_ref("api:openai"),
             log,
             err_text,
-            None,
+            crate::providers::RecordedRoute::ambient(),
         ));
     }
 
@@ -8177,18 +8186,29 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     /// seat dispatched natively writes and reads `cli:codex@native`.
     #[test]
     fn recorded_codex_profile_governs_writes_and_reads_under_a_foreign_env() {
-        let _guard = providers::codex::ENV_LOCK.lock().unwrap();
+        let _pin = providers::codex::pin_codex_env();
         std::env::set_var("SPAR_CODEX_PROFILE", "muse");
         let seat = seat_ref("cli:codex");
-        let write = quota_write_key(&seat, None, "error: 429 rate limit\n", Some(""));
+        let write = quota_write_key(
+            &seat,
+            None,
+            "error: 429 rate limit\n",
+            crate::providers::RecordedRoute {
+                profile: Some(""),
+                model: None,
+            },
+        );
         assert_eq!(write, "cli:codex@native", "write keys the recorded route");
         assert_eq!(
-            seat.quota_key(Some("")),
+            seat.quota_key(crate::providers::RecordedRoute {
+                profile: Some(""),
+                model: None
+            }),
             "cli:codex@native",
             "read keys the recorded route"
         );
         assert_eq!(
-            seat.quota_key(None),
+            seat.quota_key(crate::providers::RecordedRoute::ambient()),
             "cli:codex@openrouter",
             "no record keys this process's route"
         );
