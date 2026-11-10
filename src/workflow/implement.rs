@@ -5763,12 +5763,25 @@ fn carry_forward_section(
     );
     if !persisted.is_empty() {
         // First, so the cap cannot cut an operator ruling; these stand until the sender
-        // withdraws them, which is the point of `--persist`.
+        // withdraws them, which is the point of `--persist`. The phase is capped so
+        // the reservation below always fits: withheld messages redeliver next round.
         out.push_str(
             "### Operator messages (they stand until withdrawn; follow them over your own notes)\n",
         );
+        let phase_start = out.chars().count();
+        let mut withheld = 0;
         for m in persisted {
-            out.push_str(&format!("- {}\n", clamp_line(m, max_chars / 4)));
+            let line = format!("- {}\n", clamp_line(m, max_chars / 4));
+            if out.chars().count() - phase_start + line.chars().count() > max_chars / 4 {
+                withheld += 1;
+            } else {
+                out.push_str(&line);
+            }
+        }
+        if withheld > 0 {
+            out.push_str(&format!(
+                "- (+{withheld} more operator messages withheld by budget; they stand until withdrawn)\n"
+            ));
         }
         out.push('\n');
     }
@@ -5782,9 +5795,12 @@ fn carry_forward_section(
              be fixed, not stale notes: they supersede the previous round's own notes.\n",
         );
         // Acceptance lines render before everything expendable, sized to a share
-        // of the cap, so findings can never push a failing criterion id out of
-        // the brief. Heads and the manifest ride the same reservation; notes and
-        // findings follow, and the tail truncation below eats them first.
+        // of what the cap has left after the heading and the persisted phase,
+        // so findings can never push a failing criterion id out of the brief.
+        // Heads and the manifest ride the same reservation; notes and findings
+        // follow, and the tail truncation below eats them first. When even the
+        // floored share does not fit, the block degrades to manifest-only heads
+        // rather than dropping whole reviews.
         let verdicts: Vec<&VerdictBlocker> = blockers
             .iter()
             .filter_map(|b| match b {
@@ -5794,14 +5810,18 @@ fn carry_forward_section(
             .collect();
         let total_ac: usize = verdicts.iter().map(|v| v.acceptance.len()).sum();
         let heads_len: usize = verdicts.iter().map(|v| v.head.chars().count()).sum();
-        let share = (max_chars / 2)
+        let ac_budget = (max_chars / 2).min(max_chars.saturating_sub(out.chars().count()));
+        let share = ac_budget
             .saturating_sub(heads_len)
             .checked_div(total_ac.max(1))
             .unwrap_or(0)
             .clamp(MIN_AC_SHARE, MAX_AC_LINE);
+        let manifest_only = heads_len + MIN_AC_SHARE * total_ac > ac_budget;
         for v in &verdicts {
             let mut items = vec![v.head.clone()];
-            items.extend(v.acceptance.iter().map(|a| clamp_line(a, share)));
+            if !manifest_only {
+                items.extend(v.acceptance.iter().map(|a| clamp_line(a, share)));
+            }
             if v.findings.is_empty() && v.dropped_findings > 0 {
                 items.push(format!("(+{} more)", v.dropped_findings));
             }
@@ -7199,6 +7219,72 @@ mod carry_forward_tests {
         );
     }
 
+    fn verdict_with_ac(review: u32, criteria: u32, evidence_len: usize) -> Blocker {
+        let ids: Vec<String> = (1..=criteria).map(|n| format!("AC-{n}")).collect();
+        Blocker::Verdict(VerdictBlocker {
+            review_id: format!("rev-{review}"),
+            head: format!(
+                "review `rev-{review}` requested changes (round 2, Reviewed-Commit abcdef123456): failing {}",
+                ids.join(", ")
+            ),
+            acceptance: (1..=criteria)
+                .map(|n| {
+                    format!(
+                        "AC-{n}: fail: evid-r{review}c{n} {}",
+                        "e".repeat(evidence_len)
+                    )
+                })
+                .collect(),
+            findings: Vec::new(),
+            dropped_findings: 0,
+        })
+    }
+
+    /// Persisted operator messages render before the reserved block, but the
+    /// reservation must still hold every review: two long operator messages
+    /// beside five failing reviews keep all five manifests at the default cap.
+    #[test]
+    fn persisted_messages_do_not_evict_blocking_reviews() {
+        let blockers: Vec<Blocker> = (1..=5).map(|r| verdict_with_ac(r, 5, 300)).collect();
+        let persisted = vec!["m1".to_string(), "m2".to_string()]
+            .into_iter()
+            .map(|m| format!("from human (message {m}): {}", "o".repeat(2000)))
+            .collect::<Vec<_>>();
+        let out = carry_forward_section(3, &persisted, &blockers, None, 4000);
+        for r in 1..=5 {
+            for n in 1..=5 {
+                assert!(
+                    out.contains(&format!("evid-r{r}c{n}")),
+                    "review {r} AC-{n} evidence survives beside operator messages:\n{out}"
+                );
+            }
+        }
+        assert_eq!(
+            out.matches("failing AC-1, AC-2, AC-3, AC-4, AC-5").count(),
+            5,
+            "every review keeps its manifest beside operator messages:\n{out}"
+        );
+    }
+
+    /// The per-line share floors at 32 characters; when even floored lines do
+    /// not fit the reservation, the block degrades to manifest-only heads
+    /// rather than dropping whole reviews. Five reviews with twenty failing
+    /// criteria each keep all five manifests at the default cap.
+    #[test]
+    fn an_overflowing_share_degrades_to_manifest_only_heads() {
+        let blockers: Vec<Blocker> = (1..=5).map(|r| verdict_with_ac(r, 20, 50)).collect();
+        let out = carry_forward_section(3, &[], &blockers, None, 4000);
+        let manifest = (1..=20)
+            .map(|n| format!("AC-{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(
+            out.matches(&format!("failing {manifest}")).count(),
+            5,
+            "every review keeps its manifest when the share overflows:\n{out}"
+        );
+    }
+
     /// A git repo with one commit, for the no-progress matrix below.
     fn stalled_repo() -> (tempfile::TempDir, String) {
         let tmp = tempfile::tempdir().unwrap();
@@ -7368,6 +7454,52 @@ mod carry_forward_tests {
         assert!(
             escalation.contains("major - the retry never stops"),
             "{escalation}"
+        );
+    }
+
+    fn stalled_once(
+        round: u32,
+        max_rounds: u32,
+    ) -> (tempfile::TempDir, SparPaths, RunState, NoProgress) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
+        state.round = round;
+        state.max_rounds = max_rounds;
+        let stalled = NoProgress {
+            head: "abcdef1234567".to_string(),
+            reviews: vec![NoProgressReview {
+                slot_id: "rev-1".to_string(),
+                round: 1,
+                reviewed_commit: "abcdef1234567".to_string(),
+                findings: vec!["major - the retry never stops".to_string()],
+            }],
+        };
+        (tmp, paths, state, stalled)
+    }
+
+    /// Below the ceiling the park message re-enters with the bare command: no
+    /// flag is needed because the stall gate is not the round ceiling.
+    #[test]
+    fn stall_park_below_the_ceiling_re_enters_bare() {
+        let (_tmp, paths, mut state, stalled) = stalled_once(2, 8);
+        park_no_progress(&mut state, &paths, &stalled).unwrap();
+        let err = state.error.clone().unwrap();
+        assert!(err.contains("`spar implement --run r1`"), "{err}");
+        assert!(!err.contains("--max-rounds"), "{err}");
+    }
+
+    /// At the ceiling a bare re-entry would hit the ceiling gate before the
+    /// stall logic, so the park message names the flag that re-entry needs.
+    #[test]
+    fn stall_park_at_the_ceiling_names_max_rounds() {
+        let (_tmp, paths, mut state, stalled) = stalled_once(8, 8);
+        park_no_progress(&mut state, &paths, &stalled).unwrap();
+        let err = state.error.clone().unwrap();
+        assert!(
+            err.contains("`spar implement --run r1 --max-rounds 10`"),
+            "{err}"
         );
     }
 

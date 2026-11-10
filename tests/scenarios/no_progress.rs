@@ -197,6 +197,34 @@ fn two_empty_rounds_park_at_the_human_gate() {
     );
 }
 
+/// Re-entering a stall-parked run below the ceiling with the bare command
+/// resumes it: one warned dispatch, then it parks again with no new panel.
+#[test]
+fn re_entering_a_stall_park_below_the_ceiling_parks_again_with_no_panel() {
+    let tmp = tempdir().unwrap();
+    project_with_clean_tree(tmp.path(), 8);
+    let run_id = planned_run(tmp.path());
+
+    implement_noop(tmp.path(), &run_id, "all", &[]).code(2);
+    let rounds_before = review_rounds(tmp.path(), &run_id);
+
+    implement_noop(tmp.path(), &run_id, "all", &[]).code(2);
+
+    let st = state_json(tmp.path(), &run_id);
+    assert_eq!(st["phase"], "awaiting_round_extension", "{st}");
+    assert!(
+        st["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("no progress in two consecutive")),
+        "the re-entry stalls again on the still-unchanged tree: {st}"
+    );
+    assert_eq!(
+        review_rounds(tmp.path(), &run_id),
+        rounds_before,
+        "the re-entry parks again with no new panel"
+    );
+}
+
 /// The carry-forward section itself, and not the warning, names the round
 /// that wrote each blocking review, the commit it judged, and its open
 /// findings, so a round that never stalls still learns what blocked the ship.

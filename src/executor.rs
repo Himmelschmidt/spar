@@ -3715,13 +3715,15 @@ fn run_dry(
 }
 
 /// Test hook for the no-progress ladder: with `SPAR_DRY_IMPL_NOOP` set, a dry-run
-/// implementer dispatch changes nothing on disk, so the round can stall. A
-/// numeric value noops the first that many implementer dispatches (dispatches,
-/// not rounds, because the warning re-dispatch is a second dispatch inside the
-/// same round, so a re-dispatch past the budget runs the normal dry-run stamp
-/// and counts as progress); `all` (or any other truthy non-numeric value) noops
-/// every dispatch. `0`, `false`, and unset mean a normal dry-run stamp. Both the
-/// dispatch and the no-progress check read the same run-dir counter file, so
+/// implementer dispatch skips its worktree stamp, so HEAD and the tree stay exactly
+/// as the open review judged them and the round can stall. Everything else still
+/// happens: the dispatch writes its dry-run artifacts, log, and marker, and bumps
+/// the run-dir counter below. A numeric value noops the first that many implementer
+/// dispatches (dispatches, not rounds, because the warning re-dispatch is a second
+/// dispatch inside the same round, so a re-dispatch past the budget runs the normal
+/// dry-run stamp and counts as progress); `all` (or any other truthy non-numeric
+/// value) noops every dispatch. `0`, `false`, and unset mean a normal dry-run stamp.
+/// Both the dispatch and the no-progress check read the same run-dir counter file, so
 /// they agree on whether this dispatch was noop'd. The counter lives outside
 /// `RunState` because only the dry-run hook uses it, and it moves only while
 /// the hook is armed, so real dry runs leave the file missing.
@@ -3802,7 +3804,7 @@ fn write_dry_artifacts(
                 }
             }
             // Test hook for the no-progress ladder: a dry-run implementer that
-            // changes nothing on disk, so HEAD and the tree stay exactly as the
+            // skips its stamp, so HEAD and the tree stay exactly as the
             // open review judged them.
             if !dry_impl_noop(paths, &state.id) {
                 let stamp = cwd.join(".spar-dry-implement");
