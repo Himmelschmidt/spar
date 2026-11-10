@@ -282,7 +282,7 @@ fn same_repo(a: &Path, b: &Path) -> bool {
 /// that hasn't gitignored it would see this warning on every single run — which is how
 /// the one stderr line that matters gets trained into background noise.
 fn dirty(dir: &Path) -> bool {
-    git_out(dir, &["status", "--porcelain", "--", ":!.spar"]).is_some_and(|s| !s.is_empty())
+    porcelain(dir).is_some_and(|s| !s.is_empty())
 }
 
 pub(crate) fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
@@ -568,10 +568,11 @@ pub fn watch_primary_checkout(
 
 /// `git status --porcelain` minus `.spar/`, untrimmed at the front: the leading space of
 /// ` M path` is part of the status code, and `git_out`'s trim would strip it from the
-/// first line only.
-fn porcelain(dir: &Path) -> Option<String> {
+/// first line only. The exclusion is top-relative so it holds from any cwd: dry-run
+/// slots run in scratch dirs under `.spar/`, where a bare `:!.spar` matches nothing.
+pub(crate) fn porcelain(dir: &Path) -> Option<String> {
     let out = Command::new("git")
-        .args(["status", "--porcelain", "--", ":!.spar"])
+        .args(["status", "--porcelain", "--", ":(exclude,top).spar"])
         .current_dir(dir)
         .output()
         .ok()?;

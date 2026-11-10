@@ -3692,6 +3692,10 @@ fn run_dry(
     };
     process::run_mock(&req, &mock_note)?;
 
+    if job.role == SlotRole::Implementer {
+        bump_dry_impl_dispatches(paths, &state.id);
+    }
+
     // Write role-appropriate artifacts
     write_dry_artifacts(state, paths, job, cwd, prompt)?;
 
@@ -3708,6 +3712,53 @@ fn run_dry(
     );
     state.save(paths)?;
     Ok(())
+}
+
+/// Test hook for the no-progress ladder: with `SPAR_DRY_IMPL_NOOP` set, a dry-run
+/// implementer dispatch skips its worktree stamp, so HEAD and the tree stay exactly
+/// as the open review judged them and the round can stall. Everything else still
+/// happens: the dispatch writes its dry-run artifacts, log, and marker, and bumps
+/// the run-dir counter below. A numeric value noops the first that many implementer
+/// dispatches (dispatches, not rounds, because the warning re-dispatch is a second
+/// dispatch inside the same round, so a re-dispatch past the budget runs the normal
+/// dry-run stamp and counts as progress); `all` (or any other truthy non-numeric
+/// value) noops every dispatch. `0`, `false`, and unset mean a normal dry-run stamp.
+/// Both the dispatch and the no-progress check read the same run-dir counter file, so
+/// they agree on whether this dispatch was noop'd. The counter lives outside
+/// `RunState` because only the dry-run hook uses it, and it moves only while
+/// the hook is armed, so real dry runs leave the file missing.
+fn dry_impl_hook_armed(raw: &str) -> bool {
+    !(raw.is_empty() || raw == "0" || raw == "false")
+}
+
+fn dry_impl_count_path(paths: &SparPaths, run_id: &str) -> PathBuf {
+    paths.run_dir(run_id).join("dry_impl_dispatches")
+}
+
+pub(crate) fn dry_impl_dispatch_count(paths: &SparPaths, run_id: &str) -> u32 {
+    std::fs::read_to_string(dry_impl_count_path(paths, run_id))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+fn bump_dry_impl_dispatches(paths: &SparPaths, run_id: &str) {
+    if !dry_impl_hook_armed(&std::env::var("SPAR_DRY_IMPL_NOOP").unwrap_or_default()) {
+        return;
+    }
+    let next = dry_impl_dispatch_count(paths, run_id).saturating_add(1);
+    let _ = std::fs::write(dry_impl_count_path(paths, run_id), next.to_string());
+}
+
+pub(crate) fn dry_impl_noop(paths: &SparPaths, run_id: &str) -> bool {
+    let raw = std::env::var("SPAR_DRY_IMPL_NOOP").unwrap_or_default();
+    if !dry_impl_hook_armed(&raw) {
+        return false;
+    }
+    if let Ok(n) = raw.parse::<u64>() {
+        return u64::from(dry_impl_dispatch_count(paths, run_id)) <= n;
+    }
+    true
 }
 
 fn write_dry_artifacts(
@@ -3752,17 +3803,27 @@ fn write_dry_artifacts(
                     std::fs::write(&contract, format!("{kept}\n"))?;
                 }
             }
+            // Test hook for the no-progress ladder: a dry-run implementer that
+            // skips its stamp, so HEAD and the tree stay exactly as the
+            // open review judged them.
             let stamp = cwd.join(".spar-dry-implement");
-            std::fs::write(
-                &stamp,
-                format!("implemented (dry-run) by {} for: {task}\n", job.slot_id),
-            )?;
+            let wrote = !dry_impl_noop(paths, &state.id);
+            if wrote {
+                std::fs::write(
+                    &stamp,
+                    format!("implemented (dry-run) by {} for: {task}\n", job.slot_id),
+                )?;
+            }
+            let outcome = if wrote {
+                format!("Wrote `{}`.", stamp.display())
+            } else {
+                "Wrote nothing: the no-op stub skips its stamp.".to_string()
+            };
             std::fs::write(
                 paths.artifact(&state.id, &format!("summary-{}.md", job.slot_id)),
                 format!(
-                    "# Summary ({})\n\nDry-run implementation for:\n\n{task}\n\nWrote `{}`.\n",
+                    "# Summary ({})\n\nDry-run implementation for:\n\n{task}\n\n{outcome}\n",
                     job.slot_id,
-                    stamp.display()
                 ),
             )?;
         }

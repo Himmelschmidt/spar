@@ -78,6 +78,7 @@ mkdir -p "$art"
 SHA=$(git -C "$FAKE_PROJECT_ROOT" rev-parse HEAD 2>/dev/null || true)
 case "$slot" in
 impl)
+if [ -n "$FAKE_PROGRESS" ]; then date +%s%N >> progress.txt; fi
 printf '# Summary\nDid the stub thing.\n' > "$art/summary-impl.md"
 ;;
 review-*)
@@ -97,7 +98,9 @@ exit 0"#;
 /// probe (`auth` for claude, `login` for codex, a token that never matches
 /// for grok, which has no probe and counts as healthy when present).
 /// `$verdict` is the review verdict this fake writes (`approve` or
-/// `request_changes`); implementer summaries are always written.
+/// `request_changes`); implementer summaries are always written. `FAKE_PROGRESS`
+/// makes the implementer touch its worktree so the no-progress park (O178) does
+/// not end a run that must reach the stuck exit or a later panel.
 fn write_fake(bin: &Path, name: &str, token: &str, probe: &str, verdict: &str) {
     let script = format!(
         "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fake-{name}; exit 0; fi\nif [ \"$1\" = \"{token}\" ]; then\n{probe}\nfi\nexport FAKE_NAME={name} FAKE_VERDICT={verdict}\nif [ \"$1\" = \"-p\" ] || [ \"$1\" = \"exec\" ]; then\n{dispatch}\nfi\ncase \" $* \" in\n*\" --prompt-file \"*)\n{dispatch}\n;;\nesac\nexit 1\n",
@@ -327,6 +330,7 @@ fn stuck_rotation_passes_over_unhealthy_order_entry() {
         .env("PATH", &p.path_env)
         .env("FAKE_PROJECT_ROOT", &p.proj)
         .env("FAKE_COUNT_DIR", &p.bin)
+        .env("FAKE_PROGRESS", "1")
         .args([
             "implement",
             "-t",
@@ -379,6 +383,7 @@ fn widening_never_adds_unhealthy_order_entry() {
         .env("PATH", &p.path_env)
         .env("FAKE_PROJECT_ROOT", &p.proj)
         .env("FAKE_COUNT_DIR", &p.bin)
+        .env("FAKE_PROGRESS", "1")
         .args([
             "implement",
             "-t",
@@ -689,6 +694,7 @@ fn continued_run_reseats_a_reviewer_whose_provider_went_sick() {
         .env("PATH", &p.path_env)
         .env("FAKE_PROJECT_ROOT", &p.proj)
         .env("FAKE_COUNT_DIR", &p.bin)
+        .env("FAKE_PROGRESS", "1")
         .args([
             "implement",
             "-t",
@@ -726,6 +732,7 @@ fn continued_run_reseats_a_reviewer_whose_provider_went_sick() {
         .env("PATH", &p.path_env)
         .env("FAKE_PROJECT_ROOT", &p.proj)
         .env("FAKE_COUNT_DIR", &p.bin)
+        .env("FAKE_PROGRESS", "1")
         .args([
             "implement",
             "--run",
