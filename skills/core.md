@@ -831,12 +831,13 @@ unpushed branch falls through to the repo default, with a note on stderr. `spar 
 (`PR base:`), on the dry-run path too.
 
 `spar ship` pushes the slot worktree's **HEAD** to `spar/<id>/<slot>`, never the branch by
-name, and **never rewinds the remote branch**. Before pushing it merges the run's base
+name, and **never rewinds the remote branch**. Before pushing it fetches the remote
+branch; if the remote has commits HEAD lacks (someone pushed by hand), ship exits `1`
+with "remote <branch> has commits the run lacks" before touching the worktree, so a
+later `--adopt-remote` still fast-forwards cleanly. Then it merges the run's base
 branch forward (`[rounds] merge_base`, O195): clean or already-current proceeds, a
 skipped base is one event, and a conflict aborts the merge and parks the run at the
-ship-confirm gate (**exit 2**) with the remedy. Then it fetches the remote branch;
-if the remote has commits HEAD lacks (someone pushed by hand), ship exits `1` with "remote
-<branch> has commits the run lacks". `spar ship <id> --adopt-remote` fast-forwards the
+ship-confirm gate (**exit 2**) with the remedy. `spar ship <id> --adopt-remote` fast-forwards the
 worktree onto `origin/<branch>` and ships (O125); it refuses (exit `1`, nothing moved) when the
 worktree has uncommitted changes to tracked files, is not on the run branch, or the remote
 is not a fast-forward of HEAD (the run has commits of its own on top), which is yours to reconcile by hand. The push is leased on the exact tip it fetched, so a push landing in between
