@@ -984,6 +984,11 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             if to == "impl" && run.is_none() {
                 anyhow::bail!("--to impl needs --run to know whose implementer");
             }
+            // Inside a slot the env names the sender, so a bare
+            // `spar bus send -m …` is filed as the slot, not the human.
+            let from = from
+                .or_else(|| bus::slot_caller().0)
+                .unwrap_or_else(|| "human".to_string());
             let run_state = match run.as_deref() {
                 Some(r) if needs_run || to == "impl" => Some(state::RunState::load(&paths, r)?),
                 _ => None,
@@ -1144,7 +1149,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             // (`$SPAR_AGENT_ID`); resolve to the unique inbox key either way.
             let unique = bus::resolve_addr(run.as_deref(), &agent);
             let msgs = if claim {
-                let msgs = bus::inbox_claim(&paths, &unique, "inbox_claim")?;
+                let msgs = bus::inbox_claim(&paths, &unique, "inbox_claim", |_| true)?;
                 for m in &msgs {
                     bus::record_receipt(
                         &paths,
@@ -1210,11 +1215,17 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             Ok(ExitCode::Success)
         }
         BusCmd::Reserve { path, holder, run } => {
+            let holder = holder
+                .or_else(|| bus::slot_caller().0)
+                .unwrap_or_else(|| "human".to_string());
             bus::reserve(&paths, run.as_deref(), &path, &holder)?;
             println!("reserved {path} by {holder}");
             Ok(ExitCode::Success)
         }
         BusCmd::Release { path, holder, run } => {
+            let holder = holder
+                .or_else(|| bus::slot_caller().0)
+                .unwrap_or_else(|| "human".to_string());
             bus::release(&paths, run.as_deref(), &path, &holder)?;
             println!("released {path}");
             Ok(ExitCode::Success)
@@ -1848,11 +1859,8 @@ fn rule_cmd(action: RuleCmd) -> Result<ExitCode> {
     };
     // Rulings override reviewers and can waive criteria, so a slot must not issue its
     // own. spar exports these into every slot it dispatches (O121).
-    if !matches!(action, RuleCmd::List { .. })
-        && ["SPAR_AGENT_ID", "SPAR_RUN_ID"]
-            .iter()
-            .any(|k| std::env::var(k).is_ok_and(|v| !v.is_empty()))
-    {
+    let (slot_agent, slot_run) = bus::slot_caller();
+    if !matches!(action, RuleCmd::List { .. }) && (slot_agent.is_some() || slot_run.is_some()) {
         anyhow::bail!(
             "rulings are operator-only: `spar rule add` / `rm` refuse to run inside a spar slot"
         );
@@ -2795,9 +2803,10 @@ fn attach_cmd(run_id: &str) -> Result<ExitCode> {
 /// A slot (or anything it spawns) inherits `SPAR_AGENT_ID` / `SPAR_RUN_ID`; these
 /// commands decide a run's fate and belong to the operator.
 fn refuse_inside_slot(command: &str) -> Result<()> {
-    let set = ["SPAR_AGENT_ID", "SPAR_RUN_ID"]
-        .into_iter()
-        .find(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+    let (slot_agent, slot_run) = bus::slot_caller();
+    let set = slot_agent
+        .map(|_| "SPAR_AGENT_ID")
+        .or_else(|| slot_run.map(|_| "SPAR_RUN_ID"));
     match set {
         Some(var) => {
             anyhow::bail!(
