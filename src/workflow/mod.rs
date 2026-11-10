@@ -48,6 +48,10 @@ pub struct CommonOpts {
     /// `--reassign <role|seat>=<provider>`: move existing seats of `--run <id>` to
     /// another provider before this re-entry dispatches (O136).
     pub reassign: Vec<String>,
+    /// A `--select` resolution the launch shaping already ran (to index a
+    /// `--without` reviewer ordinal). The dispatch reuses it instead of
+    /// benchmarking twice, when it asks the same width-and-roles question.
+    pub preselected_pool: Option<crate::workflow::roles_resolve::PreselectedPool>,
 }
 
 impl Default for CommonOpts {
@@ -68,6 +72,7 @@ impl Default for CommonOpts {
             accept_contract: false,
             key: None,
             reassign: Vec::new(),
+            preselected_pool: None,
         }
     }
 }
@@ -86,6 +91,20 @@ impl CommonOpts {
         cfg: &Config,
         run_id: &str,
     ) -> Result<Vec<String>> {
+        if let Some(pre) = &self.preselected_pool {
+            let same_question = pre.width == n
+                && pre
+                    .roles
+                    .iter()
+                    .map(String::as_str)
+                    .eq(roles.iter().copied());
+            if same_question {
+                if let Some(art) = &pre.artifact {
+                    self.announce_select(paths, run_id, art)?;
+                }
+                return Ok(pre.providers.clone());
+            }
+        }
         let dry = self.resolve_dry_run();
         let select = if self.select.is_empty() {
             None
@@ -103,41 +122,51 @@ impl CommonOpts {
             dry,
         )?;
         if let Some(art) = &resolved.artifact {
-            crate::model_select::write_select_artifact(paths, run_id, art)?;
-            let _ = crate::events::append(
-                paths,
-                run_id,
-                &crate::events::Event {
-                    ts: chrono::Utc::now(),
-                    kind: crate::events::EventKind::Info,
-                    phase: None,
-                    prev_phase: None,
-                    slot: None,
-                    status: None,
-                    round: None,
-                    classifier: None,
-                    message: Some(format!(
-                        "model-select: {}",
-                        art.choices
-                            .iter()
-                            .map(|c| format!("{}→{} ({})", c.vals_id, c.provider, c.profile))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )),
-                },
-            );
-            if !self.json {
-                eprintln!(
+            self.announce_select(paths, run_id, art)?;
+        }
+        Ok(resolved.providers)
+    }
+
+    fn announce_select(
+        &self,
+        paths: &SparPaths,
+        run_id: &str,
+        art: &crate::model_select::SelectArtifact,
+    ) -> Result<()> {
+        crate::model_select::write_select_artifact(paths, run_id, art)?;
+        let _ = crate::events::append(
+            paths,
+            run_id,
+            &crate::events::Event {
+                ts: chrono::Utc::now(),
+                kind: crate::events::EventKind::Info,
+                phase: None,
+                prev_phase: None,
+                slot: None,
+                status: None,
+                round: None,
+                classifier: None,
+                message: Some(format!(
                     "model-select: {}",
                     art.choices
                         .iter()
-                        .map(|c| format!("{}→{}", c.vals_id, c.provider))
+                        .map(|c| format!("{}→{} ({})", c.vals_id, c.provider, c.profile))
                         .collect::<Vec<_>>()
                         .join(", ")
-                );
-            }
+                )),
+            },
+        );
+        if !self.json {
+            eprintln!(
+                "model-select: {}",
+                art.choices
+                    .iter()
+                    .map(|c| format!("{}→{}", c.vals_id, c.provider))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
-        Ok(resolved.providers)
+        Ok(())
     }
 }
 

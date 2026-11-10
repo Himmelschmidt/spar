@@ -57,6 +57,32 @@ pub fn pool_width(cfg: &Config) -> usize {
     1 + panel_size(cfg)
 }
 
+/// The `--select` question the implement panel asks: pool width with the
+/// implementer first, reviewers after. One function, since the launch shaping
+/// resolves it to index `--without` ordinals and the dispatch resolves it to
+/// seat the panel.
+pub fn reviewer_select_question(cfg: &Config) -> (usize, Vec<&'static str>) {
+    let n = pool_width(cfg);
+    let roles: Vec<&'static str> = std::iter::once(SlotRole::Implementer.as_config_key())
+        .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
+        .take(n)
+        .collect();
+    (n, roles)
+}
+
+/// A `--select` resolution the launch already ran (to index a `--without`
+/// reviewer ordinal). The dispatch reuses it instead of benchmarking twice,
+/// but only when it asks the same question: the width and roles that shaped
+/// the ranking travel with the providers, and a different panel shape
+/// re-resolves.
+#[derive(Debug, Clone)]
+pub struct PreselectedPool {
+    pub width: usize,
+    pub roles: Vec<String>,
+    pub providers: Vec<String>,
+    pub artifact: Option<crate::model_select::SelectArtifact>,
+}
+
 /// Whether the reviewer panel is pinned (by CLI `--role`, by `[roles].reviewer`, or
 /// narrowed by `--fleet small`), i.e. an exclusion list rather than a floor. Widening a
 /// pinned panel must duplicate an already-dispatched seat, never draw from
