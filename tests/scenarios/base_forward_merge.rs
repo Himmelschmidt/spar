@@ -15,26 +15,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
 
-fn spar_home_dir() -> PathBuf {
-    use std::sync::OnceLock;
-    static HOME: OnceLock<PathBuf> = OnceLock::new();
-    HOME.get_or_init(|| {
-        let d = std::env::temp_dir().join(format!("spar-test-home-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    })
-    .clone()
-}
-
 fn spar_cmd() -> assert_cmd::Command {
+    // `common::spar` already points HOME, XDG_CONFIG_HOME and SPAR_HOME at a
+    // per-test-thread temp dir; nothing here overrides that.
     let mut c = common::spar();
-    c.env("SPAR_HOME", spar_home_dir());
     c.env("GIT_CONFIG_GLOBAL", "/dev/null");
     c.env("GIT_CONFIG_SYSTEM", "/dev/null");
     c.env_remove("SPAR_PROJECT_ROOT");
     c.env_remove("SPAR_RUN_ID");
     c.env_remove("SPAR_AGENT_ID");
     c
+}
+
+/// Parse command stdout as one JSON document: `from_slice` reads a single value
+/// and rejects trailing bytes, so success means no second document leaked.
+fn parse_single_json(out: &[u8]) -> Value {
+    serde_json::from_slice(out).unwrap()
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -287,7 +283,7 @@ impl Fixture {
         wt
     }
 
-    fn ship(&self, extra_env: &[(&str, &str)]) -> assert_cmd::assert::Assert {
+    fn ship(&self, extra_env: &[(&str, &str)], extra_args: &[&str]) -> assert_cmd::assert::Assert {
         let path = format!(
             "{}:{}",
             self.bin.display(),
@@ -301,8 +297,9 @@ impl Fixture {
         for (k, v) in extra_env {
             c.env(k, v);
         }
-        c.args(["ship", &self.run_id, "--confirm", "--json"])
-            .assert()
+        let mut args = vec!["ship", self.run_id.as_str(), "--confirm", "--json"];
+        args.extend(extra_args);
+        c.args(args).assert()
     }
 }
 
@@ -380,7 +377,21 @@ fn ship_conflict_parks_the_run_with_the_remedy() {
     fx.advance_main("feature.txt", "base side\n");
     let before = git(&wt, &["rev-parse", "HEAD"]);
 
-    fx.ship(&[]).code(2);
+    // The park emits one JSON document: confirm ran in the same invocation,
+    // and a stale second document used to leak through here.
+    let out = fx.ship(&[], &[]).code(2).get_output().stdout.clone();
+    let v = parse_single_json(&out);
+    assert_eq!(v["run_id"], fx.run_id.as_str());
+    // The park leaves the phase at the ship gate: the next step is a new
+    // implement dispatch, per the remedy in the error.
+    assert_eq!(v["phase"], "awaiting_ship_confirm");
+    assert!(
+        v["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("conflicts with the run branch")
+                && e.contains(&format!("spar implement --run {}", fx.run_id))),
+        "the park has to name the conflict and the way out: {v}"
+    );
 
     let st = fx.state();
     assert!(
@@ -421,13 +432,144 @@ fn ship_merges_a_moved_base_before_pushing() {
     let wt = fx.real_worktree();
     let tip = fx.advance_main("base-feature.txt", "base work\n");
 
-    fx.ship(&[]).success();
+    fx.ship(&[], &[]).success();
 
     assert_eq!(fx.state()["merged_base"].as_str(), Some(tip.as_str()));
     assert_eq!(
         std::fs::read_to_string(wt.join("base-feature.txt")).unwrap(),
         "base work\n"
     );
+}
+
+/// #229: `ship --adopt-remote` adopts a run branch the remote moved past
+/// *before* merging the base, so the base merge lands on the adopted tip and
+/// the push ships both. Without the flag the run refuses with the remedy.
+#[test]
+fn ship_adopts_a_remote_ahead_run_branch_before_merging_the_base() {
+    let fx = Fixture::new("", false);
+    spar_cmd()
+        .current_dir(&fx.root)
+        .args([
+            "implement",
+            "--run",
+            &fx.run_id,
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(2);
+    let wt = fx.real_worktree();
+    let branch = format!("spar/{}/impl", fx.run_id);
+    git(&wt, &["push", "-q", "origin", &branch]);
+    // A teammate's push lands on the run branch while the operator ships.
+    let peer = fx._tmp.path().join("peer");
+    git(
+        fx._tmp.path(),
+        &[
+            "clone",
+            "-q",
+            fx._tmp.path().join("origin.git").to_str().unwrap(),
+            peer.to_str().unwrap(),
+        ],
+    );
+    git(&peer, &["config", "user.email", "t@t.com"]);
+    git(&peer, &["config", "user.name", "t"]);
+    git(&peer, &["checkout", "-q", &branch]);
+    std::fs::write(peer.join("teammate.txt"), "teammate\n").unwrap();
+    git(&peer, &["add", "teammate.txt"]);
+    git(&peer, &["commit", "-q", "-m", "teammate"]);
+    git(&peer, &["push", "-q", "origin", &branch]);
+    let hand = git(&peer, &["rev-parse", "HEAD"]);
+    let tip = fx.advance_main("base-feature.txt", "base work\n");
+
+    fx.ship(&[], &[]).code(1);
+    assert!(
+        fx.state()["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("--adopt-remote")),
+        "the refusal has to name the remedy: {}",
+        fx.state()
+    );
+
+    fx.ship(&[], &["--adopt-remote"]).success();
+
+    let head = git(&wt, &["rev-parse", "HEAD"]);
+    for want in [&hand, &tip] {
+        assert!(
+            git_ok(&wt, &["merge-base", "--is-ancestor", want, &head]),
+            "HEAD {head} has to contain {want}"
+        );
+    }
+    assert_eq!(fx.state()["merged_base"].as_str(), Some(tip.as_str()));
+    let ship_md = std::fs::read_to_string(
+        fx.root
+            .join(".spar/runs")
+            .join(&fx.run_id)
+            .join("artifacts/ship.md"),
+    )
+    .unwrap();
+    assert!(
+        ship_md.contains(&format!("pushed spar/{}/impl", fx.run_id)),
+        "the adopted tip and the base merge both shipped: {ship_md}"
+    );
+}
+
+/// #229: the implementer commits a resolution of the handed merge; re-entering
+/// implement finds the branch already merged, so `merged_base` advances to the
+/// tip instead of re-handing a conflict.
+#[test]
+fn a_committed_resolution_advances_merged_base_on_re_entry() {
+    let fx = Fixture::new("[rounds]\nmax = 3\n", false);
+    let wt = fx.adoptable_repo(&[("conflict.txt", "run side\n")]);
+    let tip = fx.advance_main("conflict.txt", "base side\n");
+
+    fx.implement_rounds().code(1);
+    assert!(git_ok(
+        &wt,
+        &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]
+    ));
+
+    std::fs::write(wt.join("conflict.txt"), "resolved\n").unwrap();
+    git(&wt, &["add", "conflict.txt"]);
+    git(&wt, &["commit", "-q", "--no-edit"]);
+
+    fx.implement_rounds().code(2);
+
+    assert_eq!(fx.state()["merged_base"].as_str(), Some(tip.as_str()));
+    assert!(
+        fx.events_text().contains("already current"),
+        "{}",
+        fx.events_text()
+    );
+}
+
+/// #229: an unresolved merge left for the next round is re-handed, not
+/// committed over and not cleared: re-entering implement re-issues the section
+/// and `merged_base` stays on the stale base.
+#[test]
+fn an_unresolved_merge_is_re_handed_on_re_entry() {
+    let fx = Fixture::new("[rounds]\nmax = 3\n", false);
+    let wt = fx.adoptable_repo(&[("conflict.txt", "run side\n")]);
+    let stale = fx.state()["merged_base"].clone();
+    fx.advance_main("conflict.txt", "base side\n");
+
+    fx.implement_rounds().code(1);
+    assert!(git_ok(
+        &wt,
+        &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]
+    ));
+
+    fx.implement_rounds().code(1);
+
+    let events = fx.events_text();
+    assert_eq!(
+        events.matches("handed to the round ").count(),
+        2,
+        "both dispatches hand the same open merge over: {events}"
+    );
+    assert_eq!(fx.state()["merged_base"], stale);
 }
 
 #[test]
