@@ -236,6 +236,17 @@ pub struct CeilingPartialRound {
     pub kind: CeilingPartialKind,
 }
 
+/// The words for naming the cut-short rounds in a sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialRoundPhrase {
+    /// "round 1" or "rounds 1, 2".
+    pub noun: String,
+    /// "was" or "were".
+    pub verb: &'static str,
+    /// "its" or "their".
+    pub possessive: &'static str,
+}
+
 /// What an interrupted `spar amend` must put back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AmendInProgress {
@@ -428,8 +439,9 @@ impl RunState {
             .find(|s| s.role == SlotRole::TestAuthor)
     }
 
-    /// Cut-short rounds, oldest first, as displayable numbers.
-    pub fn partial_round_list(&self) -> Vec<u32> {
+    /// How to name the cut-short rounds in a sentence: "round 1 ... was ... its"
+    /// or "rounds 1, 2 ... were ... their". `None` when no round was cut short.
+    pub fn partial_round_phrase(&self) -> Option<PartialRoundPhrase> {
         let mut rounds: Vec<u32> = self
             .ceiling_partial_rounds
             .iter()
@@ -437,7 +449,27 @@ impl RunState {
             .collect();
         rounds.sort_unstable();
         rounds.dedup();
-        rounds
+        if rounds.is_empty() {
+            return None;
+        }
+        let list = rounds
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(if rounds.len() == 1 {
+            PartialRoundPhrase {
+                noun: format!("round {list}"),
+                verb: "was",
+                possessive: "its",
+            }
+        } else {
+            PartialRoundPhrase {
+                noun: format!("rounds {list}"),
+                verb: "were",
+                possessive: "their",
+            }
+        })
     }
 }
 
@@ -594,10 +626,11 @@ pub struct SlotState {
     /// Reset at the start of every dispatch, like `quota_hit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_cause: Option<crate::executor::TimeoutCause>,
-    /// HEAD of this slot's worktree when the current dispatch started. Work is
+    /// HEAD of this slot's worktree when the current round started. Work is
     /// measured against it (dirty tree, or commits past it), never against the
     /// run base: from round 2 on the base predates earlier rounds' commits, so
-    /// the base always reads as work. Recorded at dispatch, like `timeout_cause`.
+    /// the base always reads as work. Stamped when the slot joins the round, and
+    /// kept across same-round backup retries and provider rotation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_head: Option<String>,
     /// The build-cache pool directory this implementer leased (O143). Kept after the

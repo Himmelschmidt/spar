@@ -176,39 +176,40 @@ fn pr_body(paths: &SparPaths, state: &RunState, branch: &str, cwd: &Path) -> Str
             body.push('\n');
         }
     }
-    let rounds = state.partial_round_list();
-    if !rounds.is_empty() {
-        let list = rounds
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        body.push_str("\n## Partial work\n\n");
-        if rounds.len() == 1 {
-            body.push_str(&format!(
-                "Round {list} was cut short at its hard ceiling; the branch carries \
-                 its partial work. Judge the diff as unfinished work continued by later rounds.\n"
-            ));
+    let final_partial = state
+        .ceiling_partial_rounds
+        .iter()
+        .any(|e| e.round == state.round);
+    if let Some(p) = state.partial_round_phrase() {
+        // A partial final round was continued by nothing: only earlier partial
+        // rounds can point at later ones.
+        let judged = if final_partial {
+            "Judge the diff as unfinished work."
         } else {
-            body.push_str(&format!(
-                "Rounds {list} were cut short at their hard ceiling; the branch carries \
-                 their partial work. Judge the diff as unfinished work continued by later rounds.\n"
-            ));
-        }
+            "Judge the diff as unfinished work continued by later rounds."
+        };
+        let mut sentence = format!(
+            "{} {} cut short at {} hard ceiling; the branch carries {} partial work. {judged}",
+            p.noun, p.verb, p.possessive, p.possessive
+        );
+        sentence[..1].make_ascii_uppercase();
+        body.push_str("\n## Partial work\n\n");
+        body.push_str(&sentence);
+        body.push('\n');
     }
     // A round cut short at its own hard ceiling never finishes its summary: the
     // file on disk is the previous round's, salvaged from the log, or missing,
     // and presenting it as this round's would ship someone else's words (or the
     // orchestrator's) under the implementer's name. Say so instead.
-    let final_partial = state
-        .ceiling_partial_rounds
-        .iter()
-        .any(|e| e.round == state.round);
     body.push_str("\n## Implementer summary\n\n");
     match &summary {
         Some((_, text)) if !final_partial => body.push_str(text.trim()),
         Some(_) => body.push_str(
             "_No finished implementer summary exists for this round: it was cut short \
+             at its hard ceiling (see Partial work above)._",
+        ),
+        None if final_partial => body.push_str(
+            "_No implementer summary was written: the round was cut short \
              at its hard ceiling (see Partial work above)._",
         ),
         None => body.push_str("_No implementer summary was written._"),
@@ -1264,6 +1265,10 @@ mod tests {
             body.contains("Did the follow-up."),
             "the finished round's summary still ships: {body}"
         );
+        assert!(
+            body.contains("continued by later rounds"),
+            "an earlier partial round points at the rounds that continued it: {body}"
+        );
     }
 
     #[test]
@@ -1298,6 +1303,14 @@ mod tests {
         assert!(
             body.contains("_No finished implementer summary exists for this round"),
             "{body}"
+        );
+        assert!(
+            body.contains("Judge the diff as unfinished work."),
+            "a partial final round was continued by nothing: {body}"
+        );
+        assert!(
+            !body.contains("continued by later rounds"),
+            "a partial final round must not point at later rounds: {body}"
         );
     }
 

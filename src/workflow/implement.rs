@@ -3300,11 +3300,16 @@ fn ceiling_partial_clean_notice(round: u32) -> String {
 
 /// What the next round is told when the previous implementer was cut short at
 /// its hard ceiling and its leftovers could not be committed: no WIP commit
-/// exists, so the notice must not claim one.
-fn ceiling_partial_refused_notice(round: u32) -> String {
+/// exists, so the notice must not claim one. The live kill names the commit
+/// error; the rebuild has none to name.
+fn ceiling_partial_refused_notice(round: u32, detail: Option<&str>) -> String {
+    let cause = match detail {
+        Some(e) => format!(" ({e})"),
+        None => String::new(),
+    };
     format!(
         "NOTE: the implementer pass for round {round} was cut short at its hard time \
-         ceiling and its partial work could not be committed; judge the HEAD commit \
+         ceiling and its partial work could not be committed{cause}; judge the HEAD commit \
          and the uncommitted tree as partial work and continue the task from there."
     )
 }
@@ -3373,11 +3378,7 @@ fn try_commit_ceiling_partial(
             eprintln!("warning: {msg}");
             let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
             return Some((
-                format!(
-                    "NOTE: the implementer pass for round {round} was cut short at its hard time \
-                     ceiling before it could finish, and its partial work could not be committed \
-                     ({e}); judge the HEAD commit and continue the task from there."
-                ),
+                ceiling_partial_refused_notice(round, Some(&e)),
                 CeilingPartialKind::Refused,
             ));
         }
@@ -4785,22 +4786,11 @@ fn write_impl_summary(state: &RunState, paths: &SparPaths) -> Result<()> {
     for s in &state.slots {
         body.push_str(&format!("- {} ({}) {:?}\n", s.id, s.provider, s.status));
     }
-    let rounds = state.partial_round_list();
-    if !rounds.is_empty() {
-        let list = rounds
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        if rounds.len() == 1 {
-            body.push_str(&format!(
-                "\nPartial work: round {list} was cut short at the hard ceiling; the branch carries partial work.\n"
-            ));
-        } else {
-            body.push_str(&format!(
-                "\nPartial work: rounds {list} were cut short at the hard ceiling; the branch carries partial work.\n"
-            ));
-        }
+    if let Some(p) = state.partial_round_phrase() {
+        body.push_str(&format!(
+            "\nPartial work: {} {} cut short at the hard ceiling; the branch carries partial work.\n",
+            p.noun, p.verb
+        ));
     }
     body.push_str("\nShip when ready: `spar ship ");
     body.push_str(&state.id);
@@ -5164,7 +5154,7 @@ fn blockers_from_disk(
         {
             out.push(match entry.kind {
                 CeilingPartialKind::Clean => ceiling_partial_clean_notice(prev),
-                CeilingPartialKind::Refused => ceiling_partial_refused_notice(prev),
+                CeilingPartialKind::Refused => ceiling_partial_refused_notice(prev, None),
                 CeilingPartialKind::Wip => ceiling_partial_notice(prev),
             });
         }
@@ -6435,5 +6425,66 @@ mod carry_forward_tests {
         state.round = 5;
         assert!(escalate_round_ceiling(&mut state, &paths).unwrap());
         assert_eq!(state.phase, Phase::AwaitingRoundExtension);
+    }
+}
+
+#[cfg(test)]
+mod ceiling_partial_notice_tests {
+    use super::{
+        blockers_from_disk, ceiling_partial_clean_notice, ceiling_partial_notice,
+        ceiling_partial_refused_notice,
+    };
+    use crate::config::Config;
+    use crate::paths::SparPaths;
+    use crate::state::{CeilingPartialKind, CeilingPartialRound, RunState};
+
+    fn blockers(kind: Option<CeilingPartialKind>) -> Vec<String> {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.round = 2;
+        if let Some(kind) = kind {
+            state.ceiling_partial_rounds = vec![CeilingPartialRound { round: 1, kind }];
+        }
+        blockers_from_disk(&state, &paths, &[], &Config::default())
+    }
+
+    #[test]
+    fn wip_round_claims_a_saved_wip_commit() {
+        let out = blockers(Some(CeilingPartialKind::Wip));
+        assert_eq!(out, [ceiling_partial_notice(1)]);
+        assert!(out[0].contains("saved as a WIP commit"), "{}", out[0]);
+    }
+
+    #[test]
+    fn clean_round_must_not_claim_a_wip_commit() {
+        let out = blockers(Some(CeilingPartialKind::Clean));
+        assert_eq!(out, [ceiling_partial_clean_notice(1)]);
+        assert!(!out[0].contains("saved as a WIP commit"), "{}", out[0]);
+        assert!(out[0].contains("no WIP commit was written"), "{}", out[0]);
+    }
+
+    #[test]
+    fn refused_round_must_not_claim_a_wip_commit() {
+        let out = blockers(Some(CeilingPartialKind::Refused));
+        assert_eq!(out, [ceiling_partial_refused_notice(1, None)]);
+        assert!(!out[0].contains("saved as a WIP commit"), "{}", out[0]);
+        assert!(out[0].contains("could not be committed"), "{}", out[0]);
+    }
+
+    #[test]
+    fn live_refused_notice_names_the_commit_error() {
+        let note = ceiling_partial_refused_notice(1, Some("hook said no"));
+        assert!(note.contains("hook said no"), "{note}");
+        assert!(!note.contains("saved as a WIP commit"), "{note}");
+    }
+
+    #[test]
+    fn no_partial_round_means_no_notice() {
+        assert!(blockers(None).is_empty());
     }
 }

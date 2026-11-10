@@ -1417,3 +1417,38 @@ fn the_all_projects_supervisor_restarts_an_abandoned_run_in_a_registered_project
         "the abandoned run was restarted and driven to its gate"
     );
 }
+
+/// Item 3 names `spar status` explicitly: after the failed fix round the
+/// human status must say which round was cut short instead of silently
+/// carrying its WIP commit. Reuses the round-2-idle flow, whose failed run
+/// still records round 1 as partial.
+#[test]
+fn status_names_the_partial_round_after_a_failed_fix_round() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    std::fs::write(
+        proj.join("spar.toml"),
+        "[suite]\nenabled = false\n[rounds]\nmax = 2\n[timeouts]\nslot_secs = 2\nhard_ceiling_multiple = 1.5\n",
+    )
+    .unwrap();
+    let bin = tmp.path().join("bin");
+    install_ceiling_idle_fix_round_muse(&bin);
+    let calls_dir = tmp.path().join("muse-state");
+    std::fs::create_dir_all(&calls_dir).unwrap();
+
+    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
+    let st = read_state(&proj, &run_id);
+    assert_eq!(st["phase"], "failed", "{st}");
+
+    let status = spar_cmd()
+        .current_dir(&proj)
+        .args(["status", &run_id])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(status.get_output().stdout.as_slice());
+    assert!(
+        stdout.contains("partial work: round 1 was cut short at hard ceiling"),
+        "status must name the partial round:\n{stdout}"
+    );
+}

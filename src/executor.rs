@@ -9272,3 +9272,45 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(waits.borrow().is_empty(), "zero tool calls never retry");
     }
 }
+
+#[cfg(test)]
+mod round_start_work_tests {
+    use super::slot_has_work;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Work is measured against the round's start HEAD: a commit the primary
+    /// seat left still reads as work for a same-round retry, while a clean
+    /// tree at the recorded HEAD reads as none.
+    #[test]
+    fn work_means_dirty_tree_or_commits_past_the_round_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.email", "t@t"]);
+        git(dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("f"), "a\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "round start"]);
+        let start = git(dir, &["rev-parse", "HEAD"]);
+
+        assert!(!slot_has_work(dir, Some(&start)));
+        std::fs::write(dir.join("f"), "b\n").unwrap();
+        assert!(slot_has_work(dir, Some(&start)));
+        git(dir, &["commit", "-qam", "primary seat work"]);
+        assert!(slot_has_work(dir, Some(&start)));
+        let now = git(dir, &["rev-parse", "HEAD"]);
+        assert!(!slot_has_work(dir, Some(&now)));
+        assert!(!slot_has_work(dir, None));
+    }
+}

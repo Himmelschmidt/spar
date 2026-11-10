@@ -1633,22 +1633,11 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 );
             }
             println!("phase: {:?}", state.phase);
-            let rounds = state.partial_round_list();
-            if !rounds.is_empty() {
-                let list = rounds
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if rounds.len() == 1 {
-                    println!(
-                        "partial work: round {list} cut short at hard ceiling, branch carries partial work"
-                    );
-                } else {
-                    println!(
-                        "partial work: rounds {list} cut short at hard ceiling, branch carries partial work"
-                    );
-                }
+            if let Some(p) = state.partial_round_phrase() {
+                println!(
+                    "partial work: {} {} cut short at hard ceiling, branch carries partial work",
+                    p.noun, p.verb
+                );
             }
             // Looking a run up by id is the documented way to reach an archived one, so it
             // has to say that it is hidden — otherwise the output is indistinguishable
