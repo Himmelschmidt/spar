@@ -187,7 +187,8 @@ const POLL_SECTION_START: &str = "<!-- spar:poll:start -->";
 const POLL_SECTION_END: &str = "<!-- spar:poll:end -->";
 
 /// Rewrite the slot's poll file from its inbox: one line per pending message,
-/// oldest first. The inbox is the only source, a message withdrawn, expired or
+/// oldest first. The inbox is the only source, a message withdrawn (including
+/// superseded, even when a stale redelivery re-files its copy), expired or
 /// acked stops being listed, wherever its copies were.
 ///
 /// Only action items render: messages addressed to the slot, plus chat
@@ -218,9 +219,9 @@ pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str
     let _lock = lock_poll_file(paths, run, agent)?;
     // The ack scan runs under the poll-file lock: an ack filed between the scan
     // and the write would otherwise lose to a stale render.
-    let acked = bus::acked_by_map(paths, run, &HashSet::from([agent.to_string()]))
-        .remove(agent)
-        .unwrap_or_default();
+    let mut scan = bus::scan_for_render(paths, run, &HashSet::from([agent.to_string()]));
+    let acked = scan.acked.remove(agent).unwrap_or_default();
+    let superseded = scan.superseded;
     let mut gate = bus::ExpiryGate::new();
     let path = poll_file(paths, run, agent);
     if let Some(parent) = path.parent() {
@@ -230,7 +231,13 @@ pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str
     let mut msgs: Vec<bus::BusMessage> = bus::filed_copies(paths, agent)
         .into_iter()
         .filter(|m| {
+            if !seen.insert(m.id.clone()) {
+                return false;
+            }
             if !bus::poll_lists(m, agent) {
+                return false;
+            }
+            if superseded.contains(&m.id) {
                 return false;
             }
             if acked.contains(&m.id) {
@@ -248,7 +255,7 @@ pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str
                     }
                 }
             }
-            seen.insert(m.id.clone())
+            true
         })
         .collect();
     msgs.sort_by_key(|m| m.ts);
@@ -288,6 +295,8 @@ pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str
     };
     fs::write(path.with_extension("tmp"), &next)?;
     fs::rename(path.with_extension("tmp"), &path)?;
+    let listed: HashSet<String> = msgs.iter().map(|m| m.id.clone()).collect();
+    bus::prune_aged_claims(paths, agent, &seen, &listed, &acked, &superseded);
     Ok(msgs.len())
 }
 
@@ -455,6 +464,9 @@ pub fn strategy_for_slot(state: &RunState, slot: &str) -> DeliveryStrategy {
 /// to drain. Each recipient's whole inbox drains through [`deliver`], which also
 /// picks up copies filed while the run state was unreadable. Other strategies
 /// keep their own pulse; bare ids resolve to no slot and stay inbox-queued.
+/// A PollFile slot with no running turn (finished, or never dispatched) is not
+/// drained: its copies stay pending and the log reads `queued` until a turn
+/// that can read the poll file starts.
 /// Best effort with a stderr line, never an error: the filing already succeeded,
 /// the inbox stays the durable queue, and the next filing retries the drain.
 /// Skipped for dry-run runs: no live slot polls their files, so the messages
@@ -482,6 +494,10 @@ pub fn drain_poll_files(paths: &SparPaths, targets: &[String]) {
             .filter(|agent| {
                 let short = agent.strip_prefix(&format!("{run}:")).unwrap_or(agent);
                 strategy_for_slot(&state, short) == DeliveryStrategy::PollFile
+                    && state
+                        .slots
+                        .iter()
+                        .any(|s| s.id == short && s.status == crate::state::SlotStatus::Running)
             })
             .collect();
         for agent in poll_agents {
@@ -496,6 +512,30 @@ pub fn drain_poll_files(paths: &SparPaths, targets: &[String]) {
                 eprintln!("warning: poll-file fan-out to {agent} failed: {e:#}");
             }
         }
+    }
+}
+
+/// Claim a PollFile slot's backlog as its dispatch starts. A message sent while
+/// the slot was idle stays `queued` until a turn that can read the poll file
+/// starts; the round-start sweep renders but never claims, and PollFile slots
+/// have no turn-end deliver hook, so without this the copy would sit in the
+/// file with the word stuck at `queued` for the whole turn. Skipped for dry
+/// runs (no live slot reads) and non-PollFile strategies. Best effort with a
+/// stderr line, like the file-time fan-out.
+pub fn drain_slot_backlog(paths: &SparPaths, state: &RunState, slot_id: &str) {
+    if state.dry_run || strategy_for_slot(state, slot_id) != DeliveryStrategy::PollFile {
+        return;
+    }
+    let agent = bus::agent_ref(Some(&state.id), slot_id);
+    if let Err(e) = deliver(
+        paths,
+        Some(&state.id),
+        &agent,
+        DeliveryStrategy::PollFile,
+        None,
+        false,
+    ) {
+        eprintln!("warning: poll-file backlog drain for {slot_id} failed: {e:#}");
     }
 }
 
@@ -957,6 +997,7 @@ mod tests {
             "cli:agy",
             crate::state::SlotRole::Implementer,
         ));
+        state.slots[0].status = crate::state::SlotStatus::Running;
         state.save(&paths).unwrap();
 
         let slot = agent_ref(Some("r1"), "impl");
@@ -976,5 +1017,84 @@ mod tests {
         refresh_run_poll_files(&paths, "r1");
         let body = std::fs::read_to_string(&file).unwrap();
         assert!(body.contains("quota note"), "{body}");
+    }
+
+    #[test]
+    fn dispatch_start_claims_the_idle_backlog() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.slots.push(crate::executor::init_slot(
+            "impl",
+            "cli:agy",
+            crate::state::SlotRole::Implementer,
+        ));
+        state.slots.push(crate::executor::init_slot(
+            "rev",
+            "cli:claude",
+            crate::state::SlotRole::Reviewer,
+        ));
+        state.save(&paths).unwrap();
+
+        let poll_slot = agent_ref(Some("r1"), "impl");
+        let hook_slot = agent_ref(Some("r1"), "rev");
+        chat(
+            &paths,
+            Some("r1"),
+            "human",
+            &poll_slot,
+            "idle ruling",
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        chat(
+            &paths,
+            Some("r1"),
+            "human",
+            &hook_slot,
+            "idle review note",
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        let claimed_count = |agent: &str| {
+            bus::bus_root(&paths)
+                .join("inbox")
+                .join(agent)
+                .join("claimed")
+                .read_dir()
+                .map(|r| r.count())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            claimed_count(&poll_slot),
+            0,
+            "no claim into a file no turn can read"
+        );
+
+        state.slots[0].status = crate::state::SlotStatus::Running;
+        state.slots[1].status = crate::state::SlotStatus::Running;
+        drain_slot_backlog(&paths, &state, "impl");
+        drain_slot_backlog(&paths, &state, "rev");
+        assert_eq!(claimed_count(&poll_slot), 1);
+        assert_eq!(claimed_count(&hook_slot), 0);
+        let body = std::fs::read_to_string(poll_file(&paths, Some("r1"), &poll_slot)).unwrap();
+        assert!(body.contains("idle ruling"), "{body}");
+
+        state.dry_run = true;
+        chat(
+            &paths,
+            Some("r1"),
+            "human",
+            &poll_slot,
+            "dry ruling",
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        drain_slot_backlog(&paths, &state, "impl");
+        assert_eq!(claimed_count(&poll_slot), 1);
     }
 }

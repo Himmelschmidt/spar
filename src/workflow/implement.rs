@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 /// Amend flags a bound `implement --run <id>` carries into the dispatch. The run's
 /// frozen config is amended under the dispatch's own lock, after the launch
-/// preconditions pass, so a refused launch changes nothing (O165).
+/// preconditions pass, so a refused launch changes nothing (O168).
 #[derive(Debug, Clone, Default)]
 pub struct BoundAmendInputs {
     pub role: Vec<String>,
@@ -964,7 +964,7 @@ fn run_from_approved(
     // The live file config loads before the run's captured env is re-applied:
     // `Config::load` fills `captured` from this process, and the re-apply below
     // overwrites the process env with the creation values (O130), so loading
-    // after it would freeze the creation values as this shell's (O165).
+    // after it would freeze the creation values as this shell's (O168).
     let live = if opts.reload_config {
         Some(Config::load(&paths.project_root)?)
     } else {
@@ -1091,7 +1091,7 @@ fn run_from_approved(
     // precondition passed (resumable, round extension, reassign resolution,
     // base): the frozen config is amended, reviewer seats are dropped with
     // their slots, and the snapshot is re-frozen, so a refused launch changes
-    // nothing (O165). The amended config shadows the frozen one for the rest
+    // nothing (O168). The amended config shadows the frozen one for the rest
     // of this dispatch. The `preview` above already passed every check, so a
     // refusal here means the surgery itself failed mid-apply.
     let amend_applied = preview.is_some();

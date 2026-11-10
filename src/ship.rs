@@ -327,7 +327,7 @@ pub struct ShipOverride {
 }
 
 /// The same findings `brief` and the escalation show: each surviving seat's latest
-/// recorded review (O167). The round rides along from the history entry the
+/// recorded review (O170). The round rides along from the history entry the
 /// finding survived from.
 fn open_findings(state: &RunState) -> Vec<OpenFinding> {
     let open = crate::workflow::review_result::open_findings(
@@ -1636,7 +1636,7 @@ mod tests {
         }
     }
 
-    /// O167: the gate judges each surviving seat's latest recorded review,
+    /// O170: the gate judges each surviving seat's latest recorded review,
     /// whatever round it judged, never `state.round`: a round begun but not yet
     /// reviewed has no reviews to judge.
     #[test]

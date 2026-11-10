@@ -439,7 +439,7 @@ fn run() -> Result<ExitCode> {
                     None => task,
                 };
                 // Seat shapers ride along into the dispatch: a bound run amends under
-                // its own lock, after the preconditions below pass (O165). The
+                // its own lock, after the preconditions below pass (O168). The
                 // preset parses here, so a `--fleet` typo fails at the pre-check
                 // instead of after the dispatch acquired its lock.
                 let amend = workflow::implement::BoundAmendInputs {
@@ -611,7 +611,7 @@ fn run() -> Result<ExitCode> {
             // A round extension refused or found busy after the pre-check is still a
             // refusal: nothing was dispatched, so `--json` gets the same shape. An
             // amend refusal is one too: the frozen config and run state were left
-            // untouched under the dispatch's lock (O165).
+            // untouched under the dispatch's lock (O168).
             workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg, amend)
                 .or_else(|e| {
                     if e.is::<workflow::implement::RoundExtensionRefused>()
@@ -1073,7 +1073,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             // `spar bus send -m …` is filed as the slot, not the human.
             let from = from
                 .or_else(|| bus::slot_caller().0)
-                .unwrap_or_else(|| "human".to_string());
+                .unwrap_or_else(|| bus::HUMAN.to_string());
             let run_state = match run.as_deref() {
                 Some(r) if needs_run || to == "impl" => Some(state::RunState::load(&paths, r)?),
                 _ => None,
@@ -1290,7 +1290,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             // `spar bus ack <id>` records the slot, not the human.
             let (env_agent, env_run) = bus::slot_caller();
             let run = run.or(env_run);
-            let from = from.or(env_agent).unwrap_or_else(|| "human".to_string());
+            let from = from.or(env_agent).unwrap_or_else(|| bus::HUMAN.to_string());
             let msg = bus::ack(&paths, run.as_deref(), &from, &msg_id)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&msg)?);
@@ -1302,7 +1302,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
         BusCmd::Reserve { path, holder, run } => {
             let holder = holder
                 .or_else(|| bus::slot_caller().0)
-                .unwrap_or_else(|| "human".to_string());
+                .unwrap_or_else(|| bus::HUMAN.to_string());
             bus::reserve(&paths, run.as_deref(), &path, &holder)?;
             println!("reserved {path} by {holder}");
             Ok(ExitCode::Success)
@@ -1310,7 +1310,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
         BusCmd::Release { path, holder, run } => {
             let holder = holder
                 .or_else(|| bus::slot_caller().0)
-                .unwrap_or_else(|| "human".to_string());
+                .unwrap_or_else(|| bus::HUMAN.to_string());
             bus::release(&paths, run.as_deref(), &path, &holder)?;
             println!("released {path}");
             Ok(ExitCode::Success)
@@ -1406,7 +1406,7 @@ fn bus_deliver(
 /// `--reload-config` is the deliberate way out: it re-reads the file and re-freezes the
 /// run against it. A bound run amends under the dispatch's own lock, after every
 /// launch precondition passes. Nothing here amends anything before those checks,
-/// so a refused launch changes nothing (O165); this context returns the frozen
+/// so a refused launch changes nothing (O168); this context returns the frozen
 /// config untouched.
 #[allow(clippy::too_many_arguments)]
 fn implement_ctx(
