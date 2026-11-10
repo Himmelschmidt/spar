@@ -83,6 +83,24 @@ pub struct PreselectedPool {
     pub artifact: Option<crate::model_select::SelectArtifact>,
 }
 
+impl PreselectedPool {
+    /// Record a resolution against the shaped panel: drops and role overrides
+    /// already ran, so the width and roles are what the dispatch asks. The
+    /// providers stay the pre-shape resolution the `--without` ordinals indexed.
+    pub fn for_shaped_panel(
+        cfg: &Config,
+        resolved: crate::model_select::ResolvedProviders,
+    ) -> Self {
+        let (width, roles) = reviewer_select_question(cfg);
+        Self {
+            width,
+            roles: roles.into_iter().map(str::to_string).collect(),
+            providers: resolved.providers,
+            artifact: resolved.artifact,
+        }
+    }
+}
+
 /// Whether the reviewer panel is pinned (by CLI `--role`, by `[roles].reviewer`, or
 /// narrowed by `--fleet small`), i.e. an exclusion list rather than a floor. Widening a
 /// pinned panel must duplicate an already-dispatched seat, never draw from
@@ -532,5 +550,28 @@ mod tests {
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:codex".into()];
         assert!(reviewer_panel_has_pins(&cfg));
+    }
+
+    #[test]
+    fn shaped_preselection_answers_the_dispatch_question() {
+        let cfg = Config::default();
+        let recorded = PreselectedPool::for_shaped_panel(
+            &cfg,
+            crate::model_select::ResolvedProviders {
+                providers: vec!["cli:handshake-probe".into()],
+                artifact: None,
+            },
+        );
+        let opts = CommonOpts {
+            preselected_pool: Some(recorded),
+            dry_run: true,
+            ..Default::default()
+        };
+        let (n, roles) = reviewer_select_question(&cfg);
+        let paths = crate::paths::SparPaths::new("/tmp/spar-handshake-probe");
+        assert_eq!(
+            opts.resolve_pool(n, &roles, &paths, &cfg, "probe").unwrap(),
+            vec!["cli:handshake-probe".to_string()]
+        );
     }
 }

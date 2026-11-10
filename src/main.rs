@@ -1378,16 +1378,9 @@ fn bus_deliver(
     Ok(ExitCode::Success)
 }
 
-/// Config for `spar implement`.
-///
-/// A new run (`--task` / `--plan`) starts from the project's live config; `--run <id>`
-/// binds to the config that run was created with, so an agent editing `spar.toml` for
-/// its own run cannot change the fleet, timeouts or ship gate of one already in flight.
-/// `--reload-config` is the deliberate way out: it re-reads the file and re-freezes the
-/// run against it. A bound run amends under the dispatch's own lock, after every
-/// launch precondition passes. Nothing here amends anything before those checks,
-/// so a refused launch changes nothing (O170); this context returns the frozen
-/// config untouched.
+/// Seat shapers for a fresh launch: pool resolution, drops, and role/backup/
+/// effort overrides, in launch order. A surviving drop records without pinning
+/// the panel (O178).
 #[allow(clippy::too_many_arguments)]
 fn fresh_seat_shapers(
     cfg: &mut Config,
@@ -1403,24 +1396,29 @@ fn fresh_seat_shapers(
     // A reviewer ordinal is the only `--without` item that indexes a panel;
     // without one the pool (and any `--select` benchmark) is skipped and the
     // channels apply clean.
-    let (pool, origin, preselected) = if config::without_has_reviewer_item(without) {
-        let (width, roles) = workflow::roles_resolve::reviewer_select_question(cfg);
-        let (resolved, origin) = cfg.fresh_reviewer_pool(providers, select, urgency, dry_run)?;
-        let preselected = match origin {
-            state::PoolOrigin::Selected => Some(workflow::roles_resolve::PreselectedPool {
-                width,
-                roles: roles.iter().map(|s| s.to_string()).collect(),
-                providers: resolved.providers.clone(),
-                artifact: resolved.artifact,
-            }),
-            _ => None,
-        };
-        (resolved.providers, origin, preselected)
-    } else {
-        (Vec::new(), state::PoolOrigin::Synth, None)
-    };
-    let dropped = cfg.apply_without(&pool, origin, dry_run, without)?;
+    if !config::without_has_reviewer_item(without) {
+        let dropped = cfg.apply_without(&[], state::PoolOrigin::Synth, dry_run, without)?;
+        cfg.apply_role_overrides(role)?;
+        cfg.refuse_emptied_reviewer_panel(&dropped)?;
+        config::warn_if_role_discards_reviewer_drop(role, &dropped);
+        cfg.apply_backup_overrides(backup)?;
+        cfg.apply_effort_overrides(effort)?;
+        return Ok(None);
+    }
+    let (resolved, origin) = cfg.fresh_reviewer_pool(providers, select, urgency, dry_run)?;
+    let selected = matches!(&origin, state::PoolOrigin::Selected);
+    let dropped = cfg.apply_without(&resolved.providers, origin, dry_run, without)?;
     cfg.apply_role_overrides(role)?;
+    // Record after the drops and role overrides shaped the panel, so the
+    // stored width and roles are the question the dispatch asks (O179). The
+    // providers stay the pre-shape resolution the ordinals indexed.
+    let preselected = if selected {
+        Some(workflow::roles_resolve::PreselectedPool::for_shaped_panel(
+            &*cfg, resolved,
+        ))
+    } else {
+        None
+    };
     cfg.refuse_emptied_reviewer_panel(&dropped)?;
     config::warn_if_role_discards_reviewer_drop(role, &dropped);
     cfg.apply_backup_overrides(backup)?;
@@ -1428,6 +1426,16 @@ fn fresh_seat_shapers(
     Ok(preselected)
 }
 
+/// Config for `spar implement`.
+///
+/// A new run (`--task` / `--plan`) starts from the project's live config; `--run <id>`
+/// binds to the config that run was created with, so an agent editing `spar.toml` for
+/// its own run cannot change the fleet, timeouts or ship gate of one already in flight.
+/// `--reload-config` is the deliberate way out: it re-reads the file and re-freezes the
+/// run against it. A bound run amends under the dispatch's own lock, after every
+/// launch precondition passes. Nothing here amends anything before those checks,
+/// so a refused launch changes nothing (O170); this context returns the frozen
+/// config untouched.
 #[allow(clippy::too_many_arguments)]
 fn implement_ctx(
     run_id: Option<&str>,
