@@ -207,7 +207,7 @@ fn receipts_ack_and_supersede_through_the_cli() {
         ])
         .assert()
         .failure();
-    assert!(String::from_utf8_lossy(&err.get_output().stderr).contains("was sent by human"));
+    assert!(String::from_utf8_lossy(&err.get_output().stderr).contains("was sent by @human"));
     let newer = send(
         &env,
         dir,
