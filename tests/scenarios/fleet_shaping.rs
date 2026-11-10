@@ -2665,3 +2665,66 @@ fn amend_after_a_reassign_freezes_the_moved_panel() {
         "the frozen pin names the moved provider with the drop applied: {panel:?}"
     );
 }
+
+/// #234 follow-up: on a bound run, `--role reviewer=...` replaces the panel
+/// outright, so a reassign that runs after the preview must not refresh the
+/// live-slot pin back over it. The frozen config keeps the role panel.
+#[test]
+fn bound_drop_with_role_pin_freezes_the_role_panel() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(
+        tmp.path(),
+        &["--providers", "cli:claude,cli:codex,cli:grok"],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        2,
+    );
+    let state = read_state(tmp.path(), &run_id);
+    let ids = slot_ids_for(&state, "reviewer");
+    assert!(ids.len() > 1, "the dispatch seated a panel: {ids:?}");
+    let seat = ids[0].clone();
+    let current = providers_for(&state, "reviewer")[0].clone();
+    // A moved seat keeps its ordinal, so any other provider's id is free.
+    let other = ["cli:claude", "cli:codex", "cli:grok"]
+        .into_iter()
+        .map(str::to_string)
+        .find(|p| *p != current)
+        .expect("a provider to move the seat to");
+    run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--reassign",
+            &format!("{seat}={other}"),
+            "--without",
+            "reviewer[0]",
+            "--role",
+            "reviewer=cli:codex",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let cfg = read_run_config(tmp.path(), &run_id);
+    let panel: Vec<&str> = cfg["roles"]["reviewer"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        panel,
+        vec!["cli:codex"],
+        "the frozen config keeps the role panel, not the refreshed pin: {panel:?}"
+    );
+}

@@ -771,8 +771,8 @@ clamped on a word boundary to `[ship] title_max` characters (default 72, `0` = n
 of spar's own), and never past GitHub's 256-character limit.
 The PR **body** is built from the run: OPEN questions from the shipped slot's summary
 (lines under an `Open questions` heading, or lines marked `OPEN`), each reviewer's final
-verdict and the commit it named, an **Open findings (non-blocking)** list (the latest
-reviewed round's surviving seats' findings from `review_history`: minors under `block_on`,
+verdict and the commit it named, an **Open findings (non-blocking)** list (each surviving
+seat's latest recorded review from `review_history`: minors under `block_on`,
 follow-ups, notes on an approving review), then the summary itself (`summary-<slot>.md`, else
 `summary-impl.md`). A body over GitHub's limit is cut from the end of the summary with a
 note naming the full file. It is written to `artifacts/pr-body.md` and passed with
@@ -833,9 +833,9 @@ reconcile gate. `--reason` is required (exit `1` without it); it refuses while t
 orchestrator is alive (`spar stop` it first) and inside a slot (operator-only). A ship that
 fails after the override puts the run back in the phase it came from. The override is kept
 on the run (`ship_override`) for the round, so a later re-ship keeps the findings section. It ships the same HEAD with the same push
-safety as a normal ship. Every finding of the last reviewed round, from the structured
-review records (severity, `file:line`, reviewer slot, round, `Reviewed-Commit`), goes in
-the PR body under **Shipped over open findings**, ahead of the summary. The override (who
+safety as a normal ship. Every finding of each surviving seat's latest recorded review,
+from the structured review records (severity, `file:line`, reviewer slot, round,
+`Reviewed-Commit`), goes in the PR body under **Shipped over open findings**, ahead of the summary. The override (who
 from `$USER`, when, reason, the findings) is written to
 `artifacts/ship.md` under `## Gate override` and logged as an `info` event.
 
