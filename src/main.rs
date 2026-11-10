@@ -1258,7 +1258,8 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             let urgent_outcome = if urgent {
                 Some(urgent_send(
                     &paths,
-                    run.as_deref(),
+                    run.as_deref()
+                        .expect("bus_cmd bails above when --urgent lacks --run"),
                     &to,
                     &msg,
                     run_state.as_ref(),
@@ -1455,7 +1456,7 @@ struct UrgentSend {
 
 fn urgent_send(
     paths: &paths::SparPaths,
-    run: Option<&str>,
+    run: &str,
     to: &str,
     msg: &bus::BusMessage,
     state: Option<&state::RunState>,
@@ -1473,9 +1474,6 @@ fn urgent_send(
             "--urgent targets one slot; the message was sent normally".into(),
         );
     }
-    let Some(run) = run else {
-        anyhow::bail!("--urgent needs --run to name the slot's run");
-    };
     let Some(st) = state else {
         anyhow::bail!("--urgent needs an existing run (no state for {run})");
     };
@@ -1518,10 +1516,14 @@ fn urgent_send(
             from: msg.from.clone(),
             body: msg.body.clone(),
             ts: chrono::Utc::now(),
+            target_pid: token.pid,
+            target_starttime: token.starttime,
         },
     )?;
     // Only the turn's process group stops here; the orchestrator resumes the
-    // same session with this message first when the dispatch returns.
+    // same session with this message first when the dispatch returns. Pid-based
+    // (no Child handle survives the process boundary), group-scoped: the same
+    // SIGTERM-then-SIGKILL the executor applies to a process group.
     process::terminate_tree(token.pid, true);
     interrupt(format!(
         "stopped {}'s turn; resuming the same session with your message first",

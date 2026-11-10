@@ -165,12 +165,17 @@ pub fn write_session_id(
 /// prompt leads with these bodies, oldest first, ahead of the normal
 /// continuation. One file per message so concurrent urgents do not overwrite
 /// each other; the orchestrator drains and deletes them all together.
+/// `target_pid`/`target_starttime` name the live dispatch the sender verified:
+/// the take keeps only requests keyed to the dispatch that is actually
+/// returning, so a stale file can never misclassify a later, unrelated kill.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UrgentInterrupt {
     pub msg_id: String,
     pub from: String,
     pub body: String,
     pub ts: chrono::DateTime<chrono::Utc>,
+    pub target_pid: u32,
+    pub target_starttime: Option<u64>,
 }
 
 fn urgent_name(slot_id: &str, msg_id: &str) -> String {
@@ -195,10 +200,16 @@ pub fn write_urgent_interrupt(
 /// Drain every pending urgent interrupt for `slot_id`, oldest first, deleting
 /// each file as it is read so a later dispatch never replays it. A torn write
 /// the sender never finished renaming into place is simply not there yet.
+/// Only requests keyed to `current` (the returning dispatch's pid token) are
+/// kept: anything else targets a turn that is already over, so it is deleted
+/// unread and the message flows through the normal turn-boundary channels.
+/// With no current token there is no dispatch to attribute a request to, and
+/// every file is stale by the same argument.
 pub fn take_urgent_interrupts(
     paths: &SparPaths,
     run_id: &str,
     slot_id: &str,
+    current: Option<&crate::process::PidToken>,
 ) -> Vec<UrgentInterrupt> {
     let prefix = format!("{slot_id}.urgent.");
     let mut out = Vec::new();
@@ -214,10 +225,15 @@ pub fn take_urgent_interrupts(
             continue;
         };
         let Ok(urgent) = serde_json::from_str::<UrgentInterrupt>(&text) else {
+            let _ = std::fs::remove_file(entry.path());
             continue;
         };
         let _ = std::fs::remove_file(entry.path());
-        out.push(urgent);
+        let for_current = current
+            .is_some_and(|t| t.pid == urgent.target_pid && t.starttime == urgent.target_starttime);
+        if for_current {
+            out.push(urgent);
+        }
     }
     out.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.msg_id.cmp(&b.msg_id)));
     out
@@ -323,11 +339,17 @@ mod tests {
     fn urgent_interrupts_drain_oldest_first_and_delete() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
+        let token = crate::process::PidToken {
+            pid: 4242,
+            starttime: Some(99),
+        };
         let first = UrgentInterrupt {
             msg_id: "m1".into(),
             from: "@human".into(),
             body: "stop, wrong direction".into(),
             ts: chrono::Utc::now(),
+            target_pid: token.pid,
+            target_starttime: token.starttime,
         };
         let second = UrgentInterrupt {
             msg_id: "m2".into(),
@@ -337,11 +359,49 @@ mod tests {
         };
         write_urgent_interrupt(&paths, "r1", "slot-a", &second).unwrap();
         write_urgent_interrupt(&paths, "r1", "slot-a", &first).unwrap();
-        let drained = take_urgent_interrupts(&paths, "r1", "slot-a");
+        let drained = take_urgent_interrupts(&paths, "r1", "slot-a", Some(&token));
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].msg_id, "m1");
         assert_eq!(drained[1].msg_id, "m2");
-        assert!(take_urgent_interrupts(&paths, "r1", "slot-a").is_empty());
+        assert!(take_urgent_interrupts(&paths, "r1", "slot-a", Some(&token)).is_empty());
+    }
+
+    #[test]
+    fn urgent_take_keeps_only_requests_keyed_to_the_returning_dispatch() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let live = crate::process::PidToken {
+            pid: 1111,
+            starttime: Some(7),
+        };
+        let current = UrgentInterrupt {
+            msg_id: "m-now".into(),
+            from: "@human".into(),
+            body: "this turn".into(),
+            ts: chrono::Utc::now(),
+            target_pid: live.pid,
+            target_starttime: live.starttime,
+        };
+        let recycled = UrgentInterrupt {
+            msg_id: "m-old".into(),
+            body: "previous turn".into(),
+            target_pid: live.pid,
+            target_starttime: Some(6),
+            ..current.clone()
+        };
+        write_urgent_interrupt(&paths, "r1", "slot-a", &current).unwrap();
+        write_urgent_interrupt(&paths, "r1", "slot-a", &recycled).unwrap();
+        let drained = take_urgent_interrupts(&paths, "r1", "slot-a", Some(&live));
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].msg_id, "m-now");
+        assert!(take_urgent_interrupts(&paths, "r1", "slot-a", Some(&live)).is_empty());
+        write_urgent_interrupt(&paths, "r1", "slot-a", &recycled).unwrap();
+        let other = crate::process::PidToken {
+            pid: 2222,
+            starttime: Some(7),
+        };
+        assert!(take_urgent_interrupts(&paths, "r1", "slot-a", Some(&other)).is_empty());
+        assert!(take_urgent_interrupts(&paths, "r1", "slot-a", Some(&live)).is_empty());
     }
 
     #[test]

@@ -639,6 +639,16 @@ fn build_dispatch_command(
     (adapter.build_headless(bin, opts), false)
 }
 
+/// The session a same-dispatch retry may resume: the id the failed attempt
+/// itself established, else the id it resumed (a resume that died before
+/// emitting anything still names a live session). Never the marker's
+/// pre-written cold id: that names a session the vendor may never have created
+/// (the first attempt died before anything persisted it), and resuming it
+/// addresses a conversation that does not exist.
+fn retry_prior_session(captured: Option<&str>, resumed: Option<&str>) -> Option<String> {
+    captured.or(resumed).map(str::to_string)
+}
+
 /// Build the command for a same-dispatch retry: the transient retry inside
 /// `dispatch_with_resume_recovery` and the credential-refresh retry below it.
 /// A retry that resolves to a resume keeps the captured session, so the work
@@ -954,7 +964,15 @@ fn dispatch_with_resume_recovery(
             ),
         );
         sleep(wait);
-        let prior = markers::read_session_id(paths, run_id, slot_id, session_provider);
+        // Resume only what the failed attempt established or resumed: the
+        // marker may still hold the pre-written cold id when the attempt died
+        // before persisting anything, and resuming that id addresses a
+        // conversation the vendor never created. A cold retry keeps its fresh
+        // `derive_retry` id (#241).
+        let prior = retry_prior_session(
+            res.stats.session_id.as_deref(),
+            last_resume_attempt.as_deref(),
+        );
         // D2 is enforced inside `build_dispatch_command` (via
         // `build_retry_command`): a retry that resolves to a resume drops the
         // cold dispatch's assigned id there, so muse can never emit
@@ -1055,11 +1073,16 @@ fn dispatch_with_resume_recovery(
             ),
         );
         sleep(wait);
-        let prior = markers::read_session_id(paths, run_id, slot_id, session_provider);
-        // Same rule as the transient retry above: a resume keeps the captured
-        // session, a cold retry takes a fresh `derive_retry` id (#241). `retries`
-        // counts the transient retries already issued, so the auth retry's id
-        // is distinct from every attempt before it.
+        // Same established-only rule as the transient retry above: a resume
+        // keeps the session the failed attempt captured (or the one it
+        // resumed), never the marker's pre-written cold id; a cold retry takes
+        // a fresh `derive_retry` id (#241). `retries` counts the transient
+        // retries already issued, so the auth retry's id is distinct from every
+        // attempt before it.
+        let prior = retry_prior_session(
+            res.stats.session_id.as_deref(),
+            last_resume_attempt.as_deref(),
+        );
         let (cmd, _) = build_retry_command(
             adapter,
             bin,
@@ -1449,12 +1472,26 @@ fn execute_prepared(
     // An `--urgent` send kills this turn's process group and files its message;
     // when the killed dispatch returns, resume the same session in place with
     // the urgent bodies first. The killed attempt never becomes an outcome: no
-    // rotation, no round cost, no ceiling-kill WIP path.
-    let pending_urgent =
-        markers::take_urgent_interrupts(&prep.paths, &prep.run_id, &prep.job.slot_id);
+    // rotation, no round cost, no ceiling-kill WIP path. Loops: a second
+    // urgent landing during the resumed turn kills and resumes again instead
+    // of being mistaken for the first. Every resume shares the killed turn's
+    // remaining ceiling, so repeated urgents cannot extend the dispatch past
+    // one window.
     let mut urgent_resumed_sid: Option<String> = None;
-    if interrupt_cause_for(&res, &pending_urgent) == Some(InterruptCause::UrgentMessage) {
-        let captured = res.stats.session_id.clone();
+    let mut established: Option<String> = resume_attempt.map(str::to_string);
+    loop {
+        let current = markers::read_pid(&prep.paths, &prep.run_id, &prep.job.slot_id);
+        let pending_urgent = markers::take_urgent_interrupts(
+            &prep.paths,
+            &prep.run_id,
+            &prep.job.slot_id,
+            current.as_ref(),
+        );
+        if interrupt_cause_for(&res, &pending_urgent) != Some(InterruptCause::UrgentMessage) {
+            break;
+        }
+        let captured = res.stats.session_id.clone().or(established.clone());
+        let resume_timeout = timeout.saturating_sub(dispatch_start.elapsed().unwrap_or_default());
         let (resumed_res, resumed_sid) = resume_urgent_turn(
             adapter.as_ref(),
             &bin,
@@ -1464,7 +1501,7 @@ fn execute_prepared(
             &prep.log_path,
             &prep.prompt_path,
             &dispatch_env,
-            timeout,
+            resume_timeout,
             &prep.paths,
             &prep.run_id,
             &prep.job.slot_id,
@@ -1476,6 +1513,7 @@ fn execute_prepared(
             &tick,
             &|d| sleep_ticking(d, &tick),
         )?;
+        established = resumed_res.stats.session_id.clone().or(resumed_sid.clone());
         res = resumed_res;
         urgent_resumed_sid = resumed_sid;
         pid = load_pid(&pid_cell);
@@ -2390,12 +2428,12 @@ fn urgent_killed_log_path(log_path: &Path) -> PathBuf {
 
 /// The resume prompt after an urgent interrupt: every urgent body first, oldest
 /// first, then a note that the previous turn was stopped mid-flight with the
-/// worktree untouched, then the normal continuation.
+/// worktree kept as is, then the normal continuation.
 fn urgent_resume_prompt(urgents: &[markers::UrgentInterrupt], normal_prompt: &str) -> String {
     let mut out = String::new();
     for u in urgents {
         out.push_str(&format!(
-            "[Urgent message from {}: your previous turn was stopped mid-flight so this could reach you first. Your worktree is unchanged; read this before anything else, then pick up where you left off.]\n\n{}\n\n---\n\n",
+            "[Urgent message from {}: your previous turn was stopped mid-flight so this could reach you first. Your worktree was not reset and partial edits from the stopped turn are still there; read this before anything else, then pick up where you left off.]\n\n{}\n\n---\n\n",
             u.from, u.body
         ));
     }
@@ -2403,12 +2441,14 @@ fn urgent_resume_prompt(urgents: &[markers::UrgentInterrupt], normal_prompt: &st
     out
 }
 
-/// Classify a returned dispatch against drained urgent interrupts. `Some` only
-/// when the turn was signal-killed while interrupts were pending: the sender
-/// kills the process group, so a signal here with a pending request is the
-/// interrupt landing. A normal exit or a ceiling timeout with pending requests
-/// is not an interrupt (the turn the request targeted is already over) and the
-/// drained requests fall through to the normal turn-boundary channels.
+/// Classify a returned dispatch against drained urgent interrupts. `Some` when
+/// interrupts keyed to this dispatch were pending as the turn ended: the take
+/// already filtered by dispatch pid token, so presence alone is the cause —
+/// including an agent CLI that traps SIGTERM and exits 1 or 130 instead of
+/// dying by signal. A clean exit with pending requests is not an interrupt
+/// (the turn the request targeted finished before the kill landed, so the
+/// message flows through the normal turn-boundary channels), and neither is a
+/// ceiling timeout.
 fn interrupt_cause_for(
     res: &process::SpawnResult,
     pending: &[markers::UrgentInterrupt],
@@ -2416,7 +2456,10 @@ fn interrupt_cause_for(
     if pending.is_empty() || res.timed_out {
         return None;
     }
-    process::ended_by_signal(res.signal, res.exit_code).then_some(InterruptCause::UrgentMessage)
+    if res.signal.is_none() && res.exit_code == Some(0) {
+        return None;
+    }
+    Some(InterruptCause::UrgentMessage)
 }
 
 /// Re-dispatch the killed turn in place: the same session it ran in (or a cold
@@ -2448,10 +2491,14 @@ fn resume_urgent_turn(
     tick: &dyn Fn(),
     sleep: &dyn Fn(Duration),
 ) -> Result<(process::SpawnResult, Option<String>)> {
-    if let Some(sid) = captured_session {
-        let _ = markers::write_session_id(paths, run_id, slot_id, session_provider, &sid);
+    // The resume names only the session the killed turn actually ran in: the
+    // one it captured, else the one it resumed. The marker's pre-written cold
+    // id is never a resume candidate (#241): when the kill landed before any
+    // session existed the resume dispatches cold with the urgent bodies first.
+    if let Some(sid) = &captured_session {
+        let _ = markers::write_session_id(paths, run_id, slot_id, session_provider, sid);
     }
-    let prior = markers::read_session_id(paths, run_id, slot_id, session_provider);
+    let prior = captured_session;
     let prompt = urgent_resume_prompt(urgents, &opts.prompt);
     let urgent_path = urgent_prompt_path(prompt_path, slot_id);
     std::fs::write(&urgent_path, &prompt)
@@ -2473,14 +2520,14 @@ fn resume_urgent_turn(
         timeout,
     };
     let recipient = format!("{run_id}:{slot_id}");
+    // Consume the inbox copies now: the resumed agent already carries these
+    // bodies in its prompt, so the next turn-boundary drain must not hand them
+    // over a second time. The claim records `Delivered`; the `Read` below
+    // records that the resume prompt carried them.
+    let _ = crate::bus::inbox_claim(paths, &recipient, "urgent", |m| {
+        urgents.iter().any(|u| u.msg_id == m.id)
+    });
     for u in urgents {
-        crate::bus::record_receipt(
-            paths,
-            &u.msg_id,
-            &recipient,
-            crate::bus::ReceiptEvent::Delivered,
-            "urgent",
-        );
         crate::bus::record_receipt(
             paths,
             &u.msg_id,
@@ -4944,11 +4991,22 @@ fn run_headless(
     // An `--urgent` send kills this turn's process group and files its message;
     // when the killed dispatch returns, resume the same session in place with
     // the urgent bodies first. The killed attempt never becomes an outcome: no
-    // rotation, no round cost, no ceiling-kill WIP path.
-    let pending_urgent = markers::take_urgent_interrupts(paths, &state.id, &job.slot_id);
+    // rotation, no round cost, no ceiling-kill WIP path. Loops: a second
+    // urgent landing during the resumed turn kills and resumes again instead
+    // of being mistaken for the first. Every resume shares the killed turn's
+    // remaining ceiling, so repeated urgents cannot extend the dispatch past
+    // one window.
     let mut urgent_resumed_sid: Option<String> = None;
-    if interrupt_cause_for(&res, &pending_urgent) == Some(InterruptCause::UrgentMessage) {
-        let captured = res.stats.session_id.clone();
+    let mut established: Option<String> = resume_attempt.map(str::to_string);
+    loop {
+        let current = markers::read_pid(paths, &state.id, &job.slot_id);
+        let pending_urgent =
+            markers::take_urgent_interrupts(paths, &state.id, &job.slot_id, current.as_ref());
+        if interrupt_cause_for(&res, &pending_urgent) != Some(InterruptCause::UrgentMessage) {
+            break;
+        }
+        let captured = res.stats.session_id.clone().or(established.clone());
+        let resume_timeout = timeout.saturating_sub(dispatch_start.elapsed().unwrap_or_default());
         let (resumed_res, resumed_sid) = resume_urgent_turn(
             adapter.as_ref(),
             &bin,
@@ -4958,7 +5016,7 @@ fn run_headless(
             log_path,
             prompt_path,
             &dispatch_env,
-            timeout,
+            resume_timeout,
             paths,
             &state.id,
             &job.slot_id,
@@ -4970,6 +5028,7 @@ fn run_headless(
             &tick,
             &|d| sleep_ticking(d, &tick),
         )?;
+        established = resumed_res.stats.session_id.clone().or(resumed_sid.clone());
         res = resumed_res;
         urgent_resumed_sid = resumed_sid;
         pid = load_pid(&pid_cell);
@@ -6091,6 +6150,32 @@ mod tests {
     }
 
     #[test]
+    fn claude_and_grok_resume_across_rounds_like_codex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        for (provider, flag) in [("claude", "-r"), ("grok", "--resume")] {
+            markers::write_session_id(&paths, "run1", "impl", provider, "sess-live").unwrap();
+            let prior = prior_session_for_role(
+                &paths,
+                "run1",
+                "impl",
+                provider,
+                crate::state::SlotRole::Implementer,
+            );
+            assert_eq!(prior.as_deref(), Some("sess-live"));
+            let adapter = providers::adapter_named(provider).expect("adapter exists");
+            assert!(adapter.supports_resume());
+            let mut opts = dispatch_opts("go");
+            let (cmd, used_resume) =
+                build_dispatch_command(&*adapter, Path::new(provider), &mut opts, prior.as_deref());
+            assert!(used_resume);
+            let (_, args) = providers::command_to_parts(&cmd);
+            let at = args.iter().position(|a| a == flag).expect("resume flag");
+            assert_eq!(args.get(at + 1).map(String::as_str), Some("sess-live"));
+        }
+    }
+
+    #[test]
     fn build_dispatch_command_is_cold_without_a_prior_session_id() {
         let mut opts = dispatch_opts("go");
         let (cmd, used_resume) = build_dispatch_command(
@@ -6280,11 +6365,26 @@ mod tests {
             from: "@human".to_string(),
             body: body.to_string(),
             ts: chrono::Utc::now(),
+            target_pid: 4242,
+            target_starttime: Some(99),
         }
     }
 
     #[test]
-    fn urgent_interrupt_needs_signal_death_with_a_pending_request() {
+    fn retry_prior_session_uses_only_what_the_attempt_established() {
+        assert_eq!(
+            retry_prior_session(Some("captured"), Some("resumed")),
+            Some("captured".to_string())
+        );
+        assert_eq!(
+            retry_prior_session(None, Some("resumed")),
+            Some("resumed".to_string())
+        );
+        assert_eq!(retry_prior_session(None, None), None);
+    }
+
+    #[test]
+    fn urgent_interrupt_needs_a_pending_request_not_a_signal() {
         let killed = process::SpawnResult {
             signal: Some(15),
             exit_code: None,
@@ -6295,6 +6395,19 @@ mod tests {
             Some(InterruptCause::UrgentMessage)
         );
         assert_eq!(interrupt_cause_for(&killed, &[]), None);
+        // An agent CLI that traps SIGTERM and exits 1 or 130 still counts: the
+        // pending request keyed to this dispatch is the cause, not the shape.
+        for code in [Some(1), Some(130)] {
+            let trapped = process::SpawnResult {
+                exit_code: code,
+                signal: None,
+                ..refused_result()
+            };
+            assert_eq!(
+                interrupt_cause_for(&trapped, &[urgent_sample("stop")]),
+                Some(InterruptCause::UrgentMessage)
+            );
+        }
         let clean = process::SpawnResult {
             exit_code: Some(0),
             signal: None,
@@ -6321,7 +6434,7 @@ mod tests {
         let second = prompt.find("second").unwrap();
         let normal = prompt.find("normal work").unwrap();
         assert!(first < second && second < normal);
-        assert!(prompt.contains("worktree is unchanged"));
+        assert!(prompt.contains("was not reset"));
     }
 
     /// The marker is the same file whichever way the id arrived: the assign path
