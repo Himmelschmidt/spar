@@ -259,7 +259,7 @@ fn run() -> Result<ExitCode> {
                 let dropped = cfg.apply_without(&pool, origin, dry_run, &without)?;
                 cfg.apply_role_overrides(&role)?;
                 cfg.refuse_emptied_reviewer_panel(&dropped)?;
-                config::warn_if_role_replaces_dropped_panel(&role, &dropped);
+                config::warn_if_role_discards_reviewer_drop(&role, &dropped);
                 cfg.apply_backup_overrides(&backup)?;
                 cfg.apply_effort_overrides(&effort)?;
                 cfg.apply_suite_command(&suite_command, &without)?;
@@ -694,7 +694,7 @@ fn run() -> Result<ExitCode> {
                 let dropped = cfg.apply_without(&pool, origin, dry_run, &without)?;
                 cfg.apply_role_overrides(&role)?;
                 cfg.refuse_emptied_reviewer_panel(&dropped)?;
-                config::warn_if_role_replaces_dropped_panel(&role, &dropped);
+                config::warn_if_role_discards_reviewer_drop(&role, &dropped);
                 cfg.apply_backup_overrides(&backup)?;
                 cfg.apply_effort_overrides(&effort)?;
                 let opts = CommonOpts {
@@ -1441,7 +1441,7 @@ fn implement_ctx(
         let dropped = cfg.apply_without(&pool, origin, dry_run, without)?;
         cfg.apply_role_overrides(role)?;
         cfg.refuse_emptied_reviewer_panel(&dropped)?;
-        config::warn_if_role_replaces_dropped_panel(role, &dropped);
+        config::warn_if_role_discards_reviewer_drop(role, &dropped);
         cfg.apply_backup_overrides(backup)?;
         cfg.apply_effort_overrides(effort)?;
         cfg.apply_suite_command(suite_command, without)?;

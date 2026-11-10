@@ -1082,9 +1082,9 @@ pub fn role_pins_reviewer(role: &[String]) -> bool {
 }
 
 /// Warn when an explicit `--role reviewer=...` replaces a panel a `--without
-/// reviewer[N]` just cut: the pin wins for the frozen panel, the dropped seat
-/// still leaves the run. Every amend path applies `--without` before `--role`,
-/// so each one calls this after both have run.
+/// reviewer[N]` just cut on a bound run: the pin wins for the frozen panel,
+/// the dropped seat still leaves the run. The bound amend path applies
+/// `--without` before `--role`, so it calls this after both have run.
 pub fn warn_if_role_replaces_dropped_panel(role: &[String], dropped: &[usize]) {
     if dropped.is_empty() {
         return;
@@ -1092,6 +1092,21 @@ pub fn warn_if_role_replaces_dropped_panel(role: &[String], dropped: &[usize]) {
     if role_pins_reviewer(role) {
         eprintln!(
             "warning: --role reviewer=... replaces the reviewer panel, so the --without reviewer seat drop still removes its seat but does not narrow the frozen panel"
+        );
+    }
+}
+
+/// Warn when an explicit `--role reviewer=...` replaces a panel a `--without
+/// reviewer[N]` just cut on a fresh launch: no slots exist yet, so the pin
+/// wins outright and the drop is discarded. Fresh paths call this after both
+/// overrides have run.
+pub fn warn_if_role_discards_reviewer_drop(role: &[String], dropped: &[usize]) {
+    if dropped.is_empty() {
+        return;
+    }
+    if role_pins_reviewer(role) {
+        eprintln!(
+            "warning: --role reviewer=... replaces the reviewer panel, discarding the --without reviewer seat drop"
         );
     }
 }

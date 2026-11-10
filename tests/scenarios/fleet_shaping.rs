@@ -1714,10 +1714,10 @@ fn fresh_launch_seat_id_without_names_the_valid_forms() {
 }
 
 /// #234: an explicit `--role reviewer=...` replaces the panel, so when it lands
-/// after a `--without reviewer[N]` drop the operator is warned the pin replaces
-/// the panel while the drop still removes its seat.
+/// after a `--without reviewer[N]` drop on a fresh launch the operator is warned
+/// the drop is discarded: no slots exist yet for surgery to remove.
 #[test]
-fn role_reviewer_pin_warns_when_it_replaces_a_dropped_panel() {
+fn role_reviewer_pin_warns_when_it_discards_a_without_drop() {
     let tmp = project("[suite]\nenabled = false\n");
     let a = spar_cmd()
         .current_dir(tmp.path())
@@ -1737,7 +1737,7 @@ fn role_reviewer_pin_warns_when_it_replaces_a_dropped_panel() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains(
-            "still removes its seat but does not narrow the frozen panel",
+            "discarding the --without reviewer seat drop",
         ));
     let v: Value = serde_json::from_slice(&a.get_output().stdout).unwrap();
     let run_id = v["run_id"].as_str().unwrap();

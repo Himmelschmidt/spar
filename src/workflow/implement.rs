@@ -3789,6 +3789,22 @@ pub(crate) fn drop_reviewer_seats(
         mut renames,
     } = plan;
     let doomed: std::collections::BTreeSet<String> = removed.iter().cloned().collect();
+    // Prune before the renames below reuse the doomed ids. Keyed entries match
+    // the doomed seats' stable keys; legacy entries (no key) match by id
+    // string, so pruning after renumbering would hand them to whichever
+    // survivor was renumbered onto the dropped id.
+    let doomed_slots: Vec<SlotState> = state
+        .slots
+        .iter()
+        .filter(|s| s.role == SlotRole::Reviewer && doomed.contains(&s.id))
+        .cloned()
+        .collect();
+    state.review_history.retain(|e| {
+        !doomed_slots.iter().any(|d| match &e.seat_key {
+            Some(key) => key == d.seat_key(),
+            None => e.slot_id == d.id || d.former_ids.contains(&e.slot_id),
+        })
+    });
     // Every fallible check is done: now mutate. Gone seats lose their checkouts
     // (renamed survivors recreate theirs on the next dispatch), their slots and
     // their verdict artifacts.
@@ -3820,20 +3836,6 @@ pub(crate) fn drop_reviewer_seats(
             }
         }
     }
-    // History entries stay with the seat that wrote them: keep every entry a
-    // surviving reviewer seat still names by stable key, and drop the rest. The
-    // gate reads history entries directly, so pruning is what stops the dropped
-    // seat's findings from counting. Pruning by id string instead would delete a
-    // survivor's entries whenever renumbering reused the dropped id.
-    let live: Vec<SlotState> = state
-        .slots
-        .iter()
-        .filter(|s| s.role == SlotRole::Reviewer)
-        .cloned()
-        .collect();
-    state
-        .review_history
-        .retain(|e| live.iter().any(|s| e.names_seat(s)));
     Ok(removed)
 }
 
@@ -3920,6 +3922,53 @@ mod reviewer_drop_history_tests {
         assert_eq!(open.len(), 1, "{open:?}");
         assert!(
             open[0].finding.text.contains("codex one finding"),
+            "{open:?}"
+        );
+    }
+
+    /// Runs frozen before `seat_key` existed leave entries with no key, matched
+    /// by id string. The prune runs before renames reuse the doomed ids, so the
+    /// dropped seat's legacy entries leave with it instead of landing on the
+    /// survivor renumbered onto its id.
+    #[test]
+    fn legacy_entries_without_keys_prune_with_the_doomed_seat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r-legacy-drops",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        for (id, provider, finding) in [
+            ("review-0-cli-claude", "cli:claude", "claude finding"),
+            ("review-1-cli-codex", "cli:codex", "codex one finding"),
+            ("review-2-cli-codex", "cli:codex", "codex two finding"),
+        ] {
+            state
+                .slots
+                .push(executor::init_slot(id, provider, SlotRole::Reviewer));
+            state.review_history.push(crate::state::ReviewHistoryEntry {
+                round: 1,
+                slot_id: id.to_string(),
+                seat_key: None,
+                review: review_result::parse_review(&finding_body(finding)),
+            });
+        }
+
+        drop_reviewer_seats(&mut state, &paths, &[1]).unwrap();
+
+        let ids: Vec<&str> = state.slots.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["review-0-cli-claude", "review-1-cli-codex"]);
+        let kept: Vec<&str> = state
+            .review_history
+            .iter()
+            .map(|e| e.slot_id.as_str())
+            .collect();
+        assert_eq!(kept, ["review-0-cli-claude", "review-2-cli-codex"]);
+        let open = review_result::open_findings(&state, tmp.path());
+        assert_eq!(open.len(), 2, "{open:?}");
+        assert!(
+            open.iter().all(|o| !o.finding.text.contains("codex one")),
             "{open:?}"
         );
     }
@@ -4503,10 +4552,7 @@ fn try_rotate_reviewer_provider(
     let eligible = |p: &String| -> bool {
         *p != cur && crate::backup::is_provider_eligible(p, &store, None, codex_profile.as_deref())
     };
-    let reviewer_role_source = if cfg
-        .cli_role_keys
-        .contains(SlotRole::Reviewer.as_config_key())
-    {
+    let reviewer_role_source = if cfg.cli_role_keys.contains(&SlotRole::Reviewer) {
         SeatSource::CliRole
     } else {
         SeatSource::RolesFile
@@ -7201,6 +7247,16 @@ mod frozen_reread_tests {
         st.gates.plan_approved = true;
         st.task = Some("add a hello function".to_string());
         st.save(&paths).unwrap();
+        // The pre-lock read `implement_ctx` takes for its cheap pre-checks sees
+        // the claude implementer with no CLI pin. A concurrent `--role`
+        // amend lands before the dispatch takes the run lock and pins the
+        // frozen snapshot at grok.
+        let stale = Config::for_run(&paths, run_id).unwrap();
+        assert_eq!(stale.roles.implementer.as_deref(), Some("cli:claude"));
+        assert!(!stale.cli_role_keys.contains(&SlotRole::Implementer));
+        frozen.roles.implementer = Some("cli:grok".to_string());
+        frozen.cli_role_keys.insert(SlotRole::Implementer);
+        frozen.save_snapshot(&paths, run_id).unwrap();
         let opts = CommonOpts {
             providers: vec!["cli:claude".to_string(), "cli:grok".to_string()],
             dry_run: true,
@@ -7220,6 +7276,6 @@ mod frozen_reread_tests {
             .filter(|s| s.role == SlotRole::Implementer)
             .map(|s| s.provider.as_str())
             .collect();
-        assert_eq!(implementers, vec!["cli:claude"]);
+        assert_eq!(implementers, vec!["cli:grok"]);
     }
 }
