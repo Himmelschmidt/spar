@@ -330,3 +330,62 @@ fn replan_restamps_the_codex_route() {
     assert_eq!(st["round"], 2);
     assert_eq!(st["codex_profile"], "", "replan re-stamps: {st}");
 }
+
+/// A paused `cli:codex@native` parks a `SPAR_CODEX_MODEL` seat at the run-start
+/// gate: the model routes the model-less seat to `native`, so in-run
+/// eligibility refuses before any dispatch. Without the model the same seat
+/// keys `openrouter` and dispatches past the gate.
+#[test]
+fn paused_native_parks_a_model_seat_before_dispatch() {
+    let sb = Sandbox::new();
+    sb.cli("codex", "exit 1");
+    sb.spar()
+        .args(["provider", "pause", "cli:codex@native"])
+        .assert()
+        .success();
+
+    let out = sb
+        .spar()
+        .env("SPAR_CODEX_MODEL", "gpt-5")
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--providers",
+            "cli:codex",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cli:codex@native"), "{stderr}");
+    let id = only_run_id(&sb.project);
+    assert_eq!(sb.state(&id)["phase"], "quota", "{stderr}");
+    assert_eq!(sb.count("codex"), 0, "refused before any dispatch");
+
+    let out = sb
+        .spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--providers",
+            "cli:codex",
+        ])
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(4), "{out:?}");
+    assert!(
+        sb.count("codex") >= 1,
+        "model-less seat dispatches: {out:?}"
+    );
+}
+
+fn only_run_id(proj: &Path) -> String {
+    std::fs::read_dir(proj.join(".spar/runs"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().join("state.json").is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .expect("a run")
+}
