@@ -1052,14 +1052,25 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                 meta: std::collections::HashMap::new(),
             };
             // Send first: a failed send leaves the old instruction untouched. The
-            // superseding send skips the file-time fan-out, so the withdrawal's
-            // render below moves the poll file from old to new in one step and a
-            // poller never sees both instructions at once.
+            // superseding send skips the file-time fan-out, so the withdrawal
+            // renders holders of the old message and the drain below renders the
+            // new message's own targets: a retargeted slot sees the replacement
+            // even though it never held the old one, and a poller never sees
+            // both instructions at once. The drain runs even when the
+            // withdrawal fails, so a filed replacement is never left unrendered.
+            let targets = supersedes
+                .is_some()
+                .then(|| bus::message_targets(&paths, &msg))
+                .transpose()?;
             let msg = bus::send(&paths, msg, bus::MessageBudget::Normal)?;
             let withdrawal = supersedes
                 .as_deref()
                 .map(|old| bus::withdraw(&paths, old))
-                .transpose()?;
+                .transpose();
+            if let Some(targets) = &targets {
+                providers::delivery::drain_poll_files(&paths, targets);
+            }
+            let withdrawal = withdrawal?;
             if json {
                 let mut v = serde_json::to_value(&msg)?;
                 v["schema_version"] = serde_json::json!(bus::LOG_SCHEMA);

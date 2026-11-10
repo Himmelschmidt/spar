@@ -1286,11 +1286,12 @@ A landing the model already saw — any `Read` receipt, from a prompt inclusion,
 a Stop-hook injection, an inbox claim or an ack — stays `delivered` under a
 later withdrawal. It is derived at read time from the inbox directories, the receipts and the
 ack events — never stored, so there is no second copy of the state to drift. A slot's
-poll file (agy, pi) renders its inbox, not an append-only log (O156, O157): every filing,
+poll file (agy, pi) renders its inbox, not an append-only log (O156–O158): every filing,
 withdrawal and round start rewrites it from the pending messages, so a withdrawn or
 expired message disappears from the file. A superseding send skips its own filing
-render; the withdrawal renders once, moving the file from the old instruction to the
-new one in a single step. Messages addressed to the slot render, plus
+render; the withdrawal renders holders of the old message and the send path then
+renders the new message's own targets (even if the withdrawal fails), so a
+replacement addressed to a slot that never held the old one still reaches its file. Messages addressed to the slot render, plus
 chat broadcasts from humans and peer slots — the default `--to broadcast` reaches every
 poll-file slot — while acks, system prompts and orchestrator broadcasts stay in the
 inbox and the bus log but never become action items. Posting into the live poll file

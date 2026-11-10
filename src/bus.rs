@@ -604,9 +604,10 @@ fn deliver_inbox(paths: &SparPaths, msg: &BusMessage) -> Result<()> {
     }
     // The one filing choke point: `send` and `tick_acks` both land here, so every
     // producer's PollFile copies reach the poll file at file time. A superseding
-    // send skips this drain: its withdrawal renders right after, moving the poll
-    // file from the old instruction to the new one in a single render, and a
-    // failed send must leave the old instruction untouched.
+    // send skips this drain: its withdrawal renders holders of the old message
+    // and the send path drains this message's own targets right after, so a
+    // retargeted slot still sees the replacement — and a failed send, which never
+    // reaches the drain, leaves the old instruction untouched.
     if msg.refs.supersedes.is_none() {
         crate::providers::delivery::drain_poll_files(paths, &targets);
     }

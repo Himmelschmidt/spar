@@ -681,6 +681,75 @@ fn failed_superseding_send_keeps_old_for_pi() {
     failed_superseding_send_keeps_old("cli:pi");
 }
 
+/// A superseding send to a different slot renders the new message: the
+/// withdrawal only refreshes holders of the old message, so the send path
+/// renders the new message's own targets after the withdrawal returns.
+fn poll_file_supersede_retargets(provider: &str) {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), provider);
+    let dir = tmp.path();
+    let claude = slot_for_provider(dir, &run_id, "cli:claude");
+
+    let old = send_json(
+        dir,
+        &run_id,
+        &["--to", &claude, "-m", "old instruction alpha"],
+    );
+    let old_id = old["id"].as_str().unwrap().to_string();
+
+    let new = send_json(
+        dir,
+        &run_id,
+        &[
+            "--to",
+            &agent,
+            "--supersedes",
+            &old_id,
+            "-m",
+            "new instruction beta",
+        ],
+    );
+    let new_id = new["id"].as_str().unwrap().to_string();
+    let withdrawal = &new["withdrawal"];
+    assert_eq!(
+        withdrawal["withdrawn_from"],
+        serde_json::json!([format!("{run_id}:{claude}")]),
+        "{withdrawal}"
+    );
+    assert_eq!(
+        withdrawal["already_delivered"],
+        serde_json::json!([]),
+        "{withdrawal}"
+    );
+
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        poll.contains("new instruction beta"),
+        "retargeted replacement reaches the new slot's poll file:\n{poll}"
+    );
+    assert!(
+        !poll.contains("old instruction alpha"),
+        "the old slot's body never lists here:\n{poll}"
+    );
+
+    let entries = log_entries(dir, &run_id);
+    let old_entry = log_entry(&entries, &old_id);
+    assert_eq!(old_entry["superseded_by"], new_id, "{old_entry}");
+    let new_entry = log_entry(&entries, &new_id);
+    assert_eq!(new_entry["delivery"], "delivered", "{new_entry}");
+}
+
+#[test]
+fn poll_file_supersede_retargets_for_agy() {
+    poll_file_supersede_retargets("cli:agy");
+}
+
+#[test]
+fn poll_file_supersede_retargets_for_pi() {
+    poll_file_supersede_retargets("cli:pi");
+}
+
 /// A message filed in its last valid round leaves the poll file once the run
 /// moves past it: the next filing re-renders, and the expired body is gone.
 fn poll_file_expiry_drops(provider: &str) {
