@@ -296,9 +296,7 @@ fn prepare_slot_execution(
     cfg: &Config,
     job: &SlotJob,
 ) -> Result<PreparedSlot> {
-    // No route stamp here: every dispatch entry stamps the route before seats
-    // resolve or quota reads, in the same process the spawn inherits, so the
-    // record already equals this dispatch's ambient route.
+    // No route stamp here: the dispatch entry stamps it; see `stamp_dispatch`.
     let slot = state
         .slots
         .iter()
@@ -2461,7 +2459,7 @@ pub fn run_slot(
     cfg: &Config,
     job: &SlotJob,
 ) -> Result<()> {
-    // No route stamp here: see `prepare_slot_execution`.
+    // No route stamp here: the dispatch entry stamps it; see `stamp_dispatch`.
     let slot = state
         .slots
         .iter()

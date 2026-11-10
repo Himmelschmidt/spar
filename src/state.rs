@@ -929,14 +929,14 @@ impl RunState {
 
     /// Mark the start of the current dispatch: the instant quota pauses are read
     /// against, and the codex route this dispatch's seats run under. Called by
-    /// every entry point that dispatches seats (plan and review `run`,
+    /// every entry point that starts a dispatch (plan and review `run`,
     /// `replan` and `continue`, `amend`, the implement entries and
-    /// resumptions), never by an in-process fix pass: a fix pass is a
-    /// continuation of the same dispatch, and re-stamping it would turn this
-    /// run's own pauses into pre-existing ones and park the run on its own
-    /// fumes. The executor never stamps: every entry stamps before seats
-    /// resolve, in the same process the spawn inherits, so the record and
-    /// the ambient route the spawn reads always agree.
+    /// resumptions, the arena/roles/peer `run` fns, `reconcile`), never by an
+    /// in-process fix pass: a fix pass is a continuation of the same dispatch,
+    /// and re-stamping it would turn this run's own pauses into pre-existing
+    /// ones and park the run on its own fumes. The executor never stamps:
+    /// every entry stamps before seats resolve, in the same process the spawn
+    /// inherits, so the record and the ambient route the spawn reads agree.
     pub fn stamp_dispatch(&mut self) {
         self.round_started_at = Some(chrono::Utc::now());
         self.stamp_codex_route();

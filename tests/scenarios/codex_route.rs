@@ -1,6 +1,6 @@
 //! Codex route unification: one resolver feeds the spawn and every quota and
 //! rejection key, so a model-less `cli:codex` seat keys the bucket it bills.
-//! All six drive the real binary with `--dry-run` (no provider CLI needed);
+//! All seven drive the real binary with `--dry-run` (no provider CLI needed);
 //! the recorded route in `state.json` is the seam under test.
 
 mod common;
@@ -309,6 +309,33 @@ fn review_stamps_the_codex_route() {
         .unwrap();
     let v = json(&out);
     let id = v["run_id"].as_str().expect("review mints a run: {v}");
+    assert_eq!(sb.state(id)["codex_profile"], "", "{v}");
+}
+
+/// An arena run dispatches seats without going through the plan or implement
+/// entries, so it must stamp the codex route itself: a dry-run arena under an
+/// emptied profile records `native`.
+#[test]
+fn arena_stamps_the_codex_route() {
+    let sb = Sandbox::new();
+    let out = sb
+        .spar()
+        .env("SPAR_CODEX_PROFILE", "")
+        .args([
+            "run",
+            "--workflow",
+            "arena",
+            "-t",
+            "race two",
+            "--providers",
+            "cli:codex",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v = json(&out);
+    let id = v["run_id"].as_str().expect("arena mints a run: {v}");
     assert_eq!(sb.state(id)["codex_profile"], "", "{v}");
 }
 

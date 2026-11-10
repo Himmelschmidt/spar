@@ -33,6 +33,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     cfg.save_snapshot(paths, &state.id)?;
     state.isolation = cfg.isolation;
     state.dry_run = dry;
+    state.stamp_dispatch();
     let roles: Vec<&str> = (0..n).map(|_| "implementer").collect();
     let requested = opts.resolve_pool(n, &roles, paths, cfg, &state.id)?;
     state.pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
@@ -365,6 +366,7 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
     // Single-flight: a second `spar reconcile` (e.g. a retried command) fails
     // fast with OrchestratorBusy instead of racing state/worktrees of the first.
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+    state.stamp_dispatch();
     state.arena_finish = Some(crate::state::ArenaFinish::Reconcile);
     state.set_phase(Phase::AwaitingReconcile);
     state.save(paths)?;
