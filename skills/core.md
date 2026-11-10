@@ -429,7 +429,8 @@ re-based after creation (O26), but it merges its base forward every round (O195)
 "make PR #N mergeable" runs converge unless the base conflicts — then the round's
 implementer resolves it, or the run parks at the ship gate. Pass
 `--max-rounds 1 --fleet small` to bound such a run to a single small round (with
-`[rounds] merge_base = false` to skip the forward merge).
+`[rounds] merge_base = false` to skip the forward merge), or `--one-pass` to
+also ship at the end of that round (see "Fleet shaping").
 `spar reconcile <id>` is an arena continuation, not a workflow: it adds a `reconciler` plus
 two more `reviewer` slots on the reconciled tree.
 
@@ -2086,11 +2087,22 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
   passes, so a refused launch (`not resumable`, round ceiling, busy run) changes nothing,
   and the overrides a run
   was launched or amended with (`--role`, `--backup`, `--effort`, without-channel drops,
-  the `--fleet small` reviewer-width override, and any pinned suite command) are recorded in the frozen
+  the `--fleet small` reviewer-width override, `--one-pass`, and any pinned suite command)
+  are recorded in the frozen
   `config.json`, so a later `--reload-config` re-reads `spar.toml` and then re-applies
   them in composition order, so nothing given before is lost unless restated differently
   (O183). A run's later round with no flags at all still picks the snapshot up unchanged
   (O27).
+
+**`--one-pass`** (on `implement` and `run --workflow loop`) is the small-change mode:
+it implies `--fleet small` (an explicit `--fleet` still wins), caps a fresh run at one
+round (on a bound `--run <id>` it allows one more round instead), and ships at the end
+of it through the real ship path (push plus draft PR, including the base forward
+merge). A passed gate ships; a failed gate ships anyway when no open finding reaches
+`[review] block_on`, with the findings recorded as follow-ups under "Shipped over
+open findings" in the PR body. A finding at or above `block_on` parks at the
+existing gate (exit 2), as without the flag. Frozen into the run's `config.json`;
+nothing changes for runs launched without it (O196).
 
 **`--suite-command "<cmd>"`** (repeatable, on `plan` and `implement`) sets this run's
 deterministic suite, replacing `[suite].command` and turning the suite channel on even under

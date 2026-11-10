@@ -58,7 +58,8 @@ caught, which is what the sweep is for.
   phase of that run reads the snapshot, so another agent's edit cannot change its fleet,
   timeouts, spec/suite channels, or ship gate. `spar implement --run <id> --reload-config`
   re-reads the file, re-freezes, and then re-applies the overrides the run was launched
-  or amended with. `--role`, `--backup`, `--effort`, `--without` and `--fleet` amend a
+  or amended with. `--role`, `--backup`, `--effort`, `--without`, `--fleet` and
+  `--one-pass` amend a
   resume's frozen config directly (only `--suite-command` still needs `--reload-config`).
   `--without reviewer[N]` (or an existing seat id) drops a reviewer seat outright: the
   seat, its review history, and its verdicts stop gating the ship. The ordinal indexes
@@ -153,6 +154,17 @@ adopt a `test-contract.md` that drifted mid-round exits `1` until you pass
 `--accept-contract`. Between rounds the implementer's
 `artifacts/carry-forward-<slot>.md` is seeded into the next round's prompt, capped by
 `[rounds] carry_forward_chars`.
+
+**One-pass runs (O196).** `spar implement -t ... --one-pass` (or `run --workflow
+loop --one-pass`) implies `--fleet small` and caps a fresh run at one round: at
+the end of it a passed gate ships, and a failed gate ships anyway when no open
+finding reaches `[review] block_on`, reusing the `ship --override-gate`
+machinery with an automatic reason so the findings ride along as follow-ups in
+the PR body. A finding at or above `block_on` parks at the round-ceiling gate
+(exit 2) exactly as without the flag. On an existing run,
+`implement --run <id> --one-pass` allows one more round and then applies the
+same verdict. The mode is frozen into the run's `config.json`; an explicit
+`--fleet` or `--max-rounds` still wins over the implied preset and ceiling.
 
 `--providers` is **required** for plan / implement / run (no implicit fleet).
 
