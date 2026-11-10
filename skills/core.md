@@ -90,6 +90,9 @@ unhealthy. Launch resolves readiness once per seat where its provider is
 settled, so a hung login can delay that launch up to the readiness timeout
 before dispatch. A non-pin seat with no healthy provider fails readiness
 (exit `1`) naming the failed probes; exit `4` is quota pauses only.
+Continuing a run (`implement --run`) re-checks auto-selected seats the same
+way and re-seats one whose provider went unhealthy; singleton order seats
+take the first usable entry no earlier seat holds.
 
 **A reviewer that cannot run is not a verdict (O103).** In the implement loop, a
 reviewer dispatch that fails because the provider could not serve it (rate limit, auth
