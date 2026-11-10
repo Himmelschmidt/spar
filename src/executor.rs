@@ -1207,6 +1207,8 @@ fn execute_prepared(
             timeout,
             dry_run: false,
             model_override: model.clone(),
+            api_key: None,
+            base_url: None,
         })?;
         let (ok, err, usage, timeout_cause) = (
             outcome.ok,
@@ -4276,6 +4278,8 @@ fn run_api(
         timeout,
         dry_run: false,
         model_override: model.clone(),
+        api_key: None,
+        base_url: None,
     })?;
     let (ok, err, usage, timeout_cause) = (
         outcome.ok,

@@ -13,21 +13,28 @@ pub struct ApiProviderConfig {
 }
 
 impl ApiProviderConfig {
-    pub fn resolve(name: &str) -> Result<Self> {
+    /// An explicitly passed key wins; the environment is the fallback, so
+    /// callers that inject a credential never touch shared process state.
+    pub fn resolve(name: &str, api_key: Option<&str>) -> Result<Self> {
+        let key = |env_name: &str| {
+            api_key
+                .map(str::to_string)
+                .or_else(|| env::var(env_name).ok())
+                .context(format!("{env_name} required"))
+        };
         let name = name.trim().to_ascii_lowercase();
         match name.as_str() {
             "openai" => Ok(Self {
                 name: "openai".into(),
                 base_url: env::var("OPENAI_BASE_URL")
                     .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
-                api_key: env::var("OPENAI_API_KEY")
-                    .context("OPENAI_API_KEY required for api:openai")?,
+                api_key: key("OPENAI_API_KEY")?,
                 model: env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
             }),
             "xai" => Ok(Self {
                 name: "xai".into(),
                 base_url: env::var("XAI_BASE_URL").unwrap_or_else(|_| "https://api.x.ai/v1".into()),
-                api_key: env::var("XAI_API_KEY").context("XAI_API_KEY required for api:xai")?,
+                api_key: key("XAI_API_KEY")?,
                 model: env::var("XAI_MODEL").unwrap_or_else(|_| "grok-3-mini".into()),
             }),
             "anthropic" => {
@@ -38,8 +45,13 @@ impl ApiProviderConfig {
                         env::var("OPENAI_BASE_URL")
                             .unwrap_or_else(|_| "https://api.openai.com/v1".into())
                     }),
-                    api_key: env::var("ANTHROPIC_API_KEY")
-                        .or_else(|_| env::var("OPENAI_API_KEY"))
+                    api_key: api_key
+                        .map(str::to_string)
+                        .or_else(|| {
+                            env::var("ANTHROPIC_API_KEY")
+                                .or_else(|_| env::var("OPENAI_API_KEY"))
+                                .ok()
+                        })
                         .context("ANTHROPIC_API_KEY or OPENAI_API_KEY required")?,
                     model: env::var("ANTHROPIC_MODEL")
                         .unwrap_or_else(|_| "claude-3-5-sonnet-latest".into()),
@@ -49,8 +61,7 @@ impl ApiProviderConfig {
                 name: name.clone(),
                 base_url: env::var("OPENAI_BASE_URL")
                     .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
-                api_key: env::var("OPENAI_API_KEY")
-                    .context("OPENAI_API_KEY required for OpenAI-compatible provider")?,
+                api_key: key("OPENAI_API_KEY")?,
                 model: env::var("SPAR_API_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
             }),
             other => bail!("unknown api provider '{other}' (openai|xai|anthropic|google|meta)"),
