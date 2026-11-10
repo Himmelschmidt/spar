@@ -224,10 +224,7 @@ impl ProviderAdapter for ClaudeAdapter {
         Capabilities {
             headless: true,
             interactive: true,
-            // No `build_resume`: a real implementation would hand the captured
-            // session id to `claude -r/--resume <id>` (fork forms add
-            // `--fork-session` / `--session-id`; verified against claude
-            // 2.1.248). Unimplemented, so the derived flag stays false.
+            // Resume is implemented, so the derived `resume` flag is true.
             resume: self.supports_resume(),
             skip_permissions: true,
             native_sandbox: false,
@@ -279,6 +276,60 @@ impl ProviderAdapter for ClaudeAdapter {
         }
         cmd.current_dir(&opts.cwd);
         cmd
+    }
+
+    /// Resume is implemented, so the derived `Capabilities.resume` reports true.
+    fn supports_resume(&self) -> bool {
+        true
+    }
+
+    /// Continue `session_id` with a new prompt: the cold command plus `-r <id>`
+    /// (verified against claude 2.1.339: `-r, --resume [value]`, "Resume an
+    /// existing session, continuing the session specified by its ID"). Never
+    /// `--session-id` alongside: that names a new or forked session, and spar
+    /// resumes in place. The id comes only from the sid argument (D2: the
+    /// dispatcher clears `opts.session_id` before calling), so the headless
+    /// builder's own `--session-id` render can never double-emit here.
+    fn build_resume(&self, bin: &Path, opts: &SpawnOpts, session_id: &str) -> Option<Command> {
+        debug_assert!(
+            opts.session_id.is_none(),
+            "resume must not carry an assigned cold-dispatch id"
+        );
+        let mut cmd = Command::new(bin);
+        cmd.arg("-p");
+        if opts.prompt_file.is_none() {
+            cmd.arg(&opts.prompt);
+        }
+        cmd.arg("--output-format").arg("stream-json");
+        cmd.arg("--verbose");
+        for a in self.permission_args(opts.trust) {
+            cmd.arg(a);
+        }
+        if let Some(m) = &opts.model {
+            cmd.arg("--model").arg(m);
+        }
+        if let Some(e) = opts.effort {
+            cmd.arg("--effort").arg(e.as_str());
+        }
+        for a in &opts.extra_args {
+            cmd.arg(a);
+        }
+        cmd.arg("-r").arg(session_id);
+        cmd.current_dir(&opts.cwd);
+        Some(cmd)
+    }
+
+    /// Fail closed: the vendor wording for a resumed-but-missing session is
+    /// unverified, so a resume that dies before establishing a session never
+    /// reads as a lost rollout. The marker stays and the failure reports like
+    /// any other, instead of a cold retry against a session that may still be
+    /// resumable once the underlying failure clears.
+    fn resume_failure_is_missing_session(
+        &self,
+        _log_text: &str,
+        _session_id: Option<&str>,
+    ) -> bool {
+        false
     }
 
     fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> Command {
@@ -437,6 +488,21 @@ mod tests {
             let (_, args) = command_to_parts(&cmd);
             assert_eq!(dash_val(&args, "--session-id").as_deref(), Some(id));
         }
+    }
+
+    #[test]
+    fn resume_continues_the_session_with_r_and_no_session_id() {
+        let opts = opts_with_session(None);
+        let cmd = ClaudeAdapter
+            .build_resume(Path::new("claude"), &opts, "sess-123")
+            .expect("claude resumes");
+        let (_, args) = command_to_parts(&cmd);
+        assert_eq!(dash_val(&args, "-r").as_deref(), Some("sess-123"));
+        assert!(
+            !args.iter().any(|a| a == "--session-id"),
+            "resume names the session with -r only: {args:?}"
+        );
+        assert!(ClaudeAdapter.supports_resume());
     }
 
     #[test]

@@ -1159,11 +1159,14 @@ mod tests {
 
     #[test]
     fn resume_failure_is_missing_session_defaults_true() {
-        // Adapters with no session-loss signature of their own (i.e. everyone but
-        // codex) keep the pre-existing behavior: any pre-session resume failure is
-        // treated as a lost session, since they have no better signal to distinguish.
-        assert!(GrokAdapter.resume_failure_is_missing_session("anything, or nothing", None));
-        assert!(GrokAdapter.resume_failure_is_missing_session("", Some("sess-1")));
+        // Adapters with no session-loss signature of their own keep the
+        // pre-existing behavior: any pre-session resume failure is treated as a
+        // lost session, since they have no better signal to distinguish. Grok
+        // resumes but its vendor missing-session wording is unverified, so it
+        // opts out: a resumed-but-missing session never auto-retries cold.
+        assert!(AgyAdapter.resume_failure_is_missing_session("anything, or nothing", None));
+        assert!(AgyAdapter.resume_failure_is_missing_session("", Some("sess-1")));
+        assert!(!GrokAdapter.resume_failure_is_missing_session("anything, or nothing", None));
         assert!(!GrokAdapter.dispatch_failure_is_transient("does not exist or you lack access"));
         assert!(!GrokAdapter.is_usage_error(Some(2)));
         assert!(!GrokAdapter.step_budget_exhausted("max-model-steps"));
@@ -1407,8 +1410,9 @@ mod tests {
     fn reported_resume_matches_the_resume_implementation_on_every_adapter() {
         // The reported `Capabilities.resume` is derived from
         // `supports_resume`, which itself must agree with `build_resume`: only
-        // codex, muse and pi implement it, so only they may report true. This pins
-        // all three together so the flag cannot drift from the code again.
+        // claude, codex, grok, muse and pi implement it, so only they may report
+        // true. This pins all five together so the flag cannot drift from the
+        // code again.
         let _pin = codex::pin_codex_env();
         // Hermetic: codex's `build_resume` reads the profile model from
         // `$CODEX_HOME`, which must not be the developer's real config here.
@@ -1449,7 +1453,7 @@ mod tests {
         }
         std::env::remove_var("CODEX_HOME");
         resumed.sort();
-        assert_eq!(resumed, vec!["codex", "muse", "pi"]);
+        assert_eq!(resumed, vec!["claude", "codex", "grok", "muse", "pi"]);
     }
 
     /// Probes are wired only where the CLI has a local check that fails on a dead
