@@ -102,7 +102,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             &provider,
             &store,
             available.as_ref(),
-            state.codex_profile.as_deref(),
+            state.recorded_route(),
         ) {
             if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Reviewer, i, cfg) {
                 if crate::backup::backup_eligible(
@@ -111,7 +111,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
                     available.as_ref(),
                     paths,
                     dry,
-                    state.codex_profile.as_deref(),
+                    state.recorded_route(),
                 ) {
                     if let Ok(bpin) = crate::provider_ref::Pin::parse(&backup_raw) {
                         provider = bpin.display();
@@ -255,7 +255,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             &slot_state,
             &store,
             available.as_ref(),
-            state.codex_profile.as_deref(),
+            state.recorded_route(),
         );
         if !cause.engages_backup() || slot_state.source == Some(crate::state::SeatSource::Backup) {
             continue;
@@ -270,7 +270,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             available.as_ref(),
             paths,
             state.dry_run,
-            state.codex_profile.as_deref(),
+            state.recorded_route(),
         ) {
             continue;
         }

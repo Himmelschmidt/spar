@@ -108,6 +108,9 @@ pub fn run(
     };
     let _ = bus::ensure_bus(paths);
     let _ = bus::join(paths, Some(&state.id), "orchestrator", None, None);
+    // Every dispatch path stamps before seats resolve or quota reads: the pause
+    // horizon and the codex route this dispatch runs under.
+    state.stamp_dispatch();
     state.save(paths)?;
 
     let mut jobs = Vec::new();
@@ -168,9 +171,9 @@ pub fn run(
                 &seat,
                 &store,
                 available.as_ref(),
-                state.codex_profile.as_deref(),
+                state.recorded_route(),
             ) {
-                let key = job.provider_ref().quota_key(state.codex_profile.as_deref());
+                let key = job.provider_ref().quota_key(state.recorded_route());
                 if !still_paused.contains(&key) {
                     still_paused.push(key);
                 }
@@ -287,7 +290,7 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> Vec<PlanSeat> {
             available.as_ref(),
             &paths,
             state.dry_run,
-            state.codex_profile.as_deref(),
+            state.recorded_route(),
         )
         .or_else(|| {
             crate::workflow::roles_resolve::resolve_seat(
@@ -369,7 +372,7 @@ pub fn execute_plan(
                     &slot_state,
                     &store,
                     available.as_ref(),
-                    state.codex_profile.as_deref(),
+                    state.recorded_route(),
                 );
                 if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
                     if let Some(raw) = crate::backup::backup_for_role(job.role, 0, cfg) {
@@ -379,7 +382,7 @@ pub fn execute_plan(
                             available.as_ref(),
                             paths,
                             state.dry_run,
-                            state.codex_profile.as_deref(),
+                            state.recorded_route(),
                         ) {
                             let cur_key = crate::provider_ref::ProviderRef::parse(&job.provider)
                                 .map(|r| r.storage_key())
@@ -626,7 +629,7 @@ fn resolve_test_author(
         &seat_ref,
         &store,
         available.as_ref(),
-        state.codex_profile.as_deref(),
+        state.recorded_route(),
     ) {
         if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg) {
             if crate::backup::backup_eligible(
@@ -635,7 +638,7 @@ fn resolve_test_author(
                 available.as_ref(),
                 paths,
                 state.dry_run,
-                state.codex_profile.as_deref(),
+                state.recorded_route(),
             ) {
                 if let Ok(pin) = crate::provider_ref::Pin::parse(&backup_raw) {
                     provider = pin.display();
@@ -745,7 +748,7 @@ fn run_test_author(
                 &slot_state,
                 &store,
                 available.as_ref(),
-                state.codex_profile.as_deref(),
+                state.recorded_route(),
             );
             if cause.engages_backup() && slot_state.source != Some(crate::state::SeatSource::Backup)
             {
@@ -756,7 +759,7 @@ fn run_test_author(
                         available.as_ref(),
                         paths,
                         state.dry_run,
-                        state.codex_profile.as_deref(),
+                        state.recorded_route(),
                     ) {
                         let cur_key = crate::provider_ref::ProviderRef::parse(&job.provider)
                             .map(|r| r.storage_key())
@@ -1194,6 +1197,10 @@ pub fn replan(
         let _ = std::fs::remove_file(paths.marker(run_id, "stopped"));
     }
     let round = state.begin_round();
+    // The replan is a new dispatch: stamp it (pause horizon and codex route)
+    // before `continue_locked` re-resolves the seats. `continue_locked` stamps
+    // again on entry; same env, same record.
+    state.stamp_dispatch();
     state.amendment = Some(directive);
     // The gate reopens: whatever was approved or rejected was about the old plan.
     state.gates.plan_approved = false;
@@ -1293,25 +1300,16 @@ fn amend_author_seat(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> R
         &seat.provider_ref().display(),
         &store,
         None,
-        state.codex_profile.as_deref(),
+        state.recorded_route(),
     ) {
         return Ok(seat.id);
     }
-    let key = seat
-        .provider_ref()
-        .quota_key(state.codex_profile.as_deref());
+    let key = seat.provider_ref().quota_key(state.recorded_route());
     let sub = crate::quota::sub_key(&seat.provider);
     let backup = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg)
         .filter(|b| crate::quota::sub_key(b) != sub)
         .filter(|b| {
-            crate::backup::backup_eligible(
-                b,
-                &store,
-                None,
-                paths,
-                false,
-                state.codex_profile.as_deref(),
-            )
+            crate::backup::backup_eligible(b, &store, None, paths, false, state.recorded_route())
         });
     let Some(raw) = backup else {
         anyhow::bail!(

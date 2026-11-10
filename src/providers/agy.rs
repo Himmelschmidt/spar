@@ -171,6 +171,7 @@ mod tests {
     ) -> SpawnOpts {
         SpawnOpts {
             codex_profile: None,
+            codex_model: None,
             prompt: prompt.into(),
             prompt_file: file.map(PathBuf::from),
             cwd: PathBuf::from("/tmp"),

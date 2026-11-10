@@ -358,6 +358,7 @@ mod tests {
     fn headless_with_a_prompt_file_reads_the_prompt_from_stdin() {
         let opts = SpawnOpts {
             codex_profile: None,
+            codex_model: None,
             prompt: "implement feature".into(),
             prompt_file: Some(PathBuf::from("/tmp/p.md")),
             cwd: PathBuf::from("/tmp"),
@@ -395,6 +396,7 @@ mod tests {
     fn opts_with_session(session_id: Option<&str>) -> SpawnOpts {
         SpawnOpts {
             codex_profile: None,
+            codex_model: None,
             prompt: "implement feature".into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
