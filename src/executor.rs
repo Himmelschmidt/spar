@@ -1354,7 +1354,12 @@ fn execute_prepared(
     // The previous round's expected artifact dies only now that the dispatch is
     // really going: every fallible pre-spawn step (adapter, binary) is above,
     // so a failure there can no longer orphan the carried file.
-    clear_expected_artifact(&prep.paths, &prep.run_id, &prep.job);
+    let expected = prep
+        .job
+        .expected_artifact
+        .as_ref()
+        .map(|n| prep.paths.artifact(&prep.run_id, n));
+    clear_expected_artifact(prep.job.role, expected.as_deref());
     let cmdline = format!("{} {}", program.display(), args.join(" "));
     // Adapter-derived env (e.g. muse's self-timeout alignment) rides the request:
     // `command_to_parts` drops anything set via `cmd.env`, so merging here is the
@@ -2244,16 +2249,18 @@ fn artifact_fresh_since(path: &Path, since: SystemTime) -> bool {
 /// its ceiling reads kept on the round before's salvaged summary and the panel
 /// re-judges an already-rejected HEAD. The agent, the recovery turn, and the next
 /// salvage each rewrite what they are owed; nothing reads the removed file back.
-fn clear_expected_artifact(paths: &SparPaths, run_id: &str, job: &SlotJob) {
+/// Takes the resolved path so the api-sdk dispatch shares this rule instead of
+/// re-implementing it.
+pub(crate) fn clear_expected_artifact(role: SlotRole, artifact: Option<&Path>) {
     // Only the implementer's kept-read credits a same-named artifact from a previous
     // dispatch, so only its dispatch starts over. The planner and the critic share
     // `plan.md`, one rewriting what the other wrote: clearing it at the critic's
     // dispatch deletes the draft before the critic reads it.
-    if !role_is_recoverable(job.role) {
+    if !role_is_recoverable(role) {
         return;
     }
-    if let Some(name) = &job.expected_artifact {
-        let _ = std::fs::remove_file(paths.artifact(run_id, name));
+    if let Some(path) = artifact {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -3506,7 +3513,7 @@ fn mark_pause_strong(paths: &SparPaths, key: &str) {
 /// judged on its typed verdicts only, never on log text, with one exception: a hard
 /// ceiling kill ran its full budget, so its log is the provider's own record and a
 /// typed or strong quota signal in it still parks and pauses. The broad bare-word
-/// scrapes never run on that tail — the transcript is also the agent's own prose,
+/// scrapes never run on that tail: the transcript is also the agent's own prose,
 /// and a line like `editing src/quota.rs, test capacity check passed` must not pause
 /// the provider for every run in the project. Any other kill (a stop, a nudge, the
 /// machine) says nothing about the provider and reads as empty.
@@ -4593,7 +4600,11 @@ fn run_headless(
     let (program, args) = sandbox::maybe_wrap(state.isolation, cwd, &program, &args);
     // See `execute_prepared`: the previous round's expected artifact dies only
     // once the dispatch is really going, never on a pre-spawn failure.
-    clear_expected_artifact(paths, &state.id, job);
+    let expected = job
+        .expected_artifact
+        .as_ref()
+        .map(|n| paths.artifact(&state.id, n));
+    clear_expected_artifact(job.role, expected.as_deref());
     let cmdline = format!("{} {}", program.display(), args.join(" "));
     // See `execute_prepared`: adapter-derived env rides the request, not the `Command`.
     let mut dispatch_env = env.to_vec();
@@ -5094,7 +5105,11 @@ fn run_tmux(
         .ok_or_else(|| anyhow::anyhow!("provider {} not on PATH", job.provider))?;
     // See `execute_prepared`: the previous round's expected artifact dies only
     // once the dispatch is really going, never on a pre-spawn failure.
-    clear_expected_artifact(paths, &state.id, job);
+    let expected = job
+        .expected_artifact
+        .as_ref()
+        .map(|n| paths.artifact(&state.id, n));
+    clear_expected_artifact(job.role, expected.as_deref());
     let mut opts = SpawnOpts {
         prompt: prompt.to_string(),
         prompt_file: Some(prompt_path.to_path_buf()),
@@ -8619,6 +8634,54 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(outcome_hit(&paths, "cli:muse", &log_path, &outcome).0);
     }
 
+    /// A dispatch that dies before spawning (here: no such provider) keeps the
+    /// carried artifact: the clear runs only once the dispatch is really going,
+    /// so a resume still finds the previous round's summary.
+    #[test]
+    fn pre_spawn_failure_keeps_the_carried_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        let state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        let job = SlotJob {
+            slot_id: "impl".into(),
+            provider: "cli:no-such-provider".into(),
+            role: SlotRole::Implementer,
+            template: String::new(),
+            extra_vars: std::collections::HashMap::new(),
+            expected_artifact: Some("summary-impl.md".into()),
+            model: None,
+            effort: None,
+        };
+        let carried = paths.artifact("r1", "summary-impl.md");
+        std::fs::write(&carried, "carried summary\n").unwrap();
+        let err = match run_headless(
+            &state,
+            &paths,
+            &Config::default(),
+            &job,
+            tmp.path(),
+            &tmp.path().join("s.log"),
+            &tmp.path().join("p.md"),
+            "prompt",
+            std::time::Duration::from_secs(1),
+            &[],
+        ) {
+            Ok(_) => panic!("no such provider fails before spawn"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("no-such-provider"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&carried).unwrap(),
+            "carried summary\n",
+            "a pre-spawn failure must not clear the carried artifact"
+        );
+    }
+
     /// The same log on an ordinary non-zero exit still routes and pauses: the signal
     /// gate must not swallow a real rejection.
     #[test]
@@ -9058,7 +9121,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         std::fs::write(repo.join("plain.txt"), "plain\n").unwrap();
         let combo = snapshot_combo(&repo).expect("a newline name still snapshots");
         let expected = std::process::Command::new("git")
-            .args(["hash-object", odd])
+            .args(["hash-object", "--", odd])
             .current_dir(&repo)
             .output()
             .unwrap();
