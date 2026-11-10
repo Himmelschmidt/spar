@@ -59,14 +59,16 @@ pub fn expand_home(raw: &str) -> std::path::PathBuf {
 
 /// Block `SIGCHLD` on the calling thread until the guard drops.
 ///
-/// Slot children are spawned and reaped on other threads of this process, so a
-/// thread blocked in a socket read can draw EINTR from `SIGCHLD` (default
-/// disposition: no handler runs, the syscall still fails) instead of the
-/// caller's timeout. ureq surfaces that as a typed `Error::Io` with kind
-/// `Interrupted`, and re-sending a POST after one is wrong: the server may
-/// already have accepted or answered it, billing another completion. Hold this
-/// guard for the whole HTTP call instead, and the kernel delivers the signal
-/// to a thread that leaves it unblocked. The previous mask is restored on drop.
+/// Slot children are spawned and reaped on other threads of this process. At
+/// `SIGCHLD`'s default disposition the kernel never interrupts a syscall for
+/// one, but any installed handler (this process installs none today; a future
+/// dependency may) turns every child reap into an EINTR on whatever blocking
+/// read is in flight. ureq forwards that as a typed `Error::Io` with kind
+/// `Interrupted` instead of retrying, and re-sending a POST after one is
+/// wrong: the server may already have accepted or answered it, billing another
+/// completion. Hold this guard for the whole HTTP call instead, and the kernel
+/// delivers the signal to a thread that leaves it unblocked. The previous mask
+/// is restored on drop.
 pub struct SigchldGuard {
     saved: libc::sigset_t,
     _thread: std::marker::PhantomData<*const ()>,
@@ -127,26 +129,114 @@ pub fn fmt_elapsed(d: Duration) -> String {
     }
 }
 
+/// Test-only SIGCHLD churn and handler helpers, shared by the mask mechanism
+/// test here and the HTTP call-site tests. Installing a handler is what makes
+/// `SIGCHLD` interrupt a read at all; the handler is process-global while
+/// installed, so every user restores it (via `InstalledHandler`'s drop) before
+/// asserting.
+#[cfg(test)]
+pub(crate) mod sigchld_test {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    };
+
+    extern "C" fn noop(_: libc::c_int) {}
+
+    /// A no-op `SIGCHLD` handler, restored to the previous disposition on drop.
+    pub(crate) struct InstalledHandler {
+        old: libc::sigaction,
+    }
+
+    impl InstalledHandler {
+        pub(crate) fn install() -> Self {
+            unsafe {
+                let mut new: libc::sigaction = std::mem::zeroed();
+                new.sa_sigaction = noop as *const () as usize;
+                libc::sigemptyset(&mut new.sa_mask);
+                new.sa_flags = 0;
+                let mut old: libc::sigaction = std::mem::zeroed();
+                let rc = libc::sigaction(libc::SIGCHLD, &new, &mut old);
+                assert_eq!(rc, 0, "installing the SIGCHLD probe handler");
+                Self { old }
+            }
+        }
+    }
+
+    impl Drop for InstalledHandler {
+        fn drop(&mut self) {
+            unsafe {
+                let rc = libc::sigaction(libc::SIGCHLD, &self.old, std::ptr::null_mut());
+                assert_eq!(rc, 0, "restoring the SIGCHLD disposition");
+            }
+        }
+    }
+
+    /// Short-lived child churn on unmasked threads: every reap delivers
+    /// `SIGCHLD` to some thread that leaves it unblocked.
+    pub(crate) struct Churn {
+        running: Arc<AtomicBool>,
+        reaped: Arc<AtomicU64>,
+        handles: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl Churn {
+        pub(crate) fn spawn(threads: usize) -> Self {
+            let running = Arc::new(AtomicBool::new(true));
+            let reaped = Arc::new(AtomicU64::new(0));
+            let handles = (0..threads)
+                .map(|_| {
+                    let (flag, count) = (running.clone(), reaped.clone());
+                    std::thread::spawn(move || {
+                        while flag.load(Ordering::Relaxed) {
+                            let _ = std::process::Command::new("/bin/true").status();
+                            count.fetch_add(1, Ordering::Relaxed);
+                        }
+                    })
+                })
+                .collect();
+            Self {
+                running,
+                reaped,
+                handles,
+            }
+        }
+
+        pub(crate) fn reaped(&self) -> u64 {
+            self.reaped.load(Ordering::Relaxed)
+        }
+
+        pub(crate) fn counter(&self) -> Arc<AtomicU64> {
+            self.reaped.clone()
+        }
+
+        pub(crate) fn stop(self) {
+            self.running.store(false, Ordering::Relaxed);
+            for handle in self.handles {
+                handle.join().unwrap();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The SIGCHLD mask must hold for the whole HTTP call and restore after.
-    /// `TcpStream::read` retries `EINTR` internally, so `Interrupted` can never
-    /// surface from a plain read on any kernel: no read shape separates masked
-    /// from unmasked here (a directed SIGCHLD storm and a funneled real-child
-    /// storm both leave reads undisturbed on this kernel). The guard therefore
-    /// pins the mechanism itself: the mask is set inside the guard and restored
-    /// on drop, real child exits keep SIGCHLD pending for the duration of a
-    /// masked read, and the read still gets its byte. Removing the guard fails
-    /// the set-inside assertion on the first iteration.
+    /// `SIGCHLD` at its default disposition never interrupts a read, and even
+    /// with a handler installed a child-reaping storm is the wrong signal
+    /// source for a test: the kernel keeps delivering to one target thread, so
+    /// the reading thread wins a lottery and sometimes observes none of
+    /// hundreds of reaps. A helper thread instead directs `SIGCHLD` at this
+    /// thread with `pthread_kill` while it blocks in `read`, deterministically
+    /// and only then; the server holds the byte until the kills are out. One
+    /// `read` per syscall surfaces the EINTR (`read_exact` would swallow it by
+    /// retrying). The unmasked phase must observe it, the masked phase none.
+    /// Removing `block_sigchld()` from the masked phase fails that assertion.
     #[test]
     fn masked_read_survives_sigchld_churn() {
         use std::io::{Read as _, Write};
-        use std::sync::{
-            atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc,
-        };
 
         fn sigchld_blocked() -> bool {
             unsafe {
@@ -155,88 +245,70 @@ mod tests {
                 libc::sigismember(&cur, libc::SIGCHLD) == 1
             }
         }
-        fn sigchld_pending() -> bool {
-            unsafe {
-                let mut pending: libc::sigset_t = std::mem::zeroed();
-                libc::sigpending(&mut pending);
-                libc::sigismember(&pending, libc::SIGCHLD) == 1
-            }
-        }
 
-        assert!(!sigchld_blocked(), "test thread starts unmasked");
-        for i in 0..2 {
-            let running = Arc::new(AtomicBool::new(true));
-            let reaped = Arc::new(AtomicU64::new(0));
-            let pending_hits = Arc::new(AtomicU64::new(0));
+        fn probe_once(masked: bool) -> (bool, u64) {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
-            let server = {
-                let count = reaped.clone();
-                std::thread::spawn(move || {
-                    let _mask = block_sigchld();
-                    let (mut conn, _) = listener.accept().unwrap();
-                    // The storm is a precondition, not a post-assertion: the byte
-                    // goes out only after the churn is proven real, so a loaded
-                    // machine delays the read instead of failing it. The bound
-                    // keeps a dead spawner a loud failure instead of a hang.
-                    let mut waited = 0;
-                    while count.load(Ordering::Relaxed) <= 500 && waited < 3000 {
-                        std::thread::sleep(Duration::from_millis(10));
-                        waited += 1;
-                    }
-                    conn.write_all(b"x").unwrap();
-                })
-            };
-            let churners: Vec<_> = (0..4)
-                .map(|_| {
-                    let (flag, count) = (running.clone(), reaped.clone());
-                    std::thread::spawn(move || {
-                        let _mask = block_sigchld();
-                        while flag.load(Ordering::Relaxed) {
-                            let _ = std::process::Command::new("/bin/true").status();
-                            count.fetch_add(1, Ordering::Relaxed);
-                        }
-                    })
-                })
-                .collect();
-            let sampler = {
-                let (flag, hits) = (running.clone(), pending_hits.clone());
-                std::thread::spawn(move || {
-                    let _mask = block_sigchld();
-                    while flag.load(Ordering::Relaxed) {
-                        if sigchld_pending() {
-                            hits.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                })
-            };
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let server = std::thread::spawn(move || {
+                let (mut conn, _) = listener.accept().unwrap();
+                done_rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("the kills go out before the byte");
+                conn.write_all(b"x").unwrap();
+            });
+            let tid = unsafe { libc::pthread_self() };
+            let killer = std::thread::spawn(move || {
+                for _ in 0..5 {
+                    std::thread::sleep(Duration::from_millis(20));
+                    let rc = unsafe { libc::pthread_kill(tid, libc::SIGCHLD) };
+                    assert_eq!(rc, 0, "directing SIGCHLD at the reading thread");
+                }
+                done_tx.send(()).unwrap();
+            });
+            let _mask: Option<SigchldGuard> = masked.then(block_sigchld);
             let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-            let _mask = block_sigchld();
-            assert!(
-                sigchld_blocked(),
-                "guard must block SIGCHLD inside, iter {i}"
-            );
+            let mut interrupted = 0u64;
             let mut buf = [0u8; 1];
-            stream.read_exact(&mut buf).unwrap();
-            running.store(false, Ordering::Relaxed);
-            for churn in churners {
-                churn.join().unwrap();
+            let mut got = false;
+            for _ in 0..1000 {
+                match stream.read(&mut buf) {
+                    Ok(_) if buf[0] == b'x' => {
+                        got = true;
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        interrupted += 1;
+                    }
+                    Err(e) => panic!("unexpected read error: {e:?}"),
+                }
             }
-            sampler.join().unwrap();
-            server.join().unwrap();
             drop(_mask);
+            killer.join().unwrap();
+            server.join().unwrap();
+            (got, interrupted)
+        }
+
+        let _handler = sigchld_test::InstalledHandler::install();
+        assert!(!sigchld_blocked(), "test thread starts unmasked");
+        for i in 0..2 {
+            let (got, interrupted) = probe_once(false);
+            assert!(got, "unmasked read still gets its byte, iter {i}");
+            assert!(
+                interrupted > 0,
+                "the directed SIGCHLD must interrupt the unmasked read, else the masked \
+                 phase proves nothing, iter {i}"
+            );
+            let (got, interrupted) = probe_once(true);
+            assert!(got, "masked read still gets its byte, iter {i}");
+            assert_eq!(
+                interrupted, 0,
+                "the mask must hold every SIGCHLD for the masked read, iter {i}"
+            );
             assert!(
                 !sigchld_blocked(),
                 "guard must restore the mask on drop, iter {i}"
-            );
-            assert_eq!(buf, *b"x", "masked read still gets its byte, iter {i}");
-            assert!(
-                reaped.load(Ordering::Relaxed) > 500,
-                "storm must be real, else the read proves nothing, iter {i}"
-            );
-            assert!(
-                pending_hits.load(Ordering::Relaxed) > 0,
-                "SIGCHLD must sit pending for the masked read, iter {i}"
             );
         }
     }

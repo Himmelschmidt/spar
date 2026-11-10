@@ -113,11 +113,7 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<ApiSlotOutcome> {
     // The expected artifact is cleared only once the dispatch actually starts:
     // a resolve failure above must leave the previous round's file alone, and
     // the dry-run arm above returns before any clear the same way.
-    if crate::executor::role_is_recoverable(req.role) {
-        if let Some(artifact) = req.expected_artifact {
-            let _ = std::fs::remove_file(artifact);
-        }
-    }
+    crate::executor::clear_expected_artifact(req.role, req.expected_artifact);
     if let Some(m) = &req.model_override {
         if !m.is_empty() {
             cfg.model = m.clone();
@@ -470,6 +466,87 @@ mod tests {
         assert_eq!(
             outcome.timeout_cause,
             Some(crate::executor::TimeoutCause::HardCeiling)
+        );
+    }
+
+    /// The api-sdk dispatch holds the SIGCHLD mask for the whole HTTP call:
+    /// child churn on the other threads must not fail it with an EINTR read.
+    /// Removing the mask fails this test.
+    #[test]
+    fn api_slot_survives_sigchld_churn() {
+        use std::io::{Read as _, Write as _};
+
+        let _handler = crate::util::sigchld_test::InstalledHandler::install();
+        let churn = crate::util::sigchld_test::Churn::spawn(4);
+        let count = churn.counter();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let len = head
+                .windows(b"Content-Length:".len())
+                .position(|w| w.eq_ignore_ascii_case(b"Content-Length:"))
+                .and_then(|at| {
+                    std::str::from_utf8(&head[at + b"Content-Length:".len()..])
+                        .ok()
+                        .and_then(|rest| {
+                            rest.lines()
+                                .next()
+                                .and_then(|line| line.trim().parse().ok())
+                        })
+                })
+                .unwrap_or(0usize);
+            let mut body = vec![0u8; len];
+            let _ = stream.read_exact(&mut body);
+            // Answer only once the storm has run through the POST's read.
+            let target = count.load(std::sync::atomic::Ordering::Relaxed) + 300;
+            while count.load(std::sync::atomic::Ordering::Relaxed) < target {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let body = r#"{"choices":[{"message":{"content":"FINAL: done"}}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let tmp = tempdir().unwrap();
+        let outcome = run_api_slot(&ApiSlotRequest {
+            provider_name: "openai",
+            prompt: "hello",
+            cwd: tmp.path(),
+            log_path: &tmp.path().join("api.log"),
+            expected_artifact: None,
+            timeout: std::time::Duration::from_secs(30),
+            dry_run: false,
+            model_override: None,
+            role: crate::state::SlotRole::Implementer,
+            credentials: ApiCredentialOverride {
+                api_key: Some("test-key".into()),
+                base_url: Some(format!("http://127.0.0.1:{port}")),
+            },
+        })
+        .expect("masked api slot survives child churn");
+        server.join().unwrap();
+        let reaped = churn.reaped();
+        churn.stop();
+        assert!(
+            outcome.ok,
+            "the churned POST is a success: {}",
+            outcome.error.as_deref().unwrap_or("no error")
+        );
+        assert!(
+            reaped > 200,
+            "the storm must be real during the POST, else the guard proves nothing: {reaped}"
         );
     }
 

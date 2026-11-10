@@ -1328,6 +1328,32 @@ pub mod tests {
         );
     }
 
+    /// The classifier POST holds the SIGCHLD mask for the whole call: child
+    /// churn on the other threads must not fail it with an EINTR read.
+    /// Removing the mask fails this test.
+    #[test]
+    fn live_post_survives_sigchld_churn() {
+        let _handler = crate::util::sigchld_test::InstalledHandler::install();
+        let churn = crate::util::sigchld_test::Churn::spawn(4);
+        // The delayed response keeps the read in flight while the storm runs.
+        let server = loopback(200, &answer_body("auth", 0.99), Duration::from_millis(800));
+        let (status, text) = live_post(
+            &format!("{}/systemone", server.base_url),
+            "test-key",
+            "{}",
+            Duration::from_secs(30),
+        )
+        .expect("masked POST survives child churn");
+        assert_eq!(status, 200);
+        assert!(text.contains("\"auth\""), "{text}");
+        let reaped = churn.reaped();
+        churn.stop();
+        assert!(
+            reaped > 200,
+            "the storm must be real during the POST, else the guard proves nothing: {reaped}"
+        );
+    }
+
     #[test]
     fn errors_timeouts_and_a_missing_key_leave_no_action() {
         let tmp = tempfile::tempdir().unwrap();
