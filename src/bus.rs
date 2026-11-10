@@ -129,8 +129,9 @@ pub struct BusMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_after_round: Option<u32>,
     /// The run round the message was filed in, stamped by [`send`] for run-tagged
-    /// messages. The poll-file render drops a non-`requires_ack` message once the
-    /// run leaves this round, so the file cannot grow without bound (O156).
+    /// messages. The poll-file render drops a non-`requires_ack` message once its
+    /// slot has dispatched in a later round, so the file cannot grow without bound
+    /// yet nothing leaves before the slot had a turn with it in the file (O160).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filed_round: Option<u32>,
     #[serde(default)]
@@ -538,6 +539,13 @@ pub fn slot_caller() -> (Option<String>, Option<String>) {
 /// itself too, or its own poll file keeps listing the acked item until
 /// an unrelated filing.
 pub fn ack(paths: &SparPaths, run: Option<&str>, from: &str, msg_id: &str) -> Result<BusMessage> {
+    // A run-qualified `--from R:slot` without `--run` still names its run: stamp
+    // it so the ack lands in the run's mirror, where the run-scoped ack scan and
+    // the log's recipient gate already read the qualified id.
+    let run = run.or_else(|| {
+        from.split_once(':')
+            .and_then(|(r, _)| crate::state::RunState::load(paths, r).ok().map(|_| r))
+    });
     let msg = send(
         paths,
         BusMessage {
@@ -628,9 +636,50 @@ pub fn message_targets(paths: &SparPaths, msg: &BusMessage) -> Result<Vec<String
     }
 }
 
+/// The qualified targets known to poll their slot file instead of reading the
+/// inbox. `Ack`/`System` copies never render there, so filing them only piles
+/// them up and lets `bus log` report `queued` for control traffic the slot never
+/// reads; the workspace log still records them. Runs without a readable live
+/// (non-`dry_run`) state file as usual: the drain filters stay the backstop.
+fn unrendered_targets(paths: &SparPaths, targets: &[String]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut by_run: HashMap<&str, Vec<&str>> = HashMap::new();
+    for t in targets {
+        if let Some((run, _)) = t.split_once(':') {
+            by_run.entry(run).or_default().push(t);
+        }
+    }
+    for (run, agents) in by_run {
+        let Ok(state) = crate::state::RunState::load(paths, run) else {
+            continue;
+        };
+        if state.dry_run {
+            continue;
+        }
+        for agent in agents {
+            if let Some(short) = agent.strip_prefix(&format!("{run}:")) {
+                if crate::providers::delivery::strategy_for_slot(&state, short)
+                    == crate::providers::DeliveryStrategy::PollFile
+                {
+                    out.insert((*agent).to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 fn deliver_inbox(paths: &SparPaths, msg: &BusMessage) -> Result<()> {
     let targets = message_targets(paths, msg)?;
+    let unrendered = if matches!(msg.kind, MsgKind::Ack | MsgKind::System) {
+        unrendered_targets(paths, &targets)
+    } else {
+        HashSet::new()
+    };
     for t in &targets {
+        if unrendered.contains(t) {
+            continue;
+        }
         let dir = inbox_dir(paths, t);
         fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{}-{}.json", msg.ts.timestamp_millis(), msg.id));
@@ -736,7 +785,16 @@ pub fn inbox(paths: &SparPaths, agent: &str) -> Result<Vec<BusMessage>> {
 /// directory already isolates one agent's traffic — two concurrent runs' same-role slots
 /// have distinct ids (`rA:impl` vs `rB:impl`) and therefore distinct inboxes — so the
 /// drain keys purely on the id with no run-tag filter.
-pub fn inbox_claim(paths: &SparPaths, agent: &str, via: &str) -> Result<Vec<BusMessage>> {
+/// `lists` selects which copies to take: the whole inbox by default, or only the
+/// copies a render would list (the PollFile drain claims those and leaves `Ack`/
+/// `System` copies pending, since the slot never reads them). Expired copies are
+/// always deleted with a `Withdrawn` receipt, never claimed.
+pub fn inbox_claim(
+    paths: &SparPaths,
+    agent: &str,
+    via: &str,
+    lists: impl Fn(&BusMessage) -> bool,
+) -> Result<Vec<BusMessage>> {
     let dir = inbox_dir(paths, agent);
     if !dir.is_dir() {
         return Ok(Vec::new());
@@ -771,67 +829,12 @@ pub fn inbox_claim(paths: &SparPaths, agent: &str, via: &str) -> Result<Vec<BusM
             }
             continue;
         }
-        let dest = claimed_dir.join(name);
-        // Whoever moves the inode owns the message. A concurrent claimer that
-        // already moved it gets ENOENT here and is skipped.
-        if fs::rename(&src, &dest).is_err() {
-            continue;
-        }
-        record_receipt(paths, &m.id, agent, ReceiptEvent::Delivered, via);
-        out.push(m);
-    }
-    out.sort_by_key(|m| m.ts);
-    Ok(out)
-}
-
-/// Claim only the inbox copies the poll-file render would list (see [`poll_lists`]),
-/// plus the expired copies, which are deleted with a `Withdrawn` receipt as in
-/// [`inbox_claim`]. `Ack`/`System` copies stay pending: the slot never reads them,
-/// so claiming them would let `bus log` report `delivered` for a message the slot
-/// never saw (O156). Same atomic-`rename` exactly-once semantics as [`inbox_claim`].
-pub fn inbox_claim_for_poll(
-    paths: &SparPaths,
-    agent: &str,
-    via: &str,
-    lists: impl Fn(&BusMessage) -> bool,
-) -> Result<Vec<BusMessage>> {
-    let dir = inbox_dir(paths, agent);
-    if !dir.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut rounds = RunRounds::default();
-    let claimed_dir = dir.join("claimed");
-    fs::create_dir_all(&claimed_dir)?;
-    let mut sources: Vec<PathBuf> = Vec::new();
-    for e in fs::read_dir(&dir)? {
-        let e = e?;
-        let p = e.path();
-        if p.extension().and_then(|x| x.to_str()) != Some("json") {
-            continue;
-        }
-        sources.push(p);
-    }
-    let mut out: Vec<BusMessage> = Vec::new();
-    for src in sources {
-        let Some(name) = src.file_name() else {
-            continue;
-        };
-        let Ok(contents) = fs::read_to_string(&src) else {
-            continue;
-        };
-        let Ok(m) = serde_json::from_str::<BusMessage>(&contents) else {
-            continue;
-        };
-        if rounds.expired(paths, &m) {
-            if fs::remove_file(&src).is_ok() {
-                record_receipt(paths, &m.id, agent, ReceiptEvent::Withdrawn, "expired");
-            }
-            continue;
-        }
         if !lists(&m) {
             continue;
         }
         let dest = claimed_dir.join(name);
+        // Whoever moves the inode owns the message. A concurrent claimer that
+        // already moved it gets ENOENT here and is skipped.
         if fs::rename(&src, &dest).is_err() {
             continue;
         }
@@ -1185,15 +1188,36 @@ pub fn record_receipt(
 
 /// Each run's current round, read once per pass.
 #[derive(Default)]
-struct RunRounds(HashMap<String, Option<u32>>);
+struct RunRounds {
+    rounds: HashMap<String, Option<u32>>,
+    dispatched: HashMap<String, Option<u32>>,
+}
 
 impl RunRounds {
     fn round(&mut self, paths: &SparPaths, run: &str) -> Option<u32> {
-        *self.0.entry(run.to_string()).or_insert_with(|| {
+        *self.rounds.entry(run.to_string()).or_insert_with(|| {
             crate::state::RunState::load(paths, run)
                 .ok()
                 .map(|s| s.round)
         })
+    }
+
+    /// The round `agent` last dispatched in, or `None` when the run state is
+    /// unreadable or names no such slot. Slot ids arrive in either spelling —
+    /// the short state id or the qualified inbox id — so both match.
+    fn slot_round(&mut self, paths: &SparPaths, run: &str, agent: &str) -> Option<u32> {
+        let key = agent.to_string();
+        if let Some(hit) = self.dispatched.get(&key) {
+            return *hit;
+        }
+        let found = crate::state::RunState::load(paths, run).ok().and_then(|s| {
+            s.slots
+                .iter()
+                .find(|sl| sl.id == agent || agent_ref(Some(run), &sl.id) == agent)
+                .map(|sl| sl.round)
+        });
+        self.dispatched.insert(key, found);
+        found
     }
 
     fn expired(&mut self, paths: &SparPaths, msg: &BusMessage) -> bool {
@@ -1690,8 +1714,8 @@ impl ExpiryGate {
         self.rounds.expired(paths, msg)
     }
 
-    pub(crate) fn round(&mut self, paths: &SparPaths, run: &str) -> Option<u32> {
-        self.rounds.round(paths, run)
+    pub(crate) fn slot_round(&mut self, paths: &SparPaths, run: &str, agent: &str) -> Option<u32> {
+        self.rounds.slot_round(paths, run, agent)
     }
 }
 
@@ -1918,6 +1942,7 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &PathBuf) -> Result<Vec<T>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{RunState, SlotRole};
     use tempfile::tempdir;
 
     #[test]
@@ -2162,11 +2187,13 @@ mod tests {
         assert_eq!(inbox(&paths, &ub).unwrap().len(), 2);
 
         // First claim drains everything; second claim sees nothing.
-        let first = inbox_claim(&paths, &ub, "test").unwrap();
+        let first = inbox_claim(&paths, &ub, "test", |_| true).unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].body, "hello");
         assert_eq!(first[1].body, "world");
-        assert!(inbox_claim(&paths, &ub, "test").unwrap().is_empty());
+        assert!(inbox_claim(&paths, &ub, "test", |_| true)
+            .unwrap()
+            .is_empty());
 
         // Peek after claim is also empty (claimed/ is excluded).
         assert!(inbox(&paths, &ub).unwrap().is_empty());
@@ -2199,10 +2226,10 @@ mod tests {
         chat(&paths, Some("rB"), "a", "b", "for B", MessageBudget::Normal).unwrap();
 
         // Each unique id drains only its own message; neither can reach the other's.
-        let b = inbox_claim(&paths, &ub, "test").unwrap();
+        let b = inbox_claim(&paths, &ub, "test", |_| true).unwrap();
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].body, "for B");
-        let a = inbox_claim(&paths, &ua, "test").unwrap();
+        let a = inbox_claim(&paths, &ua, "test", |_| true).unwrap();
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].body, "for A");
     }
@@ -2330,7 +2357,7 @@ mod tests {
         let m = req_ack(&paths, "a", "b", "please confirm");
         let ub = agent_ref(Some("r1"), "b");
         // Original delivery landed once.
-        assert_eq!(inbox_claim(&paths, &ub, "test").unwrap().len(), 1);
+        assert_eq!(inbox_claim(&paths, &ub, "test", |_| true).unwrap().len(), 1);
 
         // The original send scheduled the first redelivery a default backoff out, so
         // tick from far enough ahead that it (and every base_backoff-0 retry) is due.
@@ -2342,14 +2369,14 @@ mod tests {
         let t1 = tick_acks(&paths, &policy, now).unwrap();
         assert_eq!((t1.redelivered, t1.escalated), (1, 0));
         assert_eq!(
-            inbox_claim(&paths, &ub, "test").unwrap().len(),
+            inbox_claim(&paths, &ub, "test", |_| true).unwrap().len(),
             1,
             "redeliver 1"
         );
         let t2 = tick_acks(&paths, &policy, now).unwrap();
         assert_eq!((t2.redelivered, t2.escalated), (1, 0));
         assert_eq!(
-            inbox_claim(&paths, &ub, "test").unwrap().len(),
+            inbox_claim(&paths, &ub, "test", |_| true).unwrap().len(),
             1,
             "redeliver 2"
         );
@@ -2525,10 +2552,10 @@ mod tests {
         .unwrap();
 
         // Each lands via the recipient's own real drain, keyed purely by unique id.
-        let got_slot = inbox_claim(&paths, &slot_id, "test").unwrap();
+        let got_slot = inbox_claim(&paths, &slot_id, "test", |_| true).unwrap();
         assert_eq!(got_slot.len(), 1);
         assert_eq!(got_slot[0].body, "hi slot");
-        let got_bare = inbox_claim(&paths, "bare", "test").unwrap();
+        let got_bare = inbox_claim(&paths, "bare", "test", |_| true).unwrap();
         assert_eq!(got_bare.len(), 1);
         assert_eq!(got_bare[0].body, "hi bare");
 
@@ -2539,6 +2566,75 @@ mod tests {
         assert_eq!(run_roster[0].agent, slot_id);
         let all = list_presence(&paths, None).unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    /// `Ack`/`System` traffic is never filed to a PollFile slot's inbox: the slot
+    /// reads the poll file, not the inbox, so those copies would pile up unread
+    /// while `bus log` reported them `queued`. A non-poll slot in scope still
+    /// gets its copy.
+    #[test]
+    fn control_traffic_skips_poll_slot_inboxes() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.slots.push(crate::executor::init_slot(
+            "impl",
+            "cli:agy",
+            SlotRole::Implementer,
+        ));
+        state.slots.push(crate::executor::init_slot(
+            "critic",
+            "cli:claude",
+            SlotRole::PlanCritic,
+        ));
+        state.save(&paths).unwrap();
+        join(&paths, Some("r1"), "impl", Some("cli:agy"), None).unwrap();
+        join(&paths, Some("r1"), "critic", Some("cli:claude"), None).unwrap();
+
+        let note = chat(
+            &paths,
+            Some("r1"),
+            "human",
+            "broadcast",
+            "note",
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        // The ack targets both slots but is never filed to the poll slot; only
+        // the hook slot keeps an ack copy.
+        ack(&paths, Some("r1"), "human", &note.id).unwrap();
+
+        // The file-time drain claims listed copies into `claimed/`, so read the
+        // whole inbox tree: anything ever filed to the slot shows up.
+        let kinds = |agent: &str| {
+            let root = inbox_dir(&paths, agent);
+            let mut files: Vec<std::path::PathBuf> = Vec::new();
+            for e in std::fs::read_dir(&root).unwrap() {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    files.extend(std::fs::read_dir(path).unwrap().map(|e| e.unwrap().path()));
+                } else {
+                    files.push(path);
+                }
+            }
+            let mut kinds: Vec<MsgKind> = files
+                .into_iter()
+                .filter(|p| p.is_file())
+                .map(|p| {
+                    let m: BusMessage =
+                        serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+                    m.kind
+                })
+                .collect();
+            kinds.sort_by_key(|k| *k as u8);
+            kinds
+        };
+        assert_eq!(kinds("r1:impl"), [MsgKind::Chat]);
+        assert_eq!(kinds("r1:critic"), [MsgKind::Chat, MsgKind::Ack]);
     }
 
     /// The loop guard reads only a bounded tail of the (workspace-global, unbounded)
@@ -2659,7 +2755,9 @@ mod tests {
         assert!(r.delivered_at.is_none() && r.read_at.is_none());
 
         assert_eq!(
-            inbox_claim(&paths, "r1:impl", "poll_file").unwrap().len(),
+            inbox_claim(&paths, "r1:impl", "poll_file", |_| true)
+                .unwrap()
+                .len(),
             1
         );
         let entries = log_entries(&paths, Some("r1")).unwrap();
@@ -2707,7 +2805,7 @@ mod tests {
             .exists());
 
         let delivered = directed(&paths, "r1", "human", "impl", "use approach B");
-        inbox_claim(&paths, "r1:impl", "stop_hook").unwrap();
+        inbox_claim(&paths, "r1:impl", "stop_hook", |_| true).unwrap();
         let w = withdraw(&paths, &delivered.id).unwrap();
         assert!(w.withdrawn_from.is_empty());
         assert_eq!(w.already_delivered, vec!["r1:impl".to_string()]);
@@ -2771,7 +2869,7 @@ mod tests {
             (0, 0),
             "expired: no redelivery or escalation"
         );
-        let got: Vec<String> = inbox_claim(&paths, "r1:impl", "test")
+        let got: Vec<String> = inbox_claim(&paths, "r1:impl", "test", |_| true)
             .unwrap()
             .into_iter()
             .map(|m| m.id)
@@ -3014,7 +3112,7 @@ mod tests {
         let m = directed(&paths, "r1", "human", "impl", "x");
         rotate_receipts(&paths, 1);
         assert!(rotated_receipts_path(&paths).is_file());
-        inbox_claim(&paths, "r1:impl", "test").unwrap();
+        inbox_claim(&paths, "r1:impl", "test", |_| true).unwrap();
         let entries = log_entries(&paths, Some("r1")).unwrap();
         let r = receipt(&entries, &m.id);
         assert!(r.queued_at.is_some(), "from the rotated file");
