@@ -409,9 +409,46 @@ pub fn merge_base_forward(dir: &Path, base_ref: Option<&str>) -> Result<BaseMerg
     let Some(remote) = remote else {
         return Ok(BaseMerge::Skipped(BaseMergeSkip::NoRemote));
     };
+    // A ref that resolves to a commit without being a local or
+    // remote-tracking branch is the detached sha a sha-pinned run carries as
+    // its base; a name nothing knows is skipped the same way. Either way the
+    // answer is local, so classify before any network call: an offline repo
+    // reports the skip, not a failed fetch.
+    if !git_quiet(
+        dir,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )? && !git_quiet(
+        dir,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/{remote}/{branch}"),
+        ],
+    )? {
+        if git_out(
+            dir,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{base}^{{commit}}"),
+            ],
+        )
+        .is_some()
+        {
+            return Ok(BaseMerge::Skipped(BaseMergeSkip::NoBranchBase));
+        }
+        return Ok(BaseMerge::Skipped(BaseMergeSkip::NoUpstreamBranch));
+    }
     let remote_ref = format!("refs/remotes/{remote}/{branch}");
-    // Reachability first: a quiet `ls-remote` tells a branch the remote never
-    // had (skip) from a fetch the network refused (the round goes on stale).
+    // Reachability first: a quiet `ls-remote` tells a branch the remote
+    // dropped (skip) from a fetch the network refused (the round goes on stale).
     match git_out(
         dir,
         &[
@@ -423,34 +460,8 @@ pub fn merge_base_forward(dir: &Path, base_ref: Option<&str>) -> Result<BaseMerg
     ) {
         None => return Ok(BaseMerge::Skipped(BaseMergeSkip::FetchFailed)),
         Some(out) if out.is_empty() => {
-            // The remote never had this branch. A name that is a local branch
-            // (or plain unknown) is a branch the remote does not know; a name
-            // that resolves to a commit without being a branch is the detached
-            // sha a sha-pinned run carries as its base.
-            if git_quiet(
-                dir,
-                &[
-                    "show-ref",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/heads/{branch}"),
-                ],
-            )? {
-                return Ok(BaseMerge::Skipped(BaseMergeSkip::NoUpstreamBranch));
-            }
-            if git_out(
-                dir,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    &format!("{base}^{{commit}}"),
-                ],
-            )
-            .is_some()
-            {
-                return Ok(BaseMerge::Skipped(BaseMergeSkip::NoBranchBase));
-            }
+            // A sha or unknown name never reaches the network (classified
+            // above), so this is a branch the remote dropped or never had.
             return Ok(BaseMerge::Skipped(BaseMergeSkip::NoUpstreamBranch));
         }
         Some(_) => {}

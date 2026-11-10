@@ -650,7 +650,7 @@ pub fn ship(
     // The run branch last saw its base when it was cut or merged; pushing a
     // stale branch lands the PR behind and conflicting, so the base merges
     // forward here too (#229). A conflict parks the run at the ship gate.
-    if let Some(code) = merge_base_before_push(paths, &mut state, cfg, &cwd, json)? {
+    if let Some(code) = merge_base_before_push(paths, &mut state, cfg, &cwd, &branch, json)? {
         return Ok(code);
     }
     let title = pr_title(state.task.as_deref(), cfg.ship.title_max);
@@ -829,15 +829,20 @@ pub fn ship(
 /// `adopt_remote`, a remote tip ahead of HEAD is fast-forwarded into the worktree first.
 /// Merge the run's base branch forward before pushing (#229). Clean (or
 /// already current): record the tip and proceed. A branch base with no remote
-/// is skipped with an event. Conflict: abort the merge and park the run at
+/// is skipped with an event, as is a worktree not on the run branch (the
+/// supported ship-from-elsewhere path ships HEAD as-is; merging here would
+/// land the commit on the wrong checkout). A merge the tree refuses to start
+/// (a dirty tree overlapping the upstream change) is a recorded refusal, not
+/// a bare error. Conflict: abort the merge and park the run at
 /// the ship-confirm gate (exit 2) naming the conflict and the remedy, so
 /// `spar implement --run <id>` can hand the resolution to the next round's
-/// implementer. Returns `Some` exit code when the run parked.
+/// implementer. Returns `Some` exit code when the run parked or refused.
 fn merge_base_before_push(
     paths: &SparPaths,
     state: &mut RunState,
     cfg: &Config,
     cwd: &Path,
+    branch: &str,
     json: bool,
 ) -> Result<Option<ExitCode>> {
     if state.dry_run || !cfg.rounds.merge_base {
@@ -846,9 +851,36 @@ fn merge_base_before_push(
     let Some(base_ref) = state.base_ref.clone() else {
         return Ok(None);
     };
-    match worktree::merge_base_forward(cwd, Some(&base_ref))? {
+    if worktree::named_head(cwd).as_deref() != Some(branch) {
+        crate::events::append(
+            paths,
+            &state.id,
+            &crate::events::Event::info(format!(
+                "skipping base forward merge before ship push: worktree is not on {branch}"
+            )),
+        )?;
+        return Ok(None);
+    }
+    let merged = match worktree::merge_base_forward(cwd, Some(&base_ref)) {
+        Ok(merged) => merged,
+        Err(e) => {
+            let msg = format!("ship refused: could not merge base {base_ref} forward: {e:#}");
+            state.error = Some(msg.clone());
+            state.save(paths)?;
+            let _ =
+                crate::events::append(paths, &state.id, &crate::events::Event::info(msg.clone()));
+            if json {
+                executor::emit_run_json(state)?;
+            } else {
+                eprintln!("{msg}");
+            }
+            return Ok(Some(ExitCode::Failure));
+        }
+    };
+    match merged {
         worktree::BaseMerge::Clean { merged } => {
             state.merged_base = Some(merged.clone());
+            state.gates.ship_parked = false;
             state.save(paths)?;
             crate::events::append(
                 paths,
@@ -862,6 +894,7 @@ fn merge_base_before_push(
         }
         worktree::BaseMerge::AlreadyCurrent { tip } => {
             state.merged_base = Some(tip);
+            state.gates.ship_parked = false;
             state.save(paths)?;
             Ok(None)
         }
@@ -888,6 +921,11 @@ fn merge_base_before_push(
                 state.id
             );
             state.error = Some(msg.clone());
+            // The confirm the operator gave with `--confirm` was for the
+            // unmerged push; the remedy round ships new commits, so it needs
+            // a fresh human confirm rather than sailing through on this one.
+            state.gates.ship_confirmed = false;
+            state.gates.ship_parked = true;
             state.save(paths)?;
             crate::events::append(
                 paths,
