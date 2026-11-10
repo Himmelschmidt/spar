@@ -209,9 +209,30 @@ fn an_implementer_auth_rejection_moves_to_the_declared_backup() {
         .code(4);
     let slot = fx.slot("implementer");
     assert_eq!(slot["provider"], "cli:codex", "{slot}");
-    assert_eq!(slot["source"], "backup");
+    assert_eq!(slot["source"], "cli-backup");
     assert_eq!(fx.count("codex"), 2, "the backup gets its own retry");
     assert!(fx.state()["error"].as_str().unwrap().contains("auth"));
+}
+
+/// A fake CLI that fails its readiness probe and fails dispatches with `dispatch`.
+/// `probe_argv` is the probe's `$1` (`auth` for claude, `login` for codex).
+fn unhealthy_cli(name: &str, probe_argv: &str, dispatch: &str) -> String {
+    format!(
+        "case \"$1\" in -p|exec) echo x >> \"$FAKE_COUNT_DIR/{name}.count\"\n{dispatch};; {probe_argv}) echo 'probe failed' >&2; exit 1;; *) exit 0;; esac"
+    )
+}
+
+/// Seeds a fresh vals bench cache so `--select` ranks without network.
+fn seed_bench(home: &Path, models: &str) {
+    let dir = home.join("cache/vals");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("swebench.json"),
+        format!(
+            "{{\"bench\":\"swebench\",\"source\":\"vals\",\"url\":\"https://example.invalid\",\"fetched_at\":\"2026-01-01T00:00:00Z\",\"models\":[{models}]}}"
+        ),
+    )
+    .unwrap();
 }
 
 fn list_entry(fx: &Fixture, name: &str) -> serde_json::Value {
@@ -499,7 +520,7 @@ fn a_quota_paused_backup_is_probed_and_used_when_it_answers() {
         .code(1);
     let slot = fx.slot("implementer");
     assert_eq!(slot["provider"], "cli:codex", "{slot}");
-    assert_eq!(slot["source"], "backup");
+    assert_eq!(slot["source"], "cli-backup");
     assert_eq!(fx.count("codex"), 2, "one probe, one dispatch");
     assert!(
         fx.quota()["providers"].get("cli:codex").is_none()
@@ -546,7 +567,7 @@ fn a_bucket_paused_codex_backup_is_probed_and_used_when_it_answers() {
         .code(1);
     let slot = fx.slot("implementer");
     assert_eq!(slot["provider"], "cli:codex", "{slot}");
-    assert_eq!(slot["source"], "backup");
+    assert_eq!(slot["source"], "cli-backup");
     assert_eq!(fx.count("codex"), 2, "one probe, one dispatch");
     assert_eq!(
         fx.quota()["providers"]["cli:codex@openrouter"]["status"],
@@ -640,7 +661,7 @@ fn a_pause_set_mid_run_moves_the_next_reviewer_to_its_backup() {
     let rev = fx.slot("reviewer");
     assert_eq!(rev["id"], "review-0-cli-codex", "{rev}");
     assert_eq!(rev["provider"], "cli:codex");
-    assert_eq!(rev["source"], "backup");
+    assert_eq!(rev["source"], "cli-backup");
     assert_eq!(fx.state()["phase"], "awaiting_ship_confirm");
 }
 
@@ -725,7 +746,7 @@ fn a_reviewer_that_cannot_run_is_retried_on_its_backup_not_counted_as_a_verdict(
     );
     let rev = fx.slot("reviewer");
     assert_eq!(rev["id"], "review-0-cli-grok");
-    assert_eq!(rev["source"], "backup");
+    assert_eq!(rev["source"], "cli-backup");
     assert_eq!(fx.count("codex"), 1);
     assert_eq!(fx.count("grok"), 1);
     let stub = fx
@@ -851,7 +872,7 @@ fn a_tester_log_saying_429_passed_neither_parks_the_run_nor_moves_a_seat() {
     assert_eq!(rev["id"], "review-0-cli-codex", "{rev}");
     assert_eq!(rev["provider"], "cli:codex");
     for slot in state["slots"].as_array().unwrap() {
-        assert_ne!(slot["source"], "backup", "no seat was moved: {slot}");
+        assert_ne!(slot["source"], "cli-backup", "no seat was moved: {slot}");
     }
     let events = fs::read_to_string(
         fx.proj
@@ -1212,5 +1233,393 @@ fn amend_with_same_sub_backup_parks_with_no_eligible_backup() {
     assert!(
         err.contains("cli:agy@pro") && err.contains("no eligible backup"),
         "{err}"
+    );
+}
+
+#[test]
+fn provider_list_reports_unhealthy_and_unknown_readiness() {
+    let fx = Fixture::new();
+    fx.cli("claude", &unhealthy_cli("claude", "auth", "exit 1"));
+    let claude = list_entry(&fx, "claude");
+    assert_eq!(claude["readiness"], "unhealthy");
+    assert!(
+        claude["available"].as_bool().unwrap(),
+        "the binary resolves"
+    );
+    assert!(
+        claude["readiness_message"]
+            .as_str()
+            .unwrap()
+            .contains("probe failed"),
+        "{claude}"
+    );
+    let grok = list_entry(&fx, "grok");
+    assert_eq!(
+        grok["readiness"], "unknown",
+        "no probe stays eligible: {grok}"
+    );
+    assert!(grok["available"].as_bool().unwrap());
+}
+
+#[test]
+fn unhealthy_provider_is_skipped_by_auto_select_and_unknown_is_kept() {
+    let fx = Fixture::new();
+    fx.cli("claude", &unhealthy_cli("claude", "auth", "exit 1"));
+    fx.cli("grok", "echo x >> \"$FAKE_COUNT_DIR/grok.count\"\nexit 1");
+    // claude's model strictly dominates on accuracy and latency, so it would
+    // rank first if readiness were ignored. CLI-only: the bench ids also map to
+    // api fallbacks, which count usable without keys in this keyless fixture.
+    std::fs::write(
+        fx.proj.join("spar.toml"),
+        "[model_select]\nallow = [\"cli:*\"]\n",
+    )
+    .unwrap();
+    seed_bench(
+        &fx.home,
+        r#"{"id":"anthropic/claude-opus-4-8","accuracy":99.0,"latency":10.0,"cost_per_test":1.0},{"id":"xai/grok-4","accuracy":92.0,"latency":60.0,"cost_per_test":1.0}"#,
+    );
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--select",
+            "auto",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .failure();
+    assert_eq!(fx.count("claude"), 0, "unhealthy is never dispatched");
+    assert!(fx.count("grok") >= 1, "unknown stays eligible");
+    let state = fx.state();
+    let providers: Vec<&str> = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["provider"].as_str().unwrap())
+        .collect();
+    assert!(!providers.is_empty());
+    assert!(
+        providers.iter().all(|p| *p == "cli:grok"),
+        "every seat skips claude: {providers:?}"
+    );
+    assert!(
+        state.get("warnings").is_none(),
+        "auto-selection warns nothing: {}",
+        state["warnings"]
+    );
+}
+
+#[test]
+fn unhealthy_cli_backup_still_dispatches_with_a_warning() {
+    let fx = Fixture::new();
+    fx.cli(
+        "claude",
+        &unhealthy_cli(
+            "claude",
+            "auth",
+            &format!("echo '{CLAUDE_REVOKED}'\nexit 1"),
+        ),
+    );
+    fx.cli(
+        "codex",
+        &unhealthy_cli("codex", "login", "echo 'Not logged in' >&2\nexit 1"),
+    );
+    let out = fx
+        .spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--providers",
+            "cli:claude",
+            "--backup",
+            "implementer=cli:codex",
+            "--without",
+            "suite",
+            "--json",
+        ])
+        .assert()
+        .code(4)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("cli:claude") && stderr.contains("unhealthy"),
+        "the pinned primary warns: {stderr}"
+    );
+    assert!(
+        stderr.contains("cli:codex") && stderr.contains("unhealthy"),
+        "the unhealthy CLI backup warns when it engages: {stderr}"
+    );
+    let slot = fx.slot("implementer");
+    assert_eq!(slot["provider"], "cli:codex", "{slot}");
+    assert_eq!(slot["source"], "cli-backup", "{slot}");
+    assert!(
+        fx.count("codex") >= 1,
+        "a --backup naming a provider is a pin and still dispatches"
+    );
+    let warnings = fx.state()["warnings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("cli:codex")),
+        "the engaged backup warning is recorded: {warnings:?}"
+    );
+}
+
+#[test]
+fn unhealthy_file_backup_is_skipped_and_the_run_stays_on_the_primary() {
+    let fx = Fixture::new();
+    fx.cli(
+        "claude",
+        &unhealthy_cli(
+            "claude",
+            "auth",
+            &format!("echo '{CLAUDE_REVOKED}'\nexit 1"),
+        ),
+    );
+    fx.cli(
+        "codex",
+        &unhealthy_cli("codex", "login", "echo 'Not logged in' >&2\nexit 1"),
+    );
+    std::fs::write(
+        fx.proj.join("spar.toml"),
+        "[backups]\nimplementer = \"cli:codex\"\n",
+    )
+    .unwrap();
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--providers",
+            "cli:claude",
+            "--without",
+            "suite",
+            "--json",
+        ])
+        .assert()
+        .code(4)
+        .get_output();
+    let slot = fx.slot("implementer");
+    assert_eq!(slot["provider"], "cli:claude", "{slot}");
+    assert_eq!(slot["source"], "cli-providers", "{slot}");
+    assert_eq!(
+        fx.count("codex"),
+        0,
+        "a [backups] entry is fallback, not a pin: skipped while unhealthy"
+    );
+}
+
+#[test]
+fn unhealthy_first_order_entry_yields_to_the_next_usable_one_at_launch() {
+    let fx = Fixture::new();
+    fx.cli("claude", &unhealthy_cli("claude", "auth", "exit 1"));
+    fx.cli("grok", &counted("grok", "exit 0"));
+    std::fs::write(
+        fx.proj.join("spar.toml"),
+        "[providers]\norder = [\"cli:claude\", \"cli:grok\"]\n[roles]\nplanner = \"cli:grok\"\n",
+    )
+    .unwrap();
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--without",
+            "suite",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .get_output();
+    let slot = fx.slot("implementer");
+    assert_eq!(slot["provider"], "cli:grok", "{slot}");
+    assert_eq!(slot["source"], "providers-order", "{slot}");
+    assert_eq!(
+        fx.count("claude"),
+        0,
+        "auto-selection never dispatches the unhealthy first entry"
+    );
+}
+
+#[test]
+fn explicitly_pinned_unhealthy_provider_still_dispatches_with_a_warning() {
+    let fx = Fixture::new();
+    fx.cli(
+        "codex",
+        &unhealthy_cli("codex", "login", "echo 'Not logged in' >&2\nexit 1"),
+    );
+    let out = fx
+        .spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:codex",
+            "--without",
+            "suite",
+            "--json",
+        ])
+        .assert()
+        .code(4)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("warning") && stderr.contains("cli:codex") && stderr.contains("unhealthy"),
+        "{stderr}"
+    );
+    let run: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = run["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("cli:codex")),
+        "the --json launch output carries the warning: {run}"
+    );
+    assert!(
+        fx.count("codex") >= 1,
+        "the pin still dispatches despite the probe"
+    );
+}
+
+#[test]
+fn unknown_backup_rotates_when_the_primary_fails() {
+    let fx = Fixture::new();
+    fx.cli(
+        "claude",
+        &counted("claude", &format!("echo '{CLAUDE_REVOKED}'\nexit 1")),
+    );
+    // grok has no readiness probe, so it stays `Unknown` no matter what the fake
+    // answers; rotation must still take it once the primary fails environmentally.
+    fx.cli("grok", "echo x >> \"$FAKE_COUNT_DIR/grok.count\"\nexit 1");
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:claude",
+            "--backup",
+            "implementer=cli:grok",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .failure();
+    let slot = fx.slot("implementer");
+    assert_eq!(slot["provider"], "cli:grok", "{slot}");
+    assert_eq!(slot["source"], "cli-backup", "{slot}");
+    assert!(fx.count("grok") >= 1, "an Unknown backup still rotates");
+    assert!(
+        fx.state().get("warnings").is_none(),
+        "a healthy pin warns nothing"
+    );
+}
+
+#[test]
+fn explicitly_pinned_test_author_still_dispatches_with_a_warning() {
+    let fx = Fixture::new();
+    // The planner must succeed so the run reaches spec resolution. The agent is
+    // told to write its artifact under the run's artifacts dir, so the fake
+    // drops both files there for every run in the project (there is only one).
+    let succeed = "for d in \"$FAKE_PROJECT_ROOT\"/.spar/runs/*/artifacts; do echo ok > \"$d/plan.md\"; echo ok > \"$d/test-contract.md\"; done; exit 0";
+    fx.cli(
+        "claude",
+        &format!("case \"$1\" in auth) exit 0;; *) {succeed};; esac"),
+    );
+    fx.cli("codex", &unhealthy_cli("codex", "login", succeed));
+    let out = fx
+        .spar()
+        .args([
+            "plan",
+            "-t",
+            "work",
+            "--providers",
+            "cli:claude",
+            "--role",
+            "test_author=cli:codex",
+            "--json",
+        ])
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+    let run: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let author = run["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "test_author")
+        .expect("a test-author slot");
+    assert_eq!(author["provider"], "cli:codex", "{author}");
+    let warnings = run["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("cli:codex")),
+        "the --json launch output carries the warning: {run}"
+    );
+}
+
+#[test]
+fn explicitly_pinned_tester_still_dispatches_with_a_warning() {
+    let fx = Fixture::new();
+    std::fs::write(fx.proj.join("spar.toml"), "[suite]\nenabled = true\n").unwrap();
+    fx.cli(
+        "claude",
+        &counted(
+            "claude",
+            "for d in \"$FAKE_PROJECT_ROOT\"/.spar/runs/*/artifacts; do echo ok > \"$d/summary-impl.md\"; done; exit 0",
+        ),
+    );
+    fx.cli("codex", &unhealthy_cli("codex", "login", "exit 0"));
+    let out = fx
+        .spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:claude",
+            "--role",
+            "tester=cli:codex",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("cli:codex") && stderr.contains("unhealthy"),
+        "{stderr}"
+    );
+    let run = fx.state();
+    let tester = run["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "tester")
+        .expect("a tester slot");
+    assert_eq!(tester["provider"], "cli:codex", "{tester}");
+    assert_eq!(tester["source"], "cli-role", "{tester}");
+    let warnings = run["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("cli:codex")),
+        "the run carries the pin warning: {run}"
+    );
+    assert!(
+        fx.count("codex") >= 1,
+        "the pinned tester dispatched despite the failed probe"
     );
 }

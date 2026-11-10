@@ -240,8 +240,8 @@ mod tests {
             dispatch_head: None,
             dispatch_tree: None,
             build_cache: None,
-            former_ids: Vec::new(),
             classifier: None,
+            reviewer_kind: None,
         }
     }
 

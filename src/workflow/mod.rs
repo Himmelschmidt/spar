@@ -37,6 +37,9 @@ pub struct CommonOpts {
     /// `--accept-contract`: adopt a `test-contract.md` that drifted under the previous
     /// round. Without it, a re-entry that would re-freeze a tampered contract refuses.
     pub accept_contract: bool,
+    /// `--re-review`: send the unchanged HEAD back to the panel instead of counting
+    /// another no-progress dispatch (O180). One-shot: the stall branch consumes it.
+    pub re_review: bool,
     /// `--reload-config`: this re-entry resolved a fresh `Config` rather than reading
     /// the run's frozen one (O27), so seats that already exist are re-resolved from it
     /// instead of keeping the provider they were minted with. Without this, `--role` on
@@ -48,6 +51,10 @@ pub struct CommonOpts {
     /// `--reassign <role|seat>=<provider>`: move existing seats of `--run <id>` to
     /// another provider before this re-entry dispatches (O136).
     pub reassign: Vec<String>,
+    /// A `--select` resolution the launch shaping already ran (to index a
+    /// `--without` reviewer ordinal). The dispatch reuses it instead of
+    /// benchmarking twice, when it asks the same width-and-roles question.
+    pub preselected_pool: Option<crate::workflow::roles_resolve::PreselectedPool>,
 }
 
 impl Default for CommonOpts {
@@ -66,8 +73,10 @@ impl Default for CommonOpts {
             big: false,
             max_rounds: None,
             accept_contract: false,
+            re_review: false,
             key: None,
             reassign: Vec::new(),
+            preselected_pool: None,
         }
     }
 }
@@ -86,6 +95,20 @@ impl CommonOpts {
         cfg: &Config,
         run_id: &str,
     ) -> Result<Vec<String>> {
+        if let Some(pre) = &self.preselected_pool {
+            let same_question = pre.width == n
+                && pre
+                    .roles
+                    .iter()
+                    .map(String::as_str)
+                    .eq(roles.iter().copied());
+            if same_question {
+                if let Some(art) = &pre.artifact {
+                    self.announce_select(paths, run_id, art)?;
+                }
+                return Ok(pre.providers.clone());
+            }
+        }
         let dry = self.resolve_dry_run();
         let select = if self.select.is_empty() {
             None
@@ -101,43 +124,54 @@ impl CommonOpts {
             roles,
             cfg,
             dry,
+            &crate::providers::LiveHealth::for_dry(dry),
         )?;
         if let Some(art) = &resolved.artifact {
-            crate::model_select::write_select_artifact(paths, run_id, art)?;
-            let _ = crate::events::append(
-                paths,
-                run_id,
-                &crate::events::Event {
-                    ts: chrono::Utc::now(),
-                    kind: crate::events::EventKind::Info,
-                    phase: None,
-                    prev_phase: None,
-                    slot: None,
-                    status: None,
-                    round: None,
-                    classifier: None,
-                    message: Some(format!(
-                        "model-select: {}",
-                        art.choices
-                            .iter()
-                            .map(|c| format!("{}→{} ({})", c.vals_id, c.provider, c.profile))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )),
-                },
-            );
-            if !self.json {
-                eprintln!(
+            self.announce_select(paths, run_id, art)?;
+        }
+        Ok(resolved.providers)
+    }
+
+    fn announce_select(
+        &self,
+        paths: &SparPaths,
+        run_id: &str,
+        art: &crate::model_select::SelectArtifact,
+    ) -> Result<()> {
+        crate::model_select::write_select_artifact(paths, run_id, art)?;
+        let _ = crate::events::append(
+            paths,
+            run_id,
+            &crate::events::Event {
+                ts: chrono::Utc::now(),
+                kind: crate::events::EventKind::Info,
+                phase: None,
+                prev_phase: None,
+                slot: None,
+                status: None,
+                round: None,
+                classifier: None,
+                message: Some(format!(
                     "model-select: {}",
                     art.choices
                         .iter()
-                        .map(|c| format!("{}→{}", c.vals_id, c.provider))
+                        .map(|c| format!("{}→{} ({})", c.vals_id, c.provider, c.profile))
                         .collect::<Vec<_>>()
                         .join(", ")
-                );
-            }
+                )),
+            },
+        );
+        if !self.json {
+            eprintln!(
+                "model-select: {}",
+                art.choices
+                    .iter()
+                    .map(|c| format!("{}→{}", c.vals_id, c.provider))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
-        Ok(resolved.providers)
+        Ok(())
     }
 }
 

@@ -100,6 +100,10 @@ name = "round_loop"
 path = "tests/scenarios/round_loop.rs"
 
 [[test]]
+name = "no_progress"
+path = "tests/scenarios/no_progress.rs"
+
+[[test]]
 name = "builtin_suite"
 path = "tests/scenarios/builtin_suite.rs"
 
@@ -162,6 +166,10 @@ path = "tests/scenarios/reviewed_commit.rs"
 [[test]]
 name = "provider_health"
 path = "tests/scenarios/provider_health.rs"
+
+[[test]]
+name = "health_gating"
+path = "tests/scenarios/health_gating.rs"
 
 [[test]]
 name = "quota_buckets"

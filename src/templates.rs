@@ -95,6 +95,7 @@ pub fn base_vars(ctx: &TemplateCtx<'_>) -> HashMap<String, String> {
     m.insert("nudge_file".into(), ctx.nudge_file.into());
     m.insert("nudge_protocol".into(), nudge_protocol(ctx.nudge_file));
     m.insert("plan_body".into(), String::new());
+    m.insert("no_progress_warning".into(), String::new());
     m.insert("amendment_section".into(), String::new());
     m.insert("carry_forward_section".into(), String::new());
     m.insert(
@@ -131,6 +132,18 @@ mod tests {
         let s = render("planner", &v).unwrap();
         assert!(s.contains("fix login"));
         assert!(!s.contains("{{task}}"));
+    }
+
+    #[test]
+    fn implementer_template_renders_warning_first() {
+        let mut v = HashMap::new();
+        v.insert("task".into(), "add login".into());
+        v.insert(
+            "no_progress_warning".into(),
+            "## No-progress warning\nBody\n".into(),
+        );
+        let s = render("implementer", &v).unwrap();
+        assert!(s.starts_with("## No-progress warning\nBody\n"), "{s}");
     }
 
     #[test]

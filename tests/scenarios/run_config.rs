@@ -240,7 +240,7 @@ fn role_flag_fleets_a_run_without_touching_the_project_file() {
 }
 
 #[test]
-fn role_on_a_resume_requires_reload_config() {
+fn role_on_a_resume_amends_without_reload_config() {
     let tmp = tempdir().unwrap();
     let dir = tmp.path();
     init_repo(dir);
@@ -273,14 +273,179 @@ fn role_on_a_resume_requires_reload_config() {
             "implementer=cli:codex",
         ])
         .assert()
-        .code(1)
-        .stdout(predicates::str::contains("--reload-config"));
+        .code(2);
+    let frozen = frozen_config(dir, &run_id);
+    assert_eq!(
+        frozen["roles"]["implementer"],
+        serde_json::json!("cli:codex"),
+        "the amend lands on the frozen config: {frozen:?}"
+    );
+}
+
+/// #234: amending one shaper keeps the others. A later `--without` lands on the
+/// frozen config without disturbing the launch's `--role` / `--effort`.
+#[test]
+fn amend_keeps_other_launch_overrides() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    init_repo(dir);
+    write_roles(dir, "cli:grok");
+
+    let plan = spar_cmd()
+        .current_dir(dir)
+        .args([
+            "plan",
+            "--task",
+            "task A",
+            "--dry-run",
+            "--json",
+            "--role",
+            "implementer=cli:codex",
+            "--effort",
+            "implementer=high",
+        ])
+        .assert()
+        .code(2);
+    let run_id = json_of(&plan)["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    spar_cmd()
+        .current_dir(dir)
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    assert_eq!(
+        frozen_config(dir, &run_id)["suite"]["enabled"],
+        serde_json::json!(true),
+        "the launch leaves the suite on"
+    );
+
+    spar_cmd()
+        .current_dir(dir)
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--dry-run",
+            "--json",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .code(2);
+    let frozen = frozen_config(dir, &run_id);
+    assert_eq!(
+        frozen["roles"]["implementer"],
+        serde_json::json!("cli:codex"),
+        "the amend keeps the launch role: {frozen:?}"
+    );
+    assert_eq!(
+        frozen["effort"]["implementer"],
+        serde_json::json!("high"),
+        "the amend keeps the launch effort: {frozen:?}"
+    );
+    assert_eq!(
+        frozen["suite"]["enabled"],
+        serde_json::json!(false),
+        "the amend drops the suite: {frozen:?}"
+    );
+}
+
+/// #234: `--reload-config` re-reads the file but carries the launch and amend
+/// overrides, so a file edit cannot drop them and a recorded drop stays dropped.
+#[test]
+fn reload_preserves_launch_and_amend_overrides() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    init_repo(dir);
+    write_roles(dir, "cli:grok");
+
+    let plan = spar_cmd()
+        .current_dir(dir)
+        .args([
+            "plan",
+            "--task",
+            "task A",
+            "--dry-run",
+            "--json",
+            "--role",
+            "implementer=cli:codex",
+            "--effort",
+            "implementer=high",
+        ])
+        .assert()
+        .code(2);
+    let run_id = json_of(&plan)["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    spar_cmd()
+        .current_dir(dir)
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    spar_cmd()
+        .current_dir(dir)
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--dry-run",
+            "--json",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .code(2);
+
+    // Another agent claims the shared file, re-enables the suite, and moves the
+    // implementer: the reload must take the file's shape but keep our overrides.
+    std::fs::write(
+        dir.join("spar.toml"),
+        "[roles]\nplanner = \"cli:agy\"\nplan_critic = \"cli:agy\"\n\
+         implementer = \"cli:agy\"\ntest_author = \"cli:agy\"\n\
+         reviewer = [\"cli:agy\"]\n[suite]\nenabled = true\n",
+    )
+    .unwrap();
+    spar_cmd()
+        .current_dir(dir)
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--dry-run",
+            "--json",
+            "--reload-config",
+        ])
+        .assert()
+        .code(2);
+    let frozen = frozen_config(dir, &run_id);
+    assert_eq!(
+        frozen["roles"]["implementer"],
+        serde_json::json!("cli:codex"),
+        "the launch role beats the file: {frozen:?}"
+    );
+    assert_eq!(
+        frozen["effort"]["implementer"],
+        serde_json::json!("high"),
+        "the launch effort beats the file: {frozen:?}"
+    );
+    assert_eq!(
+        frozen["suite"]["enabled"],
+        serde_json::json!(false),
+        "the recorded suite drop beats the file: {frozen:?}"
+    );
+}
+
+fn frozen_config(dir: &std::path::Path, run_id: &str) -> serde_json::Value {
+    let text = std::fs::read_to_string(dir.join(".spar/runs").join(run_id).join("config.json"))
+        .expect("config.json");
+    serde_json::from_str::<serde_json::Value>(&text).expect("json")
 }
 
 fn frozen_suite(dir: &std::path::Path, run_id: &str) -> serde_json::Value {
-    let text = std::fs::read_to_string(dir.join(".spar/runs").join(run_id).join("config.json"))
-        .expect("config.json");
-    serde_json::from_str::<serde_json::Value>(&text).expect("json")["suite"].clone()
+    frozen_config(dir, run_id)["suite"].clone()
 }
 
 /// #172: a run's own suite is a CLI flag frozen into the run, and `--reload-config`

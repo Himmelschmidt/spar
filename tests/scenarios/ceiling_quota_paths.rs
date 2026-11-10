@@ -277,7 +277,7 @@ fn backup_retry_ceiling_kill_banks_a_partial_and_goes_to_review() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|s| s["source"] == "backup"),
+            .any(|s| s["source"] == "cli-backup"),
         "the round ran on the backup seat: {state}"
     );
     let banked = partials[0]["commit"].as_str().expect("banked commit");
@@ -309,7 +309,7 @@ fn backup_retry_ceiling_kill_banks_a_partial_and_goes_to_review() {
     );
 }
 
-/// A backup retry measures the round from its start (O170): the primary
+/// A backup retry measures the round from its start (O189): the primary
 /// commits work, then fails quota, and the backup delivers its summary before
 /// the ceiling kill, so the round is kept as done on the primary's commit.
 /// The retry must not re-stamp the round-start snapshot at failover, or the
@@ -376,7 +376,7 @@ fn backup_retry_measures_work_against_the_round_start() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|s| s["source"] == "backup"),
+            .any(|s| s["source"] == "cli-backup"),
         "the round ran on the backup seat: {state}"
     );
     assert_eq!(

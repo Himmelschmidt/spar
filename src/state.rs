@@ -7,6 +7,7 @@ use crate::provider_ref::ExecBackend;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +39,11 @@ pub struct RunState {
     pub slots: Vec<SlotState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Launch warnings that did not stop the run: explicitly pinned providers
+    /// dispatched despite a failed readiness probe. Recorded once at launch so
+    /// `--json` output carries what stderr printed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     #[serde(default)]
     pub project_root: PathBuf,
     /// Ref every slot worktree is cut from, as the operator named it (branch, tag, sha).
@@ -88,6 +94,24 @@ pub struct RunState {
     /// cannot silently re-ceiling a run in flight. `0` disables the ceiling.
     #[serde(default = "crate::config::default_max_rounds")]
     pub max_rounds: u32,
+    /// Consecutive implementer dispatches that ended with HEAD and the tree unchanged
+    /// while a still-blocking review against that same HEAD stayed open.
+    /// Reset the moment a round moves HEAD or dirties the tree; the second in a row
+    /// parks the run at the round-extension gate instead of buying another review.
+    #[serde(default)]
+    pub no_progress_rounds: u32,
+    /// One-shot operator override set by `implement --run <id> --re-review`: the
+    /// next loop pass skips the implementer dispatch and sends the unchanged
+    /// HEAD straight to the suite and panel (O180). Consumed (cleared) at the
+    /// top of the loop whether or not it fires, so it never leaks into a later
+    /// round.
+    #[serde(default)]
+    pub panel_rerun: bool,
+    /// The warning a no-progress round put at the top of the next implementer
+    /// prompt. Persisted so a re-entry after the park renders it again instead
+    /// of parking silently; cleared the moment a round makes progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_progress_warning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_session: Option<String>,
     #[serde(default)]
@@ -234,6 +258,12 @@ pub struct RunState {
     /// run is put back exactly as this records (O137).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amend_in_progress: Option<AmendInProgress>,
+    /// Reviewer seat ids a `--without` drop retired. A seat keeps its id for the
+    /// life of the run: ids are never renumbered onto survivors and never
+    /// reminted, so history and findings stay pinned to the seat that wrote
+    /// them. Runs saved before this field existed read it back empty.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retired_seat_ids: BTreeSet<String>,
 }
 
 /// How a ceiling-cut partial round left its work, so a rebuilt notice words the
@@ -311,6 +341,9 @@ pub struct ContractAmendment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewHistoryEntry {
     pub round: u32,
+    /// The seat that wrote this entry. Seats keep their ids for the life of
+    /// the run, and a rename migrates the entries it already wrote, so the
+    /// writing id always names the writing seat.
     pub slot_id: String,
     pub review: crate::workflow::review_result::ReviewResult,
 }
@@ -441,6 +474,12 @@ impl RunState {
             return;
         }
         crate::markers::clear_pid(paths, &self.id, old_id);
+        self.rename_slot_in_memory(old_id, new_id);
+    }
+
+    /// The disk-free half of `rename_slot`, for simulations that must read the
+    /// post-move state without touching pid markers.
+    pub(crate) fn rename_slot_in_memory(&mut self, old_id: &str, new_id: &str) {
         for wt in self.worktrees.iter_mut() {
             if wt.slot_id == old_id {
                 wt.slot_id = new_id.to_string();
@@ -448,9 +487,15 @@ impl RunState {
         }
         if let Some(s) = self.slots.iter_mut().find(|s| s.id == old_id) {
             s.id = new_id.to_string();
-            s.former_ids.push(old_id.to_string());
             if let Some(a) = &s.artifact {
                 s.artifact = Some(a.replace(old_id, new_id));
+            }
+        }
+        // The seat continues under its new id, so the entries it already wrote
+        // move with it: identity is the current id, never an alias chain.
+        for e in self.review_history.iter_mut() {
+            if e.slot_id == old_id {
+                e.slot_id = new_id.to_string();
             }
         }
     }
@@ -659,6 +704,11 @@ pub struct SlotState {
     /// for state written before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SeatSource>,
+    /// What kind of reviewer seat this slot holds, recorded when the seat is
+    /// minted. `None` for non-reviewer slots and for state written before this
+    /// field existed (those ids still parse, so the kind is inferred).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_kind: Option<ReviewerSeatKind>,
     /// Set when this dispatch's failure was the provider refusing its credential (401,
     /// a revoked token, "not logged in") after spar's one short-wait retry (O104). An
     /// infrastructure fault, not a verdict on the work: it engages the declared backup
@@ -692,10 +742,6 @@ pub struct SlotState {
     /// dispatch ends so the next one prefers the same warm directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_cache: Option<PathBuf>,
-    /// Ids this seat carried before a backup or `--reassign` renamed it (O85, O136),
-    /// oldest first, so lookups keyed on the id it judged under still find it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub former_ids: Vec<String>,
     /// The failure classifier's last word on this dispatch's routing (O148). Reset at
     /// dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -763,6 +809,10 @@ pub enum SeatSource {
     ModelSelect,
     SuitePreferences,
     Backup,
+    /// A `--backup` CLI entry that took the seat. Unlike a `[backups]` file entry,
+    /// naming it is an explicit pin: it dispatches despite `Unhealthy` readiness
+    /// and warns at launch, the same contract as `--providers` / `--role`.
+    CliBackup,
     /// The operator moved this seat to another provider with `implement --reassign`
     /// (O136). A `--reload-config` re-point leaves it alone.
     Reassigned,
@@ -770,6 +820,23 @@ pub enum SeatSource {
     /// not been threaded onto a real `SeatSource` yet. Never guess `ProvidersOrder`: that
     /// claims a specific rung the seat may never have taken.
     Unknown,
+}
+
+impl SeatSource {
+    /// Named by an explicit seat pin (`--providers`, `--role`, `--backup` on the
+    /// CLI): the seat dispatches despite probe-failed readiness and warns at
+    /// launch instead. A `[backups]` file entry is fallback, not a pin: rotation
+    /// skips it while it is `Unhealthy` and the run stays on the primary.
+    pub fn is_explicit_pin(self) -> bool {
+        matches!(
+            self,
+            SeatSource::CliProviders | SeatSource::CliRole | SeatSource::CliBackup
+        )
+    }
+
+    pub fn is_backup(self) -> bool {
+        matches!(self, SeatSource::Backup | SeatSource::CliBackup)
+    }
 }
 
 /// Provenance of the positional pool a run resolved, at the moment a phase's seats were
@@ -822,7 +889,14 @@ fn one_round() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerSeatKind {
+    Panel,
+    Wide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SlotRole {
     Planner,
@@ -966,6 +1040,7 @@ impl RunState {
             updated_at: now,
             slots: Vec::new(),
             error: None,
+            warnings: Vec::new(),
             project_root,
             base_ref: None,
             base_commit: None,
@@ -983,6 +1058,9 @@ impl RunState {
             fix_rounds: 0,
             max_fix_rounds: 3,
             max_rounds: crate::config::default_max_rounds(),
+            no_progress_rounds: 0,
+            no_progress_warning: None,
+            panel_rerun: false,
             tmux_session: None,
             providers: Vec::new(),
             rotated_implementer: false,
@@ -1017,11 +1095,44 @@ impl RunState {
             ceiling_partial_rounds: Vec::new(),
             amend_in_progress: None,
             pr_state: None,
+            retired_seat_ids: BTreeSet::new(),
         }
     }
 
     pub fn touch(&mut self) {
         self.updated_at = Utc::now();
+    }
+
+    /// Warn once per explicitly pinned provider (`--providers`, `--role`,
+    /// `--backup`) whose readiness probe failed. The pin still dispatches; the
+    /// warning is printed at launch and kept on the run so `--json` output
+    /// carries it. Dry runs never probe, so they record nothing.
+    pub fn record_unhealthy_pin_warnings(&mut self) {
+        if self.dry_run {
+            return;
+        }
+        let providers: Vec<(String, Option<SeatSource>)> = self
+            .slots
+            .iter()
+            .map(|slot| (slot.provider.clone(), slot.source))
+            .collect();
+        for (provider, source) in providers {
+            self.warn_unhealthy_pin(&provider, source);
+        }
+    }
+
+    pub fn warn_unhealthy_pin(&mut self, provider: &str, source: Option<SeatSource>) {
+        if self.dry_run || !source.is_some_and(SeatSource::is_explicit_pin) {
+            return;
+        }
+        let Some(warning) = crate::providers::unhealthy_pin_warning(provider) else {
+            return;
+        };
+        if self.warnings.iter().any(|w| w == &warning) {
+            return;
+        }
+        eprintln!("warning: {warning}");
+        self.warnings.push(warning);
     }
 
     /// Open a new round on this run (O45). Bumps the counter, un-archives, and hands

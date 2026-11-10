@@ -450,7 +450,6 @@ mod tests {
         assert!(!crate::backup::is_provider_eligible(
             "cli:codex",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         let seat = crate::provider_ref::ProviderRef::parse("cli:codex")
@@ -462,7 +461,6 @@ mod tests {
         assert!(crate::backup::is_provider_eligible(
             "cli:codex",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
     }
@@ -606,7 +604,8 @@ mod tests {
 
     /// A fake `codex` answering every call with `body`, with both route vars
     /// pinned at unset (restored after) so a bare ref keys the `openrouter`
-    /// bucket whatever the operator's shell holds.
+    /// bucket whatever the operator's shell holds. The fake dir is prepended
+    /// to the live PATH, so parallel tests still resolve their own binaries.
     fn with_fake_codex(body: &str, f: impl FnOnce(&SparPaths)) {
         let _pin = crate::providers::codex::pin_codex_env();
         let old_path = std::env::var("PATH").unwrap_or_default();
@@ -621,7 +620,7 @@ mod tests {
             std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o755))
                 .unwrap();
         }
-        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        std::env::set_var("PATH", format!("{}:{old_path}", bin.display()));
         f(&SparPaths::new(tmp.path().join("proj")));
         std::env::set_var("PATH", old_path);
     }
@@ -637,7 +636,6 @@ mod tests {
                 !crate::backup::is_provider_eligible(
                     "cli:codex",
                     &loaded,
-                    None,
                     crate::providers::RecordedRoute::ambient()
                 ),
                 "the bucket pause benches the bare seat"
@@ -658,7 +656,6 @@ mod tests {
                 crate::backup::is_provider_eligible(
                     "cli:codex",
                     &fresh,
-                    None,
                     crate::providers::RecordedRoute::ambient()
                 ),
                 "the recovered bucket serves the seat again"
@@ -698,7 +695,6 @@ mod tests {
                     !crate::backup::is_provider_eligible(
                         "cli:codex",
                         &fresh,
-                        None,
                         crate::providers::RecordedRoute::ambient()
                     ),
                     "the seat that hit the wall stays benched"

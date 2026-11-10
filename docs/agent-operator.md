@@ -57,7 +57,20 @@ caught, which is what the sweep is for.
 - **Each run freezes its config** at creation into `.spar/runs/<id>/config.json`. Every later
   phase of that run reads the snapshot, so another agent's edit cannot change its fleet,
   timeouts, spec/suite channels, or ship gate. `spar implement --run <id> --reload-config`
-  re-reads the file and re-freezes; `--role` on a resume without it exits `1`.
+  re-reads the file, re-freezes, and then re-applies the overrides the run was launched
+  or amended with. `--role`, `--backup`, `--effort`, `--without` and `--fleet` amend a
+  resume's frozen config directly (only `--suite-command` still needs `--reload-config`).
+  `--without reviewer[N]` (or an existing seat id) drops a reviewer seat outright: the
+  seat, its review history, and its verdicts stop gating the ship. The ordinal indexes
+  the live panel positions at the moment `--without` is parsed. Dropping the last
+  reviewer is refused, unless `--role reviewer=` in the same amend re-seats the panel
+  to its pin; a run with no live panel seats left fails before dispatch (exit 1) and
+  never reaches the ship gate unreviewed. A bound `--role reviewer=` pin moves, mints
+  or retires live seats to match it, so the panel the dispatch reviews with is the
+  panel the frozen config names. A widened `-wide` extra holds no ordinal (an ordinal
+  past the panel is refused) and keeps reviewing outside the config when the pin it
+  duplicated is dropped. The amend applies only once every launch precondition passes,
+  so a refused launch changes nothing.
 - **`--reassign <role|seat>=<provider>`** on `implement --run <id>` moves a seat that already
   exists to another provider on the same worktree and branch (a reload only changes a
   seat's model). Operator-only; refused while the run's orchestrator is alive and onto a
@@ -122,8 +135,13 @@ reaching it parks the run at the `awaiting_round_extension` human gate (**exit 2
 `--max-rounds <N>` (>= 1, sticky on the run, clears `error`) or stop the run — do not
 loop on re-entering `implement`, which gates again without dispatching. Exit `3`
 (`stuck`) still outranks this gate, and a lift preserves the escalation ladder's
-progress, so a lift loop terminates. A re-entry that would adopt a `test-contract.md`
-that drifted mid-round exits `1` until you pass `--accept-contract`. Between rounds the implementer's
+progress, so a lift loop terminates. Two consecutive implementer dispatches that change nothing
+while a still-blocking review against the same commit is open park at the same
+gate (O178): the first re-dispatches the implementer with a warning before the
+panel runs, the second parks with the reason in `error`. A stall parks before
+the panel, so re-enter after changing the tree, without `--max-rounds` below the ceiling (at the ceiling the park message names the `--max-rounds` value). On every re-entry `--max-rounds` only ever raises: a value resolving under the ceiling keeps it, and an uncapped run stays uncapped. If the blocking review is wrong, rule it out with `spar rule add` and re-enter with `implement --run <id> --re-review` (O180): the unchanged HEAD goes straight back to the suite and panel with the ruling in context, without dispatching the implementer. A re-entry that would
+adopt a `test-contract.md` that drifted mid-round exits `1` until you pass
+`--accept-contract`. Between rounds the implementer's
 `artifacts/carry-forward-<slot>.md` is seeded into the next round's prompt, capped by
 `[rounds] carry_forward_chars`.
 
@@ -150,7 +168,7 @@ spar wait "$RUN_ID" --timeout 2h --json
 
 API keys: `OPENAI_API_KEY`, `XAI_API_KEY`, optional `*_BASE_URL` / `*_MODEL`.
 
-Quota pauses: `spar provider pause <ref>` / `spar provider resume <ref>`, `spar provider list [--json]` shows every pause with its age. agy (Gemini) meters models separately, so a pause lands per model (`cli:agy@flash` never benches `cli:agy@pro`): `resume cli:agy` clears the login and every model under it, `resume cli:agy@<model>` clears one and reports when a login-wide pause still holds it. claude meters its weekly windows per model family: a per-model rejection pauses only `cli:claude@opus` / `@sonnet` / `@fable`, while login-wide windows pause `cli:claude` and hold every family; `resume cli:claude` clears the login and every family, `resume cli:claude@<family>` clears one. codex bills `/` models to one `openrouter` bucket and explicit bare models to a `native` bucket (`cli:codex@native`); only a model-less seat dispatches under the default profile, which layers OpenRouter. The bare login stays the operator key holding both buckets. pi bills `openrouter` models to one bucket and each direct upstream (`direct:<provider>`) to its own; a bare-model seat keys the login. `api:` providers bill per model. grok and muse pause per login. Only seats on a paused bucket stop: a paused seat moves to its backup when it has one, else a paused implementer or tester parks the run at `quota` (exit `4`) while a paused reviewer stands down and the run carries on, parking only when no reviewer can run. A stood-down reviewer records no new verdict, but a `request_changes` it already recorded on the head being shipped still blocks the ship gate, and the ship body marks stood-down seats instead of printing their verdicts. A bare `provider pause <ref>` names the account and holds every bucket under it; naming a model (`provider pause cli:pi@direct:anthropic/x`) pauses just that bucket and leaves its siblings running, and resuming names the same scope. Probes key what the seat would bill, never the whole login: a bare `provider probe cli:codex` keys the ambient route's bucket (an ambient model names its own bucket, so `SPAR_CODEX_MODEL=gpt-5` probes `cli:codex@native`; only a model-less seat under the default profile probes `cli:codex@openrouter`), and `provider probe --run <id>` keys that run's recorded dispatch route. Two models, families, or buckets of one login are one subscription for backups: never a primary's backup.
+Quota pauses: `spar provider pause <ref>` / `spar provider resume <ref>`, `spar provider list [--json]` shows every pause with its age. agy (Gemini) meters models separately, so a pause lands per model (`cli:agy@flash` never benches `cli:agy@pro`): `resume cli:agy` clears the login and every model under it, `resume cli:agy@<model>` clears one and reports when a login-wide pause still holds it. claude meters its weekly windows per model family: a per-model rejection pauses only `cli:claude@opus` / `@sonnet` / `@fable`, while login-wide windows pause `cli:claude` and hold every family; `resume cli:claude` clears the login and every family, `resume cli:claude@<family>` clears one. codex bills `/` models to one `openrouter` bucket and explicit bare models to a `native` bucket (`cli:codex@native`); only a model-less seat dispatches under the default profile, which layers OpenRouter. The bare login stays the operator key holding both buckets. pi bills `openrouter` models to one bucket and each direct upstream (`direct:<provider>`) to its own; a bare-model seat keys the login. `api:` providers bill per model. grok and muse pause per login. Only seats on a paused bucket stop: a paused seat moves to its backup when it has one, else a paused implementer or tester parks the run at `quota` (exit `4`) while a paused reviewer stands down and the run carries on. A panel with no usable reviewer left stops too: `quota` when any reviewer stood down on quota (exit `4`), readiness naming the failed probes when every reviewer stood down for lack of a healthy provider (exit `1`). A stood-down reviewer records no new verdict, but a `request_changes` it already recorded on the head being shipped still blocks the ship gate, and the ship body marks stood-down seats instead of printing their verdicts. A bare `provider pause <ref>` names the account and holds every bucket under it; naming a model (`provider pause cli:pi@direct:anthropic/x`) pauses just that bucket and leaves its siblings running, and resuming names the same scope. Probes key what the seat would bill, never the whole login: a bare `provider probe cli:codex` keys the ambient route's bucket (an ambient model names its own bucket, so `SPAR_CODEX_MODEL=gpt-5` probes `cli:codex@native`; only a model-less seat under the default profile probes `cli:codex@openrouter`), and `provider probe --run <id>` keys that run's recorded dispatch route. Two models, families, or buckets of one login are one subscription for backups: never a primary's backup.
 
 Failure classifier (O148): opt-in `[classifier]` in `~/.config/spar/config.toml` only.
 When on, a failure spar's rules read as work is also put to `typesafe/jev-1.14`; at
