@@ -184,8 +184,7 @@ fn call(
         return CallOutcome::without_output(Verdict::Skipped, Some("not on PATH".into()));
     };
     let opts = SpawnOpts {
-        codex_profile: route.profile.map(str::to_string),
-        codex_model: route.model.map(str::to_string),
+        codex_route: route.into_carrier(),
         prompt: PROBE_PROMPT.into(),
         prompt_file: None,
         cwd: paths.project_root.clone(),

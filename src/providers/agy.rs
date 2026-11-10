@@ -170,8 +170,7 @@ mod tests {
         extra_args: Vec<String>,
     ) -> SpawnOpts {
         SpawnOpts {
-            codex_profile: None,
-            codex_model: None,
+            codex_route: None,
             prompt: prompt.into(),
             prompt_file: file.map(PathBuf::from),
             cwd: PathBuf::from("/tmp"),
