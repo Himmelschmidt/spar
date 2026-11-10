@@ -3613,6 +3613,42 @@ fn run_dry(
     Ok(())
 }
 
+/// How the dry-run implementer behaves under the no-progress test hook.
+enum DryImplMode {
+    /// No hook: the usual stamp next to the scratch cwd, invisible to the
+    /// no-progress tree check.
+    Normal,
+    /// Hook budget unspent: change nothing on disk, so the round stalls.
+    Noop,
+    /// Hook budget spent: the round must count as progress, so the stamp goes
+    /// on visible ground — the project tree outside `.spar/`, which is what
+    /// the tree check sees from the dry-run scratch cwd.
+    Progress,
+}
+
+/// Test hook for the no-progress ladder (#236): `SPAR_DRY_IMPL_NOOP` makes dry-run
+/// implementer dispatches change nothing on disk. A numeric value noops only that
+/// many of the process's first implementer dispatches (a warning re-dispatch can
+/// then make progress); `all` (or any other truthy non-numeric value) noops every
+/// one. `0`, `false`, and unset mean a normal dry-run stamp. Scenario tests drive
+/// this through `implement --run`, which serves every round from one process, so
+/// the per-process counter is exactly per run.
+fn dry_impl_mode() -> DryImplMode {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SPENT: AtomicU64 = AtomicU64::new(0);
+    let raw = std::env::var("SPAR_DRY_IMPL_NOOP").unwrap_or_default();
+    if raw.is_empty() || raw == "0" || raw == "false" {
+        return DryImplMode::Normal;
+    }
+    if let Ok(n) = raw.parse::<u64>() {
+        if n > 0 && SPENT.fetch_add(1, Ordering::SeqCst) < n {
+            return DryImplMode::Noop;
+        }
+        return DryImplMode::Progress;
+    }
+    DryImplMode::Noop
+}
+
 fn write_dry_artifacts(
     state: &RunState,
     paths: &SparPaths,
@@ -3655,17 +3691,31 @@ fn write_dry_artifacts(
                     std::fs::write(&contract, format!("{kept}\n"))?;
                 }
             }
-            let stamp = cwd.join(".spar-dry-implement");
-            std::fs::write(
-                &stamp,
-                format!("implemented (dry-run) by {} for: {task}\n", job.slot_id),
-            )?;
+            // Test hook for the no-progress ladder (#236): a dry-run implementer
+            // that changes nothing on disk, so HEAD and the tree stay exactly as
+            // the open review judged them.
+            match dry_impl_mode() {
+                DryImplMode::Noop => {}
+                DryImplMode::Normal => {
+                    let stamp = cwd.join(".spar-dry-implement");
+                    std::fs::write(
+                        &stamp,
+                        format!("implemented (dry-run) by {} for: {task}\n", job.slot_id),
+                    )?;
+                }
+                DryImplMode::Progress => {
+                    let stamp = state.project_root.join(".spar-dry-implement");
+                    std::fs::write(
+                        &stamp,
+                        format!("implemented (dry-run) by {} for: {task}\n", job.slot_id),
+                    )?;
+                }
+            }
             std::fs::write(
                 paths.artifact(&state.id, &format!("summary-{}.md", job.slot_id)),
                 format!(
-                    "# Summary ({})\n\nDry-run implementation for:\n\n{task}\n\nWrote `{}`.\n",
+                    "# Summary ({})\n\nDry-run implementation for:\n\n{task}\n",
                     job.slot_id,
-                    stamp.display()
                 ),
             )?;
         }

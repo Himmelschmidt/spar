@@ -95,6 +95,7 @@ pub fn base_vars(ctx: &TemplateCtx<'_>) -> HashMap<String, String> {
     m.insert("nudge_file".into(), ctx.nudge_file.into());
     m.insert("nudge_protocol".into(), nudge_protocol(ctx.nudge_file));
     m.insert("plan_body".into(), String::new());
+    m.insert("no_progress_warning".into(), String::new());
     m.insert("amendment_section".into(), String::new());
     m.insert("carry_forward_section".into(), String::new());
     m.insert(
