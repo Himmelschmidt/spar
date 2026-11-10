@@ -200,6 +200,62 @@ pub enum TrustPolicy {
     Prompt,
 }
 
+/// The dispatch route a run recorded at stamp time. Only the codex adapter
+/// interprets it today: `profile` is the recorded `SPAR_CODEX_PROFILE`
+/// (`Some("")` records an empty value, `None` is no record, read ambient),
+/// and `model` the recorded `SPAR_CODEX_MODEL` with the same encoding.
+/// Readers without a run pass `ambient()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedRoute<'a> {
+    pub profile: Option<&'a str>,
+    pub model: Option<&'a str>,
+}
+
+impl<'a> RecordedRoute<'a> {
+    pub fn ambient() -> Self {
+        Self {
+            profile: None,
+            model: None,
+        }
+    }
+
+    pub fn is_recorded(self) -> bool {
+        self.profile.is_some() || self.model.is_some()
+    }
+}
+
+/// What a model-less seat's recorded dispatch route resolves to: `Ambient`
+/// when the run stamped nothing (key from this process's route through the
+/// normal path), `Login` when the recorded route bills the whole login,
+/// `Bucket` for the bucket it bills to. A named type so the
+/// recorded-but-login-wide case stays distinct from the unrecorded one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedRouteBucket {
+    Ambient,
+    Login,
+    Bucket(&'static str),
+}
+
+/// A dispatch route recorded to durable state (history rows): the codex
+/// profile and model the dispatch ran under. Rows that predate recording carry no route and key
+/// the ambient one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredRoute {
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+impl StoredRoute {
+    pub fn as_recorded(&self) -> RecordedRoute<'_> {
+        RecordedRoute {
+            profile: self.profile.as_deref(),
+            model: self.model.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SpawnOpts {
     pub prompt: String,
@@ -243,6 +299,20 @@ pub trait ProviderAdapter: Send + Sync {
     /// key derives from this, never from a name list.
     fn quota_bucket<'m>(&self, _model: &'m str) -> Option<Cow<'m, str>> {
         None
+    }
+    /// The bucket a model-less seat bills to (`None` for the whole login).
+    /// Only adapters whose no-model dispatch routes somewhere other than the
+    /// login override this: codex's default profile layers OpenRouter.
+    fn default_bucket(&self) -> Option<&'static str> {
+        None
+    }
+    /// The bucket a model-less seat bills to under the run's recorded route.
+    /// `Ambient` means no override: the seat keys this process's ambient route
+    /// exactly as a reader without the run would. Only adapters whose route
+    /// depends on recorded state override this; generic key derivation asks
+    /// the adapter instead of naming it.
+    fn recorded_route_bucket(&self, _route: RecordedRoute<'_>) -> RecordedRouteBucket {
+        RecordedRouteBucket::Ambient
     }
     /// The quota bucket a rejection covers, `None` for the whole login: the
     /// signal's votes resolved against the dispatched seat's own bucket. No votes,
@@ -350,6 +420,14 @@ pub trait ProviderAdapter: Send + Sync {
         None
     }
     fn build_headless(&self, bin: &Path, opts: &SpawnOpts) -> Command;
+    /// A probe spawn keyed to a recorded dispatch route (`provider probe
+    /// --run`). Default builds the ambient spawn: the route only changes
+    /// keying, and the spawn reads the same ambient environment. The codex
+    /// adapter replays the recorded profile and model so the spawn bills the
+    /// keyed bucket.
+    fn build_probe(&self, bin: &Path, opts: &SpawnOpts, _route: RecordedRoute<'_>) -> Command {
+        self.build_headless(bin, opts)
+    }
     fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> Command;
 
     /// Build a command that resumes a previously captured native session (e.g. codex's
@@ -1067,7 +1145,7 @@ mod tests {
         // `supports_resume`, which itself must agree with `build_resume`: only
         // codex, muse and pi implement it, so only they may report true. This pins
         // all three together so the flag cannot drift from the code again.
-        let _guard = codex::ENV_LOCK.lock().unwrap();
+        let _pin = codex::pin_codex_env();
         // Hermetic: codex's `build_resume` reads the profile model from
         // `$CODEX_HOME`, which must not be the developer's real config here.
         let home = tempfile::tempdir().unwrap();

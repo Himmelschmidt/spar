@@ -33,6 +33,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     cfg.save_snapshot(paths, &state.id)?;
     state.isolation = cfg.isolation;
     state.dry_run = dry;
+    state.stamp_dispatch();
     if dry {
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
@@ -73,7 +74,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
 
     paths.ensure_run_dirs(&state.id)?;
     bus::ensure_bus(paths)?;
-    bus::join(paths, Some(&state.id), "orchestrator", None, None)?;
+    bus::join(paths, Some(&state.id), bus::ORCHESTRATOR_SEAT, None, None)?;
     for s in &state.slots {
         let _ = bus::join(paths, Some(&state.id), &s.id, Some(&s.provider), None);
     }
@@ -89,7 +90,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     let _ = bus::broadcast(
         paths,
         Some(&state.id),
-        "orchestrator",
+        bus::ORCHESTRATOR_SEAT,
         "roles workflow started — coordinate via bus contracts",
         state.message_budget,
     );

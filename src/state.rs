@@ -7,6 +7,7 @@ use crate::provider_ref::ExecBackend;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +167,26 @@ pub struct RunState {
     /// earlier rounds' verdicts and findings for `.spar/history.jsonl`.
     #[serde(default)]
     pub review_history: Vec<ReviewHistoryEntry>,
+    /// When the current dispatch began: the instant the implement entry point
+    /// stamped this round's seats. A weak pause written before it is pre-existing
+    /// (steer the seat); at or after it belongs to this dispatch (park). `None`
+    /// only for runs stamped before this field existed, which compare against
+    /// `created_at` as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_started_at: Option<DateTime<Utc>>,
+    /// The codex profile (`SPAR_CODEX_PROFILE`) this run's seats dispatch under,
+    /// recorded when the entry point stamped the dispatch: `""` records a
+    /// set-but-empty value (codex's own default, the native login). Quota keying
+    /// for model-less codex seats derives from this, not from whatever the ambient
+    /// environment holds when a later process re-reads the seat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_profile: Option<String>,
+    /// The codex model override (`SPAR_CODEX_MODEL`) in force when the entry point
+    /// stamped the dispatch, same encoding as `codex_profile`. A model-less seat
+    /// spawns with this model, so its quota key must derive from it too; without
+    /// the record the key and the spawn disagree for the life of the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_model: Option<String>,
     /// URL of the PR `ship` opened or adopted, or `sync-prs` found for the branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
@@ -206,6 +227,12 @@ pub struct RunState {
     /// run is put back exactly as this records (O137).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amend_in_progress: Option<AmendInProgress>,
+    /// Reviewer seat ids a `--without` drop retired. A seat keeps its id for the
+    /// life of the run: ids are never renumbered onto survivors and never
+    /// reminted, so history and findings stay pinned to the seat that wrote
+    /// them. Runs saved before this field existed read it back empty.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retired_seat_ids: BTreeSet<String>,
 }
 
 /// What an interrupted `spar amend` must put back.
@@ -247,6 +274,9 @@ pub struct ContractAmendment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewHistoryEntry {
     pub round: u32,
+    /// The seat that wrote this entry. Seats keep their ids for the life of
+    /// the run, and a rename migrates the entries it already wrote, so the
+    /// writing id always names the writing seat.
     pub slot_id: String,
     pub review: crate::workflow::review_result::ReviewResult,
 }
@@ -384,9 +414,15 @@ impl RunState {
         }
         if let Some(s) = self.slots.iter_mut().find(|s| s.id == old_id) {
             s.id = new_id.to_string();
-            s.former_ids.push(old_id.to_string());
             if let Some(a) = &s.artifact {
                 s.artifact = Some(a.replace(old_id, new_id));
+            }
+        }
+        // The seat continues under its new id, so the entries it already wrote
+        // move with it: identity is the current id, never an alias chain.
+        for e in self.review_history.iter_mut() {
+            if e.slot_id == old_id {
+                e.slot_id = new_id.to_string();
             }
         }
     }
@@ -531,6 +567,12 @@ pub struct SlotState {
     /// Reset at dispatch alongside the other per-dispatch fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_commit: Option<String>,
+    /// Why a reviewer slot never dispatched this round: the quota pause that stood
+    /// it down. Recorded at stand-down so the ship gate can mark the seat as
+    /// unjudged instead of presenting its stale artifact as current, and cleared
+    /// at dispatch alongside the other per-dispatch fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stood_down: Option<String>,
     /// What the gate parsed from this reviewer's artifact: verdict, the commit it
     /// names (whether or not it matched), per-AC status and findings. `null` until the
     /// gate reads a review; reset at dispatch.
@@ -552,10 +594,6 @@ pub struct SlotState {
     /// dispatch ends so the next one prefers the same warm directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_cache: Option<PathBuf>,
-    /// Ids this seat carried before a backup or `--reassign` renamed it (O85, O136),
-    /// oldest first, so lookups keyed on the id it judged under still find it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub former_ids: Vec<String>,
     /// The failure classifier's last word on this dispatch's routing (O148). Reset at
     /// dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -858,6 +896,9 @@ impl RunState {
             pool_origin: PoolOrigin::default(),
             pool_intent: Vec::new(),
             review_history: Vec::new(),
+            round_started_at: None,
+            codex_profile: None,
+            codex_model: None,
             pr_url: None,
             merged_at: None,
             merge_commit: None,
@@ -870,6 +911,7 @@ impl RunState {
             contract_amendments: Vec::new(),
             amend_in_progress: None,
             pr_state: None,
+            retired_seat_ids: BTreeSet::new(),
         }
     }
 
@@ -896,6 +938,33 @@ impl RunState {
         self.ship_override = None;
         self.touch();
         self.round
+    }
+
+    /// Mark the start of the current dispatch: the instant quota pauses are read
+    /// against, and the codex route this dispatch's seats run under. Called by
+    /// every entry point that starts a dispatch (plan and review `run`,
+    /// `replan` and `continue`, `amend`, the implement entries and
+    /// resumptions, the arena/roles/peer `run` fns, `reconcile`), never by an
+    /// in-process fix pass: a fix pass is a continuation of the same dispatch,
+    /// and re-stamping it would turn this run's own pauses into pre-existing
+    /// ones and park the run on its own fumes. The executor never stamps:
+    /// every entry stamps before seats resolve, in the same process the spawn
+    /// inherits, so the record and the ambient route the spawn reads agree.
+    pub fn stamp_dispatch(&mut self) {
+        self.round_started_at = Some(chrono::Utc::now());
+        let route = crate::providers::codex::dispatch_route();
+        self.codex_profile = route.profile;
+        self.codex_model = route.model;
+    }
+
+    /// The dispatch route this run recorded at stamp time, for quota keying and
+    /// rejection writes. Both fields are stamped together, so both `None` means
+    /// an old run with no record: key from this process's environment.
+    pub fn recorded_route(&self) -> crate::providers::RecordedRoute<'_> {
+        crate::providers::RecordedRoute {
+            profile: self.codex_profile.as_deref(),
+            model: self.codex_model.as_deref(),
+        }
     }
 
     /// Whether opening another round would take this run past its ceiling (O52).

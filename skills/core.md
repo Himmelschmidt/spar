@@ -100,7 +100,11 @@ probe <ref>` (or `--all` for every installed CLI) makes one tiny real call throu
 adapter (`Reply with the single word OK`, the ref's `@model` if any, 120s cap) and
 writes the answer: `healthy` clears a quota pause, `quota` pauses (until the stated
 reset when claude states one), `auth` and `failed` leave the store alone. A manual pause
-is never cleared by a probe. `--dry-run` (or `SPAR_DRY_RUN=1`) prints the call each
+is never cleared by a probe. A bare `provider probe cli:codex` keys the ambient route's
+bucket (an ambient model names its own bucket, so `SPAR_CODEX_MODEL=gpt-5` probes
+`cli:codex@native`; only a model-less seat under the default profile probes
+`cli:codex@openrouter`); `provider probe --run <id>` keys that run's recorded dispatch
+route instead, replaying its recorded model (O154, O168). `--dry-run` (or `SPAR_DRY_RUN=1`) prints the call each
 probe would make and spawns nothing. Exit is `0` whatever the verdicts; read them from
 `--json`. A declared `--backup` held on a quota pause gets the same probe before a run
 skips it (O106): a stale pause no longer benches a working backup. A manually paused
@@ -110,7 +114,7 @@ a run is live moves its next seat to the declared backup (a reviewer seat is ren
 the new vendor) or parks the run at `quota` (exit `4`) when there is none. Only a manual
 pause or a trusted quota pause (a typed or clear rejection line) does this; a heuristic
 pause from a stray "429" or "quota" in a failed log steers the next run but never parks
-or reseats a live one. Like the run-start gate, this is skipped under `--dry-run`.
+or reseats a live one. Like the run-start gate, this is skipped under `--dry-run`. Pauses are per quota bucket where billing is separate (O153): codex `openrouter` vs `native`, pi `openrouter` vs each `direct:<provider>`, `api:` per model; grok and muse stay login-wide. A pre-dispatch pause moves the seat to its backup when it has one, else a paused reviewer stands down with a warning and the run carries on (it parks at `quota` only when no reviewer can run), while a paused implementer or tester parks the run. A stood-down reviewer records no new verdict, but a `request_changes` it already recorded on the head being shipped still blocks the ship gate, and the ship body marks stood-down seats instead of printing their verdicts. A bare `provider pause <ref>` holds the whole account; naming a model pauses just that bucket, and resuming names the same scope. Probes key what the seat would bill, never the whole login.
 
 **Auth faults (O104).** A dispatch that dies on a refused credential (claude's `401 ...
 OAuth access token has been revoked` or `Please run /login`, codex `Not logged in`, muse
@@ -204,7 +208,9 @@ exceptions are agy, whose Gemini models are metered separately (`cli:agy@flash` 
 model, still holds every model), and claude, whose weekly windows are metered per
 model family (`cli:claude@opus`, `cli:claude@sonnet` and `cli:claude@fable` pause
 independently of each other and of the login; a haiku seat and login-wide windows
-bucket as `cli:claude`). An explicit `@model` beats a
+bucket as `cli:claude`), codex, whose route decides (`/` slugs bucket as `openrouter`,
+explicit bare models as `native`), pi, whose upstream decides (`openrouter` vs each
+`direct:<provider>`), and `api:`, which bills per model. An explicit `@model` beats a
 model chosen by `--select`.
 
 `cli:codex` (codex, `codex exec --json`) drives whatever backend + model a codex **profile**
@@ -392,7 +398,7 @@ pane always does. Keep long tasks out of spar's own argv too: `plan --spec <file
 `--fleet small|standard` and `--without critic,spec,suite` shape the seats for one run without
 touching `spar.toml`; see "Fleet shaping" below.
 
-**Run composition (009).** The new-run form is the run's single partial specification. Workflow is optional (`plan` / `implement` / `review` / `arena`) — leaving it unset lets the Chat orchestrator propose one. Each workflow shows its dispatched roles: `plan` is `planner` plus enabled `plan_critic`/`test_author`; `implement` is `implementer` plus the exact reviewer panel plus `tester` only when no deterministic suite replaces it; `review` is the exact reviewer panel; `arena` is a positional pool of `max_agents.max(2)` contenders. The six assignable roles remain the only role rows; `ranker`, `reconciler` and `peer` keep taking fleet positions. Models are opaque free text with local suggestions (`@model` on any `provider@model` ref, stored as storage key plus optional model via the `Pin` boundary — a conflicting `@model` plus separate model is rejected and a double-model ref never emits). `--role ROLE=PROVIDER[@MODEL]` is repeatable and outranks the pool; `--backup ROLE=PROVIDER[@MODEL]` declares a per-role, per-ordinal fallback. A backup fires only for an environmental stop — quota pause, rate limit, or provider unavailable — never on a nonzero work exit, timeout, missing artifact, or adverse review, and it persists as `SeatSource::Backup`. A slot that ended by signal (or exit 143/137) is judged only on the adapter's typed rejection, never on its log text. It replaces O52's blind implementer rotation only on that cause and only while not yet consumed; arena never accepts or emits `--role` or `--backup` and retains its positional quota semantics. `--backup` is refused on `plan --run`; `implement --run <id>` amends it into the run's frozen config. A backup whose canonical storage key equals its primary is rejected even when models differ. Operator defaults that prefill a newly opened form live at `registry::spar_home()/defaults.json`, never in the project's `spar.toml`; a run still freezes its resolved fleet into `.spar/runs/<id>/config.json` (O27) so deleting or corrupting defaults after launch cannot alter a continuation.
+**Run composition (009).** The new-run form is the run's single partial specification. Workflow is optional (`plan` / `implement` / `review` / `arena`). Leaving it unset lets the Chat orchestrator propose one. Each workflow shows its dispatched roles: `plan` is `planner` plus enabled `plan_critic`/`test_author`; `implement` is `implementer` plus the exact reviewer panel plus `tester` only when no deterministic suite replaces it; `review` is the exact reviewer panel; `arena` is a positional pool of `max_agents.max(2)` contenders. The six assignable roles remain the only role rows; `ranker`, `reconciler` and `peer` keep taking fleet positions. Models are opaque free text with local suggestions (`@model` on any `provider@model` ref, stored as storage key plus optional model via the `Pin` boundary: a conflicting `@model` plus separate model is rejected and a double-model ref never emits). `--role ROLE=PROVIDER[@MODEL]` is repeatable and outranks the pool; `--backup ROLE=PROVIDER[@MODEL]` declares a per-role, per-ordinal fallback. A backup fires only for an environmental stop (quota pause, rate limit, or provider unavailable), never on a nonzero work exit, timeout, missing artifact, or adverse review, and it persists as `SeatSource::Backup`. A slot that ended by signal (or exit 143/137) is judged only on the adapter's typed rejection, never on its log text. It replaces O52's blind implementer rotation only on that cause and only while not yet consumed; arena never accepts or emits `--role` or `--backup` and retains its positional quota semantics. `--backup` is refused on `plan --run`; `implement --run <id>` amends it into the run's frozen config. A backup whose canonical storage key equals its primary is rejected even when models differ. Operator defaults that prefill a newly opened form live at `registry::spar_home()/defaults.json`, never in the project's `spar.toml`; a run still freezes its resolved fleet into `.spar/runs/<id>/config.json` (O27) so deleting or corrupting defaults after launch cannot alter a continuation.
 
 | `--workflow` | Slots | Ends at |
 |---|---|---|
@@ -1221,35 +1227,47 @@ filter** on the drain: each unique id has its own inbox, so a slot never sees an
 run's messages, and a bare agent and a run slot can directed-message each other by id.
 
 ```bash
-spar bus send -m "hello" [--from human] [--to broadcast|agent|impl] [--run <id>]
+spar bus send -m "hello" [--from <agent>] [--to broadcast|agent|impl] [--run <id>]
               [--requires-ack] [--persist] [--supersedes <msg_id>] [--expires-after-round [N]]
 spar bus log [--run <id>] [--json]                 # each message with per-recipient receipts
 spar bus presence [--run <id>]
 spar bus inbox <agent> [--claim] [--run <id>] [--json]
-spar bus reserve path/to/file --holder <agent> [--run <id>]
-spar bus release path/to/file --holder <agent> [--run <id>]
-spar bus deliver <agent> [--run <id>]              # drain inbox + inject at turn boundary (Stop-hook driven)
-spar bus ack <msg_id> --from <agent> [--run <id>]  # stop a requires_ack redelivery
+spar bus reserve path/to/file [--holder <agent>] [--run <id>]
+spar bus release path/to/file [--holder <agent>] [--run <id>]
+spar bus deliver <agent> [--run <id>]              # drain inbox + dispatch to the agent's channel
+spar bus ack <msg_id> [--from <agent>] [--run <id>]  # stop a requires_ack redelivery
 ```
 
 **Send options (O135).**
 
 - `--to impl` needs `--run` and resolves to that run's implementer slot; it errors without
   `--run`, or when the run has none or several (arena), naming them.
-- `--requires-ack` redelivers on backoff until the recipient runs `spar bus ack <id>
-  --from <agent>`, then escalates to `@human`.
+- `--requires-ack` redelivers on backoff until acked
+  (inside a slot `--from`/`--run` default to `$SPAR_AGENT_ID`/`$SPAR_RUN_ID`, so a
+  bare ack records the slot, not the human), then escalates to `@human`. Any ack
+  stops the redelivery: the operator's is the escape hatch for a wedged slot.
+  Only the recipient's ack records the read, so a stranger's ack is filed and
+  shown in the log but never flips the word to `acknowledged` and never drops
+  the item from the slot's file (a withdrawal still does both).
+- Inside a slot, `--from` (send, ack) and `--holder` (reserve, release) default to
+  `$SPAR_AGENT_ID`, so a bare command from a slot is recorded as the slot. An
+  operator ack from outside the run (`--from <run>:<slot>` without `--run`) is
+  stamped with that run when the `--from` names a live one.
 - `--persist` (with `--run`, to the implementer) also puts the message at the top of the
   implementer's carry-forward on **every** dispatch, under "Operator messages", until it
   is superseded, acked by the implementer, or expired. A relaunch or a new round cannot
   drop it. Use it for rulings, not chatter: it repeats every dispatch.
-- `--supersedes <msg_id>` withdraws an earlier message **you** sent: every inbox copy not
-  yet taken is removed and its redelivery stops; a persisted one leaves the carry-forward.
-  A copy already delivered cannot be unread; `--json` reports
+- `--supersedes <msg_id>` withdraws an earlier message **you** sent: the replacement
+  sends first, then every inbox copy not yet taken is removed and its redelivery stops,
+  so a rejected replacement leaves the original filed, listed and logged; a persisted one
+  leaves the carry-forward. A copy already injected into a model's input cannot be unread,
+  but a PollFile slot's copy is taken back out of its poll file; `--json` reports
   `withdrawal: {msg_id, withdrawn_from: [...], already_delivered: [...]}`.
 - `--expires-after-round [N]` (with `--run`; `N` defaults to the round a slot is dispatching
   in, or the next round when the run waits at a gate, the first round anyone reads it in): once
   the run passes round `N` the message is never delivered. A claim withdraws it, `inbox`
-  hides it, redelivery stops, and a persisted one leaves the carry-forward.
+  hides it, the poll file drops it on its next render, redelivery stops, and a persisted
+  one leaves the carry-forward.
 
 **Receipts (O134).** `.spar/bus/receipts.jsonl` gets a line per recipient as a message
 moves: `queued` (written to the inbox), `delivered` (claimed into the agent's channel or
@@ -1259,20 +1277,64 @@ recipient acked it), `withdrawn` (superseded or expired). A poll file or codex q
 `delivered`, not `read`, until an ack. `bus log --json` returns each message with:
 
 ```json
-{"schema_version": 1, "id": "...", "from": "human", "to": "impl", "...": "message fields",
+{"schema_version": 1, "id": "...", "from": "@human", "to": "impl", "...": "message fields",
  "persist": true, "expires_after_round": 3, "refs": {"supersedes": "..."},
  "receipts": [{"recipient": "ab12cd34:impl", "queued_at": "...", "delivered_at": "..." | null,
                "read_at": "..." | null, "withdrawn_at": "..." | null}],
+ "delivery": "queued" | "delivered" | "acknowledged" | "withdrawn",
  "superseded_by": "msg id" | null, "expired": false}
 ```
 
-Each time is the earliest of its kind. `receipts.jsonl` rolls to `receipts.jsonl.1` at
+Each time is the earliest of its kind. `delivery` reads one word off disk per message
+(O158, O159): `acknowledged` once a recipient's ack answers it (terminal, even with
+copies still waiting; a broadcast's send-time recipients are unknowable, so any acker
+counts there), else `delivered` while a claimed copy sits on disk, a withdrawal that
+arrives after the claim cannot unread a message already in the model's input, or a
+`Delivered`/`Read` receipt from a prompt inclusion that left the inbox copy behind,
+else `withdrawn` once a withdrawal postdates every landing, no copy remains, and the
+message was never read (the poll-file case: a claim records no `Read`, and the
+claimed copy is deleted on withdrawal), else `queued` while a copy still waits in
+an inbox, else `withdrawn` when no copy waits anywhere and nothing ever landed.
+For poll-file slots `withdrawn` means taken back out of the file, not never seen:
+reading the file leaves no receipt, so the slot may have read it before the withdrawal.
+A landing the model already saw, any `Read` receipt, from a prompt inclusion,
+a Stop-hook injection, an inbox claim or an ack, stays `delivered` under a
+later withdrawal. It is derived at read time from the inbox directories, the receipts and the
+ack events, never stored, so there is no second copy of the state to drift. A slot's
+poll file (agy, pi) renders its inbox, not an append-only log (O158–O163, O165–O166): every filing,
+withdrawal and round start rewrites it from the pending messages, so a withdrawn or
+expired message disappears from the file. A superseding send skips its own filing
+render; the withdrawal renders holders of the old message and the send path then
+renders the new message's own targets (even if the withdrawal fails), so a
+replacement addressed to a slot that never held the old one still reaches its file. Messages addressed to the slot render (never acks or system prompts), plus
+`Chat` broadcasts from humans, peer slots and the orchestrator, the default
+`--to broadcast` reaches every poll-file slot, while acks and system prompts stay in the
+inbox and the bus log but never become action items. Posting into the live poll file
+counts as `delivered`, and the drain claims only what renders, so `delivered` never
+describes a message the slot cannot see. A send to a poll slot with no running turn
+stays `queued` until the slot's turn starts, when the dispatch-start drain
+claims the backlog (a filing while `Running` claims it too): the round-start
+sweep may already render the copy into the file, but the word flips only on
+the claim. Dry-run runs skip the fan-out (nothing live polls their
+files); the messages stay in the inbox for inspection and no poll file is
+written. A message leaves the file once the slot acks it, the ack filing re-renders
+the acker's own file at once, and the heading names the exact ack command for the
+slot, and a message that asks for no ack also leaves once the slot has finished
+a dispatch that started after the round it was filed in; a render mid-turn never
+drops what the slot may not have opened. `requires-ack` items survive until the
+slot acks them, so the file cannot grow without bound. Claiming alone never clears
+an item. Message kinds the file never renders are never filed to a poll slot's
+inbox at all (the slot reads the file, not the inbox); the workspace log still
+records them.
+`bus deliver --json` reports `delivered` as the messages actually listed in the
+poll file, which can exceed what that call just claimed.
+`receipts.jsonl` rolls to `receipts.jsonl.1` at
 8 MiB (about the last 16 MiB are kept); `bus log` streams both. `bus send --json` returns the message with
 `schema_version` (and `withdrawal` under `--supersedes`). The human `bus log` shows the
-message id and `[delivered n/m, read n/m; superseded by …; expired]`.
+message id and `[queued|delivered|acknowledged|withdrawn; landed n/m, read n/m; superseded by …; expired]`.
 
-A message to `@human` (or any `Blocked` agent) lands in the `@human` inbox
-(`spar bus inbox @human`) and,
+A message to `human` or `@human` (one seat: both spellings canonicalise at send)
+lands in the `@human` inbox (`spar bus inbox @human`) and,
 if `[notify]` is configured, also fires an external notifier. A `requires_ack` message
 redelivers until acked, then escalates to `@human`.
 
@@ -1849,8 +1911,8 @@ it before anyone confirms:
   projected}`), resolved by the same functions the launch uses: plan-phase seats plus the
   projected implement panel for `plan`, the implement panel for `implement -t` and
   `--workflow loop`, the reviewers for `--workflow review`, and the run's own seats for
-  `implement --run <id>` and `plan --run <id>` — with a `--without reviewer[N]` amend
-  applied to the shown fleet, so the dropped seat is gone and survivors show renumbered. Availability, quota pauses and backups are
+  `implement --run <id>` and `plan --run <id>`, with a `--without reviewer[N]` amend
+  applied to the shown fleet, so the dropped seat is gone and survivors keep their ids. Availability, quota pauses and backups are
   not applied, so a paused primary shows as itself. `null` with `--select` and for arena,
   peer and roles.
 - `gates`: `autonomy` plus `auto_plan`, `auto_winner`, `auto_ship`, true when the config
@@ -1936,13 +1998,15 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
   slot (and the spec bus protocol coordinates with the planner alone, addressing nothing to
   a critic that does not exist); `spec` -> `[spec] enabled = false` for this run (no
   `test_author`, no `test-contract.md`); `suite` -> `[suite] enabled = false` for this run
-  (no `tester` slot); `reviewer[N]` -> the panel's Nth seat (0-based) is removed, with its
-  per-ordinal backup, or an existing seat id (`review-1-cli-claude`) names the seat
-  directly. The ordinal indexes the panel the dispatch would use: an explicit
-  `--providers`/`--select` pool beats a `[roles].reviewer` file pin. Dropping a reviewer
-  removes it from the panel, the run's state slots, and
-  the review history, so its verdicts stop gating the ship; the higher remaining seats
-  are renumbered down so ordinals stay contiguous. Unknown names are refused, naming
+  (no `tester` slot); `reviewer[N]` -> the panel's Nth live seat (0-based) is removed,
+  with its per-ordinal backup, or an existing seat id (`review-1-cli-claude`) names
+  the seat directly. The ordinal resolves against the live panel when `--without`
+  is parsed: an explicit `--providers`/`--select` pool beats a `[roles].reviewer`
+  file pin. Dropping a reviewer removes it from the panel, the run's state slots, and
+  the review history, so its verdicts stop gating the ship. Seats keep their ids for
+  the life of the run: nothing renumbers, and a dropped id retires and is never
+  reminted, so a later ordinal always indexes the seats that are actually there.
+  Unknown names are refused, naming
   the valid ones, and dropping every reviewer is refused, since the run would reach
   the ship gate unreviewed. On an existing `--run <id>` it amends the frozen config, exactly
   like `--role`.
@@ -1950,10 +2014,10 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
   passes, so a refused launch (`not resumable`, round ceiling, busy run) changes nothing,
   and the overrides a run
   was launched or amended with (`--role`, `--backup`, `--effort`, without-channel drops,
-  the `--fleet small` narrowing, and any pinned suite command) are recorded in the frozen
+  the `--fleet small` reviewer-width override, and any pinned suite command) are recorded in the frozen
   `config.json`, so a later `--reload-config` re-reads `spar.toml` and then re-applies
-  them in composition order — nothing given before is lost unless restated differently
-  (O153). A run's later round with no flags at all still picks the snapshot up unchanged
+  them in composition order, so nothing given before is lost unless restated differently
+  (O169). A run's later round with no flags at all still picks the snapshot up unchanged
   (O27).
 
 **`--suite-command "<cmd>"`** (repeatable, on `plan` and `implement`) sets this run's
@@ -2005,7 +2069,7 @@ spar implement --run <id> --reload-config   # deliberately re-read spar.toml and
 
 `--reload-config` re-reads `spar.toml` into an existing run's snapshot and then re-applies the overrides the run was launched or amended with, so later resumes keep both the file edits and the earlier flags. `--role`, `--backup`, `--effort`, `--without` and `--fleet` amend a `--run <id>` resume's frozen config directly, without `--reload-config`; only `--suite-command` still needs it. Amending and reloading are both refused while the run's orchestrator is alive. Runs created before snapshots existed fall back to the live file.
 
-`--reload-config` re-points an existing seat's **model**, never its provider (O80): a seat id encodes its provider. To change **who** fills a seat that already exists, reassign it:
+An amend that changes the implementer pin re-points the live `impl` seat (provider, model, source) instead of only its model: that id names no provider. The re-point is validated read-only in the amend preview, so a refused one persists nothing (O175). Any other amend leaves existing seats alone, and a reviewer seat only ever re-points its model, since its id encodes its provider. To change **who** fills a seat that already exists, reassign it:
 
 ```bash
 spar implement --run <id> --reassign implementer=cli:claude@sonnet
