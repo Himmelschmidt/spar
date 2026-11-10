@@ -974,7 +974,7 @@ slot is stuck on.**
   (`exit 143`, a signal) without parsing prose. Exit codes are unchanged.
 - **The ceiling is a clock, not a verdict.** Before an implementer the ceiling killed is
   marked failed, spar checks whether it finished anyway: an expected artifact written
-  during this dispatch keeps the slot `done`; new commits since the dispatch began earn the
+  during this dispatch keeps the slot `done`; new commits since the round began earn the
   same artifact-only recovery turn a clean exit without its artifact gets (below). Either
   way the slot note reads `killed at the hard ceiling after finishing its work; kept as
   done` and the round goes on to review. A dirty tree alone, or commits the recovery turn
@@ -982,7 +982,10 @@ slot is stuck on.**
   `WIP: implementer cut short at hard ceiling (round N, partial work)` commit lands on the
   run branch and the suite and the panel judge it like any round, with the reviewers and
   the next round told the previous pass was cut short. Only a ceiling kill with no work at
-  all fails the round. Implementer only, like the recovery turn.
+  all fails the round. Implementer only, like the recovery turn. Cut-short rounds stay
+  visible as partial work: a `partial work: …` line in `spar status` and a `## Partial
+  work` section in the ship PR body, and a ceiling-cut final round never ships the
+  previous round's `summary-impl.md` as its own.
 - Delivery is per-adapter and you never choose it. **claude** takes nudges through its
   inbox, which its `Stop` hook drains at the turn boundary. **grok** takes them through
   the same `Stop`-hook injection that **claude** uses: spar writes a project hook file

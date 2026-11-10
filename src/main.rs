@@ -1633,6 +1633,12 @@ fn status_cmd(run_id: Option<String>, json: bool, all: bool, archived: bool) -> 
                 );
             }
             println!("phase: {:?}", state.phase);
+            if let Some(p) = state.partial_round_phrase() {
+                println!(
+                    "partial work: {} {} cut short at hard ceiling, branch carries partial work",
+                    p.noun, p.verb
+                );
+            }
             // Looking a run up by id is the documented way to reach an archived one, so it
             // has to say that it is hidden — otherwise the output is indistinguishable
             // from a run that simply is not in the listing for some other reason.

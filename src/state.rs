@@ -202,17 +202,49 @@ pub struct RunState {
     #[serde(default)]
     pub contract_amendments: Vec<ContractAmendment>,
     /// Rounds whose implementer was cut short at its hard ceiling with work left
-    /// behind, oldest first. The leftovers were committed as a partial WIP round,
-    /// so a fresh process entering the next round — past the round-ceiling gate,
-    /// a stop, a quota park, a crashed orchestrator — still tells its implementer
-    /// the previous pass never finished (`blockers_from_disk` rebuilds the note).
+    /// behind, oldest first, and how each left its work. The leftovers were
+    /// committed as a partial round, so a fresh process entering the next round —
+    /// past the round-ceiling gate, a stop, a quota park, a crashed orchestrator —
+    /// still tells its implementer the previous pass never finished
+    /// (`blockers_from_disk` rebuilds the note).
     #[serde(default)]
-    pub ceiling_partial_rounds: Vec<u32>,
+    pub ceiling_partial_rounds: Vec<CeilingPartialRound>,
     /// Set while `spar amend` has the test author out, cleared when it settles. Found
     /// set by a later `amend`, `resume` or `approve`, it means the amend was killed: the
     /// run is put back exactly as this records (O137).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amend_in_progress: Option<AmendInProgress>,
+}
+
+/// How a ceiling-cut partial round left its work, so a rebuilt notice words the
+/// WIP commit honestly: the claim "saved as a WIP commit" is only true for `Wip`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CeilingPartialKind {
+    /// Leftovers committed as a WIP commit on the branch.
+    Wip,
+    /// Killed after committing; tree clean, no WIP commit written.
+    Clean,
+    /// Leftovers could not be committed; judged from the dirty tree as-is.
+    Refused,
+}
+
+/// A recorded ceiling-cut round and how it left its work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CeilingPartialRound {
+    pub round: u32,
+    pub kind: CeilingPartialKind,
+}
+
+/// The words for naming the cut-short rounds in a sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialRoundPhrase {
+    /// "round 1" or "rounds 1, 2".
+    pub noun: String,
+    /// "was" or "were".
+    pub verb: &'static str,
+    /// "its" or "their".
+    pub possessive: &'static str,
 }
 
 /// What an interrupted `spar amend` must put back.
@@ -406,6 +438,39 @@ impl RunState {
             .rev()
             .find(|s| s.role == SlotRole::TestAuthor)
     }
+
+    /// How to name the cut-short rounds in a sentence: "round 1 ... was ... its"
+    /// or "rounds 1, 2 ... were ... their". `None` when no round was cut short.
+    pub fn partial_round_phrase(&self) -> Option<PartialRoundPhrase> {
+        let mut rounds: Vec<u32> = self
+            .ceiling_partial_rounds
+            .iter()
+            .map(|e| e.round)
+            .collect();
+        rounds.sort_unstable();
+        rounds.dedup();
+        if rounds.is_empty() {
+            return None;
+        }
+        let list = rounds
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(if rounds.len() == 1 {
+            PartialRoundPhrase {
+                noun: format!("round {list}"),
+                verb: "was",
+                possessive: "its",
+            }
+        } else {
+            PartialRoundPhrase {
+                noun: format!("rounds {list}"),
+                verb: "were",
+                possessive: "their",
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -561,6 +626,13 @@ pub struct SlotState {
     /// Reset at the start of every dispatch, like `quota_hit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_cause: Option<crate::executor::TimeoutCause>,
+    /// HEAD of this slot's worktree when the current round started. Work is
+    /// measured against it (dirty tree, or commits past it), never against the
+    /// run base: from round 2 on the base predates earlier rounds' commits, so
+    /// the base always reads as work. Stamped when the slot joins the round, and
+    /// kept across same-round backup retries and provider rotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_head: Option<String>,
     /// The build-cache pool directory this implementer leased (O143). Kept after the
     /// dispatch ends so the next one prefers the same warm directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -590,7 +662,9 @@ impl SlotState {
     ///
     /// Every outcome field of the last dispatch is dropped with the old provider (O149):
     /// a seat that names one provider while carrying another's `quota_hit`, `auth_fault`
-    /// or usage reports that failure against a provider that never ran.
+    /// or usage reports that failure against a provider that never ran. `dispatch_head`
+    /// is not an outcome: rotation keeps the round and the worktree, so the round's
+    /// start HEAD still measures this round's work and survives the rotation.
     /// The ref this seat dispatches as: its stored provider plus its recorded
     /// model. Quota gates resolve through this so a seat whose model came from
     /// config or model-select keys identically to the writer's backfilled job.
