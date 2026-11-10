@@ -3806,17 +3806,23 @@ fn write_dry_artifacts(
             // Test hook for the no-progress ladder: a dry-run implementer that
             // skips its stamp, so HEAD and the tree stay exactly as the
             // open review judged them.
-            if !dry_impl_noop(paths, &state.id) {
-                let stamp = cwd.join(".spar-dry-implement");
+            let stamp = cwd.join(".spar-dry-implement");
+            let wrote = !dry_impl_noop(paths, &state.id);
+            if wrote {
                 std::fs::write(
                     &stamp,
                     format!("implemented (dry-run) by {} for: {task}\n", job.slot_id),
                 )?;
             }
+            let outcome = if wrote {
+                format!("Wrote `{}`.", stamp.display())
+            } else {
+                "Wrote nothing: the no-op stub skips its stamp.".to_string()
+            };
             std::fs::write(
                 paths.artifact(&state.id, &format!("summary-{}.md", job.slot_id)),
                 format!(
-                    "# Summary ({})\n\nDry-run implementation for:\n\n{task}\n",
+                    "# Summary ({})\n\nDry-run implementation for:\n\n{task}\n\n{outcome}\n",
                     job.slot_id,
                 ),
             )?;

@@ -242,6 +242,45 @@ fn re_entering_a_stall_park_below_the_ceiling_parks_again_with_no_panel() {
     );
 }
 
+/// Resolving `--max-rounds` at a below-ceiling stall park never lowers the
+/// ceiling: a stall park reuses the extension gate, and `+N` from a round
+/// under the ceiling resolves under it. The same holds for an uncapped run,
+/// which stays uncapped.
+#[test]
+fn extending_a_stall_park_below_the_ceiling_never_lowers_it() {
+    let tmp = tempdir().unwrap();
+    project_with_clean_tree(tmp.path(), 8);
+    let run_id = planned_run(tmp.path());
+
+    implement_noop(tmp.path(), &run_id, "all", &[]).code(2);
+    let parked = state_json(tmp.path(), &run_id);
+    assert_eq!(parked["phase"], "awaiting_round_extension", "{parked}");
+    assert_eq!(parked["max_rounds"], 8, "{parked}");
+    assert!(
+        parked["round"].as_u64().unwrap() < 7,
+        "the stall must park far enough under the ceiling that +1 resolves under it: {parked}"
+    );
+
+    implement_noop(tmp.path(), &run_id, "all", &["--max-rounds", "+1"]).code(2);
+    let st = state_json(tmp.path(), &run_id);
+    assert_eq!(
+        st["max_rounds"], 8,
+        "extending below the ceiling keeps it: {st}"
+    );
+
+    let tmp = tempdir().unwrap();
+    project_with_clean_tree(tmp.path(), 0);
+    let run_id = planned_run(tmp.path());
+
+    implement_noop(tmp.path(), &run_id, "all", &[]).code(2);
+    let parked = state_json(tmp.path(), &run_id);
+    assert_eq!(parked["phase"], "awaiting_round_extension", "{parked}");
+
+    implement_noop(tmp.path(), &run_id, "all", &["--max-rounds", "+1"]).code(2);
+    let st = state_json(tmp.path(), &run_id);
+    assert_eq!(st["max_rounds"], 0, "an uncapped run stays uncapped: {st}");
+}
+
 /// The carry-forward section itself, and not the warning, names the round
 /// that wrote each blocking review, the commit it judged, and its open
 /// findings, so a round that never stalls still learns what blocked the ship.
@@ -285,6 +324,72 @@ fn the_carry_forward_section_names_round_commit_and_findings() {
     );
 }
 
+/// `--re-review` sends the unchanged HEAD straight to the suite and panel: the
+/// direct pass dispatches no implementer, the panel re-judges the stalled
+/// commit with the ruling in context, and the one-shot arm is consumed. The
+/// still-blocking verdict re-arms the normal stall cycle, which burns two
+/// dispatches and parks again.
+#[test]
+fn re_review_sends_the_unchanged_head_straight_to_the_panel() {
+    let tmp = tempdir().unwrap();
+    project_with_clean_tree(tmp.path(), 8);
+    let run_id = planned_run(tmp.path());
+
+    implement_noop(tmp.path(), &run_id, "all", &[]).code(2);
+    let dispatches_before = dry_impl_dispatches(tmp.path(), &run_id);
+    let rounds_before = review_rounds(tmp.path(), &run_id);
+
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "rule",
+            "add",
+            "--run",
+            &run_id,
+            "--",
+            "the blocking review is wrong: the tree is correct as is",
+        ])
+        .assert()
+        .success();
+    implement_noop(tmp.path(), &run_id, "all", &["--re-review"]).code(2);
+
+    assert_eq!(
+        dry_impl_dispatches(tmp.path(), &run_id),
+        dispatches_before + 2,
+        "the direct pass dispatches no implementer; the follow-on stall cycle burns two"
+    );
+    assert_eq!(
+        review_rounds(tmp.path(), &run_id).len(),
+        rounds_before.len() + 2,
+        "the panel re-judges the stalled HEAD once, one review per seat"
+    );
+    let events =
+        std::fs::read_to_string(run_dir(tmp.path(), &run_id).join("events.jsonl")).unwrap();
+    assert!(
+        events.contains("skipping the implementer dispatch"),
+        "the direct pass leaves a trace"
+    );
+    let st = state_json(tmp.path(), &run_id);
+    assert_eq!(st["phase"], "awaiting_round_extension", "{st}");
+    assert_eq!(st["panel_rerun"], false, "the one-shot arm is consumed");
+
+    let reviewer = st["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["role"] == "reviewer")
+        .and_then(|s| s["id"].as_str())
+        .expect("reviewer slot")
+        .to_string();
+    let review_prompt =
+        std::fs::read_to_string(run_dir(tmp.path(), &run_id).join(format!("prompt-{reviewer}.md")))
+            .unwrap();
+    assert!(
+        review_prompt.contains("the blocking review is wrong"),
+        "the ruling must reach the reviewer prompt on the direct pass, not just the implementer: {review_prompt}"
+    );
+}
+
 /// One empty round re-dispatches the implementer with the warning and no new
 /// panel; when that dispatch makes progress, the panel runs again and the run
 /// continues to the round ceiling instead of the stall gate.
@@ -320,7 +425,7 @@ fn warning_round_then_progress_reaches_the_panel_again() {
     let events =
         std::fs::read_to_string(run_dir(tmp.path(), &run_id).join("events.jsonl")).unwrap();
     assert!(
-        events.contains("no-progress round"),
+        events.contains("no-progress dispatch"),
         "the skipped panel must leave a trace"
     );
 }

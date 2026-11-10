@@ -122,11 +122,11 @@ reaching it parks the run at the `awaiting_round_extension` human gate (**exit 2
 `--max-rounds <N>` (>= 1, sticky on the run, clears `error`) or stop the run — do not
 loop on re-entering `implement`, which gates again without dispatching. Exit `3`
 (`stuck`) still outranks this gate, and a lift preserves the escalation ladder's
-progress, so a lift loop terminates. Two consecutive rounds that change nothing
-while a `request_changes` review against the same commit is open park at the same
+progress, so a lift loop terminates. Two consecutive implementer dispatches that change nothing
+while a still-blocking review against the same commit is open park at the same
 gate (O169): the first re-dispatches the implementer with a warning before the
 panel runs, the second parks with the reason in `error`. A stall parks before
-the panel, so re-enter after changing the tree, without `--max-rounds` below the ceiling (at the ceiling the park message names the `--max-rounds` value). A re-entry that would
+the panel, so re-enter after changing the tree, without `--max-rounds` below the ceiling (at the ceiling the park message names the `--max-rounds` value). On every re-entry `--max-rounds` only ever raises: a value resolving under the ceiling keeps it, and an uncapped run stays uncapped. If the blocking review is wrong, rule it out with `spar rule add` and re-enter with `implement --run <id> --re-review` (O171): the unchanged HEAD goes straight back to the suite and panel with the ruling in context, without dispatching the implementer. A re-entry that would
 adopt a `test-contract.md` that drifted mid-round exits `1` until you pass
 `--accept-contract`. Between rounds the implementer's
 `artifacts/carry-forward-<slot>.md` is seeded into the next round's prompt, capped by

@@ -192,15 +192,28 @@ test("extend defaults to one round, accepts +N and refuses nonsense without runn
 	await performAction(one.ctx, "extend", run("awaiting_round_extension", { round: 6 }));
 	assert.match(one.dialogs[1]!, /^confirm: Buy 1 more round for run r1\?\nRuns: spar implement --run r1 --max-rounds \+1 --detach --json\n\nRaises the ceiling to round 7/);
 	const plus = fakeCtx(f.dir, { input: ["+3"] });
-	await performAction(plus.ctx, "extend", run("awaiting_round_extension"));
+	await performAction(plus.ctx, "extend", run("awaiting_round_extension", { round: 6 }));
 	const bad = fakeCtx(f.dir, { input: ["0"] });
-	assert.equal((await performAction(bad.ctx, "extend", run("awaiting_round_extension"))).kind, "cancelled");
+	assert.equal((await performAction(bad.ctx, "extend", run("awaiting_round_extension", { round: 6 }))).kind, "cancelled");
 	assert.equal(bad.notes[0]!.level, "error");
 	assert.equal(one.notes[0]!.text, "spar extend r1: done, continuing detached; follow with spar wait r1");
 	assert.deepEqual(f.calls(), [
 		"implement --run r1 --max-rounds +1 --detach --json",
 		"implement --run r1 --max-rounds +3 --detach --json",
 	]);
+});
+
+test("extend at a stall park re-enters bare without asking for rounds", async () => {
+	const f = installFake({ "implement --run r1 --detach --json": { id: "r1", phase: "reconcile" } });
+	const { ctx, dialogs, notes } = fakeCtx(f.dir);
+	const out = await performAction(ctx, "extend", run("awaiting_round_extension", { round: 1 }));
+	assert.equal(out.kind, "ran");
+	assert.match(
+		dialogs[0]!,
+		/^confirm: Re-enter run r1\?\nRuns: spar implement --run r1 --detach --json\n\nRe-enters without raising the ceiling: round 1 stalled below it, so the next dispatch carries the no-progress warning\./,
+	);
+	assert.deepEqual(f.calls(), ["implement --run r1 --detach --json"]);
+	assert.equal(notes[0]!.text, "spar extend r1: done, continuing detached; follow with spar wait r1");
 });
 
 test("ship at the ship gate runs in the background and reports a failure with spar's error", async () => {
@@ -329,7 +342,7 @@ test("refusals name the real spar command for every verb", () => {
 	assert.equal(cliCommand("override", "r1"), "spar ship r1 --override-gate --reason=<why>");
 	assert.equal(cliCommand("rule", "r1"), 'spar rule add --run r1 [--waive AC-<n>] -- "<text>"');
 	assert.equal(cliCommand("reassign", "r1"), "spar implement --run r1 --reassign <seat>=<provider> --detach");
-	assert.equal(cliCommand("extend", "r1"), "spar implement --run r1 --max-rounds +<N> --detach");
+	assert.equal(cliCommand("extend", "r1"), "spar implement --run r1 [--max-rounds +<N>] --detach");
 	assert.equal(cliCommand("cleanup", "r1"), "spar cleanup r1 --if-merged");
 });
 

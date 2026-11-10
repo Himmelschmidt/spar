@@ -202,6 +202,21 @@ pub fn reviewed_commit_matches(panel_head: &str, parsed: &str) -> bool {
     }
 }
 
+/// Whether two parsed `Reviewed-Commit` values name the same commit, either
+/// order: the longer is the panel head, the shorter its prefix. Unanchored on
+/// one side only never matches, so a half-anchored panel gets a full review;
+/// unanchored on both sides cannot disagree.
+pub fn same_reviewed_commit(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            let (long, short) = if x.len() >= y.len() { (x, y) } else { (y, x) };
+            reviewed_commit_matches(long, short)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 pub fn parse_review(body: &str) -> ReviewResult {
     let mut out = ReviewResult {
         reviewed_commit: parse_reviewed_commit(body),
@@ -1255,6 +1270,17 @@ mod tests {
         assert!(reviewed_commit_matches(HEAD, HEAD));
         assert!(reviewed_commit_matches(HEAD, &HEAD[..7]));
         assert!(reviewed_commit_matches(HEAD, &HEAD.to_ascii_uppercase()));
+    }
+
+    #[test]
+    fn same_reviewed_commit_compares_either_order() {
+        assert!(same_reviewed_commit(Some(HEAD), Some(&HEAD[..7])));
+        assert!(same_reviewed_commit(Some(&HEAD[..7]), Some(HEAD)));
+        assert!(same_reviewed_commit(Some(HEAD), Some(HEAD)));
+        assert!(same_reviewed_commit(None, None));
+        assert!(!same_reviewed_commit(Some(HEAD), Some("deadbeef")));
+        assert!(!same_reviewed_commit(Some(HEAD), None));
+        assert!(!same_reviewed_commit(None, Some(&HEAD[..7])));
     }
 
     #[test]

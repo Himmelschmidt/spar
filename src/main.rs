@@ -299,6 +299,7 @@ fn run() -> Result<ExitCode> {
                     big,
                     max_rounds: None,
                     accept_contract: false,
+                    re_review: false,
                     // `plan` / `run` mint their config fresh; there is no frozen one to
                     // reload against, so seats are resolved for the first time either way.
                     reload_config: false,
@@ -398,6 +399,7 @@ fn run() -> Result<ExitCode> {
             recapture_env,
             max_rounds,
             accept_contract,
+            re_review,
             key,
             key_scope,
             reassign,
@@ -453,6 +455,7 @@ fn run() -> Result<ExitCode> {
                     big,
                     max_rounds,
                     accept_contract,
+                    re_review,
                     reload_config,
                     key,
                     reassign,
@@ -632,6 +635,7 @@ fn run() -> Result<ExitCode> {
                     big,
                     max_rounds: None,
                     accept_contract: false,
+                    re_review: false,
                     // `plan` / `run` mint their config fresh; there is no frozen one to
                     // reload against, so seats are resolved for the first time either way.
                     reload_config: false,
