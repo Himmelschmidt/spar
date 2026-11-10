@@ -64,6 +64,11 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         return Ok(ExitCode::Failure);
     }
 
+    // This entry dispatches seats, so it stamps the dispatch like every other
+    // entry: the horizon for pause reads, and the codex route the quota keys
+    // derive from.
+    state.stamp_dispatch();
+    state.save(paths)?;
     // The independent-review workflow bypasses `build_implement_seats` (no panel
     // pinning), but each reviewer's source is still resolved per position so a `Synth`
     // pool mixing `[roles]` and `[providers].order` seats reports each honestly.

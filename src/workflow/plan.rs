@@ -1197,10 +1197,7 @@ pub fn replan(
         let _ = std::fs::remove_file(paths.marker(run_id, "stopped"));
     }
     let round = state.begin_round();
-    // The replan is a new dispatch: stamp it (pause horizon and codex route)
-    // before `continue_locked` re-resolves the seats. `continue_locked` stamps
-    // again on entry; same env, same record.
-    state.stamp_dispatch();
+    // A new dispatch, stamped by `continue_locked` below on entry.
     state.amendment = Some(directive);
     // The gate reopens: whatever was approved or rejected was about the old plan.
     state.gates.plan_approved = false;
