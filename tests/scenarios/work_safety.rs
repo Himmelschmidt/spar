@@ -339,7 +339,7 @@ fn a_ceiling_killed_implementer_with_new_commits_is_recovered() {
     assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
 }
 
-/// A fake `muse` for the #228 tests. The implementer hangs past the hard ceiling
+/// A fake `muse` for the ceiling-kill tests. The implementer hangs past the hard ceiling
 /// like `install_ceiling_muse`, but leaves its work uncommitted (`dirty`) or leaves
 /// nothing at all. Reviewers approve whatever HEAD they are shown.
 fn install_ceiling_leftover_muse(bin: &Path, dirty: bool) {
@@ -435,7 +435,7 @@ fn run_ceiling_leftover_implement(
         .expect("run created")
 }
 
-/// #228: a ceiling kill with uncommitted edits commits them as a WIP round and the
+/// A ceiling kill with uncommitted edits commits them as a WIP round and the
 /// run goes to review, not Failed. No recovery turn runs; the panel judges the WIP
 /// commit in the same round.
 #[test]
@@ -519,7 +519,7 @@ fn a_ceiling_kill_with_uncommitted_edits_becomes_a_wip_round() {
     );
 }
 
-/// #228: a ceiling kill with nothing left behind still fails the round.
+/// A ceiling kill with nothing left behind still fails the round.
 #[test]
 fn a_ceiling_kill_with_no_work_still_fails() {
     let tmp = tempdir().unwrap();
@@ -552,7 +552,7 @@ fn a_ceiling_kill_with_no_work_still_fails() {
     );
 }
 
-/// #228 follow-up (1): round-start dirt is not round work. A commit-msg hook
+/// Round-start dirt is not round work. A commit-msg hook
 /// refuses every commit, so round 1 dies at the ceiling with an edit that stays
 /// uncommitted (a Refused round whose leftovers remain in the tree); the first
 /// review requests changes and the round-2 implementer hangs with no edits at
@@ -614,7 +614,7 @@ fn a_second_round_ceiling_kill_over_refused_leftovers_fails_the_run() {
     );
 }
 
-/// #228 (tmux backend): a ceiling kill terminates the agent's process group
+/// A ceiling kill terminates the agent's process group
 /// before the WIP snapshot, so the round still goes to review on the committed
 /// partial work and nothing is left alive to keep mutating the tree under the
 /// suite and panel.
@@ -659,7 +659,7 @@ fn a_ceiling_kill_on_tmux_kills_the_agent_before_the_wip_snapshot() {
     );
 }
 
-/// A fake `muse` for the #228 follow-ups. The implementer hangs past the hard
+/// A fake `muse` for the ceiling-cut follow-ups. The implementer hangs past the hard
 /// ceiling leaving its edit uncommitted; the first review requests changes, the
 /// rest approve whatever HEAD they are shown.
 fn install_ceiling_requesting_muse(bin: &Path) {
@@ -730,7 +730,7 @@ fn run_requesting_ceiling_implement(proj: &Path, bin: &Path, calls_dir: &Path, m
     run_ceiling_leftover_implement(proj, bin, calls_dir, None)
 }
 
-/// #228 follow-up: the round after a ceiling-cut WIP round is told the previous
+/// The round after a ceiling-cut WIP round is told the previous
 /// pass never finished. The first review requests changes, so the fix round's
 /// implementer prompt carries the cut-short notice.
 #[test]
@@ -759,7 +759,7 @@ fn ceiling_cut_notice_reaches_the_next_round_implementer() {
     );
 }
 
-/// #228 follow-up: the cut-short notice survives the round-ceiling gate. Past it
+/// The cut-short notice survives the round-ceiling gate. Past it
 /// the operator buys a round and a fresh process re-enters; the rebuilt
 /// `prompt-impl.md` still tells the new round its WIP commit is partial work.
 #[test]
@@ -806,7 +806,7 @@ fn ceiling_cut_notice_survives_the_round_ceiling_gate() {
     );
 }
 
-/// A fake `muse` for the #228 dispatch-HEAD regression test. The first
+/// A fake `muse` for the dispatch-HEAD test. The first
 /// implementer dispatch leaves an edit uncommitted and hangs past the hard
 /// ceiling, so round 1 becomes a WIP round; every later implementer dispatch
 /// hangs with no edits at all. The first review requests changes, the rest
@@ -866,7 +866,7 @@ exit 0
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// #228 follow-up: work is measured against the dispatch's own start HEAD, not
+/// Work is measured against the dispatch's own start HEAD, not
 /// the run's base commit. Round 1 dies at the ceiling with an edit (WIP round),
 /// the review requests changes, and the round 2 implementer hangs with no edits
 /// at all. The run must fail; measuring against the base commit would see round
@@ -982,7 +982,7 @@ exit 0
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// #228 follow-up: a run stopped after a ceiling-cut partial round resumes in
+/// A run stopped after a ceiling-cut partial round resumes in
 /// the same round. The resumed implementer sees the cut-short notice for its
 /// own round, and finishing normally clears the round's mark, so the run
 /// ships the real summary instead of the stale notice.
