@@ -228,8 +228,12 @@ pub enum Command {
         /// `+N`, and keep going. A run that reaches `[rounds] max` parks at the
         /// `awaiting_round_extension` gate (exit 2) rather than buying another cold
         /// re-dispatch; this is the operator saying the next one is worth paying for.
-        /// Sticky: it persists on the run. Must land above the current round, and is
-        /// queued (not refused) while an orchestrator is driving the run. Must be >= 1:
+        /// Sticky: it persists on the run. On any re-entry after implementer slots
+        /// exist the flag only ever raises: a value resolving at or under the
+        /// ceiling keeps it, and an uncapped run stays uncapped. The first
+        /// implement entry still sets the ceiling outright. Must land above the
+        /// current round, and is queued (not refused) while an orchestrator is
+        /// driving the run. Must be >= 1:
         /// turning the ceiling off entirely is `[rounds] max = 0` in `spar.toml`, a
         /// deliberate project setting rather than a flag typed under pressure at a gate.
         #[arg(long, value_parser = parse_max_rounds)]

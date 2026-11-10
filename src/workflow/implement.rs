@@ -687,12 +687,6 @@ fn run_from_approved(
     // the run's task; absent `-t`, any prior amendment is cleared so it never silently
     // re-applies to a later round.
     state.amendment = amendment;
-    // `--re-review` arms the reviewer-is-wrong exit (O171) for this re-entry only:
-    // assigning (not OR-ing) keeps a stale arm from a stopped run from leaking
-    // into a later stall. Saved now so the flag survives anything below that
-    // returns before the loop reaches the stall branch.
-    state.panel_rerun = opts.re_review;
-    state.save(paths)?;
     if !opts.json {
         match &state.amendment {
             Some(a) => println!("amendment applied for this round: {a}"),
@@ -808,12 +802,20 @@ fn run_from_approved(
     apply_queued_round_extension(&mut state, paths);
     if let Some(mr) = opts.max_rounds {
         let target = mr.resolve(state.round);
-        let kept = gate_max_rounds(state.max_rounds, target, state.round > 0);
+        // A prior implement entry minted implementer slots; a first entry after
+        // plan approval has only planner slots, so the flag still sets the
+        // ceiling the way a fresh launch does.
+        let implement_entered = state.slots.iter().any(|s| s.role == SlotRole::Implementer);
+        let kept = gate_max_rounds(state.max_rounds, target, implement_entered);
         if kept != target && !opts.json {
-            println!(
-                "note: --max-rounds {target} is at or under the current ceiling {}; keeping it",
-                state.max_rounds
-            );
+            if state.max_rounds == 0 {
+                println!("note: --max-rounds {target} ignored: the run has no round ceiling");
+            } else {
+                println!(
+                    "note: --max-rounds {target} is at or under the current ceiling {}; keeping it",
+                    state.max_rounds
+                );
+            }
         }
         state.max_rounds = kept;
     }
@@ -887,6 +889,13 @@ fn run_from_approved(
     if state.slots.iter().all(|s| s.role != SlotRole::Implementer) {
         bail!("no implementer slot after provider pick");
     }
+    // `--re-review` arms the reviewer-is-wrong exit (O171) here, at loop entry:
+    // assigning (not OR-ing) keeps a stale arm from an entry that never reached
+    // the loop from leaking into a later resume, which carries no flag of its
+    // own. The quota and ceiling parks above return before this point, so that
+    // entry's flag dies with it; detach carries it, since the detached child is
+    // the same entry continuing.
+    state.panel_rerun = opts.re_review;
     state.save(paths)?;
     crate::providers::delivery::refresh_run_poll_files(paths, run_id);
     if opts.detach {
@@ -2300,6 +2309,10 @@ pub fn execute_loop(
             return stop_now(state, paths);
         }
         state.set_phase(Phase::Dispatch);
+        // Consumed before the save: a crash between the save and the take
+        // would otherwise leave the arm on disk for an entry that never saw
+        // the flag.
+        let panel_direct = take_panel_rerun(state);
         state.save(paths)?;
 
         if let Some(id) = state
@@ -2328,9 +2341,9 @@ pub fn execute_loop(
 
         // `--re-review`: the operator judged the blocking review wrong, so this
         // pass sends the current HEAD straight to the suite and panel below
-        // without dispatching the implementer. One-shot: the arm is consumed
-        // here, and a still-blocking panel re-arms the normal stall cycle.
-        let panel_direct = take_panel_rerun(state);
+        // without dispatching the implementer. One-shot: the arm was consumed
+        // at the top of the loop, and a still-blocking panel re-arms the
+        // normal stall cycle.
         if panel_direct {
             let head = worktree::git_out(&impl_cwd(state, &impl_slot), &["rev-parse", "HEAD"])
                 .unwrap_or_default();
@@ -5363,7 +5376,8 @@ pub struct RoundExtensionRefused {
 /// there must not drop the ceiling it never reached, or install one on an
 /// uncapped run; the same holds for a stopped or failed run re-entered below
 /// its ceiling. A fresh launch sets its own ceiling, so the guard is scoped to
-/// re-entries (rounds already opened).
+/// entries that already minted implementer slots: the first implement entry on
+/// a planned run still has only planner slots, and the flag sets the ceiling.
 fn gate_max_rounds(current: u32, target: u32, reentry: bool) -> u32 {
     if reentry && (current == 0 || target <= current) {
         current
@@ -5576,17 +5590,9 @@ fn scoped_review_section(state: &RunState, cfg: &Config, review_cwd: &Path) -> S
         return String::new();
     }
     let commit = panel[0].review.reviewed_commit.clone();
-    if panel
-        .iter()
-        .any(|e| match (&e.review.reviewed_commit, &commit) {
-            (Some(a), Some(b)) => {
-                let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
-                !review_result::reviewed_commit_matches(long, short)
-            }
-            (None, None) => false,
-            _ => true,
-        })
-    {
+    if panel.iter().any(|e| {
+        !review_result::same_reviewed_commit(e.review.reviewed_commit.as_deref(), commit.as_deref())
+    }) {
         return String::new();
     }
     // A critical filed under Follow-up blocked its round, so it is re-judged too.
@@ -5829,7 +5835,7 @@ fn verdict_blocker(
     }
     VerdictBlocker {
         review_id: rev.id.clone(),
-        review_path: review_path.display().to_string(),
+        review_path: review_artifact_name(review_path),
         head,
         compact,
         acceptance: lines,
@@ -5843,6 +5849,16 @@ fn verdict_blocker(
 /// full value stays in state and on the review artifact.
 fn short_commit(c: &str) -> &str {
     c.get(..12).unwrap_or(c)
+}
+
+/// The review artifact's file name, not its absolute path: the implementer
+/// prompt already prints the artifacts dir, and an absolute path per review
+/// comes out of the acceptance reservation, evicting failing-criterion
+/// evidence under tight caps.
+fn review_artifact_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// At most this many findings ride along in one blocker line or warning alongside
@@ -5962,8 +5978,8 @@ fn carry_forward_section(
         // review below, and repeating it per bullet costs a multi-review panel its
         // brief under a tight budget.
         out.push_str(
-            "These reviews are the current verdict on the implementer's HEAD and must \
-             be fixed, not stale notes: they supersede the previous round's own notes.\n",
+            "These reviews are the current verdict on the implementer's HEAD and \
+             supersede the previous round's own notes.\n",
         );
         // Acceptance lines render before everything expendable, sized to a share
         // of what the cap has left after the heading and the persisted phase,
@@ -5987,10 +6003,9 @@ fn carry_forward_section(
         // promises lines that do not fit and the tail cut eats a whole review.
         let manifest_overhead = verdicts.len() * 3;
         let joins_overhead = total_ac * 2;
-        // The `full review:` path lines ride the same reservation: they render
-        // once per review, and an absolute artifact path is ~100 chars in a
-        // real project, so sizing acceptance lines without them pushes later
-        // reviews' bullets past the tail cut.
+        // The `full review:` file-name lines ride the same reservation: they
+        // render once per review, so sizing acceptance lines without them
+        // pushes later reviews' bullets past the tail cut.
         let paths_overhead: usize = verdicts
             .iter()
             .map(|v| v.review_path.chars().count() + "  full review: ``\n".chars().count())
@@ -7607,46 +7622,67 @@ mod carry_forward_tests {
         );
     }
 
-    /// The `full review:` path lines count against the reservation: with
-    /// realistic absolute artifact paths, five blocking reviews with two
-    /// failing criteria each keep every manifest and artifact line at a
-    /// 2000-char cap beside a persisted operator message.
+    /// `verdict_blocker` keeps the artifact's file name, never its absolute
+    /// path: the implementer prompt already prints the artifacts dir.
     #[test]
-    fn absolute_review_paths_do_not_evict_manifests() {
-        let blockers: Vec<Blocker> = (1..=5)
+    fn review_artifacts_render_as_bare_names() {
+        let abs = Path::new(
+            "/home/operator/projects/acme-widget-factory/.spar/runs/3dd3f29d-01kn6v/artifacts/review-rev-1.md",
+        );
+        assert!(abs.display().to_string().chars().count() > 90);
+        assert_eq!(review_artifact_name(abs), "review-rev-1.md");
+    }
+
+    /// The `full review:` lines name the artifact's file, not its absolute
+    /// path: two blocking reviews beside a realistic run dir keep their
+    /// failing criterion's evidence, both artifact lines and the slot's own
+    /// brief at a 800-char cap. Absolute paths used to tip `manifest_only`
+    /// and evict the evidence and the brief here.
+    #[test]
+    fn bare_review_names_keep_evidence_and_brief_at_a_tight_cap() {
+        let run_dir = "/home/operator/projects/acme-widget-factory/.spar/runs/3dd3f29d-01kn6v";
+        let blockers: Vec<Blocker> = (1..=2)
             .map(|r| {
-                let mut b = verdict_with_ac(r, 2, 300);
+                let mut b = verdict_with_ac(r, 1, 20);
                 if let Blocker::Verdict(v) = &mut b {
-                    v.review_path = format!(
-                        "/home/operator/projects/acme-widget-factory/.spar/runs/3dd3f29d-01kn6v/artifacts/review-rev-{r}.md"
-                    );
+                    v.review_path = review_artifact_name(Path::new(&format!(
+                        "{run_dir}/artifacts/review-rev-{r}.md"
+                    )));
                 }
                 b
             })
             .collect();
-        assert!(
-            blockers.iter().all(|b| match b {
-                Blocker::Verdict(v) => v.review_path.chars().count() > 90,
-                _ => false,
-            }),
-            "the test paths must stay realistic"
+        let brief = format!(
+            "SENTINEL-BRIEF\n{}\n",
+            "padding that a real slot would write\n".repeat(20)
         );
-        let persisted = vec![format!("from human (message m1): {}", "o".repeat(400))];
-        let out = carry_forward_section(3, &persisted, &blockers, None, 2000);
+        let out = carry_forward_section(3, &[], &blockers, Some(&brief), 800);
         assert_eq!(
-            out.matches("failing AC-1, AC-2").count(),
-            5,
-            "every review keeps its manifest beside absolute paths:\n{out}"
+            out.matches("failing AC-1").count(),
+            2,
+            "both reviews keep their manifests:\n{out}"
         );
-        for r in 1..=5 {
+        for r in 1..=2 {
             assert!(
-                out.contains(&format!("artifacts/review-rev-{r}.md`")),
-                "review {r} keeps its artifact line:\n{out}"
+                out.contains(&format!("evid-r{r}c1")),
+                "review {r} evidence survives:\n{out}"
+            );
+            assert!(
+                out.contains(&format!("full review: `review-rev-{r}.md`")),
+                "review {r} keeps its artifact line as a bare name:\n{out}"
             );
         }
         assert!(
-            out.chars().count() <= 2000,
-            "the section honors its cap:\n{out}"
+            !out.contains(run_dir),
+            "no absolute run path leaks into the section:\n{out}"
+        );
+        assert!(
+            out.contains("SENTINEL-BRIEF"),
+            "the slot's own brief survives beside the blockers:\n{out}"
+        );
+        assert!(
+            out.contains("truncated by spar at 800"),
+            "the tail cut discloses itself where it happened:\n{out}"
         );
     }
 
