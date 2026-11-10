@@ -4264,6 +4264,9 @@ fn run_api(
         .as_ref()
         .map(|n| paths.artifact(&state.id, n));
     let model = slot_model_for(Some(state), job);
+    // Stamped before the dispatch starts, the way `execute_prepared` stamps
+    // its own: the kept-read below only counts an artifact this dispatch wrote.
+    let dispatch_start = SystemTime::now();
     let outcome = api::run_api_slot(&api::runtime::ApiSlotRequest {
         provider_name: &pref.name,
         prompt,
@@ -4310,7 +4313,7 @@ fn run_api(
                     banked_head: banked_partial_commit(state, state.round).as_deref(),
                     artifact: &paths.artifact(&state.id, name),
                 },
-                SystemTime::now(),
+                dispatch_start,
             )
         });
     if kept {
@@ -9464,6 +9467,81 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             !artifact_fresh_since(&path, mtime + Duration::from_secs(2)),
             "mtime a second past the grace must fail"
         );
+    }
+
+    /// The api-sdk kept-read stamps its `since` before `run_api_slot` starts,
+    /// the way `execute_prepared` stamps its own. The artifact is already on
+    /// disk when the dispatch begins and the fake server never answers, so the
+    /// ceiling fires ~2s in: a `since` taken after the dispatch lands past the
+    /// write plus the 1s grace and the kept-read misses it, failing a round
+    /// whose work is done. Fails if the stamp moves back below the dispatch.
+    #[test]
+    fn run_api_ceiling_keep_sees_an_artifact_written_before_the_ceiling() {
+        use crate::state::RunState;
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let cwd = tmp.path().join("wt");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let artifact = paths.artifact("r1", "summary.md");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, "done\n").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = vec![0u8; 65536];
+            let _ = stream.read(&mut buf);
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
+        let mut st = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
+        st.worktrees.push(crate::state::WorktreeRecord {
+            slot_id: "impl".into(),
+            path: cwd.clone(),
+            branch: "impl".into(),
+        });
+        st.slots
+            .push(init_slot("impl", "api:openai", SlotRole::Implementer));
+        let job = SlotJob {
+            slot_id: "impl".into(),
+            provider: "api:openai".into(),
+            role: SlotRole::Implementer,
+            template: String::new(),
+            extra_vars: std::collections::HashMap::new(),
+            expected_artifact: Some("summary.md".into()),
+            model: None,
+            effort: None,
+        };
+        let pref = ProviderRef::parse("api:openai").unwrap();
+        let log = tmp.path().join("slot.log");
+        let prompt = tmp.path().join("prompt.md");
+        std::fs::write(&prompt, "do it").unwrap();
+        let outcome = run_api(
+            &st,
+            &paths,
+            &job,
+            &pref,
+            &cwd,
+            &log,
+            &prompt,
+            "do it",
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("OPENAI_BASE_URL");
+        assert!(
+            outcome.ok,
+            "a ceiling kill after finished work stays done: {:?}",
+            outcome.error
+        );
+        assert_eq!(outcome.timeout_cause, None);
     }
 
     /// The role gate on the session marker: an implementer reads the prior
