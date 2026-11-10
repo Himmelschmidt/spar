@@ -12,10 +12,339 @@ use crate::util::{self, sanitize_slot};
 use crate::workflow::review_result::{self, AcStatus, ReviewResult};
 use crate::worktree;
 use anyhow::{bail, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+/// Amend flags a bound `implement --run <id>` carries into the dispatch. The run's
+/// frozen config is amended under the dispatch's own lock, after the launch
+/// preconditions pass, so a refused launch changes nothing (O154).
+#[derive(Debug, Clone, Default)]
+pub struct BoundAmendInputs {
+    pub role: Vec<String>,
+    pub backup: Vec<String>,
+    pub effort: Vec<String>,
+    pub without: Vec<String>,
+    pub fleet: Option<crate::config::FleetPreset>,
+    pub suite_command: Vec<String>,
+    pub recapture_env: bool,
+}
+
+impl BoundAmendInputs {
+    /// No seat shaper was passed. Whether the dispatch reloads the file config
+    /// is not part of this: callers pair it with the live config's presence
+    /// (`live.is_none() && amend.is_noop()`), so a reload alone still replays
+    /// the recorded pool.
+    pub fn is_noop(&self) -> bool {
+        self.role.is_empty()
+            && self.backup.is_empty()
+            && self.effort.is_empty()
+            && self.without.is_empty()
+            && self.suite_command.is_empty()
+            && matches!(
+                self.fleet,
+                None | Some(crate::config::FleetPreset::Standard)
+            )
+    }
+}
+
+/// An amend-phase refusal: the frozen config and run state were left untouched,
+/// so the caller reports it as a launch refusal (exit 1), never an internal error.
+#[derive(Debug)]
+pub struct AmendRefused(pub String);
+
+impl std::fmt::Display for AmendRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for AmendRefused {}
+
+/// The amended config plus the reviewer ordinals the amend dropped, computed
+/// read-only from the frozen config, the run state the surgery will apply to,
+/// and the live file config when that is present (its presence means reload).
+/// Both the `--validate-only` preview and the under-lock dispatch path use it;
+/// the dispatch path calls it after acquiring the run lock so seat-id
+/// resolution and the panel pin see the state the surgery is about to change.
+pub struct BoundAmend {
+    pub cfg: Config,
+    pub dropped: Vec<usize>,
+    /// The pin came from the run's own slots: a reassign that moves reviewer
+    /// seats afterwards must refresh it before the freeze.
+    pub panel_pinned: bool,
+}
+
+/// The run's own reviewer panel in ordinal order, never slot order and never a
+/// widened extra (their ids carry no ordinal): a reassign may have moved seats
+/// around, and widening appends `-wide` seats past the panel.
+fn reviewer_panel_by_ordinal(state: &RunState) -> Vec<String> {
+    let mut panel: Vec<(usize, String)> = state
+        .slots
+        .iter()
+        .filter(|s| s.role == SlotRole::Reviewer)
+        .filter_map(|s| reviewer_ordinal(&s.id).map(|o| (o, s.provider_ref().display())))
+        .collect();
+    panel.sort_by_key(|(o, _)| *o);
+    panel.into_iter().map(|(_, p)| p).collect()
+}
+
+pub fn preview_bound_amend(
+    frozen: &Config,
+    live: Option<&Config>,
+    state: &RunState,
+    inputs: &BoundAmendInputs,
+) -> Result<BoundAmend> {
+    let mut cfg = if let Some(live) = live {
+        let mut cfg = live.clone();
+        cfg.reapply_cli_overrides(frozen);
+        // A reload re-reads the file, not the shell: names still captured keep
+        // the creation values, a name removed from `capture` is dropped, and
+        // only a name newly added to `capture` takes this process's value (O130).
+        // `--recapture-env` is the deliberate exception: everything is retaken.
+        if !inputs.recapture_env {
+            for (k, v) in &frozen.env.captured {
+                if cfg.env.capture.contains(k) {
+                    cfg.env.captured.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        cfg
+    } else {
+        frozen.clone()
+    };
+    if let Some(preset) = inputs.fleet {
+        cfg.apply_fleet_preset(preset);
+    }
+    let without = resolve_without_seat_ids(state, &inputs.without)?;
+    let mut panel_pinned = false;
+    if without
+        .iter()
+        .any(|w| crate::config::parse_reviewer_without(w).is_ok())
+    {
+        let panel = reviewer_panel_by_ordinal(state);
+        if !panel.is_empty() {
+            cfg.roles.reviewer = panel;
+            cfg.cli_role_keys.insert(SlotRole::Reviewer);
+            panel_pinned = true;
+        }
+    }
+    let (pool, pool_origin, dry) = if !state.providers.is_empty() {
+        (state.providers.clone(), state.pool_origin, state.dry_run)
+    } else {
+        (
+            cfg.providers.order.clone(),
+            PoolOrigin::Synth,
+            state.dry_run,
+        )
+    };
+    let dropped = cfg.apply_without(&pool, pool_origin, dry, &without)?;
+    cfg.apply_role_overrides(&inputs.role)?;
+    if crate::config::role_pins_reviewer(&inputs.role) {
+        // The role replaces the panel outright: the live-slot pin is no longer
+        // the panel's source, so a later reassign must not refresh it back.
+        panel_pinned = false;
+    }
+    cfg.refuse_emptied_reviewer_panel(&dropped)?;
+    crate::config::warn_if_role_discards_reviewer_drop(&inputs.role, &dropped);
+    cfg.apply_backup_overrides(&inputs.backup)?;
+    cfg.apply_effort_overrides(&inputs.effort)?;
+    cfg.apply_suite_command(&inputs.suite_command, &without)?;
+    Ok(BoundAmend {
+        cfg,
+        dropped,
+        panel_pinned,
+    })
+}
+
+/// Seat ids in `--without` resolved to `reviewer[N]` ordinals against one run
+/// state. Channels and ordinals pass through; anything else is refused naming
+/// the run's own seats.
+pub fn resolve_without_seat_ids(state: &RunState, without: &[String]) -> Result<Vec<String>> {
+    without
+        .iter()
+        .map(|w| {
+            let item = w.trim();
+            if crate::config::DroppedChannel::parse(item).is_some()
+                || crate::config::parse_reviewer_without(item).is_ok()
+            {
+                return Ok(w.clone());
+            }
+            let slot = state.slots.iter().find(|s| s.id == item).ok_or_else(|| {
+                let mut seats: Vec<&str> = state
+                    .slots
+                    .iter()
+                    .filter(|s| s.role == SlotRole::Reviewer)
+                    .map(|s| s.id.as_str())
+                    .collect();
+                seats.sort();
+                anyhow::anyhow!(
+                    "--without {item:?}: no such seat on run {} (valid: critic, spec, suite, reviewer[N], or one of: {})",
+                    state.id,
+                    seats.join(", ")
+                )
+            })?;
+            if slot.role != SlotRole::Reviewer {
+                anyhow::bail!("--without {item:?}: only reviewer seats can be dropped by seat id");
+            }
+            let ordinal = reviewer_ordinal(&slot.id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--without {item:?}: extra seats from widening cannot be dropped; drop a panel seat as reviewer[N]"
+                )
+            })?;
+            Ok(format!("reviewer[{ordinal}]"))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod preview_amend_tests {
+    use super::*;
+
+    fn dry_stateless_run() -> RunState {
+        let mut st = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            std::path::PathBuf::from("/x"),
+        );
+        st.dry_run = true;
+        st
+    }
+
+    /// #234 follow-up: a dry-run run with no recorded pool resolves the reviewer
+    /// panel with the run's own dry-run state, never a hard `false`, so the
+    /// order-derived panel survives availability filtering.
+    #[test]
+    fn pool_less_dry_run_amend_indexes_the_order_panel() {
+        let inputs = BoundAmendInputs {
+            without: vec!["reviewer[0]".to_string()],
+            ..BoundAmendInputs::default()
+        };
+        let amend =
+            preview_bound_amend(&Config::default(), None, &dry_stateless_run(), &inputs).unwrap();
+        assert_eq!(amend.dropped, vec![0]);
+        assert_eq!(amend.cfg.roles.reviewer, vec!["cli:grok".to_string()]);
+    }
+
+    /// #234 follow-up: the bound pin is the run's panel in ordinal order, never
+    /// slot order, and widened extras (ids with no ordinal) are not panel seats.
+    /// Slots stored codex-first still pin claude-first, and the `-wide` extra
+    /// is neither pinned nor counted.
+    #[test]
+    fn bound_pin_sorts_by_ordinal_and_ignores_wide_extras() {
+        let mut st = dry_stateless_run();
+        for (id, provider) in [
+            ("review-1-cli-codex", "cli:codex"),
+            ("review-0-cli-claude", "cli:claude"),
+            ("review-cli-grok-wide", "cli:grok"),
+        ] {
+            st.slots
+                .push(executor::init_slot(id, provider, SlotRole::Reviewer));
+        }
+        let inputs = BoundAmendInputs {
+            without: vec!["reviewer[1]".to_string()],
+            ..BoundAmendInputs::default()
+        };
+        let amend = preview_bound_amend(&Config::default(), None, &st, &inputs).unwrap();
+        assert_eq!(amend.dropped, vec![1]);
+        assert_eq!(amend.cfg.roles.reviewer, vec!["cli:claude".to_string()]);
+    }
+
+    /// The last-seat refusal judges the final panel: `--role reviewer=` re-seats
+    /// it, so a drop plus a re-seat is allowed, while a drop alone is refused.
+    #[test]
+    fn drop_plus_role_reseat_is_allowed() {
+        let mut st = dry_stateless_run();
+        st.slots.push(executor::init_slot(
+            "review-0-cli-claude",
+            "cli:claude",
+            SlotRole::Reviewer,
+        ));
+        let inputs = BoundAmendInputs {
+            without: vec!["reviewer[0]".to_string()],
+            role: vec!["reviewer=cli:codex".to_string()],
+            ..BoundAmendInputs::default()
+        };
+        let amend = preview_bound_amend(&Config::default(), None, &st, &inputs).unwrap();
+        assert_eq!(amend.dropped, vec![0]);
+        assert_eq!(amend.cfg.roles.reviewer, vec!["cli:codex".to_string()]);
+        let bare = BoundAmendInputs {
+            without: vec!["reviewer[0]".to_string()],
+            ..BoundAmendInputs::default()
+        };
+        match preview_bound_amend(&Config::default(), None, &st, &bare) {
+            Ok(_) => panic!("a drop with no re-seat must be refused"),
+            Err(e) => assert!(
+                format!("{e:#}").contains("cannot drop the last reviewer seat"),
+                "{e:#}"
+            ),
+        }
+    }
+
+    /// O130: a reload re-reads the file, not the shell. Names still captured keep
+    /// the creation values, a name removed from `capture` is dropped, and only a
+    /// name newly added to `capture` takes this process's value; `--recapture-env`
+    /// retakes everything.
+    #[test]
+    fn reload_merges_env_per_name() {
+        fn env(capture: &[&str], captured: &[(&str, &str)]) -> crate::config::EnvConfig {
+            crate::config::EnvConfig {
+                capture: capture.iter().map(|s| s.to_string()).collect(),
+                captured: captured
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }
+        }
+        let frozen = Config {
+            env: env(
+                &["KEEP", "GONE"],
+                &[("KEEP", "frozen"), ("GONE", "frozen-gone")],
+            ),
+            ..Config::default()
+        };
+        let live = Config {
+            env: env(&["KEEP", "NEW"], &[("KEEP", "shell"), ("NEW", "shell-new")]),
+            ..Config::default()
+        };
+        let kept = preview_bound_amend(
+            &frozen,
+            Some(&live),
+            &dry_stateless_run(),
+            &BoundAmendInputs::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            kept.cfg.env.captured.get("KEEP").map(String::as_str),
+            Some("frozen")
+        );
+        assert_eq!(
+            kept.cfg.env.captured.get("NEW").map(String::as_str),
+            Some("shell-new")
+        );
+        assert!(!kept.cfg.env.captured.contains_key("GONE"));
+        let retaken = preview_bound_amend(
+            &frozen,
+            Some(&live),
+            &dry_stateless_run(),
+            &BoundAmendInputs {
+                recapture_env: true,
+                ..BoundAmendInputs::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            retaken.cfg.env.captured.get("KEEP").map(String::as_str),
+            Some("shell")
+        );
+        assert_eq!(
+            retaken.cfg.env.captured.get("NEW").map(String::as_str),
+            Some("shell-new")
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_from_cli(
     run_id: Option<String>,
     plan: Option<PathBuf>,
@@ -24,12 +353,13 @@ pub fn run_from_cli(
     opts: CommonOpts,
     paths: &SparPaths,
     cfg: &Config,
+    amend: BoundAmendInputs,
 ) -> Result<ExitCode> {
     if let Some(t) = &task {
         crate::workflow::validate_task(t).map_err(anyhow::Error::msg)?;
     }
     if let Some(id) = run_id {
-        return run_from_approved(&id, task, opts, paths, cfg);
+        return run_from_approved(&id, task, opts, paths, cfg, amend);
     }
     if let Some(plan_path) = plan {
         // A plan belongs to the run that produced it. Implementing it is that run
@@ -45,7 +375,7 @@ pub fn run_from_cli(
             if !opts.json {
                 eprintln!("continuing run {id} (it wrote this plan)");
             }
-            return run_from_approved(&id, task, opts, paths, cfg);
+            return run_from_approved(&id, task, opts, paths, cfg, amend);
         }
         if !new {
             bail!("{}", unlinked_plan_error(&plan_path, paths));
@@ -203,7 +533,7 @@ pub fn resume(
         dry_run: state.dry_run,
         ..CommonOpts::default()
     };
-    run_from_approved(run_id, None, opts, paths, cfg)
+    run_from_approved(run_id, None, opts, paths, cfg, BoundAmendInputs::default())
 }
 
 /// The run that wrote this plan, if spar wrote it: plan artifacts live at
@@ -581,6 +911,7 @@ fn run_from_approved(
     mut opts: CommonOpts,
     paths: &SparPaths,
     cfg: &Config,
+    amend: BoundAmendInputs,
 ) -> Result<ExitCode> {
     // Loaded once before the lock only so a mistyped id fails without the lock minting
     // a run directory for it. Everything below mutates the run, so it all happens under
@@ -597,7 +928,8 @@ fn run_from_approved(
             && opts.base.is_none()
             && !opts.reload_config
             && !opts.accept_contract
-            && opts.reassign.is_empty();
+            && opts.reassign.is_empty()
+            && amend.is_noop();
         let live = crate::runlock::RunLock::owner(paths, run_id).filter(|o| o.alive());
         if let (true, Some(owner)) = (extension_only, live) {
             if let Some(code) =
@@ -616,6 +948,15 @@ fn run_from_approved(
                 Err(code) => return Ok(code),
             }
         }
+    };
+    // The live file config loads before the run's captured env is re-applied:
+    // `Config::load` fills `captured` from this process, and the re-apply below
+    // overwrites the process env with the creation values (O130), so loading
+    // after it would freeze the creation values as this shell's (O154).
+    let live = if opts.reload_config {
+        Some(Config::load(&paths.project_root)?)
+    } else {
+        None
     };
     // Every way back into a run (`--run`, `resume`, a `--plan` the run wrote) dispatches
     // under the environment the run was created in (O130), from its own snapshot.
@@ -641,6 +982,19 @@ fn run_from_approved(
     }
     let moves = resolve_reassignments(&state, &reassignments)
         .map_err(|e| ReassignRefused(format!("{e:#}")))?;
+    // The amend previews here, read-only, before any side effect below (the
+    // stopped-marker removal, the terminal-slot clearing, the base worktrees,
+    // the reassigns): a refused amend — a bad seat id, a malformed override, the
+    // last-seat drop — changes nothing on disk or in the saved state. It is
+    // applied after the preconditions, further down.
+    let preview = if live.is_none() && amend.is_noop() {
+        None
+    } else {
+        Some(
+            preview_bound_amend(cfg, live.as_ref(), &state, &amend)
+                .map_err(|e| AmendRefused(format!("{e:#}")))?,
+        )
+    };
     // Resuming a stopped run: drop the marker so execute_loop dispatches instead
     // of halting again at its first boundary.
     if state.phase == Phase::Stopped {
@@ -715,6 +1069,60 @@ fn run_from_approved(
             );
         }
     }
+    // Bound amend, applied under this same lock and after every launch
+    // precondition passed (resumable, round extension, reassign resolution,
+    // base): the frozen config is amended, reviewer seats are dropped with
+    // their slots, and the snapshot is re-frozen — so a refused launch changes
+    // nothing (O154). The amended config shadows the frozen one for the rest
+    // of this dispatch. The `preview` above already passed every check, so a
+    // refusal here means the surgery itself failed mid-apply.
+    let amended;
+    let cfg: &Config = if let Some(mut preview) = preview {
+        if preview.panel_pinned {
+            // The reassigns above moved seats after the preview pinned them, and
+            // the pin records providers by panel ordinal: refresh it from the
+            // moved seats, then re-apply the recorded drops.
+            let mut panel = reviewer_panel_by_ordinal(&state);
+            for d in preview.dropped.iter() {
+                panel.remove(*d);
+            }
+            preview.cfg.roles.reviewer = panel;
+        }
+        if !preview.dropped.is_empty() {
+            let removed = drop_reviewer_seats(&mut state, paths, &preview.dropped)
+                .map_err(|e| AmendRefused(format!("{e:#}")))?;
+            disengage_spent_reviewer_backups(&state, &mut preview.cfg.backups.reviewer);
+            if !removed.is_empty() {
+                let _ = crate::events::append(
+                    paths,
+                    run_id,
+                    &crate::events::Event::info(format!(
+                        "operator dropped reviewer seat(s) {} on re-entry",
+                        removed.join(", ")
+                    )),
+                );
+                eprintln!(
+                    "run {run_id}: dropped reviewer seat(s) {} (the amended config re-freezes this dispatch)",
+                    removed.join(", ")
+                );
+            }
+        }
+        state
+            .save(paths)
+            .map_err(|e| AmendRefused(format!("{e:#}")))?;
+        preview
+            .cfg
+            .save_snapshot(paths, run_id)
+            .map_err(|e| AmendRefused(format!("{e:#}")))?;
+        preview.cfg.reapply_captured_env();
+        amended = preview;
+        state.isolation = amended.cfg.isolation;
+        state.autonomy = amended.cfg.autonomy;
+        state.message_budget = amended.cfg.message_budget;
+        &amended.cfg
+    } else {
+        cfg
+    };
     if state.dry_run {
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
@@ -3250,19 +3658,24 @@ fn panel_seat_with_ordinal(state: &RunState, ordinal: usize) -> Option<String> {
         .map(|s| s.id.clone())
 }
 
-/// Drop reviewer seats by panel ordinal (`--without reviewer[N]`): remove the
-/// matching state slots, prune their review history so the ship gate and review
-/// history stop counting that seat's open findings, delete the seats' verdict
-/// artifacts, and renumber the higher remaining seats down so ordinals (and the
-/// per-ordinal backups behind them) stay contiguous. Returns the removed slot ids.
-pub(crate) fn drop_reviewer_seats(
-    state: &mut RunState,
-    paths: &SparPaths,
+/// What a reviewer drop removes and how the survivors renumber, computed without
+/// touching anything. Both the dispatch (which applies it under the run lock)
+/// and `--validate-only` (which folds it into the displayed fleet) plan from it.
+pub struct ReviewerDropPlan {
+    pub removed: Vec<String>,
+    pub renames: Vec<(String, String)>,
+}
+
+pub(crate) fn plan_reviewer_drop(
+    state: &RunState,
     ordinals: &[usize],
-) -> Result<Vec<String>> {
+) -> Result<Option<ReviewerDropPlan>> {
     let mut gone: Vec<usize> = ordinals.to_vec();
     gone.sort_unstable();
     gone.dedup();
+    if gone.is_empty() {
+        return Ok(None);
+    }
     // Resolve the doomed seats first. A missing ordinal means no slot was ever
     // seated for it (e.g. a plan continuation), so there is nothing to reap.
     let mut removed: Vec<String> = Vec::new();
@@ -3272,19 +3685,12 @@ pub(crate) fn drop_reviewer_seats(
         }
     }
     if removed.is_empty() {
-        return Ok(removed);
-    }
-    let doomed: std::collections::BTreeSet<String> = removed.iter().cloned().collect();
-    // History entries keep the id of the seat that wrote them (`former_ids` maps a
-    // renamed seat back); pruning by every id the doomed seats ever held drops the
-    // whole seat, whatever it was called in earlier rounds.
-    let mut doomed_ids = doomed.clone();
-    for slot in state.slots.iter().filter(|s| doomed.contains(&s.id)) {
-        doomed_ids.extend(slot.former_ids.iter().cloned());
+        return Ok(None);
     }
     // Close ranks: rename higher remaining seats down over the gaps. The full plan
     // is computed up front and checked against the post-rename id set, so a rename
     // can never collide with a seat that is itself about to move.
+    let doomed: BTreeSet<String> = removed.iter().cloned().collect();
     let mut renames: Vec<(String, String)> = Vec::new();
     for slot in state
         .slots
@@ -3306,8 +3712,7 @@ pub(crate) fn drop_reviewer_seats(
             renames.push((slot.id.clone(), format!("review-{target}-{rest}")));
         }
     }
-    let mut final_ids: std::collections::BTreeSet<String> =
-        state.slots.iter().map(|s| s.id.clone()).collect();
+    let mut final_ids: BTreeSet<String> = state.slots.iter().map(|s| s.id.clone()).collect();
     for id in &doomed {
         final_ids.remove(id);
     }
@@ -3318,6 +3723,34 @@ pub(crate) fn drop_reviewer_seats(
                 "cannot drop reviewer seat: rename {old} to {new} collides with a live seat"
             );
         }
+    }
+    Ok(Some(ReviewerDropPlan { removed, renames }))
+}
+
+/// Drop reviewer seats by panel ordinal (`--without reviewer[N]`): remove the
+/// matching state slots, prune their review history so the ship gate and review
+/// history stop counting that seat's open findings, delete the seats' verdict
+/// artifacts, and renumber the higher remaining seats down so ordinals (and the
+/// per-ordinal backups behind them) stay contiguous. Returns the removed slot ids.
+pub(crate) fn drop_reviewer_seats(
+    state: &mut RunState,
+    paths: &SparPaths,
+    ordinals: &[usize],
+) -> Result<Vec<String>> {
+    let Some(plan) = plan_reviewer_drop(state, ordinals)? else {
+        return Ok(Vec::new());
+    };
+    let ReviewerDropPlan {
+        removed,
+        mut renames,
+    } = plan;
+    let doomed: std::collections::BTreeSet<String> = removed.iter().cloned().collect();
+    // History entries keep the id of the seat that wrote them (`former_ids` maps a
+    // renamed seat back); pruning by every id the doomed seats ever held drops the
+    // whole seat, whatever it was called in earlier rounds.
+    let mut doomed_ids = doomed.clone();
+    for slot in state.slots.iter().filter(|s| doomed.contains(&s.id)) {
+        doomed_ids.extend(slot.former_ids.iter().cloned());
     }
     // Every fallible check is done: now mutate. Gone seats lose their checkouts
     // (renamed survivors recreate theirs on the next dispatch), their slots, their
@@ -5263,7 +5696,7 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
             dry_run: state.dry_run,
             ..CommonOpts::default()
         };
-        return run_from_approved(run_id, None, opts, paths, cfg);
+        return run_from_approved(run_id, None, opts, paths, cfg, BoundAmendInputs::default());
     }
     if state.workflow == crate::cli::WorkflowKind::Plan {
         return crate::workflow::plan::continue_run(paths, cfg, run_id);

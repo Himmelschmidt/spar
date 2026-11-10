@@ -730,6 +730,40 @@ pub fn panel_findings<'a>(
     out
 }
 
+/// Each surviving reviewer seat's latest recorded review, whatever round it judged:
+/// a seat's older rounds are superseded, and a dropped seat (gone from the slots)
+/// contributes nothing. Never `state.round`: a round begun but not yet reviewed
+/// has no reviews to judge.
+fn latest_panel(state: &RunState) -> Vec<&crate::state::ReviewHistoryEntry> {
+    let mut out = Vec::new();
+    for slot in state
+        .slots
+        .iter()
+        .filter(|s| s.role == crate::state::SlotRole::Reviewer)
+    {
+        let names_slot = |e: &&crate::state::ReviewHistoryEntry| {
+            e.slot_id == slot.id || slot.former_ids.contains(&e.slot_id)
+        };
+        let Some(latest) = state
+            .review_history
+            .iter()
+            .filter(&names_slot)
+            .map(|e| e.round)
+            .max()
+        else {
+            continue;
+        };
+        out.extend(
+            state
+                .review_history
+                .iter()
+                .filter(|e| e.round == latest)
+                .filter(names_slot),
+        );
+    }
+    out
+}
+
 /// One finding as a markdown bullet: severity, follow-up mark, location, reviewer, text.
 /// Continuation lines are indented under the bullet.
 pub fn finding_line(slot_id: &str, f: &Finding) -> String {
@@ -786,11 +820,12 @@ impl OpenFinding {
     }
 }
 
-/// The last panel's reviewer findings, each checked against the commits since its
-/// review that touched its cited file, in `cwd` (the implementer's worktree). No model
-/// call: one `git log` per distinct (commit, file).
+/// Each surviving seat's latest recorded review's findings, each checked against
+/// the commits since its review that touched its cited file, in `cwd` (the
+/// implementer's worktree). No model call: one `git log` per distinct
+/// (commit, file).
 pub fn open_findings(state: &RunState, cwd: &std::path::Path) -> Vec<OpenFinding> {
-    let panel = panel_before(&state.review_history, u32::MAX);
+    let panel = latest_panel(state);
     let mut cache: std::collections::HashMap<(String, String), Option<Vec<String>>> =
         std::collections::HashMap::new();
     panel_findings(&panel)
@@ -2176,6 +2211,11 @@ The loop at src/resolver.rs:88 never stops.\n\
         git(dir, &["commit", "-q", "-am", "fix a"]);
 
         let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, dir.into());
+        state.slots.push(crate::executor::init_slot(
+            "rev",
+            "cli:codex",
+            crate::state::SlotRole::Reviewer,
+        ));
         state.review_history.push(crate::state::ReviewHistoryEntry {
             round: 2,
             slot_id: "rev".into(),

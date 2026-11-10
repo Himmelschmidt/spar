@@ -2271,3 +2271,460 @@ fn reconcile_seats_report_the_rung_their_pool_came_from() {
         );
     }
 }
+
+/// #234 follow-up (item 1): a refused launch changes nothing. The run below is a
+/// plan that was never approved, so `implement --run` is not resumable; the
+/// `--without reviewer[0]` it carries must not shrink the panel, and retrying
+/// the same refused command must not shrink it again.
+#[test]
+fn refused_without_drop_leaves_panel_and_state_unchanged() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(
+        tmp.path(),
+        &["--providers", "cli:claude,cli:codex,cli:grok"],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    let config_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("config.json");
+    let state_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("state.json");
+    let config_before = std::fs::read(&config_path).unwrap();
+    let state_before = std::fs::read(&state_path).unwrap();
+    for _ in 0..2 {
+        spar_cmd()
+            .current_dir(tmp.path())
+            .args([
+                "implement",
+                "--run",
+                &run_id,
+                "--without",
+                "reviewer[0]",
+                "--dry-run",
+                "--json",
+            ])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("not resumable"));
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            config_before,
+            "a refused launch leaves the frozen config alone"
+        );
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            state_before,
+            "a refused launch leaves the run state alone"
+        );
+    }
+}
+
+/// #234 follow-up (item 2a): on a fresh launch an explicit `--providers` pool
+/// beats a `[roles].reviewer` file pin, so `reviewer[0]` indexes the pool panel
+/// (`cli:codex`), not the file panel (`api:openai`).
+#[test]
+fn fresh_without_ordinal_ignores_a_file_pin_for_an_explicit_pool() {
+    let tmp =
+        project("[roles]\nreviewer = [\"api:openai\",\"cli:agy\"]\n[suite]\nenabled = false\n");
+    let v = implement_json(
+        tmp.path(),
+        &[
+            "--providers",
+            "cli:claude,cli:codex,cli:grok",
+            "--without",
+            "reviewer[0]",
+        ],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    let cfg = read_run_config(tmp.path(), &run_id);
+    assert_eq!(
+        cfg["roles"]["reviewer"],
+        serde_json::json!(["cli:grok"]),
+        "the drop hits the pool panel, not the file pin: {:?}",
+        cfg["roles"]["reviewer"]
+    );
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        providers_for(&state, "reviewer"),
+        vec!["cli:grok".to_string()],
+        "the dispatched survivor is the pool seat: {:?}",
+        state["slots"]
+    );
+}
+
+/// #234 follow-up (item 2b): a bound-run amend on a run with no reviewer slots
+/// yet (a plan continuation) resolves the ordinal against the recorded pool via
+/// `--reload-config`, never against a file pin edited in after the freeze.
+#[test]
+fn bound_amend_without_slots_replays_the_recorded_pool() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(
+        tmp.path(),
+        &["--providers", "cli:claude,cli:codex,cli:grok"],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    std::fs::write(
+        tmp.path().join("spar.toml"),
+        "[roles]\nreviewer = [\"api:openai\",\"cli:agy\"]\n[suite]\nenabled = false\n",
+    )
+    .unwrap();
+    run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--reload-config",
+            "--without",
+            "reviewer[0]",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let cfg = read_run_config(tmp.path(), &run_id);
+    assert_eq!(
+        cfg["roles"]["reviewer"],
+        serde_json::json!(["cli:grok"]),
+        "the amend replays the recorded pool, not the file pin: {:?}",
+        cfg["roles"]["reviewer"]
+    );
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        vec!["review-0-cli-grok"],
+        "the dispatched panel is the pool survivor: {:?}",
+        state["slots"]
+    );
+}
+
+/// #234 follow-up (item 3): `--without` refuses to drop the last reviewer seat,
+/// and the refusal leaves the frozen config and the state alone.
+#[test]
+fn without_refuses_to_drop_the_last_reviewer_seat() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(
+        tmp.path(),
+        &["--providers", "cli:claude,cli:codex,cli:grok"],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--without",
+            "reviewer[0]",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let config_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("config.json");
+    let config_before = std::fs::read(&config_path).unwrap();
+    let out = run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--without",
+            "reviewer[0]",
+            "--dry-run",
+            "--json",
+        ],
+        1,
+    );
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot drop the last reviewer seat"),
+        "the refusal says why the ship gate needs the seat: {out}"
+    );
+    assert_eq!(
+        std::fs::read(&config_path).unwrap(),
+        config_before,
+        "the refused drop leaves the frozen config alone"
+    );
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        vec!["review-0-cli-grok"],
+        "the refused drop leaves the survivor alone: {:?}",
+        state["slots"]
+    );
+}
+
+/// #234 follow-up (item 6): `--validate-only` with `--without reviewer[N]`
+/// shows the fleet after the drop, with the surviving seat renumbered.
+#[test]
+fn validate_only_shows_the_fleet_after_the_drop() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(tmp.path(), &["--providers", "cli:claude,cli:grok"]);
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        2,
+    );
+    let v = run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--without",
+            "reviewer[0]",
+            "--validate-only",
+            "--json",
+        ],
+        0,
+    );
+    let seats: Vec<String> = fleet_seats(&v, "reviewer")
+        .iter()
+        .map(|s| seat_field(s, "seat"))
+        .collect();
+    assert_eq!(
+        seats,
+        vec!["review-0-cli-claude"],
+        "the dropped seat is gone and the survivor renumbered down: {seats:?}"
+    );
+}
+
+/// Every file under a run dir, so a refused re-entry can prove it wrote nothing.
+fn snapshot_run_dir(dir: &std::path::Path, run_id: &str) -> Vec<(String, Vec<u8>)> {
+    fn walk(base: &std::path::Path, path: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(path)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            if p.is_dir() {
+                walk(base, &p, out);
+            } else if p.file_name().unwrap() != "orchestrator.lock" {
+                out.push((
+                    p.strip_prefix(base).unwrap().to_string_lossy().into_owned(),
+                    std::fs::read(&p).unwrap(),
+                ));
+            }
+        }
+    }
+    let base = dir.join(".spar/runs").join(run_id);
+    let mut out = Vec::new();
+    walk(&base, &base, &mut out);
+    out
+}
+
+/// #234 follow-up (item 1c): a refused amend after a valid reassign changes
+/// nothing. The reassign resolves, then the out-of-range `--without` refuses;
+/// the old code applied the reassign (renamed artifact, cleared marker, event)
+/// before the amend ran. The run dir is byte-identical afterwards.
+#[test]
+fn refused_amend_after_a_reassign_changes_nothing() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(
+        tmp.path(),
+        &["--providers", "cli:claude,cli:codex,cli:grok"],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        2,
+    );
+    let state = read_state(tmp.path(), &run_id);
+    let ids = slot_ids_for(&state, "reviewer");
+    assert!(!ids.is_empty(), "the dispatch seated reviewers");
+    let seat = ids[0].clone();
+    let current = providers_for(&state, "reviewer")[0].clone();
+    let other = ["cli:claude", "cli:codex", "cli:grok"]
+        .into_iter()
+        .map(str::to_string)
+        .find(|p| *p != current && !ids.contains(&format!("review-0-{}", p.replace(':', "-"))))
+        .expect("a provider to move the seat to");
+    let before = snapshot_run_dir(tmp.path(), &run_id);
+    let out = run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--reassign",
+            &format!("{seat}={other}"),
+            "--without",
+            "reviewer[9]",
+            "--dry-run",
+            "--json",
+        ],
+        1,
+    );
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reviewer[9]"),
+        "the refusal names the bad ordinal: {out}"
+    );
+    assert_eq!(
+        snapshot_run_dir(tmp.path(), &run_id),
+        before,
+        "a refused amend leaves state, config, events, artifacts and markers alone"
+    );
+}
+
+/// #234 follow-up: the frozen pin records providers by panel ordinal, and a
+/// `--reassign` moves seats after the preview pinned them. A successful amend
+/// with both must freeze the moved panel, not the pre-move one.
+#[test]
+fn amend_after_a_reassign_freezes_the_moved_panel() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(
+        tmp.path(),
+        &["--providers", "cli:claude,cli:codex,cli:grok"],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        2,
+    );
+    let state = read_state(tmp.path(), &run_id);
+    let ids = slot_ids_for(&state, "reviewer");
+    assert!(ids.len() > 1, "the dispatch seated a panel: {ids:?}");
+    let seat = ids[0].clone();
+    let current = providers_for(&state, "reviewer")[0].clone();
+    // A moved seat keeps its ordinal, so any other provider's id is free.
+    let other = ["cli:claude", "cli:codex", "cli:grok"]
+        .into_iter()
+        .map(str::to_string)
+        .find(|p| *p != current)
+        .expect("a provider to move the seat to");
+    run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--reassign",
+            &format!("{seat}={other}"),
+            "--without",
+            "reviewer[1]",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let cfg = read_run_config(tmp.path(), &run_id);
+    let panel: Vec<&str> = cfg["roles"]["reviewer"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        panel,
+        vec![other.as_str()],
+        "the frozen pin names the moved provider with the drop applied: {panel:?}"
+    );
+}
+
+/// #234 follow-up: on a bound run, `--role reviewer=...` replaces the panel
+/// outright, so a reassign that runs after the preview must not refresh the
+/// live-slot pin back over it. The frozen config keeps the role panel.
+#[test]
+fn bound_drop_with_role_pin_freezes_the_role_panel() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(
+        tmp.path(),
+        &["--providers", "cli:claude,cli:codex,cli:grok"],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        2,
+    );
+    let state = read_state(tmp.path(), &run_id);
+    let ids = slot_ids_for(&state, "reviewer");
+    assert!(ids.len() > 1, "the dispatch seated a panel: {ids:?}");
+    let seat = ids[0].clone();
+    let current = providers_for(&state, "reviewer")[0].clone();
+    // A moved seat keeps its ordinal, so any other provider's id is free.
+    let other = ["cli:claude", "cli:codex", "cli:grok"]
+        .into_iter()
+        .map(str::to_string)
+        .find(|p| *p != current)
+        .expect("a provider to move the seat to");
+    run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--reassign",
+            &format!("{seat}={other}"),
+            "--without",
+            "reviewer[0]",
+            "--role",
+            "reviewer=cli:codex",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let cfg = read_run_config(tmp.path(), &run_id);
+    let panel: Vec<&str> = cfg["roles"]["reviewer"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        panel,
+        vec!["cli:codex"],
+        "the frozen config keeps the role panel, not the refreshed pin: {panel:?}"
+    );
+}

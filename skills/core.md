@@ -771,9 +771,9 @@ clamped on a word boundary to `[ship] title_max` characters (default 72, `0` = n
 of spar's own), and never past GitHub's 256-character limit.
 The PR **body** is built from the run: OPEN questions from the shipped slot's summary
 (lines under an `Open questions` heading, or lines marked `OPEN`), each reviewer's final
-verdict and the commit it named, an **Open findings (non-blocking)** list (the last
-panel's reviewer findings from `review_history`: minors under `block_on`, follow-ups,
-notes on an approving review), then the summary itself (`summary-<slot>.md`, else
+verdict and the commit it named, an **Open findings (non-blocking)** list (each surviving
+seat's latest recorded review from `review_history`: minors under `block_on`,
+follow-ups, notes on an approving review), then the summary itself (`summary-<slot>.md`, else
 `summary-impl.md`). A body over GitHub's limit is cut from the end of the summary with a
 note naming the full file. It is written to `artifacts/pr-body.md` and passed with
 `--body-file`; dry-run puts both into `artifacts/ship.md`.
@@ -833,9 +833,9 @@ reconcile gate. `--reason` is required (exit `1` without it); it refuses while t
 orchestrator is alive (`spar stop` it first) and inside a slot (operator-only). A ship that
 fails after the override puts the run back in the phase it came from. The override is kept
 on the run (`ship_override`) for the round, so a later re-ship keeps the findings section. It ships the same HEAD with the same push
-safety as a normal ship. Every finding of the last reviewed round, from the structured
-review records (severity, `file:line`, reviewer slot, round, `Reviewed-Commit`), goes in
-the PR body under **Shipped over open findings**, ahead of the summary. The override (who
+safety as a normal ship. Every finding of each surviving seat's latest recorded review,
+from the structured review records (severity, `file:line`, reviewer slot, round,
+`Reviewed-Commit`), goes in the PR body under **Shipped over open findings**, ahead of the summary. The override (who
 from `$USER`, when, reason, the findings) is written to
 `artifacts/ship.md` under `## Gate override` and logged as an `info` event.
 
@@ -1849,7 +1849,8 @@ it before anyone confirms:
   projected}`), resolved by the same functions the launch uses: plan-phase seats plus the
   projected implement panel for `plan`, the implement panel for `implement -t` and
   `--workflow loop`, the reviewers for `--workflow review`, and the run's own seats for
-  `implement --run <id>` and `plan --run <id>`. Availability, quota pauses and backups are
+  `implement --run <id>` and `plan --run <id>` — with a `--without reviewer[N]` amend
+  applied to the shown fleet, so the dropped seat is gone and survivors show renumbered. Availability, quota pauses and backups are
   not applied, so a paused primary shows as itself. `null` with `--select` and for arena,
   peer and roles.
 - `gates`: `autonomy` plus `auto_plan`, `auto_winner`, `auto_ship`, true when the config
@@ -1937,12 +1938,17 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
   `test_author`, no `test-contract.md`); `suite` -> `[suite] enabled = false` for this run
   (no `tester` slot); `reviewer[N]` -> the panel's Nth seat (0-based) is removed, with its
   per-ordinal backup, or an existing seat id (`review-1-cli-claude`) names the seat
-  directly. Dropping a reviewer removes it from the panel, the run's state slots, and
+  directly. The ordinal indexes the panel the dispatch would use: an explicit
+  `--providers`/`--select` pool beats a `[roles].reviewer` file pin. Dropping a reviewer
+  removes it from the panel, the run's state slots, and
   the review history, so its verdicts stop gating the ship; the higher remaining seats
   are renumbered down so ordinals stay contiguous. Unknown names are refused, naming
-  the valid ones. On an existing `--run <id>` it amends the frozen config, exactly
+  the valid ones, and dropping every reviewer is refused, since the run would reach
+  the ship gate unreviewed. On an existing `--run <id>` it amends the frozen config, exactly
   like `--role`.
-- All of these flags are applied where `--role` is (`main.rs`), and the overrides a run
+- All of these flags amend under the dispatch's run lock once every launch precondition
+  passes, so a refused launch (`not resumable`, round ceiling, busy run) changes nothing,
+  and the overrides a run
   was launched or amended with (`--role`, `--backup`, `--effort`, without-channel drops,
   the `--fleet small` narrowing, and any pinned suite command) are recorded in the frozen
   `config.json`, so a later `--reload-config` re-reads `spar.toml` and then re-applies

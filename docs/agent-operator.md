@@ -61,7 +61,10 @@ caught, which is what the sweep is for.
   or amended with. `--role`, `--backup`, `--effort`, `--without` and `--fleet` amend a
   resume's frozen config directly (only `--suite-command` still needs `--reload-config`).
   `--without reviewer[N]` (or an existing seat id) drops a reviewer seat outright: the
-  seat, its review history, and its verdicts stop gating the ship.
+  seat, its review history, and its verdicts stop gating the ship. The ordinal indexes
+  the panel the dispatch would use, and dropping the last reviewer is refused. The
+  amend applies only once every launch precondition passes, so a refused launch changes
+  nothing.
 - **`--reassign <role|seat>=<provider>`** on `implement --run <id>` moves a seat that already
   exists to another provider on the same worktree and branch (a reload only changes a
   seat's model). Operator-only; refused while the run's orchestrator is alive and onto a

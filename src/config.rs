@@ -1070,21 +1070,26 @@ pub fn without_has_reviewer_item(without: &[String]) -> bool {
         .any(|w| parse_reviewer_without(w.trim()).is_ok())
 }
 
+/// Whether any `--role` assignment pins the reviewer panel outright, replacing
+/// whatever the file or a `--without` drop built.
+pub fn role_pins_reviewer(role: &[String]) -> bool {
+    role.iter().any(|r| {
+        r.split('=').next().is_some_and(|k| {
+            crate::state::SlotRole::from_config_key(k.trim())
+                == Some(crate::state::SlotRole::Reviewer)
+        })
+    })
+}
+
 /// Warn when an explicit `--role reviewer=...` replaces a panel a `--without
 /// reviewer[N]` just cut: the pin wins and the dropped seats are lost. Every
 /// amend path applies `--without` before `--role`, so each one calls this after
 /// both have run.
 pub fn warn_if_role_discards_reviewer_drop(role: &[String], dropped: &[usize]) {
-    use crate::state::SlotRole;
     if dropped.is_empty() {
         return;
     }
-    let pins_reviewer = role.iter().any(|r| {
-        r.split('=')
-            .next()
-            .is_some_and(|k| SlotRole::from_config_key(k.trim()) == Some(SlotRole::Reviewer))
-    });
-    if pins_reviewer {
+    if role_pins_reviewer(role) {
         eprintln!(
             "warning: --role reviewer=... replaces the reviewer panel, discarding the --without reviewer seat drop"
         );
@@ -1993,11 +1998,25 @@ impl Config {
         Ok(ordinals.into_iter().map(|(_, n)| n).rev().collect())
     }
 
-    /// Pin the operator-visible reviewer panel onto `roles.reviewer` when it is not
-    /// pinned yet, so an ordinal drop has a list to index. Draws the same seats the
-    /// dispatch would (`build_implement_seats` over the run's pool), never a fresh
-    /// draw from the provider order: on a `--providers` run the panel comes from the
-    /// pool, with reviewer `r` at pool position `r + 1`.
+    /// A drop that emptied the reviewer panel is refused once the role overrides
+    /// have run: `--role reviewer=` re-seats the panel, so the check judges the
+    /// final panel, not the intermediate one a `--without` alone leaves behind.
+    pub fn refuse_emptied_reviewer_panel(&self, dropped: &[usize]) -> Result<()> {
+        if !dropped.is_empty() && self.roles.reviewer.is_empty() {
+            anyhow::bail!(
+                "--without reviewer[N]: cannot drop the last reviewer seat; the run would reach the ship gate unreviewed (--role reviewer=<provider> re-seats the panel)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Pin the operator-visible reviewer panel onto `roles.reviewer`, so an ordinal
+    /// drop has a list to index. Only a panel pinned by an explicit operator choice
+    /// (a CLI `--role`, or an amend that pinned the run's own live seats) is taken
+    /// as-is: a `[roles].reviewer` file pin never beats the explicit pool the
+    /// dispatch itself would resolve. Every other case replays the dispatch's own
+    /// resolution (`build_implement_seats` over the run's pool), from that one
+    /// source rather than a second copy of the precedence rules.
     fn materialize_reviewer_panel(
         &mut self,
         pool: &[String],
@@ -2006,7 +2025,7 @@ impl Config {
     ) -> Result<()> {
         use crate::state::SlotRole;
         use crate::workflow::roles_resolve;
-        if !self.roles.reviewer.is_empty() || self.cli_role_keys.contains(&SlotRole::Reviewer) {
+        if self.cli_role_keys.contains(&SlotRole::Reviewer) {
             return Ok(());
         }
         let expanded = crate::providers::pick_providers(
