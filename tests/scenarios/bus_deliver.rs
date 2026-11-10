@@ -935,8 +935,10 @@ fn poll_file_lists_directed_and_human_broadcasts_for_pi() {
 
 /// A slot's bare `spar bus ack <id>` resolves the caller from the slot env:
 /// `SPAR_AGENT_ID`/`SPAR_RUN_ID` default `--from`/`--run`, so the ack records
-/// the slot instead of the human. A stranger's ack is filed but clears nothing:
-/// the redelivery stays pending and the item stays listed until the slot acks.
+/// the slot instead of the human. A stranger's ack is filed and stops the
+/// redelivery, but the item stays listed and the word stays delivered until
+/// the slot acks: the operator's ack is the escape hatch for a wedged slot,
+/// not a read receipt.
 fn slot_env_ack_resolves_caller(provider: &str) {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
@@ -966,7 +968,8 @@ fn slot_env_ack_resolves_caller(provider: &str) {
         "a requires-ack send records a pending redelivery"
     );
 
-    // The operator's ack is a stranger's: filed, but the redelivery stands.
+    // The operator's ack is a stranger's: filed, stops the redelivery, but the
+    // item stays listed until the slot acks.
     spar_cmd()
         .current_dir(dir)
         .args(["bus", "ack", &needy_id, "--run", &run_id])
@@ -977,8 +980,8 @@ fn slot_env_ack_resolves_caller(provider: &str) {
         "a stranger's ack leaves the item listed"
     );
     assert!(
-        pending(&needy_id),
-        "a stranger's ack leaves the redelivery pending"
+        !pending(&needy_id),
+        "the operator's ack stops the redelivery"
     );
     assert_eq!(
         log_entry(&log_entries(dir, &run_id), &needy_id)["delivery"],
@@ -1020,10 +1023,11 @@ fn slot_env_ack_resolves_caller_for_pi() {
     slot_env_ack_resolves_caller("cli:pi");
 }
 
-/// The file stops growing without bound: a claimed message without
-/// `requires-ack` is last-valid in its filing round, so bumping the round and
-/// re-rendering drops it while a `requires-ack` item survives until the slot
-/// acks it. Aging out of the file is not unread: the log still reads delivered.
+/// The file stops growing without bound, but nothing leaves mid-turn unread: a
+/// claimed message without `requires-ack` drops out once its slot has finished
+/// a dispatch that started after the filing round. A `requires-ack` item
+/// survives until the slot acks it. Aging out of the file is not unread: the
+/// log still reads delivered.
 fn poll_file_ages_out_last_round_non_ack(provider: &str) {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
@@ -1032,6 +1036,8 @@ fn poll_file_ages_out_last_round_non_ack(provider: &str) {
 
     let stale = send_json(dir, &run_id, &["--to", &agent, "-m", "yesterday's news"]);
     let stale_id = stale["id"].as_str().unwrap().to_string();
+    let stale2 = send_json(dir, &run_id, &["--to", &agent, "-m", "second stale note"]);
+    let stale2_id = stale2["id"].as_str().unwrap().to_string();
     let needy = send_json(
         dir,
         &run_id,
@@ -1040,6 +1046,7 @@ fn poll_file_ages_out_last_round_non_ack(provider: &str) {
     let needy_id = needy["id"].as_str().unwrap().to_string();
     let poll = poll_body(dir, &run_id, &agent);
     assert!(poll.contains("yesterday's news"), "{poll}");
+    assert!(poll.contains("second stale note"), "{poll}");
     assert!(poll.contains("still needs eyes"), "{poll}");
 
     let state_path = dir.join(".spar/runs").join(&run_id).join("state.json");
@@ -1050,7 +1057,7 @@ fn poll_file_ages_out_last_round_non_ack(provider: &str) {
     std::fs::write(&state_path, state.to_string()).unwrap();
 
     // The round bumped but the slot has not dispatched since the filing: the
-    // item stays, so the next turn can still read it.
+    // items stay, so the next turn can still read them.
     deliver_json(dir, &run_id, &agent);
     let poll = poll_body(dir, &run_id, &agent);
     assert!(
@@ -1058,12 +1065,17 @@ fn poll_file_ages_out_last_round_non_ack(provider: &str) {
         "a round bump alone never removes what the slot has not had a turn with:\n{poll}"
     );
     assert!(
+        poll.contains("second stale note"),
+        "a round bump alone never removes what the slot has not had a turn with:\n{poll}"
+    );
+    assert!(
         poll.contains("still needs eyes"),
         "a requires-ack item survives the round bump until acked:\n{poll}"
     );
 
-    // Once the slot dispatches past the filing round it had its turn: the
-    // non-ack item leaves on the next render.
+    // The slot's turn starts in the new round. Its own ack re-renders the file
+    // mid-turn: the acked item leaves, but the stale sibling stays listed even
+    // though its filing round has passed.
     let mut state: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
     let slot = state["slots"]
@@ -1073,13 +1085,46 @@ fn poll_file_ages_out_last_round_non_ack(provider: &str) {
         .find(|s| s["id"] == agent)
         .unwrap();
     slot["round"] = serde_json::Value::from(round + 1);
+    slot["status"] = serde_json::Value::from("running");
+    std::fs::write(&state_path, state.to_string()).unwrap();
+    spar_cmd()
+        .current_dir(dir)
+        .env("SPAR_AGENT_ID", &agent)
+        .env("SPAR_RUN_ID", &run_id)
+        .args(["bus", "ack", &stale_id])
+        .assert()
+        .success();
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        !poll.contains("yesterday's news"),
+        "the slot's own ack clears the item at once:\n{poll}"
+    );
+    assert!(
+        poll.contains("second stale note"),
+        "a render mid-turn never drops what the slot may not have opened:\n{poll}"
+    );
+    assert!(
+        poll.contains("still needs eyes"),
+        "a requires-ack item survives the slot's turn until acked:\n{poll}"
+    );
+
+    // The turn finishes: the stale sibling leaves on the next render.
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let slot = state["slots"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["id"] == agent)
+        .unwrap();
+    slot["status"] = serde_json::Value::from("done");
     std::fs::write(&state_path, state.to_string()).unwrap();
 
     deliver_json(dir, &run_id, &agent);
     let poll = poll_body(dir, &run_id, &agent);
     assert!(
-        !poll.contains("yesterday's news"),
-        "last round's non-ack message ages out after the slot's turn:\n{poll}"
+        !poll.contains("second stale note"),
+        "last round's non-ack message ages out after the slot's finished turn:\n{poll}"
     );
     assert!(
         poll.contains("still needs eyes"),
@@ -1088,6 +1133,11 @@ fn poll_file_ages_out_last_round_non_ack(provider: &str) {
     let entries = log_entries(dir, &run_id);
     assert_eq!(
         log_entry(&entries, &stale_id)["delivery"],
+        "acknowledged",
+        "the slot-acked item reads acknowledged: {entries}"
+    );
+    assert_eq!(
+        log_entry(&entries, &stale2_id)["delivery"],
         "delivered",
         "aging out of the file is not unread: {entries}"
     );
