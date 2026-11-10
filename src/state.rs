@@ -89,24 +89,16 @@ pub struct RunState {
     #[serde(default = "crate::config::default_max_rounds")]
     pub max_rounds: u32,
     /// Consecutive implementer rounds that ended with HEAD and the tree unchanged
-    /// while a `request_changes` review against that same HEAD stayed open (#236).
+    /// while a `request_changes` review against that same HEAD stayed open.
     /// Reset the moment a round moves HEAD or dirties the tree; the second in a row
     /// parks the run at the round-extension gate instead of buying another review.
     #[serde(default)]
     pub no_progress_rounds: u32,
     /// The warning a no-progress round put at the top of the next implementer
-    /// prompt (#236). Persisted so a re-entry after the park renders it again
-    /// instead of parking silently; cleared the moment a round makes progress.
+    /// prompt. Persisted so a re-entry after the park renders it again instead
+    /// of parking silently; cleared the moment a round makes progress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_progress_warning: Option<String>,
-    /// Dry-run implementer dispatches consumed so far (#236). Only moves while
-    /// the `SPAR_DRY_IMPL_NOOP` hook is armed, so real dry runs keep it at zero.
-    /// The hook budgets no-ops in dispatches, not rounds: the warning
-    /// re-dispatch is a second dispatch inside the same round, so a
-    /// round-based budget could never stall the first dispatch and let the
-    /// re-dispatch count as progress.
-    #[serde(default)]
-    pub dry_impl_dispatches: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_session: Option<String>,
     #[serde(default)]
@@ -881,7 +873,6 @@ impl RunState {
             max_rounds: crate::config::default_max_rounds(),
             no_progress_rounds: 0,
             no_progress_warning: None,
-            dry_impl_dispatches: 0,
             tmux_session: None,
             providers: Vec::new(),
             rotated_implementer: false,

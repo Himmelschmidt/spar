@@ -2185,10 +2185,6 @@ pub fn execute_loop(
         cfg,
     );
 
-    // #236: warning rendered at the top of the implementer prompt on the round after
-    // a no-progress round. One-shot: cleared the moment a round moves HEAD or the tree.
-    let mut no_progress_warning: Option<String> = None;
-
     loop {
         // Stop boundary: before the implementer (and every fix-round re-dispatch).
         if should_stop(paths, &state.id) {
@@ -2245,10 +2241,7 @@ pub fn execute_loop(
         extra.insert("amendment_section".into(), amendment_section.clone());
         extra.insert(
             "no_progress_warning".into(),
-            no_progress_warning
-                .clone()
-                .or_else(|| state.no_progress_warning.clone())
-                .unwrap_or_default(),
+            state.no_progress_warning.clone().unwrap_or_default(),
         );
         extra.insert(
             "carry_forward_section".into(),
@@ -2475,14 +2468,14 @@ pub fn execute_loop(
             .unwrap();
         let review_cwd = impl_cwd(state, &impl_slot);
 
-        // #236: the implementer burned a round without moving HEAD or the tree while a
-        // `request_changes` review against that same commit is still open. Don't pay for
-        // another full review of that commit: re-dispatch once with a warning at the top
-        // of the prompt, and park at the human gate when the next round is empty too.
-        // Any round that moves HEAD or dirties the tree resets both the count and the
-        // warning and flows to the suite and panel below.
+        // The implementer burned a round without moving HEAD or the tree while a
+        // `request_changes` review against that same commit is still open. Do not pay
+        // for another full review of that commit: re-dispatch once with a warning at
+        // the top of the prompt, and park at the human gate when the next round is
+        // empty too. Any round that moves HEAD or dirties the tree resets both the
+        // count and the warning and flows to the suite and panel below.
         if let Some(stalled) =
-            detect_no_progress(state, cfg, &review_cwd, round_start_head.as_deref())
+            detect_no_progress(state, paths, cfg, &review_cwd, round_start_head.as_deref())
         {
             state.no_progress_rounds += 1;
             if state.no_progress_rounds >= 2 {
@@ -2497,8 +2490,7 @@ pub fn execute_loop(
                 stalled.reviews.iter().map(|r| r.slot_id.as_str()).collect::<Vec<_>>(),
             );
             let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
-            no_progress_warning = Some(stalled.prompt());
-            state.no_progress_warning = no_progress_warning.clone();
+            state.no_progress_warning = Some(stalled.prompt());
             state.save(paths)?;
             continue;
         }
@@ -2507,7 +2499,6 @@ pub fn execute_loop(
             state.no_progress_warning = None;
             state.save(paths)?;
         }
-        no_progress_warning = None;
 
         // Stop boundary: before the suite job.
         if should_stop(paths, &state.id) {
@@ -3251,9 +3242,8 @@ impl NoProgress {
              unchanged while the review below still requests changes against that \
              exact commit. This round re-dispatches you instead of paying for \
              another full review of the same commit. Change the tree this round: \
-             address the open findings, or use your summary to explain why no \
-             change was needed. A second consecutive round with no changes parks \
-             the run for a human.\n",
+             address the open findings. A second consecutive unchanged round with \
+             an open request_changes review parks the run for the operator.\n",
             self.head
         );
         for r in &self.reviews {
@@ -3265,7 +3255,7 @@ impl NoProgress {
                 out.push_str(
                     "\n- no findings recorded; the review blocks without naming a \
                      severable finding (acceptance criteria, an untagged item, or a \
-                     bare verdict — see the carry-forward blockers).",
+                     bare verdict; see the carry-forward blockers).",
                 );
             } else {
                 for line in r.findings.iter().take(MAX_LISTED_FINDINGS) {
@@ -3302,23 +3292,24 @@ impl NoProgress {
 }
 
 /// A round that changed nothing while a `request_changes` review against that same
-/// HEAD is open (#236). Compares HEAD before and after the implementer dispatch
-/// and requires a clean tree, so a round that wrote files it could not commit
-/// still counts as progress and flows to the panel. (The previous round's
+/// HEAD is open. Compares HEAD before and after the implementer dispatch and
+/// requires a clean tree, so a round that wrote files it could not commit still
+/// counts as progress and flows to the panel. (The previous round's
 /// `commit_before_review` moved already-judged work into HEAD before this round
 /// started.) A dry-run implementer moves no HEAD by design, so it counts as
-/// progress unless the `SPAR_DRY_IMPL_NOOP` hook nooped this dispatch — only the
-/// hook simulates a stall. The hook budgets dispatches, not rounds, so the check
-/// reads the same `dry_impl_dispatches` counter the dispatch just consumed.
+/// progress unless the `SPAR_DRY_IMPL_NOOP` hook nooped this dispatch (only the
+/// hook simulates a stall). The hook budgets dispatches, not rounds, so the
+/// check reads the same run-dir counter file the dispatch just wrote.
 /// Returns the open reviews driving the re-dispatch, or `None` when the round
 /// made progress or nothing blocks it.
 fn detect_no_progress(
     state: &RunState,
+    paths: &SparPaths,
     cfg: &Config,
     cwd: &Path,
     start_head: Option<&str>,
 ) -> Option<NoProgress> {
-    if state.dry_run && !crate::executor::dry_impl_noop(state.dry_impl_dispatches) {
+    if state.dry_run && !crate::executor::dry_impl_noop(paths, &state.id) {
         return None;
     }
     let start = start_head?;
@@ -3353,20 +3344,43 @@ fn detect_no_progress(
     Some(NoProgress { head: end, reviews })
 }
 
-/// Second consecutive no-progress round: park at the round-extension gate — an
-/// existing human gate, exit 2 — instead of paying for another full review of a
+/// Second consecutive no-progress round: park at the round-extension gate (the
+/// existing human gate, exit 2) instead of paying for another full review of a
 /// commit the panel already judged. The message names the unaddressed findings so
 /// the human knows what the implementer would not touch.
 fn park_no_progress(state: &mut RunState, paths: &SparPaths, stalled: &NoProgress) -> Result<()> {
+    // The panel never runs on a stalled round, so a reviewer paused after the
+    // last panel never gets its seat check. Stand those seats down here so the
+    // park records who cannot re-judge the carried veto.
+    let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+    let paused: Vec<(String, String)> = stalled
+        .reviews
+        .iter()
+        .filter_map(|r| {
+            let slot = state.slots.iter().find(|s| s.id == r.slot_id)?;
+            if slot.stood_down.is_some() {
+                return None;
+            }
+            seat_quota_blocked(state, &store, slot).map(|key| (r.slot_id.clone(), key))
+        })
+        .collect();
+    for (id, key) in paused {
+        if let Some(slot) = state.slot_mut(&id) {
+            slot.stood_down = Some(format!(
+                "provider {key} is paused or on cooldown; stood down at the no-progress park \
+                 without dispatch. resume with `spar provider resume {key}` or reassign the role"
+            ));
+        }
+    }
     // Kept in state so a re-entry renders the warning on its first dispatch
     // instead of parking silently.
     state.no_progress_warning = Some(stalled.prompt());
     let msg = format!(
         "no progress in two consecutive implementer rounds: HEAD `{}` and the worktree \
          are unchanged while {} still request changes against it ({}). The run is parked \
-         for a human: take it over by hand (`spar stop {}`) or re-enter with \
-         `spar implement --run {} --max-rounds N` after changing the tree; re-entering \
-         with nothing changed renders the warning once more and parks again at once.",
+         for a human: take it over by hand (`spar stop {}`) or change the tree and \
+         re-enter with `spar implement --run {}`; re-entering with nothing changed \
+         renders the warning once more and parks again at once.",
         stalled.head,
         if stalled.reviews.len() == 1 {
             "a review"
@@ -3682,6 +3696,32 @@ fn gate_implementer_seat(
     }
 }
 
+/// Whether a seat's quota bucket holds it right now, without moving the seat.
+/// The live branch of the re-check gate (O106): a live run trusts only pauses it
+/// can trust, manual and strong, plus a weak pause written before this dispatch
+/// started. The line is the dispatch start, not the run creation: one id threads
+/// plan, implement, and every round (O45), so `created_at` long predates any
+/// later round. Returns the quota key when blocked. `None` in dry runs, which
+/// skip pause gating, as the run-start gate always has.
+fn seat_quota_blocked(
+    state: &RunState,
+    store: &crate::quota::QuotaStore,
+    slot: &SlotState,
+) -> Option<String> {
+    if state.dry_run {
+        return None;
+    }
+    let seat = slot.provider_ref();
+    let key = seat.quota_key(state.codex_profile.as_deref());
+    let horizon = state.round_started_at.unwrap_or(state.created_at);
+    let blocked = if store.blocks_live_dispatch(&key) {
+        true
+    } else {
+        !store.is_usable(&key) && store.get(&key).updated_at.is_none_or(|at| at < horizon)
+    };
+    blocked.then_some(key)
+}
+
 /// Re-read pause state right before a dispatch (#175, O106). Pauses used to be read
 /// only when a run started or resumed, so `provider pause grok --until 2027-01-01` did
 /// not stop a live run from dispatching its next grok reviewer. A seat whose provider
@@ -3708,18 +3748,12 @@ fn recheck_seat(
     let sub = seat.storage_key();
     // A live run trusts only pauses it can trust: manual and strong (O106). A
     // weak heuristic pause ("429" in "429 passed") written by this very dispatch
-    // must not park it or reseat it — but a weak pause written before this
-    // dispatch started steers the seat onto its backup, so the first dispatch
-    // reads it strict while later dispatches stay trust-only. The line is the
-    // dispatch start, not the run creation: one id threads plan, implement, and
-    // every round (O45), so `created_at` long predates any later round.
-    let horizon = state.round_started_at.unwrap_or(state.created_at);
+    // must not park it or reseat it, so the first dispatch reads it strict
+    // while later dispatches stay trust-only.
     let blocked = if strict {
         !store.is_usable(&key)
-    } else if store.blocks_live_dispatch(&key) {
-        true
     } else {
-        !store.is_usable(&key) && store.get(&key).updated_at.is_none_or(|at| at < horizon)
+        seat_quota_blocked(state, &store, &slot).is_some()
     };
     if !blocked {
         return Ok(SeatCheck::Ready(slot_id.to_string()));
@@ -5454,14 +5488,14 @@ fn take_carry_forward(paths: &SparPaths, run_id: &str, slot_id: &str) -> Option<
     (!body.is_empty()).then_some(body)
 }
 
-/// One blocking review, described the way #236 requires the next implementer to see
-/// it: that it requested changes, the round that wrote it and the commit it
-/// judged, then the open findings as severity plus one line each, followed by
-/// that review's failing criteria. One bullet per review: a panel that repeats
-/// the same criterion failure in every review would otherwise pay the line once
-/// per seat and squeeze the slot's own brief out of the budget. The plain
-/// statement that these reviews are the current verdict lives once in
-/// `carry_forward_section`, not in every bullet, for the same reason.
+/// One blocking review: that it requested changes, the round that wrote it and the
+/// commit it judged, then that review's failing criteria followed by the open
+/// findings as severity plus one line each. The failing criteria lead because the
+/// bullet is clamped and the tail is the part truncation eats. One bullet per
+/// review: a panel that repeats the same criterion failure in every review would
+/// otherwise pay the line once per seat and squeeze the slot's own brief out of
+/// the budget. The plain statement that these reviews are the current verdict
+/// lives once in `carry_forward_section`, not in every bullet, for the same reason.
 fn verdict_blocker(
     state: &RunState,
     rev: &SlotState,
@@ -5481,21 +5515,27 @@ fn verdict_blocker(
         (Some(r), None) => s.push_str(&format!(" (round {r}, no Reviewed-Commit recorded)")),
         (None, None) => {}
     }
-    let mut items: Vec<String> = res
+    let mut items: Vec<String> = acceptance
+        .iter()
+        .map(|a| a.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    let room = MAX_LISTED_FINDINGS.saturating_sub(items.len().min(MAX_LISTED_FINDINGS));
+    let findings: Vec<String> = res
         .findings
         .iter()
         .filter(|f| !f.synthetic)
         .map(open_finding_line)
         .collect();
-    items.extend(
-        acceptance
-            .iter()
-            .map(|a| a.split_whitespace().collect::<Vec<_>>().join(" ")),
-    );
+    let dropped = findings.len().saturating_sub(room);
+    items.extend(findings.into_iter().take(room));
     if items.is_empty() {
         s.push_str(": no open findings recorded; see the review artifact.");
     } else {
-        s.push_str(&format!(": {}.", list_findings(&items)));
+        let mut list = items.join("; ");
+        if dropped > 0 {
+            list.push_str(&format!(" (+{dropped} more)"));
+        }
+        s.push_str(&format!(": {list}."));
     }
     s
 }
@@ -5507,19 +5547,9 @@ fn short_commit(c: &str) -> &str {
     c.get(..12).unwrap_or(c)
 }
 
-/// At most this many findings print; the count after names the rest.
-fn list_findings(open: &[String]) -> String {
-    let extra = open.len().saturating_sub(MAX_LISTED_FINDINGS);
-    let shown = open.len().min(MAX_LISTED_FINDINGS);
-    let mut out = open[..shown].join("; ");
-    if extra > 0 {
-        out.push_str(&format!(" (+{extra} more)"));
-    }
-    out
-}
-
-/// At most this many findings ride along in one blocker line or warning; the
-/// carry-forward clamp bounds the characters on top.
+/// At most this many findings ride along in one blocker line or warning alongside
+/// the failing criteria, which always print first; the carry-forward clamp bounds
+/// the characters on top.
 const MAX_LISTED_FINDINGS: usize = 5;
 
 /// Severity plus one clamped line, so a finding can never smuggle a paragraph
@@ -5536,7 +5566,7 @@ fn open_finding_line(f: &review_result::Finding) -> String {
     } else {
         format!("{at} {text}")
     };
-    clamp_line(&format!("{} — {shown}", f.severity.as_str()), 160)
+    clamp_line(&format!("{} - {shown}", f.severity.as_str()), 160)
 }
 
 /// Which round wrote this blocking review and which commit it judged: the latest
@@ -5565,7 +5595,7 @@ fn blocking_review_anchor(
 ///
 /// Blockers first, deliberately: they are the machine-known half (which `AC-n` failed and
 /// why, whether the suite went red) and the truncation eats the tail, so a slot that
-/// wrote a 40k-character essay cannot squeeze them out. The whole section is capped —
+/// wrote a 40k-character essay cannot squeeze them out. The whole section is capped;
 /// carrying more every round is the quadratic problem this exists to avoid.
 fn carry_forward_section(
     round: u32,
@@ -5578,7 +5608,7 @@ fn carry_forward_section(
         return String::new();
     }
     let mut out = format!(
-        "## Carry-forward (you already ran on this worktree — this is round {round})\n\
+        "## Carry-forward (you already ran on this worktree, this is round {round})\n\
          Context from the previous round, not a verdict.\n\n"
     );
     if !persisted.is_empty() {
@@ -5598,8 +5628,8 @@ fn carry_forward_section(
         // review below, and repeating it per bullet costs a multi-review panel its
         // brief under a tight budget.
         out.push_str(
-            "These reviews are the current verdict on the implementer's HEAD, not \
-             stale notes: they supersede the previous round's own notes.\n",
+            "These reviews are the current verdict on the implementer's HEAD and must \
+             be fixed, not stale notes: they supersede the previous round's own notes.\n",
         );
         for b in blockers {
             // Clamped per bullet, not just in aggregate. A reviewer that pastes a stack
@@ -5612,6 +5642,9 @@ fn carry_forward_section(
     }
     if let Some(brief) = brief {
         out.push_str("### The previous round's own notes\n");
+        out.push_str(
+            "These notes are context, not a verdict. The acceptance gate never reads it.\n",
+        );
         out.push_str(brief);
         out.push('\n');
     }
@@ -6626,21 +6659,22 @@ mod carry_forward_tests {
         ));
         std::fs::write(
             paths.artifact("r1", "review-rev-1.md"),
-            "## Verdict\nrequest_changes\n\n## Acceptance\nAC-1: fail — no guard exists\n",
+            "## Verdict\nrequest_changes\n\n## Acceptance\nAC-1: fail - no guard exists\n",
         )
         .unwrap();
 
         let out = blockers_from_disk(&state, &paths, &["AC-1".to_string()], &Config::default());
         assert!(
             out.iter()
-                .any(|b| b.contains("AC-1: fail — no guard exists")),
+                .any(|b| b.contains("AC-1:") && b.contains("no guard exists")),
             "{out:?}"
         );
         assert!(
             out.iter().any(|b| b.contains("requested changes")
                 && b.contains("(round ")
                 && b.contains("no Reviewed-Commit recorded")
-                && b.contains("AC-1: fail — no guard exists")),
+                && b.contains("AC-1:")
+                && b.contains("no guard exists")),
             "a verdict with no findings still anchors round and commit state, \
              carrying its failing criterion: {out:?}"
         );
@@ -6713,8 +6747,8 @@ mod carry_forward_tests {
         assert_eq!(blockers_from_disk(&state, &paths, &ac, &strict).len(), 1);
     }
 
-    /// #236: the carry-forward names the round that wrote the blocking review, the
-    /// commit it judged, and its open findings — not just the review's file path —
+    /// The carry-forward names the round that wrote the blocking review, the
+    /// commit it judged, and its open findings (not just the review's file path)
     /// and says plainly the reviews are the current verdict, not stale notes. The
     /// sentence lives once in the section, the anchor and findings in each bullet,
     /// so a multi-review panel fits under a tight budget with the brief.
@@ -6733,12 +6767,12 @@ mod carry_forward_tests {
             round: 3,
             slot_id: "rev-1".to_string(),
             review: review_result::parse_review(
-                "## Verdict\nrequest_changes\n\nReviewed-Commit: abcdef1234567\n\n## Findings\n- severity: major — the retry at src/net.rs:40 never stops\n",
+                "## Verdict\nrequest_changes\n\nReviewed-Commit: abcdef1234567\n\n## Findings\n- severity: major - the retry at src/net.rs:40 never stops\n",
             ),
         });
         std::fs::write(
             paths.artifact("r1", "review-rev-1.md"),
-            "## Verdict\nrequest_changes\n\nReviewed-Commit: abcdef1234567\n\n## Acceptance\nAC-1: fail — no guard exists\n\n## Findings\n- severity: major — the retry at src/net.rs:40 never stops\n",
+            "## Verdict\nrequest_changes\n\nReviewed-Commit: abcdef1234567\n\n## Acceptance\nAC-1: fail - no guard exists\n\n## Findings\n- severity: major - the retry at src/net.rs:40 never stops\n",
         )
         .unwrap();
 
@@ -6754,11 +6788,11 @@ mod carry_forward_tests {
             "{verdict}"
         );
         assert!(
-            verdict.contains("major — the retry at src/net.rs:40 never stops"),
+            verdict.contains("major - the retry at src/net.rs:40 never stops"),
             "{verdict}"
         );
         assert!(
-            verdict.contains("AC-1: fail — no guard exists"),
+            verdict.contains("AC-1:") && verdict.contains("no guard exists"),
             "the review's failing criterion rides in its own bullet: {verdict}"
         );
 
@@ -6790,10 +6824,10 @@ mod carry_forward_tests {
             SlotRole::Reviewer,
         ));
         let res = review_result::parse_review(
-            "## Verdict\nrequest_changes\n\nReviewed-Commit: 1234567890abcdef1234\n\n## Findings\n- severity: major — nothing was changed at src/main.rs:9\n",
+            "## Verdict\nrequest_changes\n\nReviewed-Commit: 1234567890abcdef1234\n\n## Findings\n- severity: major - nothing was changed at src/main.rs:9\n",
         );
         let rev = state.slots[0].clone();
-        let out = verdict_blocker(&state, &rev, &res, &["AC-9: fail — seized".to_string()]);
+        let out = verdict_blocker(&state, &rev, &res, &["AC-9: fail - seized".to_string()]);
         assert!(out.contains("requested changes"), "{out}");
         assert!(
             out.contains(&format!(
@@ -6803,11 +6837,11 @@ mod carry_forward_tests {
             "{out}"
         );
         assert!(
-            out.contains("major — nothing was changed at src/main.rs:9"),
+            out.contains("major - nothing was changed at src/main.rs:9"),
             "{out}"
         );
         assert!(
-            out.contains("AC-9: fail — seized"),
+            out.contains("AC-9: fail - seized"),
             "the review's failing criterion rides in its own bullet: {out}"
         );
     }
@@ -6826,7 +6860,7 @@ mod carry_forward_tests {
         );
         for i in 1..=7 {
             body.push_str(&format!(
-                "- severity: major — finding number {i}\n  with a wrapped second line that must not survive\n"
+                "- severity: major - finding number {i}\n  with a wrapped second line that must not survive\n"
             ));
         }
         let res = review_result::parse_review(&body);
@@ -6835,6 +6869,45 @@ mod carry_forward_tests {
         assert_eq!(out.matches("finding number").count(), 5, "{out}");
         assert!(out.contains("(+2 more)"), "{out}");
         assert!(!out.contains('\n'), "one line per finding: {out:?}");
+    }
+
+    /// Failing criteria lead the bullet, so five long findings cannot push them
+    /// out at the default cap.
+    #[test]
+    fn verdict_blocker_keeps_failing_criteria_before_long_findings() {
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, "/nonexistent".into());
+        state.slots.push(crate::executor::init_slot(
+            "rev-1",
+            "cli:claude",
+            SlotRole::Reviewer,
+        ));
+        let mut body = String::from(
+            "## Verdict\nrequest_changes\n\nReviewed-Commit: abcdef1234567\n\n## Findings\n",
+        );
+        for i in 1..=5 {
+            body.push_str(&format!(
+                "- severity: major - finding number {i} {}\n",
+                "x".repeat(200)
+            ));
+        }
+        let res = review_result::parse_review(&body);
+        let rev = state.slots[0].clone();
+        let acceptance = vec![
+            "AC-1: fail - guard missing".to_string(),
+            "AC-2: fail - no test".to_string(),
+        ];
+        let out = verdict_blocker(&state, &rev, &res, &acceptance);
+        assert!(out.contains("AC-1: fail - guard missing"), "{out}");
+        assert!(out.contains("AC-2: fail - no test"), "{out}");
+        let section = carry_forward_section(2, &[], &[out], None, 4000);
+        assert!(
+            section.contains("AC-1: fail - guard missing"),
+            "AC lines survive the default cap:\n{section}"
+        );
+        assert!(
+            section.contains("AC-2: fail - no test"),
+            "AC lines survive the default cap:\n{section}"
+        );
     }
 
     /// A git repo with one commit, for the no-progress matrix below.
@@ -6875,14 +6948,15 @@ mod carry_forward_tests {
         }
     }
 
-    const STALLED_RC: &str = "## Verdict\nrequest_changes\n\nReviewed-Commit: {head}\n\n## Findings\n- severity: major — the retry never stops\n";
+    const STALLED_RC: &str = "## Verdict\nrequest_changes\n\nReviewed-Commit: {head}\n\n## Findings\n- severity: major - the retry never stops\n";
 
-    /// #236: HEAD and the tree unchanged while a `request_changes` review against
-    /// that same commit is open is a no-progress round, and the warning names the
+    /// HEAD and the tree unchanged while a `request_changes` review against that
+    /// same commit is open is a no-progress round, and the warning names the
     /// review, its round and commit, and the open findings.
     #[test]
     fn unchanged_head_and_tree_with_open_review_is_no_progress() {
         let (tmp, head) = stalled_repo();
+        let paths = SparPaths::new(tmp.path());
         let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
         state.round = 2;
         state
@@ -6890,7 +6964,8 @@ mod carry_forward_tests {
             .push(stalled_history(&head, STALLED_RC));
 
         let stalled =
-            detect_no_progress(&state, &Config::default(), tmp.path(), Some(&head)).unwrap();
+            detect_no_progress(&state, &paths, &Config::default(), tmp.path(), Some(&head))
+                .unwrap();
         assert_eq!(stalled.head, head);
         assert_eq!(stalled.reviews.len(), 1);
         let prompt = stalled.prompt();
@@ -6898,13 +6973,14 @@ mod carry_forward_tests {
         assert!(prompt.contains("`rev-1`"), "{prompt}");
         assert!(prompt.contains("(round 1, Reviewed-Commit"), "{prompt}");
         assert!(prompt.contains(&head), "{prompt}");
-        assert!(prompt.contains("major — the retry never stops"), "{prompt}");
+        assert!(prompt.contains("major - the retry never stops"), "{prompt}");
     }
 
     /// Anything the implementer committed, wrote, or earned counts as progress.
     #[test]
     fn progress_or_no_open_review_is_not_no_progress() {
         let (tmp, head) = stalled_repo();
+        let paths = SparPaths::new(tmp.path());
         let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
         state.round = 2;
         state
@@ -6916,7 +6992,7 @@ mod carry_forward_tests {
         let mut first = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
         first.round = 1;
         assert!(
-            detect_no_progress(&first, &cfg, tmp.path(), Some(&head)).is_none(),
+            detect_no_progress(&first, &paths, &cfg, tmp.path(), Some(&head)).is_none(),
             "no previous panel, no stall"
         );
 
@@ -6928,7 +7004,7 @@ mod carry_forward_tests {
             .status()
             .unwrap();
         assert!(
-            detect_no_progress(&state, &cfg, tmp.path(), Some(&head)).is_none(),
+            detect_no_progress(&state, &paths, &cfg, tmp.path(), Some(&head)).is_none(),
             "a moved HEAD is progress"
         );
 
@@ -6940,7 +7016,7 @@ mod carry_forward_tests {
             .unwrap();
         std::fs::write(tmp.path().join("draft.txt"), "uncommitted\n").unwrap();
         assert!(
-            detect_no_progress(&state, &cfg, tmp.path(), Some(&head)).is_none(),
+            detect_no_progress(&state, &paths, &cfg, tmp.path(), Some(&head)).is_none(),
             "uncommitted work still flows to the panel"
         );
         std::fs::remove_file(tmp.path().join("draft.txt")).unwrap();
@@ -6953,7 +7029,7 @@ mod carry_forward_tests {
             "## Verdict\napprove\n\nReviewed-Commit: {head}\n",
         ));
         assert!(
-            detect_no_progress(&approved, &cfg, tmp.path(), Some(&head)).is_none(),
+            detect_no_progress(&approved, &paths, &cfg, tmp.path(), Some(&head)).is_none(),
             "an approval is not an open review"
         );
 
@@ -6965,13 +7041,13 @@ mod carry_forward_tests {
             STALLED_RC,
         ));
         assert!(
-            detect_no_progress(&other, &cfg, tmp.path(), Some(&head)).is_none(),
+            detect_no_progress(&other, &paths, &cfg, tmp.path(), Some(&head)).is_none(),
             "a review against another commit does not stall this one"
         );
     }
 
-    /// #236: the second consecutive no-progress round parks at the existing human
-    /// gate (exit 2), with the unaddressed findings in the reason.
+    /// The second consecutive no-progress round parks at the existing human gate
+    /// (exit 2), with the unaddressed findings in the reason.
     #[test]
     fn second_consecutive_no_progress_parks_at_the_human_gate() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6985,7 +7061,7 @@ mod carry_forward_tests {
                 slot_id: "rev-1".to_string(),
                 round: 1,
                 reviewed_commit: "abcdef1234567".to_string(),
-                findings: vec!["major — the retry never stops".to_string()],
+                findings: vec!["major - the retry never stops".to_string()],
             }],
         };
         park_no_progress(&mut state, &paths, &stalled).unwrap();
@@ -7001,7 +7077,7 @@ mod carry_forward_tests {
             "{escalation}"
         );
         assert!(
-            escalation.contains("major — the retry never stops"),
+            escalation.contains("major - the retry never stops"),
             "{escalation}"
         );
     }
@@ -7019,7 +7095,7 @@ mod carry_forward_tests {
         state
     }
 
-    const PRIOR: &str = "## Verdict\nrequest_changes\n\nReviewed-Commit: abcdef1234567\n\n## Findings\n- severity: major — the retry at src/net.rs:40 never stops\n\n## Follow-up\n- severity: minor — split the module later\n";
+    const PRIOR: &str = "## Verdict\nrequest_changes\n\nReviewed-Commit: abcdef1234567\n\n## Findings\n- severity: major - the retry at src/net.rs:40 never stops\n\n## Follow-up\n- severity: minor - split the module later\n";
 
     #[test]
     fn scoped_review_starts_at_its_round_and_carries_the_prior_findings() {
