@@ -84,7 +84,7 @@ fn planner_paused_activates_backup_and_records_backup_source() {
     // Create a fake claude and grok that handle --version quickly
     let bin = tmp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
-    for name in ["claude", "grok"] {
+    for name in ["claude", "grok", "agy"] {
         let p = bin.join(name);
         fs::write(&p, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\necho \"hi\"\n").unwrap();
         #[cfg(unix)]
@@ -124,7 +124,7 @@ fn planner_paused_activates_backup_and_records_backup_source() {
     let slot = &state["slots"][0];
     assert_eq!(slot["provider"], "cli:grok");
     assert_eq!(slot["model"], "fast");
-    assert_eq!(slot["source"], "backup");
+    assert_eq!(slot["source"], "cli-backup");
     // Fleet output via status --json must also report backup source
     let status = spar_cmd()
         .current_dir(&proj)
@@ -151,12 +151,12 @@ fn planner_paused_activates_backup_and_records_backup_source() {
         );
     }
     assert!(
-        v_obj["slots"][0]["source"] == "backup"
+        v_obj["slots"][0]["source"] == "cli-backup"
             || v_obj["slots"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|s| s["source"] == "backup"),
+                .any(|s| s["source"] == "cli-backup"),
         "status slots source must be backup: {v_obj}"
     );
 }
@@ -170,7 +170,7 @@ fn reviewer_unavailable_activates_only_its_ordinal_backup() {
     let spar_home = spar_home_dir();
     let bin = tmp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
-    for name in ["claude", "grok"] {
+    for name in ["claude", "grok", "agy"] {
         let p = bin.join(name);
         fs::write(
             &p,
@@ -236,7 +236,7 @@ fn reviewer_unavailable_activates_only_its_ordinal_backup() {
         .iter()
         .find(|s| s["id"].as_str().unwrap().starts_with("review-0"))
         .unwrap();
-    let has_backup = slots.iter().any(|s| s["source"] == "backup");
+    let has_backup = slots.iter().any(|s| s["source"] == "cli-backup");
     assert!(
         has_backup,
         "at least one reviewer should have used backup when primary unavailable: {:?}",
@@ -244,7 +244,7 @@ fn reviewer_unavailable_activates_only_its_ordinal_backup() {
     );
     assert_eq!(r0["provider"], "cli:codex");
     assert_eq!(r0["model"], "backup");
-    assert_eq!(r0["source"], "backup");
+    assert_eq!(r0["source"], "cli-backup");
     // Fleet output and pool checks via status --json
     let status = spar_cmd()
         .current_dir(&proj)
@@ -275,7 +275,7 @@ fn reviewer_unavailable_activates_only_its_ordinal_backup() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|s| s["source"] == "backup"),
+            .any(|s| s["source"] == "cli-backup"),
         "slot source must be backup: {v2_obj}"
     );
 }
@@ -309,6 +309,18 @@ fn timeout_does_not_activate_backup() {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+    // agy must not inherit the 10s sleep below: it answers presence probes only.
+    let p = bin.join("agy");
+    std::fs::write(
+        &p,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
     }
     let path_env = format!(
         "{}:{}",
@@ -348,7 +360,10 @@ fn timeout_does_not_activate_backup() {
         .find(|s| s["role"] == "implementer")
         .unwrap();
     assert_eq!(slot["provider"], "cli:claude");
-    assert_ne!(slot["source"], "backup", "timeout must not activate backup");
+    assert_ne!(
+        slot["source"], "cli-backup",
+        "timeout must not activate backup"
+    );
     // Ensure error indicates hard ceiling / timeout, not quota
     let err = slot["error"].as_str().unwrap_or("");
     assert!(
@@ -366,7 +381,7 @@ fn missing_artifact_does_not_activate_backup() {
     let spar_home = spar_home_dir();
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    for name in ["claude", "grok"] {
+    for name in ["claude", "grok", "agy"] {
         let p = bin.join(name);
         std::fs::write(
             &p,
@@ -418,7 +433,7 @@ fn missing_artifact_does_not_activate_backup() {
         .unwrap();
     assert_eq!(slot["provider"], "cli:claude");
     assert_ne!(
-        slot["source"], "backup",
+        slot["source"], "cli-backup",
         "missing artifact must not activate backup"
     );
 }
@@ -432,7 +447,7 @@ fn adverse_review_does_not_activate_backup() {
     let spar_home = spar_home_dir();
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    for name in ["claude", "grok", "codex"] {
+    for name in ["claude", "grok", "codex", "agy"] {
         let p = bin.join(name);
         std::fs::write(
             &p,
@@ -484,7 +499,7 @@ fn adverse_review_does_not_activate_backup() {
     let state = read_state(&proj, &run_id);
     for slot in state["slots"].as_array().unwrap() {
         assert_ne!(
-            slot["source"], "backup",
+            slot["source"], "cli-backup",
             "adverse review must not activate backup: {slot:?}"
         );
     }
@@ -508,7 +523,7 @@ fn work_failure_does_not_activate_backup() {
     let spar_home = spar_home_dir();
     let bin = tmp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
-    for name in ["claude", "grok"] {
+    for name in ["claude", "grok", "agy"] {
         let p = bin.join(name);
         fs::write(
             &p,
@@ -563,7 +578,7 @@ fn work_failure_does_not_activate_backup() {
     let slot = &state["slots"][0];
     // Work failure must stay on primary, not backup
     assert_eq!(slot["provider"], "cli:claude");
-    assert_ne!(slot["source"], "backup");
+    assert_ne!(slot["source"], "cli-backup");
     let _ = combined;
 }
 
@@ -584,7 +599,7 @@ fn implementer_paused_activates_backup_and_records_backup_source() {
         .success();
     let bin = tmp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
-    for name in ["claude", "grok", "codex"] {
+    for name in ["claude", "grok", "codex", "agy"] {
         let p = bin.join(name);
         fs::write(
             &p,
@@ -634,7 +649,7 @@ fn implementer_paused_activates_backup_and_records_backup_source() {
         .unwrap();
     assert_eq!(slot["provider"], "cli:grok");
     assert_eq!(slot["model"], "fast");
-    assert_eq!(slot["source"], "backup");
+    assert_eq!(slot["source"], "cli-backup");
     // Pool must still contain the original primary, not be rewritten to backup-only.
     let pool = state["providers"].as_array().unwrap();
     assert!(
@@ -677,7 +692,7 @@ fn implementer_paused_activates_backup_and_records_backup_source() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|s| s["source"] == "backup"),
+            .any(|s| s["source"] == "cli-backup"),
         "slots must contain backup"
     );
 }
@@ -691,7 +706,7 @@ fn implementer_work_failure_does_not_activate_backup() {
     let spar_home = spar_home_dir();
     let bin = tmp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
-    for name in ["claude", "grok"] {
+    for name in ["claude", "grok", "agy"] {
         let p = bin.join(name);
         fs::write(
             &p,
@@ -746,7 +761,7 @@ fn implementer_work_failure_does_not_activate_backup() {
         .unwrap();
     assert_eq!(slot["provider"], "cli:claude");
     assert_ne!(
-        slot["source"], "backup",
+        slot["source"], "cli-backup",
         "work failure must not activate backup"
     );
     let _ = combined;
@@ -768,6 +783,10 @@ fn implementer_quota_mid_dispatch_activates_backup() {
         ),
         (
             "grok",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
+        ),
+        (
+            "agy",
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
         ),
     ] {
@@ -820,7 +839,7 @@ fn implementer_quota_mid_dispatch_activates_backup() {
         slot["provider"], "cli:grok",
         "quota mid-dispatch must activate backup: {state:?}"
     );
-    assert_eq!(slot["source"], "backup");
+    assert_eq!(slot["source"], "cli-backup");
     assert_eq!(slot["model"], "backup");
     assert_ne!(
         slot["status"], "pending",
@@ -845,6 +864,10 @@ fn planner_quota_mid_dispatch_activates_backup() {
         (
             "grok",
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\necho \"plan content\" > plan.md 2>/dev/null; exit 0\n",
+        ),
+        (
+            "agy",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
         ),
         (
             "codex",
@@ -898,7 +921,7 @@ fn planner_quota_mid_dispatch_activates_backup() {
         planner["provider"], "cli:grok",
         "planner quota must activate backup: {state:?}"
     );
-    assert_eq!(planner["source"], "backup");
+    assert_eq!(planner["source"], "cli-backup");
     assert_ne!(
         planner["status"], "pending",
         "planner backup must have been dispatched: {state:?}"
@@ -921,6 +944,10 @@ fn reviewer_quota_mid_dispatch_activates_backup() {
         ),
         (
             "grok",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
+        ),
+        (
+            "agy",
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
         ),
         (
@@ -981,7 +1008,7 @@ fn reviewer_quota_mid_dispatch_activates_backup() {
         r0["provider"], "cli:codex",
         "reviewer quota must activate backup: {state:?}"
     );
-    assert_eq!(r0["source"], "backup");
+    assert_eq!(r0["source"], "cli-backup");
     assert_ne!(
         r0["status"], "pending",
         "reviewer backup must have been dispatched: {state:?}"
@@ -1002,13 +1029,22 @@ fn implementer_backup_wins_over_pool_only_on_environmental_and_not_reused() {
     let spar_home = spar_home_dir();
     let bin = tmp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
-    for name in ["claude", "codex", "grok"] {
-        let p = bin.join(name);
-        fs::write(
-            &p,
+    for (name, script) in [
+        (
+            "claude",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nif [ \"$1\" = \"auth\" ]; then exit 0; fi\nexit 1\n",
+        ),
+        (
+            "codex",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nif [ \"$1\" = \"login\" ]; then exit 0; fi\nexit 1\n",
+        ),
+        (
+            "grok",
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 1\n",
-        )
-        .unwrap();
+        ),
+    ] {
+        let p = bin.join(name);
+        fs::write(&p, script).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

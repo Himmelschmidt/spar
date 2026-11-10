@@ -159,6 +159,10 @@ name = "provider_health"
 path = "tests/scenarios/provider_health.rs"
 
 [[test]]
+name = "health_gating"
+path = "tests/scenarios/health_gating.rs"
+
+[[test]]
 name = "quota_buckets"
 path = "tests/scenarios/quota_buckets.rs"
 

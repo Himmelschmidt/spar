@@ -239,10 +239,13 @@ fn sigkilled_orchestrator_leaves_orphans_that_status_names_and_sweep_reaps() {
     init_repo(&proj);
 
     // A provider CLI that announces its pid and then sits there, like a working agent.
+    // Readiness probes (`auth status`) answer fast like the real CLI: they are
+    // local-only status checks, never agent dispatches, so they neither record a
+    // pid nor sleep. Anything else is a dispatch: it records its pid and sits.
     let fake = bin.join("claude");
     std::fs::write(
         &fake,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ] || [ \"$1\" = \"-v\" ] || [ \"$1\" = \"--help\" ]; then echo \"fake version\"; exit 0; fi\necho $$ >> \"$SLOT_PIDS_FILE\"\nsleep 300\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ] || [ \"$1\" = \"-v\" ] || [ \"$1\" = \"--help\" ]; then echo \"fake version\"; exit 0; fi\nif [ \"$1\" = \"auth\" ]; then exit 0; fi\necho $$ >> \"$SLOT_PIDS_FILE\"\nsleep 300\n",
     )
     .unwrap();
     #[cfg(unix)]

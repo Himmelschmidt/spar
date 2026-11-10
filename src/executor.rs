@@ -4890,6 +4890,7 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "providers": state.providers,
         "gates": state.gates,
         "error": state.error,
+        "warnings": state.warnings,
         "project_root": state.project_root,
         // `providers` is the pool; this is what each role actually drew from it.
         "roles": role_assignments(state),
@@ -4967,6 +4968,9 @@ pub fn print_run_human(state: &RunState) {
     if state.dry_run {
         println!("dry_run: true  (no git worktrees; agent processes stubbed only)");
     }
+    for warning in &state.warnings {
+        println!("warning: {warning}");
+    }
     // Gate phases only (feature 011, item C): that is where a human decides whether to
     // pay for the panel, and a table on every status print would just be noise.
     if state.phase.is_gate() {
@@ -5012,6 +5016,7 @@ fn source_label(source: SeatSource) -> &'static str {
         SeatSource::ModelSelect => "model-select",
         SeatSource::SuitePreferences => "suite-preferences",
         SeatSource::Backup => "backup",
+        SeatSource::CliBackup => "cli-backup",
         SeatSource::Reassigned => "reassigned",
         SeatSource::Unknown => "unknown",
     }
@@ -7761,13 +7766,11 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(crate::backup::is_provider_eligible(
             "cli:agy@flash",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         assert!(crate::backup::is_provider_eligible(
             "cli:agy@pro",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
     }
@@ -7827,7 +7830,6 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(!crate::backup::is_provider_eligible(
             &slot.provider_ref().display(),
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         let plan_job = SlotJob {

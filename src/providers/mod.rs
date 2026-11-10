@@ -12,6 +12,7 @@ pub mod presence;
 pub mod usage;
 
 use crate::provider_ref::{ExecBackend, ProviderRef};
+use crate::state::PoolOrigin;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -76,14 +77,19 @@ pub enum Readiness {
     /// The probe ran and passed.
     Healthy,
     /// The probe ran and failed. The provider is still `available`, but
-    /// `doctor` and `provider list` report it as unhealthy instead.
+    /// auto-selection and backup rotation skip it; an explicit pin still
+    /// dispatches, with a launch warning.
     Unhealthy,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderReport {
     pub name: String,
-    pub available: bool,
+    /// The binary resolves on PATH. Only `is_available` reads this outside
+    /// detection and display; every auto-selection, dispatch and backup path
+    /// goes through `usable()` instead, so a probe-failed provider is not
+    /// rotated onto.
+    available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,6 +104,167 @@ pub struct ProviderReport {
     pub delivery: DeliveryStrategy,
     /// Where this adapter's presence transitions come from.
     pub presence: PresenceSource,
+}
+
+impl ProviderReport {
+    /// Auto-selection eligibility: the binary resolves and its readiness probe
+    /// did not fail. `Unknown` (no probe, timeout, spawn failure) stays eligible;
+    /// only a failed probe (`Unhealthy`) benches the provider. Explicit pins
+    /// bypass this and warn at launch instead.
+    pub fn usable(&self) -> bool {
+        self.available && self.readiness != Readiness::Unhealthy
+    }
+
+    /// Whether the binary resolves on PATH, ignoring probe readiness. Display
+    /// only; selection paths use `usable()`.
+    pub fn is_available(&self) -> bool {
+        self.available
+    }
+}
+
+#[cfg(test)]
+pub fn test_report(name: &str, available: bool, readiness: Readiness) -> ProviderReport {
+    ProviderReport {
+        name: name.into(),
+        available,
+        path: Some("/bin/x".into()),
+        version: None,
+        readiness,
+        readiness_message: (readiness == Readiness::Unhealthy).then(|| "probe failed".into()),
+        capabilities: Capabilities::default(),
+        delivery: DeliveryStrategy::None,
+        presence: PresenceSource::None,
+    }
+}
+
+/// One readiness verdict for a provider: whether it may be auto-selected, plus
+/// the failed probe's detail when a probe ran and failed it.
+#[derive(Debug, Clone)]
+pub struct HealthVerdict {
+    pub usable: bool,
+    pub probe_message: Option<String>,
+}
+
+/// Where a seat's provider is resolved and its source is known, health is read
+/// through this rather than through the quota availability set: auto-selection
+/// skips a provider whose probe failed, while pins warn and dispatch anyway.
+/// One method, so a check costs one detection and unit tests inject canned
+/// readiness without spawning host CLIs.
+pub trait HealthSource {
+    fn check(&self, provider: &str) -> HealthVerdict;
+}
+
+/// Production health: real detection when probing, blind parse checks wherever
+/// a probe must not spawn (dry runs and the projection-only paths).
+pub struct LiveHealth {
+    probe: bool,
+}
+
+impl LiveHealth {
+    pub fn probing() -> Self {
+        Self { probe: true }
+    }
+    pub fn for_dry(dry: bool) -> Self {
+        Self { probe: !dry }
+    }
+}
+
+impl HealthSource for LiveHealth {
+    fn check(&self, provider: &str) -> HealthVerdict {
+        if !self.probe || crate::util::env_truthy("SPAR_DRY_RUN") {
+            return HealthVerdict {
+                usable: ProviderRef::parse(provider).is_ok(),
+                probe_message: None,
+            };
+        }
+        let Ok(pref) = ProviderRef::parse(provider) else {
+            return HealthVerdict {
+                usable: false,
+                probe_message: None,
+            };
+        };
+        match pref.backend {
+            ExecBackend::NativeCli => match native_adapter(provider) {
+                Some(adapter) => {
+                    let report = adapter.detect();
+                    HealthVerdict {
+                        usable: report.usable(),
+                        probe_message: probe_detail(&report, adapter.as_ref()),
+                    }
+                }
+                None => HealthVerdict {
+                    usable: false,
+                    probe_message: None,
+                },
+            },
+            ExecBackend::ApiSdk => HealthVerdict {
+                usable: api_provider_supported(&pref.name),
+                probe_message: None,
+            },
+        }
+    }
+}
+
+/// The failed probe's detail for an error or a warning: the probe argv that
+/// ran plus its own message. `None` when no probe failed this provider, that is
+/// when it is healthy, unprobed, or missing rather than probe-failed. Takes
+/// the already-run detection so one check costs one detection.
+fn probe_detail(report: &ProviderReport, adapter: &dyn ProviderAdapter) -> Option<String> {
+    if report.readiness != Readiness::Unhealthy {
+        return None;
+    }
+    let message = report.readiness_message.clone()?;
+    match adapter.readiness_probe() {
+        Some(argv) => Some(format!(
+            "probe `{} {}` failed: {message}",
+            adapter.name(),
+            argv.join(" ")
+        )),
+        None => Some(message),
+    }
+}
+
+/// Canned readiness for unit tests: named providers are probe-failed, everything
+/// else stays usable. Hermetic: no host CLI is ever spawned.
+#[cfg(test)]
+pub struct StubHealth {
+    refusals: std::collections::HashMap<String, String>,
+}
+
+#[cfg(test)]
+impl StubHealth {
+    pub fn allow_all() -> Self {
+        Self {
+            refusals: std::collections::HashMap::new(),
+        }
+    }
+    pub fn refuse(provider: &str, message: &str) -> Self {
+        Self::refuse_all(&[(provider, message)])
+    }
+    pub fn refuse_all(entries: &[(&str, &str)]) -> Self {
+        Self {
+            refusals: entries
+                .iter()
+                .map(|(p, m)| (p.to_string(), m.to_string()))
+                .collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl HealthSource for StubHealth {
+    fn check(&self, provider: &str) -> HealthVerdict {
+        match self.refusals.get(provider) {
+            Some(message) => HealthVerdict {
+                usable: false,
+                probe_message: Some(message.clone()),
+            },
+            None => HealthVerdict {
+                usable: true,
+                probe_message: None,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -812,28 +979,68 @@ pub fn adapter_named(name: &str) -> Option<Box<dyn ProviderAdapter>> {
     all_adapters().into_iter().find(|a| a.name() == bare)
 }
 
-/// Whether a provider ref can be used for a live slot.
-pub fn is_provider_usable(raw: &str, allow_missing: bool) -> bool {
+/// The native-CLI adapter a ref names, if it names one. Bare ids (`claude`)
+/// and seat refs (`cli:claude`, `cli:claude@sonnet`) both resolve; api-sdk refs
+/// and unknown names yield `None` without probing.
+fn native_adapter(raw: &str) -> Option<Box<dyn ProviderAdapter>> {
+    let pref = ProviderRef::parse(raw).ok()?;
+    if pref.backend != ExecBackend::NativeCli {
+        return None;
+    }
+    adapter_named(&pref.storage_key()).or_else(|| adapter_named(&pref.name))
+}
+
+/// Whether a provider ref names something spar can dispatch: a known adapter whose
+/// binary resolves (or a supported api-sdk name). Says nothing about readiness;
+/// an explicitly pinned provider passes this while `Unhealthy` and warns at
+/// launch instead of being dropped.
+pub fn is_provider_present(raw: &str, allow_missing: bool) -> bool {
+    if allow_missing || crate::util::env_truthy("SPAR_DRY_RUN") {
+        return ProviderRef::parse(raw).is_ok();
+    }
     let Ok(pref) = ProviderRef::parse(raw) else {
         return false;
     };
     match pref.backend {
-        ExecBackend::NativeCli => {
-            if allow_missing {
-                return true;
-            }
-            adapter_named(&pref.storage_key())
-                .or_else(|| adapter_named(&pref.name))
-                .map(|a| a.resolve_binary().is_some())
-                .unwrap_or(false)
-        }
-        ExecBackend::ApiSdk => {
-            if allow_missing {
-                return true;
-            }
-            api_provider_supported(&pref.name)
-        }
+        ExecBackend::NativeCli => native_adapter(raw).is_some_and(|a| a.resolve_binary().is_some()),
+        ExecBackend::ApiSdk => api_provider_supported(&pref.name),
     }
+}
+
+/// Whether a provider ref can take an auto-selected seat: present plus, for
+/// native CLIs, not probe-failed (`Unknown` stays eligible). Probes never run
+/// under `--dry-run` / `allow_missing`.
+pub fn is_provider_usable(raw: &str, allow_missing: bool) -> bool {
+    if allow_missing || crate::util::env_truthy("SPAR_DRY_RUN") {
+        return ProviderRef::parse(raw).is_ok();
+    }
+    let Ok(pref) = ProviderRef::parse(raw) else {
+        return false;
+    };
+    match pref.backend {
+        ExecBackend::NativeCli => native_adapter(raw).is_some_and(|a| a.detect().usable()),
+        ExecBackend::ApiSdk => api_provider_supported(&pref.name),
+    }
+}
+
+/// The launch warning for an explicitly pinned provider whose readiness probe
+/// failed. `None` for anything auto-selection would already skip or keep
+/// (missing, healthy, `Unknown`, api-sdk): only a present-but-`Unhealthy` CLI
+/// pin warns, and it still dispatches.
+pub fn unhealthy_pin_warning(provider: &str) -> Option<String> {
+    let adapter = native_adapter(provider)?;
+    let report = adapter.detect();
+    if !report.available || report.usable() {
+        return None;
+    }
+    Some(format!(
+        "explicitly pinned provider {provider} is unhealthy{}; dispatching anyway",
+        report
+            .readiness_message
+            .as_deref()
+            .map(|m| format!(": {m}"))
+            .unwrap_or_default()
+    ))
 }
 
 /// Named API providers the api-sdk backend actually has an adapter for.
@@ -864,18 +1071,20 @@ pub fn ensure_known(raw: &str) -> anyhow::Result<()> {
     )
 }
 
-/// Providers that are on PATH, as `cli:name` keys, optionally filtered by `order`.
-pub fn available_providers(order: &[String]) -> Vec<String> {
+/// Providers eligible for auto-selection, as `cli:name` keys, optionally filtered
+/// by `order`. Skips probe-failed (`Unhealthy`) providers; `Unknown` stays in.
+/// The empty-order branch live-detects: unit tests never pass an empty order.
+pub fn available_providers(order: &[String], health: &dyn HealthSource) -> Vec<String> {
     if order.is_empty() {
         detect_all()
             .into_iter()
-            .filter(|p| p.available)
+            .filter(|p| p.usable())
             .map(|p| format!("cli:{}", p.name))
             .collect()
     } else {
         order
             .iter()
-            .filter(|n| is_provider_usable(n, false))
+            .filter(|n| health.check(n).usable)
             .cloned()
             .collect()
     }
@@ -892,13 +1101,23 @@ pub fn pick_providers(
     n: usize,
     requested: Option<&[String]>,
     allow_missing: bool,
+    pool_origin: PoolOrigin,
+    health: &dyn HealthSource,
 ) -> Vec<String> {
     let allow_missing = allow_missing || crate::util::env_truthy("SPAR_DRY_RUN");
     let base = if let Some(req) = requested {
-        req.iter()
-            .filter(|n| is_provider_usable(n, allow_missing))
-            .filter_map(|n| ProviderRef::parse(n).ok().map(|p| p.display()))
-            .collect::<Vec<_>>()
+        // Only a real `--providers` pin survives a failed readiness probe here:
+        // it still dispatches, with a launch warning. A `--select` pool or a
+        // synthesized pool is a constrained auto-pick, health-gated like any
+        // other. Dry runs stay unprobed and allow everything.
+        if matches!(pool_origin, PoolOrigin::CliProviders) || allow_missing {
+            req.iter()
+                .filter(|n| is_provider_present(n, allow_missing))
+                .filter_map(|n| ProviderRef::parse(n).ok().map(|p| p.display()))
+                .collect::<Vec<_>>()
+        } else {
+            available_providers(req, health)
+        }
     } else if allow_missing {
         if order.is_empty() {
             vec!["cli:claude".into(), "cli:grok".into(), "cli:agy".into()]
@@ -909,7 +1128,7 @@ pub fn pick_providers(
                 .collect()
         }
     } else {
-        available_providers(order)
+        available_providers(order, health)
     };
 
     if base.is_empty() {
@@ -974,6 +1193,8 @@ mod tests {
             2,
             Some(&["api:openai".into(), "cli:grok".into()]),
             true,
+            PoolOrigin::CliProviders,
+            &StubHealth::allow_all(),
         );
         assert_eq!(picked.len(), 2);
         assert_eq!(picked[0], "api:openai");
@@ -990,6 +1211,8 @@ mod tests {
                 "api:openai@gpt-5".into(),
             ]),
             true,
+            PoolOrigin::CliProviders,
+            &StubHealth::allow_all(),
         );
         assert_eq!(picked.len(), 2);
         assert_eq!(picked[0], "cli:codex@openai/gpt-4o-mini");
@@ -1033,6 +1256,31 @@ mod tests {
     }
 
     #[test]
+    fn usable_skips_only_unhealthy() {
+        let report = |available: bool, readiness: Readiness| ProviderReport {
+            name: "stub".into(),
+            available,
+            path: None,
+            version: None,
+            readiness,
+            readiness_message: None,
+            capabilities: Capabilities::default(),
+            delivery: DeliveryStrategy::StopHookInject,
+            presence: PresenceSource::None,
+        };
+        assert!(
+            report(true, Readiness::Unknown).usable(),
+            "no probe stays eligible"
+        );
+        assert!(report(true, Readiness::Healthy).usable());
+        assert!(!report(true, Readiness::Unhealthy).usable());
+        assert!(
+            !report(false, Readiness::Unknown).usable(),
+            "binary must still resolve"
+        );
+    }
+
+    #[test]
     fn no_probe_reports_unknown_and_stays_available() {
         let r = StubAdapter { probe: None }.detect();
         assert!(
@@ -1063,6 +1311,22 @@ mod tests {
         assert!(r.available, "binary still resolves; only readiness changes");
         assert_eq!(r.readiness, Readiness::Unhealthy);
         assert_eq!(r.readiness_message.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn detect_feeds_usable() {
+        let healthy = StubAdapter {
+            probe: Some(&["-c", "exit 0"]),
+        }
+        .detect();
+        assert!(healthy.usable());
+        let unhealthy = StubAdapter {
+            probe: Some(&["-c", "exit 1"]),
+        }
+        .detect();
+        assert!(!unhealthy.usable());
+        let unknown = StubAdapter { probe: None }.detect();
+        assert!(unknown.usable());
     }
 
     #[test]

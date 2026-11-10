@@ -368,8 +368,8 @@ fn a_healthy_probe_clears_the_paused_bucket_it_reads() {
 
 /// O153. A `request_changes` recorded on the shipping head still blocks ship after
 /// its seat stands down on quota: the panel head has not moved, so the veto carries
-/// instead of dying with the seat's dispatch. Dry runs cannot cover this — they
-/// skip pause gating — so the panel runs on fake CLIs.
+/// instead of dying with the seat's dispatch. Dry runs skip pause gating, so the
+/// panel runs on fake CLIs.
 #[test]
 fn a_stood_down_request_changes_on_this_head_still_blocks_ship() {
     let fx = Fixture::new();

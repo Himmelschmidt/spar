@@ -463,7 +463,7 @@ pub fn report(
             }
         }
         for r in &run.row.roles {
-            if r.source == Some(SeatSource::Backup) {
+            if r.source.is_some_and(SeatSource::is_backup) {
                 quota_row(
                     &mut quota,
                     crate::provider_ref::ProviderRef::for_seat(&r.provider, r.model.as_deref())
