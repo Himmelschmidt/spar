@@ -152,14 +152,17 @@ fn backup_eligible(
     store: &QuotaStore,
     paths: &crate::paths::SparPaths,
     dry: bool,
+    presence_dry: bool,
     route: crate::providers::RecordedRoute<'_>,
     health: &dyn crate::providers::HealthSource,
     cli: bool,
 ) -> bool {
-    // A missing binary is never eligible, pin or not: presence is parse-only
-    // under dry runs, so projections keep providers whose binaries are absent.
+    // A missing binary is never eligible, pin or not. `dry` is the
+    // never-re-probe-quota flag (always set in projections); presence answers
+    // a different question — whether this launch would run the binary — so it
+    // reads `presence_dry`, the run's own dry flag, never `dry`.
     let seat_ok = if cli {
-        crate::providers::is_provider_present(backup, dry)
+        crate::providers::is_provider_present(backup, presence_dry)
     } else {
         health.check(backup).usable
     };
@@ -194,11 +197,12 @@ pub fn takeover(
     store: &QuotaStore,
     paths: &crate::paths::SparPaths,
     dry: bool,
+    presence_dry: bool,
     route: crate::providers::RecordedRoute<'_>,
     health: &dyn crate::providers::HealthSource,
 ) -> Option<crate::state::SeatSource> {
     let cli = cfg.cli_backup_keys.contains(role.as_config_key());
-    backup_eligible(backup, store, paths, dry, route, health, cli).then_some(if cli {
+    backup_eligible(backup, store, paths, dry, presence_dry, route, health, cli).then_some(if cli {
         crate::state::SeatSource::CliBackup
     } else {
         crate::state::SeatSource::Backup
@@ -273,6 +277,7 @@ pub fn resolve_with_backup(
     store: &QuotaStore,
     paths: &crate::paths::SparPaths,
     dry: bool,
+    presence_dry: bool,
     route: crate::providers::RecordedRoute<'_>,
     health: &dyn crate::providers::HealthSource,
     used: &[String],
@@ -298,7 +303,17 @@ pub fn resolve_with_backup(
         return Some((prov, src));
     }
     if let Some(backup_raw) = backup_for_role(role, role_index, cfg) {
-        if let Some(source) = takeover(&backup_raw, role, cfg, store, paths, dry, route, health) {
+        if let Some(source) = takeover(
+            &backup_raw,
+            role,
+            cfg,
+            store,
+            paths,
+            dry,
+            presence_dry,
+            route,
+            health,
+        ) {
             if let Ok(parsed) = crate::provider_ref::Pin::parse(&backup_raw) {
                 return Some((parsed.display(), source));
             }
@@ -442,6 +457,7 @@ mod tests {
             model,
             store,
             paths,
+            dry,
             dry,
             crate::providers::RecordedRoute::ambient(),
             health,
@@ -1128,7 +1144,9 @@ mod tests {
     /// `SPAR_CODEX_PROFILE` (None leaves the pinned default); the recorded
     /// profile passed to `backup_eligible` decides the bucket, never the
     /// ambient value. The route vars are pinned at unset (restored after), so
-    /// an ambient `SPAR_CODEX_MODEL` cannot move the asserted bucket.
+    /// an ambient `SPAR_CODEX_MODEL` cannot move the asserted bucket. The fake
+    /// dir is prepended to the live PATH, so parallel tests still resolve
+    /// their own binaries.
     fn with_fake_codex(
         profile: Option<&str>,
         body: &str,
@@ -1150,7 +1168,7 @@ mod tests {
             std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o755))
                 .unwrap();
         }
-        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        std::env::set_var("PATH", format!("{}:{old_path}", bin.display()));
         f(&crate::paths::SparPaths::new(tmp.path().join("proj")));
         std::env::set_var("PATH", old_path);
     }
@@ -1175,6 +1193,7 @@ mod tests {
                     "cli:codex",
                     &loaded,
                     paths,
+                    false,
                     false,
                     crate::providers::RecordedRoute::ambient(),
                     &crate::providers::StubHealth::allow_all(),
@@ -1209,6 +1228,7 @@ mod tests {
                         "cli:codex",
                         &loaded,
                         paths,
+                        false,
                         false,
                         crate::providers::RecordedRoute {
                             profile: Some(""),
@@ -1273,6 +1293,7 @@ mod tests {
             &store,
             &paths,
             true,
+            true,
             crate::providers::RecordedRoute::ambient(),
             &healthy
         )
@@ -1287,6 +1308,7 @@ mod tests {
                 &cfg,
                 &paused,
                 &paths,
+                true,
                 true,
                 crate::providers::RecordedRoute::ambient(),
                 &healthy
@@ -1304,6 +1326,7 @@ mod tests {
                 &store,
                 &paths,
                 true,
+                true,
                 crate::providers::RecordedRoute::ambient(),
                 &sick
             )
@@ -1320,6 +1343,7 @@ mod tests {
                 &cfg,
                 &manual,
                 &paths,
+                false,
                 false,
                 crate::providers::RecordedRoute::ambient(),
                 &healthy
@@ -1354,8 +1378,68 @@ mod tests {
                 &store,
                 &paths,
                 true,
+                true,
                 crate::providers::RecordedRoute::ambient(),
                 &sick,
+            ),
+            Some(crate::state::SeatSource::CliBackup)
+        );
+    }
+
+    #[test]
+    fn cli_backup_without_a_binary_is_ineligible() {
+        use crate::providers::StubHealth;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let mut cfg = crate::config::Config::default();
+        cfg.cli_backup_keys.insert(
+            crate::state::SlotRole::Implementer
+                .as_config_key()
+                .to_string(),
+        );
+        let health = StubHealth::allow_all();
+        let store = QuotaStore::default();
+        assert!(
+            takeover(
+                "cli:no-such-provider",
+                crate::state::SlotRole::Implementer,
+                &cfg,
+                &store,
+                &paths,
+                false,
+                false,
+                crate::providers::RecordedRoute::ambient(),
+                &health,
+            )
+            .is_none(),
+            "a CLI backup whose binary does not resolve never takes the seat"
+        );
+    }
+
+    #[test]
+    fn cli_backup_without_a_binary_stays_projected_under_dry_run() {
+        use crate::providers::StubHealth;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let mut cfg = crate::config::Config::default();
+        cfg.cli_backup_keys.insert(
+            crate::state::SlotRole::Implementer
+                .as_config_key()
+                .to_string(),
+        );
+        let health = StubHealth::allow_all();
+        let store = QuotaStore::default();
+        assert_eq!(
+            takeover(
+                "cli:no-such-provider",
+                crate::state::SlotRole::Implementer,
+                &cfg,
+                &store,
+                &paths,
+                true,
+                true,
+                crate::providers::RecordedRoute::ambient(),
+                &health,
             ),
             Some(crate::state::SeatSource::CliBackup)
         );
@@ -1478,6 +1562,7 @@ mod tests {
                 model,
                 &store,
                 &paths,
+                true,
                 true,
                 crate::providers::RecordedRoute::ambient(),
                 &health,

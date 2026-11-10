@@ -122,6 +122,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
                         &store,
                         paths,
                         dry,
+                        dry,
                         state.recorded_route(),
                         &health,
                     ) {
@@ -254,7 +255,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             &slot_state,
             &store,
             state.recorded_route(),
-            providers::is_provider_present(&slot_state.provider, false),
+            providers::is_provider_present(&slot_state.provider, state.dry_run),
         );
         if !cause.engages_backup()
             || slot_state
@@ -273,6 +274,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             cfg,
             &store,
             paths,
+            state.dry_run,
             state.dry_run,
             state.recorded_route(),
             &health,

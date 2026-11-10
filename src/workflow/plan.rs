@@ -263,6 +263,7 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> anyhow::Result<Vec<PlanSea
             &store,
             &paths,
             state.dry_run,
+            state.dry_run,
             state.recorded_route(),
             &health,
             &used,
@@ -352,7 +353,7 @@ pub fn execute_plan(
                     &slot_state,
                     &store,
                     state.recorded_route(),
-                    providers::is_provider_present(&slot_state.provider, false),
+                    providers::is_provider_present(&slot_state.provider, state.dry_run),
                 );
                 if cause.engages_backup() && !slot_state.source.is_some_and(SeatSource::is_backup) {
                     if let Some(raw) = crate::backup::backup_for_role(job.role, 0, cfg) {
@@ -362,6 +363,7 @@ pub fn execute_plan(
                             cfg,
                             &store,
                             paths,
+                            state.dry_run,
                             state.dry_run,
                             state.recorded_route(),
                             &health,
@@ -614,6 +616,7 @@ fn resolve_test_author(
                 &store,
                 paths,
                 state.dry_run,
+                state.dry_run,
                 state.recorded_route(),
                 &health,
             ) {
@@ -712,7 +715,7 @@ fn run_test_author(
                 &slot_state,
                 &store,
                 state.recorded_route(),
-                providers::is_provider_present(&slot_state.provider, false),
+                providers::is_provider_present(&slot_state.provider, state.dry_run),
             );
             if cause.engages_backup()
                 && !slot_state
@@ -726,6 +729,7 @@ fn run_test_author(
                         cfg,
                         &store,
                         paths,
+                        state.dry_run,
                         state.dry_run,
                         state.recorded_route(),
                         &health,
@@ -1299,6 +1303,7 @@ fn amend_author_seat(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> R
                 cfg,
                 &store,
                 paths,
+                false,
                 false,
                 state.recorded_route(),
                 &health,

@@ -228,14 +228,24 @@ fn run() -> Result<ExitCode> {
                 if validate_only {
                     // A replan still dispatches the stored seats through the
                     // re-check, so show the projection, not the stored seats.
-                    return launch_validated(
-                        json,
-                        Some(&id),
+                    // A replan re-resolves the plan panel, never the implement one.
+                    let proj = workflow::implement::project_continued_fleet(
+                        &st,
+                        &paths,
                         &cfg,
-                        Some(workflow::implement::project_continued_fleet(
-                            &st, &paths, &cfg,
-                        )),
+                        &[
+                            crate::state::SlotRole::Planner,
+                            crate::state::SlotRole::PlanCritic,
+                        ],
                     );
+                    if let Some(stop) = proj.stop {
+                        let err = anyhow::anyhow!("{}", stop.message());
+                        if stop.quota() {
+                            return launch_quota_stopped(err, json, Some(&id));
+                        }
+                        return launch_refused(err, json, Some(&id));
+                    }
+                    return launch_validated(json, Some(&id), &cfg, Some(proj.fleet));
                 }
                 cfg.reapply_captured_env();
                 return workflow::plan::replan(&paths, &cfg, &id, directive, json);
@@ -472,6 +482,7 @@ fn run() -> Result<ExitCode> {
                     providers::codex::dispatch_route().as_recorded(),
                 )?;
                 let mut fleet = None;
+                let mut precheck_stop: Option<workflow::implement::ProjectionStop> = None;
                 match &run_id {
                     Some(id) => {
                         let st = state::RunState::load(&paths, id)?;
@@ -505,10 +516,25 @@ fn run() -> Result<ExitCode> {
                                 }
                             }
                             // A continued run re-resolves stored seats on dispatch, so
-                            // show the projection, not the stored seats.
-                            fleet = Some(workflow::implement::project_continued_fleet(
-                                &st, &paths, &cfg,
-                            ));
+                            // show the projection, not the stored seats. A
+                            // projection that would stop the dispatch fails the
+                            // pre-check the same way the dispatch would. Only the
+                            // implement panel re-resolves here; the plan phase's
+                            // seats are history the dispatch leaves untouched. The
+                            // tester re-resolves only under the suite channel,
+                            // exactly as the dispatch rechecks it.
+                            let mut panel = vec![
+                                crate::state::SlotRole::Implementer,
+                                crate::state::SlotRole::Reviewer,
+                            ];
+                            if cfg.suite.enabled {
+                                panel.push(crate::state::SlotRole::Tester);
+                            }
+                            let proj = workflow::implement::project_continued_fleet(
+                                &st, &paths, &cfg, &panel,
+                            );
+                            precheck_stop = proj.stop;
+                            fleet = Some(proj.fleet);
                         }
                         if let Some(mr) = max_rounds {
                             workflow::implement::check_round_extension(
@@ -537,12 +563,19 @@ fn run() -> Result<ExitCode> {
                     }
                     None => {}
                 }
-                Ok((paths, cfg, opts, task, fleet))
+                Ok((paths, cfg, opts, task, fleet, precheck_stop))
             })();
-            let (paths, cfg, opts, task, fleet) = match prepared {
+            let (paths, cfg, opts, task, fleet, precheck_stop) = match prepared {
                 Ok(v) => v,
                 Err(e) => return launch_refused(e, json, run_id.as_deref()),
             };
+            if let Some(stop) = precheck_stop {
+                let err = anyhow::anyhow!("{}", stop.message());
+                if stop.quota() {
+                    return launch_quota_stopped(err, json, run_id.as_deref());
+                }
+                return launch_refused(err, json, run_id.as_deref());
+            }
             if run_id.is_none() {
                 if let Some(code) =
                     runkey::guard(&paths, opts.key.as_deref(), key_scope, json, opts.dry_run)?
@@ -924,6 +957,23 @@ fn subcommand_of(args: &[String]) -> Option<&str> {
 
 /// A launch refused before it made a run. `--json` callers get one parseable shape on
 /// stdout instead of an `error:` line to grep; the exit code is 1 either way.
+fn launch_quota_stopped(err: anyhow::Error, json: bool, run_id: Option<&str>) -> Result<ExitCode> {
+    if !json {
+        eprintln!("error: {err:#}");
+        return Ok(ExitCode::Quota);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": false,
+            "error": format!("{err:#}"),
+            "run_id": run_id,
+            "kind": "validation",
+        }))?
+    );
+    Ok(ExitCode::Quota)
+}
+
 fn launch_refused(err: anyhow::Error, json: bool, run_id: Option<&str>) -> Result<ExitCode> {
     if !json {
         return Err(err);
