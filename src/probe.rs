@@ -184,14 +184,19 @@ fn call(
         return CallOutcome::without_output(Verdict::Skipped, Some("not on PATH".into()));
     };
     let opts = SpawnOpts {
-        route: route.into_carrier(),
         prompt: PROBE_PROMPT.into(),
         prompt_file: None,
         cwd: paths.project_root.clone(),
         trust: TrustPolicy::Prompt,
         extra_args: vec![],
         session_id: None,
-        model: pref.model.clone(),
+        // A `--run` probe replays the run's recorded model; the key above was
+        // derived from that same route, and the spawn reads this process's
+        // ambient route, which agrees on the box that stamped the run.
+        model: pref
+            .model
+            .clone()
+            .or_else(|| route.model.filter(|m| !m.is_empty()).map(str::to_string)),
         effort: None,
         timeout_secs: Some(PROBE_TIMEOUT.as_secs()),
         session_dir: None,

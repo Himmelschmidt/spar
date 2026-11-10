@@ -229,7 +229,6 @@ mod tests {
 
     fn opts(prompt: &str, model: Option<&str>) -> SpawnOpts {
         SpawnOpts {
-            route: None,
             prompt: prompt.into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),

@@ -222,14 +222,38 @@ impl<'a> RecordedRoute<'a> {
     pub fn is_recorded(self) -> bool {
         self.profile.is_some() || self.model.is_some()
     }
+}
 
-    /// The owned carrier a dispatch struct holds for the spawn: `None` when
-    /// the run stamped nothing, so the spawn reads the ambient route instead.
-    pub fn into_carrier(self) -> Option<codex::CodexRoute> {
-        codex::CodexRoute::recorded(
-            self.profile.map(str::to_string),
-            self.model.map(str::to_string),
-        )
+/// What a model-less seat's recorded dispatch route resolves to: `Ambient`
+/// when the run stamped nothing (key from this process's route through the
+/// normal path), `Login` when the recorded route bills the whole login,
+/// `Bucket` for the bucket it bills to. A named type so the
+/// recorded-but-login-wide case stays distinct from the unrecorded one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedRouteBucket {
+    Ambient,
+    Login,
+    Bucket(&'static str),
+}
+
+/// A dispatch route recorded to durable state (history rows), in
+/// provider-neutral shape: the profile and model the dispatch ran under,
+/// without naming whose. Rows that predate recording carry no route and key
+/// the ambient one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredRoute {
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+impl StoredRoute {
+    pub fn as_recorded(&self) -> RecordedRoute<'_> {
+        RecordedRoute {
+            profile: self.profile.as_deref(),
+            model: self.model.as_deref(),
+        }
     }
 }
 
@@ -266,11 +290,6 @@ pub struct SpawnOpts {
     /// in the user's home. Stable across rounds, so a resume finds what the cold
     /// dispatch wrote. `None` outside a run.
     pub session_dir: Option<PathBuf>,
-    /// The run's recorded codex route (`RunState::codex_route`), carried as one
-    /// value so the halves cannot split across dispatch structs. `None` means
-    /// no recorded dispatch, so the adapter reads this process's ambient
-    /// route. Only codex reads this field.
-    pub route: Option<codex::CodexRoute>,
 }
 
 pub trait ProviderAdapter: Send + Sync {
@@ -288,13 +307,13 @@ pub trait ProviderAdapter: Send + Sync {
     fn default_bucket(&self) -> Option<&'static str> {
         None
     }
-    /// The bucket a model-less seat bills to under the run's recorded route
-    /// (`Some(None)` for the whole login). `None` means no override: the seat
-    /// keys the ambient route exactly as a reader without the run would. Only
-    /// adapters whose route depends on recorded state override this; generic
-    /// key derivation asks the adapter instead of naming it.
-    fn recorded_route_bucket(&self, _route: RecordedRoute<'_>) -> Option<Option<&'static str>> {
-        None
+    /// The bucket a model-less seat bills to under the run's recorded route.
+    /// `Ambient` means no override: the seat keys this process's ambient route
+    /// exactly as a reader without the run would. Only adapters whose route
+    /// depends on recorded state override this; generic key derivation asks
+    /// the adapter instead of naming it.
+    fn recorded_route_bucket(&self, _route: RecordedRoute<'_>) -> RecordedRouteBucket {
+        RecordedRouteBucket::Ambient
     }
     /// The quota bucket a rejection covers, `None` for the whole login: the
     /// signal's votes resolved against the dispatched seat's own bucket. No votes,
@@ -924,7 +943,6 @@ mod tests {
         assert!(!GrokAdapter.step_budget_exhausted("max-model-steps"));
         // Grok dispatches carry run-scoped folder trust (never operator state).
         let env = GrokAdapter.extra_env(&SpawnOpts {
-            route: None,
             prompt: String::new(),
             prompt_file: None,
             cwd: std::path::PathBuf::from("/tmp"),
@@ -1120,13 +1138,12 @@ mod tests {
         // `supports_resume`, which itself must agree with `build_resume`: only
         // codex, muse and pi implement it, so only they may report true. This pins
         // all three together so the flag cannot drift from the code again.
-        let _guard = codex::ENV_LOCK.lock().unwrap();
+        let _pin = codex::pin_codex_env();
         // Hermetic: codex's `build_resume` reads the profile model from
         // `$CODEX_HOME`, which must not be the developer's real config here.
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("CODEX_HOME", home.path());
         let opts = SpawnOpts {
-            route: None,
             prompt: "go".into(),
             prompt_file: None,
             cwd: std::path::PathBuf::from("/tmp"),

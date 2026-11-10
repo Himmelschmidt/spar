@@ -934,17 +934,15 @@ impl RunState {
     /// resumptions), never by an in-process fix pass: a fix pass is a
     /// continuation of the same dispatch, and re-stamping it would turn this
     /// run's own pauses into pre-existing ones and park the run on its own
-    /// fumes. `run_slot` re-stamps the codex route on every seat as a backstop,
-    /// so an entry that forgot the horizon stamp still records its route.
+    /// fumes. The executor never stamps: every entry stamps before seats
+    /// resolve, in the same process the spawn inherits, so the record and
+    /// the ambient route the spawn reads always agree.
     pub fn stamp_dispatch(&mut self) {
         self.round_started_at = Some(chrono::Utc::now());
         self.stamp_codex_route();
     }
 
-    /// Re-record the codex route from this process's environment. Idempotent
-    /// within a process, so unlike the horizon above it is safe on every seat
-    /// dispatch; `run_slot` calls it so a dispatch path whose entry never
-    /// stamped (review, future workflows) still records its route.
+    /// Re-record the codex route from this process's environment.
     pub fn stamp_codex_route(&mut self) {
         let route = crate::providers::codex::dispatch_route();
         self.codex_profile = route.profile;
@@ -959,12 +957,6 @@ impl RunState {
             profile: self.codex_profile.as_deref(),
             model: self.codex_model.as_deref(),
         }
-    }
-
-    /// The recorded route as the owned carrier dispatch structs hold: `None`
-    /// when this run never stamped one, so the spawn reads the ambient route.
-    pub fn codex_route(&self) -> Option<crate::providers::codex::CodexRoute> {
-        self.recorded_route().into_carrier()
     }
 
     /// Whether opening another round would take this run past its ceiling (O52).
