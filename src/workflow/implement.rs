@@ -1287,7 +1287,7 @@ fn run_from_approved(
         // instead of reaching the ship gate with no reviewer.
         if crate::config::role_pins_reviewer(&amend.role) && !preview.cfg.roles.reviewer.is_empty()
         {
-            let resynced = resync_reviewer_panel_to_pin(&mut state, paths, &mut preview.cfg)
+            let resynced = resync_reviewer_panel_to_pin(&mut state, &mut preview.cfg)
                 .map_err(|e| AmendRefused(format!("{e:#}")))?;
             removed.extend(resynced);
         }
@@ -1312,9 +1312,10 @@ fn run_from_approved(
             .cfg
             .stage_snapshot(paths, run_id)
             .map_err(|e| AmendRefused(format!("{e:#}")))?;
-        state
-            .save(paths)
-            .map_err(|e| AmendRefused(format!("{e:#}")))?;
+        state.save(paths).map_err(|e| {
+            let _ = std::fs::remove_file(&staged);
+            AmendRefused(format!("{e:#}"))
+        })?;
         crate::config::Config::commit_snapshot(paths, run_id, &staged)
             .map_err(|e| AmendRefused(format!("{e:#}")))?;
         if !removed.is_empty() {
@@ -1612,16 +1613,12 @@ fn prepare_implement_slots(
             available.as_ref(),
             state.recorded_route(),
         ) {
-            // A fresh panel is minted in order, so the count of reviewer seats
+            // A fresh panel is minted in order, so the count of panel seats
             // already pushed is both the live panel position and the config index
-            // the backup list is filed under — never the ordinal baked into the
+            // the backup list is filed under, never the ordinal baked into the
             // seat id, which a later drop can strand.
             let ordinal = if seat.role == SlotRole::Reviewer {
-                state
-                    .slots
-                    .iter()
-                    .filter(|s| s.role == SlotRole::Reviewer)
-                    .count()
+                state.slots.iter().filter(|s| is_panel_reviewer(s)).count()
             } else {
                 0
             };
@@ -4141,8 +4138,7 @@ pub fn execute_loop(
         }
         // No reviewer seats at all: the stood-down check above only fires on a
         // non-empty panel, so an emptied panel would fall through to the ship
-        // confirm below. Fail closed instead — the run can never ship
-        // unreviewed.
+        // confirm below. Fail closed: the run can never ship unreviewed.
         if reviewers.is_empty() {
             return fail(
                 state,
@@ -4449,16 +4445,13 @@ pub(crate) fn delete_dropped_reviewer_files(
 }
 
 /// Re-seat the live reviewer panel to a `--role reviewer=` pin, so the live
-/// panel and the frozen config panel stay one fact. A live seat already
-/// carrying the pinned provider keeps its seat (and its history); a mismatched
-/// seat is moved to the pinned provider; a pinned entry with no live seat is
-/// minted; live seats past the pin's length retire like drops. Returns the
-/// retired ids, whose files the caller deletes after its save lands.
-fn resync_reviewer_panel_to_pin(
-    state: &mut RunState,
-    paths: &SparPaths,
-    cfg: &mut Config,
-) -> Result<Vec<String>> {
+/// panel and the frozen config panel stay one fact. A seat already carrying
+/// the pinned provider keeps its seat (and its history); a pinned provider
+/// seated elsewhere in the panel swaps into position; anything else retires
+/// like a drop and mints fresh at an id neither live nor retired. Live seats
+/// past the pin's length retire the same way. Returns the retired ids, whose
+/// files the caller deletes after its save lands.
+fn resync_reviewer_panel_to_pin(state: &mut RunState, cfg: &mut Config) -> Result<Vec<String>> {
     let pin: Vec<crate::provider_ref::Pin> = cfg
         .roles
         .reviewer
@@ -4466,74 +4459,104 @@ fn resync_reviewer_panel_to_pin(
         .map(|raw| crate::provider_ref::Pin::parse(raw.as_str()))
         .collect::<Result<Vec<_>>>()?;
     let mut removed = Vec::new();
+    // Seats already placed by an earlier pin entry: a repeated provider in
+    // the pin mints a second seat instead of seating one seat twice.
+    let mut placed: BTreeSet<String> = BTreeSet::new();
     for (position, want) in pin.iter().enumerate() {
-        let live = panel_seat_with_ordinal(state, position);
-        match live {
-            Some(slot_id)
-                if state
-                    .slots
-                    .iter()
-                    .any(|s| s.id == slot_id && s.provider == want.provider) =>
+        let panel: Vec<String> = state
+            .slots
+            .iter()
+            .filter(|s| is_panel_reviewer(s))
+            .map(|s| s.id.clone())
+            .collect();
+        let provider_of = |id: &str| {
+            state
+                .slots
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.provider.clone())
+        };
+        if let Some(id) = panel.get(position) {
+            if provider_of(id).as_deref() == Some(want.provider.as_str())
+                && placed.insert(id.clone())
             {
-                if let Some(s) = state.slot_mut(&slot_id) {
+                if let Some(s) = state.slot_mut(id) {
                     s.reviewer_kind = Some(ReviewerSeatKind::Panel);
                 }
-            }
-            Some(slot_id) => {
-                let new_id = move_seat(state, paths, &slot_id, want, SeatSource::CliRole)?;
-                let moved = state
-                    .slots
-                    .iter()
-                    .find(|s| s.id == new_id)
-                    .ok_or_else(|| anyhow::anyhow!("seat {slot_id} vanished in the re-seat"))?;
-                if moved.provider != want.provider {
-                    anyhow::bail!(
-                        "seat {slot_id} keeps a live seat's id after the re-seat to {}",
-                        want.display()
-                    );
-                }
-                if let Some(s) = state.slot_mut(&new_id) {
-                    s.reviewer_kind = Some(ReviewerSeatKind::Panel);
-                }
-                // A moved seat keeps the panel position its backup entry is
-                // filed under: blank a same-position entry that now names the
-                // seat's own provider, the same spent-backup rule drops apply.
-                if let Some(entry) = cfg.backups.reviewer.get_mut(position) {
-                    if !entry.is_empty() && backup_key(entry) == want.provider {
-                        entry.clear();
-                    }
-                }
-            }
-            None => {
-                let mut ordinal = position;
-                while {
-                    let id = format!(
-                        "review-{ordinal}-{}",
-                        crate::util::sanitize_slot(&want.provider)
-                    );
-                    state.slots.iter().any(|s| s.id == id) || state.retired_seat_ids.contains(&id)
-                } {
-                    ordinal += 1;
-                }
-                let seat_id = format!(
-                    "review-{ordinal}-{}",
-                    crate::util::sanitize_slot(&want.provider)
-                );
-                let mut slot = executor::init_slot_model(
-                    &seat_id,
-                    want.display(),
-                    SlotRole::Reviewer,
-                    want.model.clone(),
-                );
-                slot.source = Some(SeatSource::CliRole);
-                slot.reviewer_kind = Some(ReviewerSeatKind::Panel);
-                state.slots.push(slot);
+                blank_spent_backup_entry(&mut cfg.backups.reviewer, position, &want.provider);
+                continue;
             }
         }
+        if let Some(other) = panel
+            .iter()
+            .find(|id| {
+                provider_of(id).as_deref() == Some(want.provider.as_str()) && !placed.contains(*id)
+            })
+            .cloned()
+        {
+            let here = panel
+                .get(position)
+                .and_then(|id| state.slots.iter().position(|s| &s.id == id));
+            let there = state.slots.iter().position(|s| s.id == other);
+            if let (Some(a), Some(b)) = (here, there) {
+                state.slots.swap(a, b);
+                if let Some(s) = state.slot_mut(&other) {
+                    s.reviewer_kind = Some(ReviewerSeatKind::Panel);
+                }
+                placed.insert(other);
+                blank_spent_backup_entry(&mut cfg.backups.reviewer, position, &want.provider);
+                continue;
+            }
+        }
+        // The pinned provider is nowhere in the panel, or the only seat
+        // carrying it is already placed: the seat here retires like a drop
+        // and a fresh seat mints at an id neither live nor retired, so a
+        // move can never land on a live or retired id.
+        let at = panel
+            .get(position)
+            .and_then(|id| state.slots.iter().position(|s| &s.id == id));
+        if let Some(id) = panel.get(position).cloned() {
+            state.review_history.retain(|e| e.slot_id != id);
+            state.retired_seat_ids.insert(id.clone());
+            state.slots.retain(|s| s.id != id);
+            removed.push(id);
+        }
+        let mut ordinal = position;
+        while {
+            let id = format!(
+                "review-{ordinal}-{}",
+                crate::util::sanitize_slot(&want.provider)
+            );
+            state.slots.iter().any(|s| s.id == id) || state.retired_seat_ids.contains(&id)
+        } {
+            ordinal += 1;
+        }
+        let seat_id = format!(
+            "review-{ordinal}-{}",
+            crate::util::sanitize_slot(&want.provider)
+        );
+        let mut slot = executor::init_slot_model(
+            &seat_id,
+            want.display(),
+            SlotRole::Reviewer,
+            want.model.clone(),
+        );
+        slot.source = Some(SeatSource::CliRole);
+        slot.reviewer_kind = Some(ReviewerSeatKind::Panel);
+        match at {
+            Some(i) if i <= state.slots.len() => state.slots.insert(i, slot),
+            _ => state.slots.push(slot),
+        }
+        placed.insert(seat_id);
+        blank_spent_backup_entry(&mut cfg.backups.reviewer, position, &want.provider);
     }
     while cfg.backups.reviewer.last().is_some_and(|s| s.is_empty()) {
         cfg.backups.reviewer.pop();
     }
+    // Entries past the pin length sit under positions no seat can hold: the
+    // live panel is exactly the pin's length after this function, so they
+    // can never be read back.
+    cfg.backups.reviewer.truncate(pin.len());
     // Live seats past the pin's length retire like drops: their history is
     // pruned now, their ids retire, their files go after the save.
     let live_ids: Vec<String> = state
@@ -4549,6 +4572,93 @@ fn resync_reviewer_panel_to_pin(
         removed.push(id);
     }
     Ok(removed)
+}
+
+/// Blank a same-position backup entry that now names the seat's own provider:
+/// a seat serving its engaged backup is not governed by the config, the same
+/// spent-backup rule drops apply.
+fn blank_spent_backup_entry(backups: &mut [String], position: usize, provider: &str) {
+    if let Some(entry) = backups.get_mut(position) {
+        if !entry.is_empty() && backup_key(entry) == provider {
+            entry.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod resync_panel_tests {
+    use super::*;
+
+    fn resync_state(ids: &[(&str, &str)]) -> RunState {
+        let mut state = RunState::new(
+            "r-resync",
+            crate::cli::WorkflowKind::Loop,
+            std::path::PathBuf::from("/x"),
+        );
+        for &(id, provider) in ids {
+            state
+                .slots
+                .push(executor::init_slot(id, provider, SlotRole::Reviewer));
+        }
+        state
+    }
+
+    fn panel_ids(state: &RunState) -> Vec<String> {
+        state
+            .slots
+            .iter()
+            .filter(|s| is_panel_reviewer(s))
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn swapped_pin_swaps_live_seats_into_position() {
+        let mut state = resync_state(&[
+            ("review-0-cli-claude", "cli:claude"),
+            ("review-1-cli-grok", "cli:grok"),
+        ]);
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:grok".to_string(), "cli:claude".to_string()];
+        let removed = resync_reviewer_panel_to_pin(&mut state, &mut cfg).unwrap();
+        assert!(removed.is_empty());
+        assert!(state.retired_seat_ids.is_empty());
+        assert_eq!(
+            panel_ids(&state),
+            vec![
+                "review-1-cli-grok".to_string(),
+                "review-0-cli-claude".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn replaced_provider_retires_and_mints_fresh_at_position() {
+        let mut state = resync_state(&[("review-0-cli-claude", "cli:claude")]);
+        state
+            .retired_seat_ids
+            .insert("review-0-cli-codex".to_string());
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:codex".to_string()];
+        let removed = resync_reviewer_panel_to_pin(&mut state, &mut cfg).unwrap();
+        assert_eq!(removed, vec!["review-0-cli-claude".to_string()]);
+        assert_eq!(panel_ids(&state), vec!["review-1-cli-codex".to_string()]);
+        assert!(state.retired_seat_ids.contains("review-0-cli-claude"));
+    }
+
+    #[test]
+    fn repeated_pin_provider_mints_a_second_seat() {
+        let mut state = resync_state(&[("review-0-cli-claude", "cli:claude")]);
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:claude".to_string(), "cli:claude".to_string()];
+        let removed = resync_reviewer_panel_to_pin(&mut state, &mut cfg).unwrap();
+        assert!(removed.is_empty());
+        assert_eq!(panel_ids(&state).len(), 2);
+        let mut ids = panel_ids(&state);
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 2);
+    }
 }
 
 #[cfg(test)]
@@ -4834,6 +4944,16 @@ fn move_seat(
         .find(|s| s.id == slot_id)
         .ok_or_else(|| anyhow::anyhow!("unknown slot {slot_id}"))?;
     let new_id = moved_seat_id(slot.role, reviewer_seat_kind(slot), slot_id, &pin.provider);
+    // A move onto a live or retired id fails closed before the seat is
+    // touched: pointing the seat at the new provider first would leave an
+    // id/provider mismatch behind, and a retired id would come back with the
+    // dropped seat's history pruned and its verdict files deleted.
+    if new_id != slot_id && state.slots.iter().any(|s| s.id == new_id) {
+        anyhow::bail!("seat {new_id} is already live; refusing to move {slot_id} onto it");
+    }
+    if new_id != slot_id && state.retired_seat_ids.contains(&new_id) {
+        anyhow::bail!("seat {new_id} is retired; refusing to remint it");
+    }
     if let Some(s) = state.slot_mut(slot_id) {
         s.point_at(&pin.display());
         // A level the old CLI took may not exist on the new one; the dispatch then
@@ -4843,7 +4963,7 @@ fn move_seat(
         }
         s.source = Some(source);
     }
-    if new_id != slot_id && state.slots.iter().all(|s| s.id != new_id) {
+    if new_id != slot_id {
         state.rename_slot(paths, slot_id, &new_id);
         return Ok(new_id);
     }

@@ -1592,38 +1592,17 @@ impl Config {
     }
 
     pub fn save_snapshot(&self, paths: &SparPaths, run_id: &str) -> Result<()> {
-        paths.ensure_run_dirs(run_id)?;
-        let path = paths.run_config_file(run_id);
-        let text = serde_json::to_string_pretty(self)?;
-        // Captured `[env]` values can carry proxy credentials: owner-only, set at creation
-        // of a temp file and renamed in, so the file is never readable wider in between.
-        let mode = if self.env.captured.is_empty() {
-            0o644
-        } else {
-            0o600
-        };
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(mode)
-                .open(&tmp)
-                .with_context(|| format!("write run config {}", tmp.display()))?;
-            f.write_all(text.as_bytes())
-                .with_context(|| format!("write run config {}", tmp.display()))?;
-        }
-        std::fs::rename(&tmp, &path).with_context(|| format!("write run config {}", path.display()))
+        let staged = self.stage_snapshot(paths, run_id)?;
+        Self::commit_snapshot(paths, run_id, &staged)
     }
 
     /// Write the snapshot to a temp file and hand back its path without
     /// publishing it: the caller renames it into place only after the paired
     /// state write succeeds, so a failed `RunState::save` can never leave the
     /// frozen config narrowed while the slots it narrowed are still live.
+    /// Captured `[env]` values can carry proxy credentials: owner-only, set at
+    /// creation of a temp file and renamed in, so the file is never readable
+    /// wider in between.
     pub fn stage_snapshot(&self, paths: &SparPaths, run_id: &str) -> Result<PathBuf> {
         paths.ensure_run_dirs(run_id)?;
         let path = paths.run_config_file(run_id);

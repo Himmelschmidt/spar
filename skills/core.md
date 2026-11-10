@@ -2074,7 +2074,7 @@ spar implement --run <id> --reload-config   # deliberately re-read spar.toml and
 
 `--reload-config` re-reads `spar.toml` into an existing run's snapshot and then re-applies the overrides the run was launched or amended with, so later resumes keep both the file edits and the earlier flags. `--role`, `--backup`, `--effort`, `--without` and `--fleet` amend a `--run <id>` resume's frozen config directly, without `--reload-config`; only `--suite-command` still needs it. Amending and reloading are both refused while the run's orchestrator is alive. Runs created before snapshots existed fall back to the live file.
 
-An amend that changes the implementer pin re-points the live `impl` seat (provider, model, source) instead of only its model: that id names no provider. The amend is validated read-only in the preview, so a refused one persists nothing (O181). Any other amend leaves existing seats alone, and a reviewer seat only ever re-points its model, since its id encodes its provider. To change **who** fills a seat that already exists, reassign it:
+An amend that changes the implementer pin re-points the live `impl` seat (provider, model, source) instead of only its model: that id names no provider. The amend is validated read-only in the preview, so a refused one persists nothing (O181). Any other amend leaves existing seats alone, except a `--role reviewer=` pin, which swaps, mints or retires live panel seats until the live panel matches the pin. To change **who** fills a seat that already exists outside a panel pin, reassign it:
 
 ```bash
 spar implement --run <id> --reassign implementer=cli:claude@sonnet
