@@ -61,11 +61,7 @@ impl ProviderAdapter for GrokAdapter {
         Capabilities {
             headless: true,
             interactive: true,
-            // No `build_resume`: a real implementation would resume via
-            // `grok -r/--resume <id>` (`--fork-session` for the fork form;
-            // `-s/--session-id` only names a new or forked session, verified
-            // against grok 1.0.34). Unimplemented, so the derived flag stays
-            // false.
+            // Resume is implemented, so the derived `resume` flag is true.
             resume: self.supports_resume(),
             skip_permissions: true,
             native_sandbox: false,
@@ -99,8 +95,8 @@ impl ProviderAdapter for GrokAdapter {
         }
         // Long form; `-s` is equivalent but this greps. Never alongside `--resume`:
         // grok only allows `--session-id` with `--resume` together with
-        // `--fork-session`, and spar has no grok `build_resume`, so the two are
-        // structurally disjoint.
+        // `--fork-session`, and spar never forks, so the two are structurally
+        // disjoint.
         if let Some(id) = opts.session_id.as_deref() {
             cmd.arg("--session-id").arg(id);
         }
@@ -112,6 +108,61 @@ impl ProviderAdapter for GrokAdapter {
         }
         cmd.current_dir(&opts.cwd);
         cmd
+    }
+
+    /// Resume is implemented, so the derived `Capabilities.resume` reports true.
+    fn supports_resume(&self) -> bool {
+        true
+    }
+
+    /// Continue `session_id` with a new prompt: the cold command with
+    /// `--session-id` swapped for `-r/--resume <id>` (verified against grok
+    /// 1.0.70: `-r, --resume [<SESSION_ID_OR_TITLE>]`, "Resume a previous
+    /// session"). Never `--session-id` alongside: grok only allows the pair
+    /// with `--fork-session`, and spar resumes in place. The id comes only
+    /// from the sid argument (D2: the dispatcher clears `opts.session_id`
+    /// before calling), so the headless builder's own `--session-id`
+    /// render can never double-emit here.
+    fn build_resume(&self, bin: &Path, opts: &SpawnOpts, session_id: &str) -> Option<Command> {
+        debug_assert!(
+            opts.session_id.is_none(),
+            "resume must not carry an assigned cold-dispatch id"
+        );
+        let mut cmd = Command::new(bin);
+        cmd.arg("--output-format").arg("streaming-json");
+        if let Some(pf) = &opts.prompt_file {
+            cmd.arg("--prompt-file").arg(pf);
+        } else {
+            cmd.arg("--single").arg(&opts.prompt);
+        }
+        for a in self.permission_args(opts.trust) {
+            cmd.arg(a);
+        }
+        if let Some(m) = &opts.model {
+            cmd.arg("--model").arg(m);
+        }
+        if let Some(e) = opts.effort {
+            cmd.arg("--reasoning-effort").arg(e.as_str());
+        }
+        for a in &opts.extra_args {
+            cmd.arg(a);
+        }
+        cmd.arg("--resume").arg(session_id);
+        cmd.current_dir(&opts.cwd);
+        Some(cmd)
+    }
+
+    /// Fail closed: the vendor wording for a resumed-but-missing session is
+    /// unverified, so a resume that dies before establishing a session never
+    /// reads as a lost rollout. The marker stays and the failure reports like
+    /// any other, instead of a cold retry against a session that may still be
+    /// resumable once the underlying failure clears.
+    fn resume_failure_is_missing_session(
+        &self,
+        _log_text: &str,
+        _session_id: Option<&str>,
+    ) -> bool {
+        false
     }
 
     fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> Command {
@@ -215,6 +266,21 @@ mod tests {
                 .any(|(k, v)| k == "GROK_FOLDER_TRUST" && v == "0"),
             "grok dispatches must carry folder trust: {env:?}"
         );
+    }
+
+    #[test]
+    fn resume_continues_the_session_with_resume_and_no_session_id() {
+        let opts = opts_with_session("hi", None, None);
+        let cmd = GrokAdapter
+            .build_resume(Path::new("grok"), &opts, "sess-123")
+            .expect("grok resumes");
+        let (_, args) = command_to_parts(&cmd);
+        assert_eq!(dash_val(&args, "--resume").as_deref(), Some("sess-123"));
+        assert!(
+            !args.iter().any(|a| a == "--session-id"),
+            "resume names the session with --resume only: {args:?}"
+        );
+        assert!(GrokAdapter.supports_resume());
     }
 
     fn opts_with_session(prompt: &str, file: Option<&str>, session_id: Option<&str>) -> SpawnOpts {

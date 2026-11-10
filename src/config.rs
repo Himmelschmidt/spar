@@ -75,7 +75,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet_reviewer_override: Option<usize>,
     /// `--one-pass`: one implementer pass, one review pass, then the verdict
-    /// (O196). A passed gate ships; anything that fails the gate parks at it
+    /// (O200). A passed gate ships; anything that fails the gate parks at it
     /// exactly as without the flag. Frozen into the run config like the other
     /// CLI seat shapers, so re-entries and `--reload-config` keep it.
     #[serde(default)]

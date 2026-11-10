@@ -1,4 +1,4 @@
-//! `--one-pass` (O196): one small round, then the verdict. A passed gate ships;
+//! `--one-pass` (O200): one small round, then the verdict. A passed gate ships;
 //! a sub-threshold `request_changes` counts as approve-with-notes and ships
 //! clean with the findings as follow-ups in the PR body. Anything that fails
 //! the gate parks at it (exit 2), as without the flag.

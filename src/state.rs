@@ -1433,7 +1433,7 @@ impl RunOwner {
 /// the bug this exists to close. So a start-time-less token counts as *not* evidence of
 /// life. The `.pid` marker survives re-dispatch on purpose (`markers::clear_slot`), and
 /// the start-time check is what makes reading a prior dispatch's pid safe.
-fn slot_process_alive(paths: &SparPaths, run_id: &str, slot: &SlotState) -> bool {
+pub fn slot_process_alive(paths: &SparPaths, run_id: &str, slot: &SlotState) -> bool {
     crate::markers::read_pid(paths, run_id, &slot.id)
         .or_else(|| slot.pid.map(crate::process::PidToken::from_pid))
         .is_some_and(|t| t.starttime.is_some() && t.alive())

@@ -1290,6 +1290,7 @@ run's messages, and a bare agent and a run slot can directed-message each other 
 ```bash
 spar bus send -m "hello" [--from <agent>] [--to broadcast|agent|impl] [--run <id>]
               [--requires-ack] [--persist] [--supersedes <msg_id>] [--expires-after-round [N]]
+              [--urgent]
 spar bus log [--run <id>] [--json]                 # each message with per-recipient receipts
 spar bus presence [--run <id>]
 spar bus inbox <agent> [--claim] [--run <id>] [--json]
@@ -1329,6 +1330,14 @@ spar bus ack <msg_id> [--from <agent>] [--run <id>]  # stop a requires_ack redel
   the run passes round `N` the message is never delivered. A claim withdraws it, `inbox`
   hides it, the poll file drops it on its next render, redelivery stops, and a persisted
   one leaves the carry-forward.
+- `--urgent` (with `--run`, to a single slot) interrupts a mid-turn slot: the orchestrator
+  stops the turn's process group and resumes the same session with this message first, ahead
+  of the normal continuation. The interrupt is not a failure, timeout, ceiling kill or quota
+  event: it costs no rotation and no round, and the slot keeps its worktree. An idle slot, an
+  unknown slot, a broadcast, or a provider without resume (agy) delivers normally instead and
+  the send says so. Needs a resumable provider: resume exists for codex, pi, muse, claude
+  (`-r`) and grok (`--resume`). A turn killed before it established any session restarts
+  cold under a fresh id, never the killed turn's id.
 
 **Receipts (O134).** `.spar/bus/receipts.jsonl` gets a line per recipient as a message
 moves: `queued` (written to the inbox), `delivered` (claimed into the agent's channel or
@@ -2110,7 +2119,7 @@ itself fails (or the orchestrator dies after the gate passed), the run sits at
 `awaiting_ship_confirm`; resume and `__internal_continue` do not re-run the
 ship, so retry it with a plain `spar ship <id>` (the passed gate already
 recorded its confirm). Frozen into the run's
-`config.json`; nothing changes for runs launched without it (O196).
+`config.json`; nothing changes for runs launched without it (O200).
 
 **`--suite-command "<cmd>"`** (repeatable, on `plan` and `implement`) sets this run's
 deterministic suite, replacing `[suite].command` and turning the suite channel on even under

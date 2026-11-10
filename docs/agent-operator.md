@@ -155,7 +155,7 @@ adopt a `test-contract.md` that drifted mid-round exits `1` until you pass
 `artifacts/carry-forward-<slot>.md` is seeded into the next round's prompt, capped by
 `[rounds] carry_forward_chars`.
 
-**One-pass runs (O196).** `spar implement -t ... --one-pass` (or `run --workflow
+**One-pass runs (O200).** `spar implement -t ... --one-pass` (or `run --workflow
 loop --one-pass`) implies `--fleet small` and caps a fresh run at one round: at
 the end of it a passed gate ships through the real ship path. A sub-threshold
 `request_changes` counts as approve-with-notes, so minor findings ship clean
@@ -233,7 +233,11 @@ slot, `bus send`/`ack` (`--from`) and `reserve`/`release` (`--holder`) default t
 From outside, `spar bus ack <id> --run <id>` stops a `requires-ack` redelivery
 without dropping the slot's file copy and without flipping the log word; it is the
 escape hatch for a wedged slot. To take the item back entirely, withdraw the message
-instead.
+instead. `spar bus send --urgent --run <id> --to <slot>` interrupts a mid-turn slot instead
+of waiting for the turn boundary: the orchestrator stops the turn and resumes the same
+session with the message first, at no rotation or round cost. A turn killed before it
+established any session restarts cold under a fresh id. Idle slots and providers
+without resume (agy) get a normal delivery, and the send says so.
 
 ## Event feed
 

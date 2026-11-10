@@ -3764,7 +3764,7 @@ fn panel_stop(
     Some((cause, messages))
 }
 
-/// The one-pass ship verdict (O196): a run whose frozen config carries
+/// The one-pass ship verdict (O200): a run whose frozen config carries
 /// `one_pass` ships only off a passed gate. The loop gate already counts a
 /// sub-threshold `request_changes` as approve-with-notes (O118), so a round
 /// that fails the gate always fails it on something that must park: a finding
