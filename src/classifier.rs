@@ -266,23 +266,28 @@ fn live_post(
     body: &str,
     timeout: Duration,
 ) -> Result<(u16, String), String> {
-    crate::util::retry_interrupted(timeout, |remaining| {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(remaining))
-            .http_status_as_error(false)
-            .build()
-            .into();
-        let resp = agent
-            .post(url)
-            .header("Authorization", &format!("Bearer {api_key}"))
-            .header("Content-Type", "application/json")
-            .header("X-OpenRouter-Title", "spar")
-            .send(body)?;
-        let status = resp.status().as_u16();
-        let text = resp.into_body().read_to_string()?;
-        Ok((status, text))
-    })
-    .map_err(|e| e.to_string())
+    // One attempt, never re-sent: an interrupted read may already have billed
+    // a completion server-side. The mask keeps child churn from failing it.
+    let _mask = crate::util::block_sigchld();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    match agent
+        .post(url)
+        .header("Authorization", &format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .header("X-OpenRouter-Title", "spar")
+        .send(body)
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let text = resp.into_body().read_to_string().unwrap_or_default();
+            Ok((status, text))
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 const BREAKER_OPEN: Duration = Duration::from_secs(300);

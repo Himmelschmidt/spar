@@ -57,33 +57,35 @@ pub fn expand_home(raw: &str) -> std::path::PathBuf {
     }
 }
 
-/// Re-run a blocking HTTP call while the kernel reports it as interrupted.
+/// Block `SIGCHLD` on the calling thread until the guard drops.
 ///
 /// Slot children are spawned and reaped on other threads of this process, so a
-/// blocked socket read can draw EINTR (SIGCHLD, default disposition: no handler
-/// runs, the syscall still fails) instead of the caller's timeout. ureq reports
-/// that as a typed `Error::Io`, never as `Error::Timeout`, so without a retry a
-/// slow server reads as a transport failure. An interruption carries no server
-/// answer, so the re-send is not an attempt against the endpoint. Every attempt
-/// shares one deadline: `op` receives the time it may still spend, so retries
-/// can never push the total past `budget`. At most three attempts bound a
-/// signal storm; a spent budget reports `Timeout`, never another re-send.
-pub fn retry_interrupted<T>(
-    budget: Duration,
-    mut op: impl FnMut(Duration) -> Result<T, ureq::Error>,
-) -> Result<T, ureq::Error> {
-    let deadline = std::time::Instant::now() + budget;
-    let mut tries = 0;
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(ureq::Error::Timeout(ureq::Timeout::Global));
-        }
-        match op(remaining) {
-            Err(ureq::Error::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted && tries < 2 => {
-                tries += 1;
-            }
-            done => return done,
+/// thread blocked in a socket read can draw EINTR from `SIGCHLD` (default
+/// disposition: no handler runs, the syscall still fails) instead of the
+/// caller's timeout. ureq surfaces that as a typed `Error::Io` with kind
+/// `Interrupted`, and re-sending a POST after one is wrong: the server may
+/// already have accepted or answered it, billing another completion. Hold this
+/// guard for the whole HTTP call instead, and the kernel delivers the signal
+/// to a thread that leaves it unblocked. The previous mask is restored on drop.
+pub struct SigchldGuard {
+    saved: libc::sigset_t,
+}
+
+pub fn block_sigchld() -> SigchldGuard {
+    unsafe {
+        let mut add: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut add);
+        libc::sigaddset(&mut add, libc::SIGCHLD);
+        let mut saved: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &add, &mut saved);
+        SigchldGuard { saved }
+    }
+}
+
+impl Drop for SigchldGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.saved, std::ptr::null_mut());
         }
     }
 }
@@ -123,56 +125,60 @@ pub fn fmt_elapsed(d: Duration) -> String {
 mod tests {
     use super::*;
 
-    fn interrupted() -> ureq::Error {
-        ureq::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "interrupted",
-        ))
-    }
-
+    /// Child churn on another thread must not interrupt a masked blocking read.
+    /// The churn spawns and reaps real children, which is what delivers SIGCHLD
+    /// to this process; with the mask held the kernel hands it to a thread that
+    /// leaves it unblocked, so the read waits out the slow server instead of
+    /// failing with `Interrupted`.
     #[test]
-    fn retry_interrupted_reruns_only_an_interrupted_read() {
-        let mut calls = 0;
-        let ok = retry_interrupted(Duration::from_secs(30), |_| {
-            calls += 1;
-            if calls < 3 {
-                Err(interrupted())
-            } else {
-                Ok("done")
+    fn masked_read_survives_sigchld_churn() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(800));
+            conn.write_all(b"slow answer").unwrap();
+        });
+
+        let running = Arc::new(AtomicBool::new(true));
+        let churn_flag = running.clone();
+        let churn = std::thread::spawn(move || {
+            while churn_flag.load(Ordering::Relaxed) {
+                let _ = std::process::Command::new("/bin/true").status();
             }
         });
-        assert_eq!(ok.unwrap(), "done");
-        assert_eq!(calls, 3, "two interruptions then a success");
-        let mut other = 0;
-        let err = retry_interrupted::<()>(Duration::from_secs(30), |_| {
-            other += 1;
-            Err(ureq::Error::HostNotFound)
-        });
-        assert!(err.is_err());
-        assert_eq!(other, 1, "a non-interruption returns at once");
-        let mut storms = 0;
-        let err = retry_interrupted::<()>(Duration::from_secs(30), |_| {
-            storms += 1;
-            Err(interrupted())
-        });
-        assert!(err.is_err());
-        assert_eq!(storms, 3, "a signal storm still terminates");
-    }
 
-    #[test]
-    fn retry_interrupted_never_spends_past_its_budget() {
-        let budget = Duration::from_millis(100);
-        let mut calls = 0;
-        let err = retry_interrupted::<()>(budget, |_| {
-            calls += 1;
-            std::thread::sleep(budget + Duration::from_millis(50));
-            Err(interrupted())
-        });
-        assert_eq!(calls, 1, "a spent budget is not re-sent");
-        assert!(
-            matches!(err, Err(ureq::Error::Timeout(_))),
-            "exhaustion reports a timeout, not another send"
-        );
+        let _mask = block_sigchld();
+        let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 64];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e) => {
+                    assert_ne!(
+                        e.kind(),
+                        std::io::ErrorKind::Interrupted,
+                        "a masked read must not draw EINTR from child churn"
+                    );
+                    panic!("masked read failed: {e:?}");
+                }
+            }
+        }
+        assert_eq!(buf, b"slow answer");
+        running.store(false, Ordering::Relaxed);
+        churn.join().unwrap();
+        server.join().unwrap();
     }
 
     #[test]

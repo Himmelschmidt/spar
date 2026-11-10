@@ -13,13 +13,12 @@ pub struct ApiProviderConfig {
 }
 
 impl ApiProviderConfig {
-    /// An explicitly passed key wins; the environment is the fallback, so
-    /// callers that inject a credential never touch shared process state.
-    pub fn resolve(name: &str, api_key: Option<&str>) -> Result<Self> {
+    /// Credentials and endpoints come from the process environment, the same
+    /// source every caller reads, so there is no per-call injection path.
+    pub fn resolve(name: &str) -> Result<Self> {
         let key = |env_name: &str| {
-            api_key
-                .map(str::to_string)
-                .or_else(|| env::var(env_name).ok())
+            env::var(env_name)
+                .ok()
                 .context(format!("{env_name} required"))
         };
         let name = name.trim().to_ascii_lowercase();
@@ -45,13 +44,8 @@ impl ApiProviderConfig {
                         env::var("OPENAI_BASE_URL")
                             .unwrap_or_else(|_| "https://api.openai.com/v1".into())
                     }),
-                    api_key: api_key
-                        .map(str::to_string)
-                        .or_else(|| {
-                            env::var("ANTHROPIC_API_KEY")
-                                .or_else(|_| env::var("OPENAI_API_KEY"))
-                                .ok()
-                        })
+                    api_key: env::var("ANTHROPIC_API_KEY")
+                        .or_else(|_| env::var("OPENAI_API_KEY"))
                         .context("ANTHROPIC_API_KEY or OPENAI_API_KEY required")?,
                     model: env::var("ANTHROPIC_MODEL")
                         .unwrap_or_else(|_| "claude-3-5-sonnet-latest".into()),
@@ -120,23 +114,22 @@ pub fn chat_completion(
     });
     // Bound the whole request by the slot's remaining ceiling: the step loop
     // only checks between calls, so one hung call would otherwise overrun it.
-    // Every attempt shares that single deadline via `remaining`.
-    let (status, text) = crate::util::retry_interrupted(timeout, |remaining| {
-        let agent = ureq::Agent::new_with_config(
-            ureq::Agent::config_builder()
-                .timeout_global(Some(remaining))
-                .build(),
-        );
-        let resp = agent
-            .post(&url)
-            .header("Authorization", &format!("Bearer {}", cfg.api_key))
-            .header("Content-Type", "application/json")
-            .send_json(&body)?;
-        let status = resp.status();
-        let text = resp.into_body().read_to_string()?;
-        Ok((status, text))
-    })
-    .with_context(|| format!("POST {url}"))?;
+    // One attempt, never re-sent: an interrupted read may already have billed
+    // a completion server-side. The mask keeps child churn from failing it.
+    let _mask = crate::util::block_sigchld();
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .build(),
+    );
+    let resp = agent
+        .post(&url)
+        .header("Authorization", &format!("Bearer {}", cfg.api_key))
+        .header("Content-Type", "application/json")
+        .send_json(&body)
+        .with_context(|| format!("POST {url}"))?;
+    let status = resp.status();
+    let text = resp.into_body().read_to_string()?;
     if !status.is_success() {
         bail!("api {} status {status}: {}", cfg.name, truncate(&text, 400));
     }
