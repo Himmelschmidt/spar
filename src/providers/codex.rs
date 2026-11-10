@@ -48,6 +48,18 @@ fn codex_model(opts: &SpawnOpts) -> Option<String> {
         })
 }
 
+/// The profile a codex spawn dispatches under: the run's recorded profile when
+/// the dispatch belongs to one, else this process's ambient
+/// `SPAR_CODEX_PROFILE`. A recorded empty string is the native route (drop
+/// `-p`); it never falls through to the ambient value.
+fn spawn_profile(opts: &SpawnOpts) -> Option<String> {
+    match opts.codex_profile.as_deref() {
+        Some(recorded) if !recorded.is_empty() => Some(recorded.into()),
+        Some(_) => None,
+        None => codex_profile(),
+    }
+}
+
 /// Flags that select a model. A `/` marks an OpenRouter slug (`openai/gpt-4o-mini`,
 /// `tencent/hy3:free`) and routes explicitly through the openrouter provider; a bare
 /// model (`gpt-5`) goes to codex's own default provider.
@@ -225,7 +237,7 @@ impl CodexAdapter {
                 }
             }
             None => {
-                if let Some(p) = codex_profile() {
+                if let Some(p) = spawn_profile(opts) {
                     cmd.arg("-p").arg(p);
                 }
             }
@@ -421,7 +433,7 @@ impl ProviderAdapter for CodexAdapter {
                 }
             }
             None => {
-                if let Some(p) = codex_profile() {
+                if let Some(p) = spawn_profile(opts) {
                     if let Some(args) = profile_model_args(&p) {
                         for a in args {
                             cmd.arg(a);
@@ -491,6 +503,7 @@ mod tests {
 
     fn opts(prompt: &str, model: Option<&str>) -> SpawnOpts {
         SpawnOpts {
+            codex_profile: None,
             prompt: prompt.into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
@@ -655,6 +668,25 @@ mod tests {
             command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &opts("x", None)));
         assert!(a.windows(2).any(|w| w[0] == "-p" && w[1] == "muse"));
         assert!(!a.iter().any(|x| x == "-m"));
+    }
+
+    #[test]
+    fn spawn_honours_the_recorded_profile_over_the_process_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_MODEL");
+        // Recorded OpenRouter profile wins over a natively-set process.
+        std::env::set_var("SPAR_CODEX_PROFILE", "");
+        let mut o = opts("x", None);
+        o.codex_profile = Some("muse".into());
+        let (_, a) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &o));
+        assert!(a.windows(2).any(|w| w[0] == "-p" && w[1] == "muse"));
+        // Recorded native route drops `-p` even when the process names a profile.
+        std::env::set_var("SPAR_CODEX_PROFILE", "muse");
+        let mut o = opts("x", None);
+        o.codex_profile = Some("".into());
+        let (_, a) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &o));
+        assert!(!a.iter().any(|x| x == "-p"));
+        std::env::remove_var("SPAR_CODEX_PROFILE");
     }
 
     #[test]
@@ -1042,6 +1074,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let run = dir.path().join("run1");
         let o = SpawnOpts {
+            codex_profile: None,
             prompt: "x".into(),
             prompt_file: Some(run.join("prompt-rev.md")),
             cwd: PathBuf::from("/tmp"),

@@ -166,8 +166,14 @@ fn a_resume_restamps_the_horizon_past_an_interim_weak_pause() {
     let restamped = after["round_started_at"]
         .as_str()
         .expect("resume must stamp the dispatch horizon");
+    let restamped_at = restamped
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .expect("round_started_at parses as RFC 3339");
+    let paused_at = paused_at
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .expect("seeded pause parses as RFC 3339");
     assert!(
-        restamped > paused_at.as_str(),
+        restamped_at > paused_at,
         "resume must re-stamp the horizon past the interim pause"
     );
 }

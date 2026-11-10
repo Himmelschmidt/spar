@@ -175,6 +175,7 @@ fn call(paths: &SparPaths, provider: &str, dry: bool) -> CallOutcome {
         return CallOutcome::without_output(Verdict::Skipped, Some("not on PATH".into()));
     };
     let opts = SpawnOpts {
+        codex_profile: None,
         prompt: PROBE_PROMPT.into(),
         prompt_file: None,
         cwd: paths.project_root.clone(),

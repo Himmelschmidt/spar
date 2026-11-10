@@ -1406,6 +1406,9 @@ pub fn amend_contract(
         .contract_fingerprint
         .clone()
         .unwrap_or_else(|| on_disk_fp.clone());
+    // The author dispatches now: re-stamp the horizon and the profile so its
+    // quota reads and its spawn key this amend, not an earlier dispatch.
+    state.stamp_dispatch();
     let author = amend_author_seat(&mut state, paths, cfg)?;
     let mut n = state.contract_amendments.len() + 1;
     while paths
@@ -1575,6 +1578,11 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
 /// `continue_run`'s body, for callers that already hold the run lock.
 fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
+    // Re-entering an existing run is a new dispatch: re-stamp the horizon and
+    // the profile before any seat reads quota, so a weak pause written before
+    // this entry steers instead of being trusted. Both callers (replan and
+    // `plan::continue_run`) hold the run lock here.
+    state.stamp_dispatch();
     let amendment_section = plan_amendment_section(&state);
     let mut jobs = Vec::new();
     for slot in &state.slots {

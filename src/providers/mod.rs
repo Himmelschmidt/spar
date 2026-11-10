@@ -232,7 +232,11 @@ pub struct SpawnOpts {
     /// (`SparPaths::sessions_dir`), for an adapter whose CLI otherwise keeps sessions
     /// in the user's home. Stable across rounds, so a resume finds what the cold
     /// dispatch wrote. `None` outside a run.
+    /// Recorded `SPAR_CODEX_PROFILE` from run state (`RunState::codex_profile`).
+    /// `None` means no recorded dispatch, so the adapter reads this process's
+    /// ambient value. Only codex reads this field.
     pub session_dir: Option<PathBuf>,
+    pub codex_profile: Option<String>,
 }
 
 pub trait ProviderAdapter: Send + Sync {
@@ -878,6 +882,7 @@ mod tests {
         assert!(!GrokAdapter.step_budget_exhausted("max-model-steps"));
         // Grok dispatches carry run-scoped folder trust (never operator state).
         let env = GrokAdapter.extra_env(&SpawnOpts {
+            codex_profile: None,
             prompt: String::new(),
             prompt_file: None,
             cwd: std::path::PathBuf::from("/tmp"),
@@ -1079,6 +1084,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("CODEX_HOME", home.path());
         let opts = SpawnOpts {
+            codex_profile: None,
             prompt: "go".into(),
             prompt_file: None,
             cwd: std::path::PathBuf::from("/tmp"),

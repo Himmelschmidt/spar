@@ -5438,6 +5438,10 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
         return crate::workflow::plan::continue_run(paths, cfg, run_id);
     }
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+    // Re-read under the lock: the routing load above can be stale, and the
+    // stamp below writes, so stamping the stale copy would clobber a
+    // concurrent writer's fields.
+    state = RunState::load(paths, run_id)?;
     // A resume is a new dispatch in this process: re-stamp the horizon and the
     // profile so a pause written before this resume steers the seat, and reads
     // key the seats this process actually dispatches. Fix passes inside the
