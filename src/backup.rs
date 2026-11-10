@@ -283,10 +283,19 @@ pub fn resolve_with_backup(
     dry: bool,
     codex_profile: Option<&str>,
     health: &dyn crate::providers::HealthSource,
+    used: &[String],
 ) -> Option<(String, crate::state::SeatSource)> {
     use crate::workflow::roles_resolve as rr;
-    let (prov, src) =
-        rr::resolve_seat(role, pool_index, role_index, pool, pool_origin, cfg, health)?;
+    let (prov, src) = rr::resolve_seat(
+        role,
+        pool_index,
+        role_index,
+        pool,
+        pool_origin,
+        cfg,
+        health,
+        used,
+    )?;
     let seat = crate::provider_ref::ProviderRef::for_seat(&prov, primary_model).display();
     // An auto-selected seat on a probe-failed provider yields to the declared
     // backup, then to the order rung: resolution carries the source, so the
@@ -317,7 +326,7 @@ pub fn resolve_with_backup(
         if role == crate::state::SlotRole::Reviewer {
             return None;
         }
-        let (order_prov, order_src) = rr::resolve_order_rung(role, pool_index, cfg, health)?;
+        let (order_prov, order_src) = rr::resolve_order_rung(role, pool_index, cfg, health, used)?;
         return Some((order_prov, order_src));
     }
     Some((prov, src))
@@ -429,7 +438,20 @@ mod tests {
         health: &dyn crate::providers::HealthSource,
     ) -> Option<(String, crate::state::SeatSource)> {
         resolve_with_backup(
-            role, 0, 0, pool, origin, cfg, model, store, None, paths, dry, None, health,
+            role,
+            0,
+            0,
+            pool,
+            origin,
+            cfg,
+            model,
+            store,
+            None,
+            paths,
+            dry,
+            None,
+            health,
+            &[],
         )
     }
 
@@ -1274,6 +1296,7 @@ mod tests {
                 true,
                 None,
                 &health,
+                &[],
             )
             .unwrap()
             .0

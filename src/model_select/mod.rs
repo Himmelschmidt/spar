@@ -138,6 +138,7 @@ fn synthesize_from_roles(
             crate::state::PoolOrigin::Synth,
             cfg,
             health,
+            &out,
         );
         let (p, _source) = match seat {
             Some(seat) => seat,
@@ -154,7 +155,7 @@ fn synthesize_from_roles(
                     return Err(err.context(format!("slot {i} (role '{label}')")));
                 }
                 anyhow::bail!(
-                    "slot {i} (role '{label}'): no provider in [roles] and [providers].order is exhausted"
+                    "slot {i} (role '{label}'): no usable provider in [roles] or [providers].order"
                 );
             }
         };

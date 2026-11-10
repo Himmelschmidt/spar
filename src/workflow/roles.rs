@@ -73,6 +73,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             state.pool_origin,
             cfg,
             &health,
+            &[],
         ) {
             if pin_source.is_explicit_pin() {
                 *seat = pin_provider;
