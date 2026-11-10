@@ -1,6 +1,6 @@
 //! Codex route unification: one resolver feeds the spawn and every quota and
 //! rejection key, so a model-less `cli:codex` seat keys the bucket it bills.
-//! All three drive the real binary with `--dry-run` (no provider CLI needed);
+//! All six drive the real binary with `--dry-run` (no provider CLI needed);
 //! the recorded route in `state.json` is the seam under test.
 
 mod common;
