@@ -386,9 +386,8 @@ impl Classifier {
         &LIVE
     }
 
-    /// A classifier no test may consult: any post panics. Tests that need a
-    /// `&Classifier` with the classifier disabled use this, so the type — not
-    /// a config default — keeps them off the shared live instance.
+    /// A classifier whose post panics, for tests that need a `&Classifier`
+    /// with the classifier disabled.
     #[cfg(test)]
     pub fn inert() -> Self {
         Classifier {
@@ -978,13 +977,11 @@ pub mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    /// An in-process System One endpoint: answers every request with `status`
-    /// and `body`, after `delay`, and records request bodies and auth headers.
-    /// Never touches the network, so a loaded machine cannot add or drop a
-    /// request through a transport retry. Each stub comes with its own
-    /// classifier, so no test shares memo or breaker state with another.
+    /// In process, so a loaded machine cannot add or drop a request through a
+    /// transport retry.
     pub struct StubSystemOne {
         pub base_url: String,
+        pub urls: Arc<Mutex<Vec<String>>>,
         pub bodies: Arc<Mutex<Vec<String>>>,
         pub auth_headers: Arc<Mutex<Vec<String>>>,
     }
@@ -996,11 +993,13 @@ pub mod tests {
     ) -> (Classifier, StubSystemOne) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let urls = Arc::new(Mutex::new(Vec::new()));
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let auth_headers = Arc::new(Mutex::new(Vec::new()));
-        let (b, a) = (bodies.clone(), auth_headers.clone());
+        let (u, b, a) = (urls.clone(), bodies.clone(), auth_headers.clone());
         let post: PostFn = Arc::new(
-            move |_url: &str, api_key: &str, req: &str, timeout: Duration| {
+            move |url: &str, api_key: &str, req: &str, timeout: Duration| {
+                u.lock().unwrap().push(url.to_string());
                 b.lock().unwrap().push(req.to_string());
                 a.lock()
                     .unwrap()
@@ -1023,6 +1022,7 @@ pub mod tests {
             },
             StubSystemOne {
                 base_url: format!("stub://classifier-{n}"),
+                urls,
                 bodies,
                 auth_headers,
             },
@@ -1236,10 +1236,14 @@ pub mod tests {
             answer_body("quota_or_rate_limit", 0.91),
             Duration::ZERO,
         );
-        let cfg = enabled_cfg(&fake.base_url, &tmp.path().join("key"));
+        let cfg = enabled_cfg(&format!("{}/", fake.base_url), &tmp.path().join("key"));
         let a = cls
             .classify(&cfg, "claude", &state("credits are gone for today"))
             .unwrap();
+        assert_eq!(
+            fake.urls.lock().unwrap()[0],
+            format!("{}/systemone", fake.base_url)
+        );
         assert_eq!(a.choice, FailureClass::QuotaOrRateLimit);
         assert!((a.probability - 0.91).abs() < 1e-9);
         assert_eq!(a.cost_usd, Some(0.00005));
@@ -1289,7 +1293,7 @@ pub mod tests {
                 .unwrap()
                 .first()
                 .map(String::as_str),
-            Some(concat!("Bearer ", "test-key")),
+            Some("Bearer test-key"),
             "sends the bearer key"
         );
 
