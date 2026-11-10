@@ -77,6 +77,11 @@ pub struct BoundAmend {
     /// shows these seats instead of the stale live ones. `None` when the amend
     /// touches no reviewer seat. Freshly minted seats are `projected`.
     pub resynced_panel: Option<Vec<FleetSeat>>,
+    /// Live seats the re-seat retired beyond the explicit drops (a replaced
+    /// provider, a panel position past the pin): `--validate-only` hides
+    /// exactly these, so widened extras sitting outside the panel survive the
+    /// splice.
+    pub resync_removed: Vec<String>,
 }
 
 /// Which reviewer seat a slot holds. A panel seat owns a backup-list position
@@ -177,13 +182,14 @@ pub fn preview_bound_amend(
     // simulation runs on a throwaway clone, so both this refusal and
     // `--validate-only` read the same outcome the dispatch will apply.
     let resync_applies = bound_panel_resync_applies(state, &inputs.role, cfg.roles.reviewer.len());
+    let mut resync_removed = Vec::new();
     let resynced_panel: Option<Vec<FleetSeat>> = if !dropped.is_empty() || resync_applies {
         let mut sim = state.clone();
         retire_reviewer_seats(&mut sim, &dropped)?;
         let mut sim_backups = cfg.backups.reviewer.clone();
         if resync_applies {
             let pin = parse_reviewer_pin(&cfg.roles.reviewer)?;
-            resync_reviewer_panel_to_pin(&mut sim, &mut sim_backups, &pin)?;
+            resync_removed = resync_reviewer_panel_to_pin(&mut sim, &mut sim_backups, &pin)?;
         }
         Some(
             sim.slots
@@ -225,6 +231,7 @@ pub fn preview_bound_amend(
         dropped,
         panel_pinned,
         resynced_panel,
+        resync_removed,
     })
 }
 
@@ -1005,7 +1012,7 @@ fn reassign_target(state: &RunState, target: &str) -> Result<String> {
 
 /// Resolve every `--reassign` against the run before anything moves, so one bad
 /// target leaves every seat as it was.
-fn resolve_reassignments(
+pub(crate) fn resolve_reassignments(
     state: &RunState,
     wanted: &[Reassignment],
 ) -> Result<Vec<(String, crate::provider_ref::Pin)>> {
@@ -1249,6 +1256,12 @@ fn run_from_approved(
     }
     let moves = resolve_reassignments(&state, &reassignments)
         .map_err(|e| ReassignRefused(format!("{e:#}")))?;
+    // The amend previews against the post-move state: the reassigns below apply
+    // after the preconditions, and the amend applies after them, so ordinals,
+    // pins and the re-seat simulation must read the seats the dispatch will
+    // actually amend. Simulating on a clone keeps the preview read-only; a bad
+    // move fails here, before any side effect below.
+    let moved = simulate_moves(&state, &moves).map_err(|e| ReassignRefused(format!("{e:#}")))?;
     // The amend previews here, read-only, before any side effect below (the
     // stopped-marker removal, the terminal-slot clearing, the base worktrees,
     // the reassigns). A refused amend (a bad seat id, a malformed override, the
@@ -1258,7 +1271,7 @@ fn run_from_approved(
         None
     } else {
         Some(
-            preview_bound_amend(cfg, live.as_ref(), &state, &amend)
+            preview_bound_amend(cfg, live.as_ref(), &moved, &amend)
                 .map_err(|e| AmendRefused(format!("{e:#}")))?,
         )
     };
@@ -1348,9 +1361,9 @@ fn run_from_approved(
     let amended;
     let cfg: &Config = if let Some(mut preview) = preview {
         if preview.panel_pinned {
-            // The reassigns above moved seats after the preview pinned them:
-            // rebuild the pin from the plan's own retired ids, so the pin and
-            // the live panel it was derived from stay one fact.
+            // The preview already pinned post-move seats, but the pin is rebuilt
+            // here from the live state anyway: the re-seat and the config it
+            // freezes must read the same panel, never a stale copy.
             let doomed: BTreeSet<String> = plan_reviewer_drop(&state, &preview.dropped)
                 .map_err(|e| AmendRefused(format!("{e:#}")))?
                 .map(|plan| plan.removed)
@@ -4501,16 +4514,9 @@ pub(crate) fn retire_reviewer_seats(
         return Ok(Vec::new());
     };
     let ReviewerDropPlan { removed } = plan;
-    let doomed: BTreeSet<String> = removed.iter().cloned().collect();
-    // History is keyed by the writing seat's id and ids are never reused, so an
-    // id match is always the doomed seat's own record.
-    state
-        .review_history
-        .retain(|e| !doomed.contains(&e.slot_id));
-    for id in &doomed {
-        state.retired_seat_ids.insert(id.clone());
+    for id in &removed {
+        retire_panel_seat(state, id);
     }
-    state.slots.retain(|s| !doomed.contains(&s.id));
     Ok(removed)
 }
 
@@ -5173,16 +5179,32 @@ fn move_seat(
     pin: &crate::provider_ref::Pin,
     source: SeatSource,
 ) -> Result<String> {
+    let new_id = stage_move(state, slot_id, pin, source)?;
+    if new_id != slot_id {
+        state.rename_slot(paths, slot_id, &new_id);
+    }
+    Ok(new_id)
+}
+
+/// The disk-free half of a seat move: guards, re-point and rename, the same
+/// outcome `move_seat` leaves in memory. The amend preview runs this on its
+/// throwaway clone so `--validate-only` reads the post-move panel the dispatch
+/// re-seats, and a `--reassign` onto a live or retired id fails the preview
+/// instead of the dispatch. A move onto a retired id fails closed: the id
+/// would come back with the dropped seat's history pruned and its verdict
+/// files deleted.
+fn stage_move(
+    state: &mut RunState,
+    slot_id: &str,
+    pin: &crate::provider_ref::Pin,
+    source: SeatSource,
+) -> Result<String> {
     let slot = state
         .slots
         .iter()
         .find(|s| s.id == slot_id)
         .ok_or_else(|| anyhow::anyhow!("unknown slot {slot_id}"))?;
     let new_id = moved_seat_id(slot.role, reviewer_seat_kind(slot), slot_id, &pin.provider);
-    // A move onto a live or retired id fails closed before the seat is
-    // touched: pointing the seat at the new provider first would leave an
-    // id/provider mismatch behind, and a retired id would come back with the
-    // dropped seat's history pruned and its verdict files deleted.
     if new_id != slot_id && state.slots.iter().any(|s| s.id == new_id) {
         anyhow::bail!("seat {new_id} is already live; refusing to move {slot_id} onto it");
     }
@@ -5199,10 +5221,24 @@ fn move_seat(
         s.source = Some(source);
     }
     if new_id != slot_id {
-        state.rename_slot(paths, slot_id, &new_id);
-        return Ok(new_id);
+        state.rename_slot_in_memory(slot_id, &new_id);
     }
-    Ok(slot_id.to_string())
+    Ok(new_id)
+}
+
+/// The post-move state an amend preview judges: every resolved `--reassign`
+/// applied in order to a clone, the way the dispatch applies them after the
+/// preview passes, so ordinals, pins and the re-seat simulation all read the
+/// seats the dispatch will actually amend.
+pub(crate) fn simulate_moves(
+    state: &RunState,
+    moves: &[(String, crate::provider_ref::Pin)],
+) -> Result<RunState> {
+    let mut moved = state.clone();
+    for (seat, pin) in moves {
+        stage_move(&mut moved, seat, pin, SeatSource::Reassigned)?;
+    }
+    Ok(moved)
 }
 
 /// The id a seat takes when `provider` fills it: reviewer and tester ids name their

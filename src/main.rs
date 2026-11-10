@@ -481,7 +481,7 @@ fn run() -> Result<ExitCode> {
                 // The pause check keys the route this process's dispatch will
                 // stamp (new or resumed: continuing entries stamp on entry),
                 // not the previous record.
-                workflow::implement::parse_reassignments(
+                let reassignments = workflow::implement::parse_reassignments(
                     &opts.reassign,
                     &paths,
                     providers::codex::dispatch_route().as_recorded(),
@@ -496,7 +496,12 @@ fn run() -> Result<ExitCode> {
                         if validate_only {
                             // The amend preview runs first and read-only: it validates the
                             // seat shapers exactly as the dispatch would, before any
-                            // pre-check can swallow its refusal.
+                            // pre-check can swallow its refusal. It reads the post-move
+                            // state, the seats the dispatch amends after applying the
+                            // reassigns.
+                            let moves =
+                                workflow::implement::resolve_reassignments(&st, &reassignments)?;
+                            let moved = workflow::implement::simulate_moves(&st, &moves)?;
                             let preview = if !reload_config && amend.is_noop() {
                                 None
                             } else {
@@ -508,7 +513,7 @@ fn run() -> Result<ExitCode> {
                                 Some(workflow::implement::preview_bound_amend(
                                     &cfg,
                                     live.as_ref(),
-                                    &st,
+                                    &moved,
                                     &amend,
                                 )?)
                             };
@@ -539,22 +544,33 @@ fn run() -> Result<ExitCode> {
                                     .into());
                                 }
                             }
-                            let mut seats = executor::run_fleet_seats(&st);
+                            let mut seats = executor::run_fleet_seats(&moved);
                             if let Some(preview) = &preview {
                                 // Show the fleet after the drop: gone seats vanish and
                                 // survivors keep their ids.
-                                if let Some(plan) =
-                                    workflow::implement::plan_reviewer_drop(&st, &preview.dropped)?
-                                {
+                                if let Some(plan) = workflow::implement::plan_reviewer_drop(
+                                    &moved,
+                                    &preview.dropped,
+                                )? {
                                     let doomed: std::collections::BTreeSet<&str> =
                                         plan.removed.iter().map(|s| s.as_str()).collect();
                                     seats.retain(|s| !doomed.contains(s.seat.as_str()));
                                 }
                                 // A `--role reviewer=` pin re-seats the live panel: show
-                                // the simulated panel, not the stale live seats it
-                                // replaces. Freshly minted seats are `projected`.
+                                // the simulated panel instead of exactly the seats the
+                                // re-seat retires. Seats outside the panel (widened
+                                // extras) keep reviewing, so they survive the splice.
+                                // Freshly minted seats are `projected`.
                                 if let Some(resynced) = &preview.resynced_panel {
-                                    seats.retain(|s| s.role != crate::state::SlotRole::Reviewer);
+                                    let retired: std::collections::BTreeSet<&str> =
+                                        preview.resync_removed.iter().map(|s| s.as_str()).collect();
+                                    seats.retain(|s| !retired.contains(s.seat.as_str()));
+                                    // The simulation re-lists kept panel seats, so the
+                                    // simulated entries replace their live twins and
+                                    // each seat appears once.
+                                    let simulated: std::collections::BTreeSet<&str> =
+                                        resynced.iter().map(|s| s.seat.as_str()).collect();
+                                    seats.retain(|s| !simulated.contains(s.seat.as_str()));
                                     seats.extend(resynced.iter().cloned());
                                 }
                                 shown_cfg = Some(preview.cfg.clone());

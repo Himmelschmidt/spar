@@ -2604,7 +2604,7 @@ fn without_refuses_to_drop_the_last_reviewer_seat() {
         out["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("cannot drop the last reviewer seat"),
+            .contains("cannot drop the last reviewer panel seat"),
         "the refusal says why the ship gate needs the seat: {out}"
     );
     assert_eq!(
@@ -3045,5 +3045,429 @@ fn role_amend_with_new_implementer_provider_repoints_the_live_seat() {
         vec!["cli:grok"],
         "the live seat tracks the amended pin: {:?}",
         state["slots"]
+    );
+}
+
+/// A run with no live reviewer seats fails readiness with exit 1 and a failed
+/// phase instead of reaching the ship confirm with no review.
+#[test]
+fn no_live_reviewer_seats_fails_readiness_with_exit_1() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(tmp.path(), &["--providers", "cli:claude,cli:grok"]);
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        2,
+    );
+    let p = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("state.json");
+    let mut state: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    state["slots"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|s| s["role"] != "reviewer");
+    std::fs::write(&p, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    let v = run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        1,
+    );
+    assert_eq!(
+        v["phase"].as_str().unwrap_or_default(),
+        "failed",
+        "the emitted run says failed: {v:?}"
+    );
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no reviewer seats"),
+        "the failure names the missing panel: {v:?}"
+    );
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        state["phase"].as_str().unwrap_or_default(),
+        "failed",
+        "the persisted run never reaches the ship confirm: {:?}",
+        state["phase"]
+    );
+}
+
+/// A `--role reviewer=` pin on the first dispatch mints the pinned panel once:
+/// one seat per pinned provider, no duplicate.
+#[test]
+fn first_implement_with_role_pin_mints_the_panel_once() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(tmp.path(), &["--providers", "cli:claude,cli:grok"]);
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--role",
+            "reviewer=cli:codex",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let cfg = read_run_config(tmp.path(), &run_id);
+    assert_eq!(
+        cfg["roles"]["reviewer"],
+        serde_json::json!(["cli:codex"]),
+        "the first dispatch freezes the pin: {:?}",
+        cfg["roles"]["reviewer"]
+    );
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        vec!["review-0-cli-codex"],
+        "the pin mints exactly its panel: {:?}",
+        state["slots"]
+    );
+}
+
+/// `--validate-only` with drop-all plus a pin shows exactly the panel the
+/// dispatch seats: the preview and the dispatch agree seat for seat.
+#[test]
+fn validate_only_drop_all_plus_pin_agrees_with_the_dispatch() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(tmp.path(), &["--providers", "cli:claude,cli:grok"]);
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        2,
+    );
+    let v = run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--without",
+            "reviewer[0]",
+            "--without",
+            "reviewer[1]",
+            "--role",
+            "reviewer=cli:codex",
+            "--validate-only",
+            "--json",
+        ],
+        0,
+    );
+    let preview: Vec<String> = fleet_seats(&v, "reviewer")
+        .iter()
+        .map(|s| seat_field(s, "seat"))
+        .collect();
+    assert_eq!(
+        preview,
+        vec!["review-0-cli-codex"],
+        "the preview re-seats the pin: {preview:?}"
+    );
+    run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--without",
+            "reviewer[0]",
+            "--without",
+            "reviewer[1]",
+            "--role",
+            "reviewer=cli:codex",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        preview,
+        "the dispatch seats what the preview showed: {:?}",
+        state["slots"]
+    );
+    assert_eq!(
+        read_run_config(tmp.path(), &run_id)["roles"]["reviewer"],
+        serde_json::json!(["cli:codex"]),
+        "the frozen config keeps the pin"
+    );
+}
+
+/// From the round-extension gate the amend applies but the run stays parked
+/// until an explicit `--max-rounds` buys the next round; then the re-seated
+/// panel reviews before the run can ship.
+#[test]
+fn drop_all_plus_pin_from_round_extension_needs_an_explicit_ceiling() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(tmp.path(), &["--providers", "cli:claude,cli:grok"]);
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    let _ = spar_cmd()
+        .current_dir(tmp.path())
+        .env("SPAR_FORCE_REQUEST_CHANGES", "1")
+        .args(["implement", "--run", &run_id, "--dry-run", "--json"])
+        .assert()
+        .code(2);
+    assert_eq!(
+        read_state(tmp.path(), &run_id)["phase"]
+            .as_str()
+            .unwrap_or_default(),
+        "awaiting_round_extension",
+        "the forced verdict parks for an extension"
+    );
+    run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--without",
+            "reviewer[0]",
+            "--without",
+            "reviewer[1]",
+            "--role",
+            "reviewer=cli:codex",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        state["phase"].as_str().unwrap_or_default(),
+        "awaiting_round_extension",
+        "the amend alone does not lift the ceiling: {:?}",
+        state["phase"]
+    );
+    assert_eq!(
+        read_run_config(tmp.path(), &run_id)["roles"]["reviewer"],
+        serde_json::json!(["cli:codex"]),
+        "the parked amend still freezes the pin"
+    );
+    run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--max-rounds",
+            "+2",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        state["phase"].as_str().unwrap_or_default(),
+        "awaiting_ship_confirm",
+        "the bought round runs the re-seated panel: {:?}",
+        state["phase"]
+    );
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        vec!["review-0-cli-codex"],
+        "the extension round seats the pin: {:?}",
+        state["slots"]
+    );
+}
+
+/// `--validate-only` simulates the reassign before the drop and the pin, so
+/// the preview and the dispatch agree when all three combine.
+#[test]
+fn validate_only_simulates_reassign_drop_and_pin_together() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(tmp.path(), &["--providers", "cli:claude,cli:grok"]);
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        2,
+    );
+    let state = read_state(tmp.path(), &run_id);
+    let ids = slot_ids_for(&state, "reviewer");
+    assert_eq!(ids.len(), 2, "the panel under test: {ids:?}");
+    let grok = ids
+        .iter()
+        .find(|id| id.contains("grok"))
+        .expect("a grok seat to reassign");
+    let grok_pos: usize = grok
+        .split('-')
+        .nth(1)
+        .and_then(|n| n.parse().ok())
+        .expect("an id-encoded ordinal");
+    let drop_pos = 1 - grok_pos;
+    let reassign = format!("{grok}=cli:codex");
+    let drop = format!("reviewer[{drop_pos}]");
+    let v = run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--reassign",
+            &reassign,
+            "--without",
+            &drop,
+            "--role",
+            "reviewer=cli:grok",
+            "--validate-only",
+            "--json",
+        ],
+        0,
+    );
+    let preview: Vec<String> = fleet_seats(&v, "reviewer")
+        .iter()
+        .map(|s| seat_field(s, "seat"))
+        .collect();
+    assert_eq!(
+        preview,
+        vec!["review-0-cli-grok"],
+        "the moved seat drops out of position and the pin re-seats it: {preview:?}"
+    );
+    run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--reassign",
+            &reassign,
+            "--without",
+            &drop,
+            "--role",
+            "reviewer=cli:grok",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        preview,
+        "the dispatch seats what the preview showed: {:?}",
+        state["slots"]
+    );
+}
+
+/// `--validate-only` with a pin keeps a live `-wide` extra in the fleet: the
+/// splice hides only what the resync removed, so the preview and the dispatch
+/// agree on the extra too.
+#[test]
+fn validate_only_pin_keeps_the_live_wide_extra() {
+    let tmp = project(
+        r#"
+[suite]
+enabled = false
+[roles]
+implementer = "cli:agy"
+reviewer = ["cli:codex", "cli:grok"]
+"#,
+    );
+    let out = spar_cmd()
+        .current_dir(tmp.path())
+        .env("SPAR_FORCE_REQUEST_CHANGES", "1")
+        .args([
+            "implement",
+            "--task",
+            "force stuck path",
+            "--max-rounds",
+            "20",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(3);
+    let stdout = String::from_utf8_lossy(out.get_output().stdout.as_slice()).to_string();
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    let run_id = v["run_id"].as_str().unwrap();
+    let ids = slot_ids_for(&read_state(tmp.path(), run_id), "reviewer");
+    assert_eq!(ids.len(), 3, "the stuck ladder widened: {ids:?}");
+    assert!(
+        ids.iter().any(|id| id.ends_with("-wide")),
+        "a widened extra seat exists: {ids:?}"
+    );
+    let v = run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            run_id,
+            "--role",
+            "reviewer=cli:grok",
+            "--validate-only",
+            "--json",
+        ],
+        0,
+    );
+    let preview: Vec<String> = fleet_seats(&v, "reviewer")
+        .iter()
+        .map(|s| seat_field(s, "seat"))
+        .collect();
+    assert!(
+        preview.iter().any(|id| id.ends_with("-wide")),
+        "the preview keeps the widened extra: {preview:?}"
+    );
+    run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            run_id,
+            "--role",
+            "reviewer=cli:grok",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let state = read_state(tmp.path(), run_id);
+    let mut seated = slot_ids_for(&state, "reviewer");
+    seated.sort();
+    let mut shown = preview.clone();
+    shown.sort();
+    assert_eq!(
+        seated, shown,
+        "the dispatch seats what the preview showed: {:?}",
+        state["slots"]
+    );
+    assert_eq!(
+        read_run_config(tmp.path(), run_id)["roles"]["reviewer"],
+        serde_json::json!(["cli:grok"]),
+        "the frozen config keeps the pin"
     );
 }

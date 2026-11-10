@@ -407,6 +407,12 @@ impl RunState {
             return;
         }
         crate::markers::clear_pid(paths, &self.id, old_id);
+        self.rename_slot_in_memory(old_id, new_id);
+    }
+
+    /// The disk-free half of `rename_slot`, for simulations that must read the
+    /// post-move state without touching pid markers.
+    pub(crate) fn rename_slot_in_memory(&mut self, old_id: &str, new_id: &str) {
         for wt in self.worktrees.iter_mut() {
             if wt.slot_id == old_id {
                 wt.slot_id = new_id.to_string();
