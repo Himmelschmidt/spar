@@ -742,6 +742,73 @@ mod base_merge_tests {
         );
     }
 
+    /// #229: the pre-review verdict records a resolution the implementer
+    /// committed during the round, and fails the round while the merge is
+    /// still open. This is the in-round path the dry-run suite cannot reach
+    /// through the CLI (the resolution lands mid-round during a real
+    /// dispatch), driven here against a real repo instead.
+    #[test]
+    fn pre_review_verdict_records_a_committed_resolution() {
+        let fx = setup();
+        std::fs::write(fx.run.join("file.txt"), "run side\n").unwrap();
+        tgit(&fx.run, &["add", "."]);
+        tgit(&fx.run, &["commit", "-q", "-m", "run work"]);
+        let tip = advance_origin(&fx, "base side\n");
+        let mut st = round_state(&fx, 2);
+        let (_, pending) = merge_base_at_round_start(&mut st, &fx.paths, &Config::default())
+            .unwrap()
+            .expect("conflict hands a section to the implementer");
+        let err = pre_review_merge_verdict(&fx.run, "main", Some(&pending)).unwrap_err();
+        assert!(
+            err.contains("unresolved") && err.contains("file.txt"),
+            "{err}"
+        );
+        std::fs::write(fx.run.join("file.txt"), "resolved\n").unwrap();
+        tgit(&fx.run, &["add", "."]);
+        tgit(&fx.run, &["commit", "-q", "--no-edit"]);
+        assert_eq!(
+            pre_review_merge_verdict(&fx.run, "main", Some(&pending)),
+            Ok(Some(tip))
+        );
+    }
+
+    /// #229: the pre-review verdict fails a merge the implementer aborted
+    /// instead of resolving.
+    #[test]
+    fn pre_review_verdict_fails_an_aborted_merge() {
+        let fx = setup();
+        std::fs::write(fx.run.join("file.txt"), "run side\n").unwrap();
+        tgit(&fx.run, &["add", "."]);
+        tgit(&fx.run, &["commit", "-q", "-m", "run work"]);
+        advance_origin(&fx, "base side\n");
+        let mut st = round_state(&fx, 2);
+        let (_, pending) = merge_base_at_round_start(&mut st, &fx.paths, &Config::default())
+            .unwrap()
+            .expect("conflict hands a section to the implementer");
+        tgit(&fx.run, &["merge", "--abort"]);
+        let err = pre_review_merge_verdict(&fx.run, "main", Some(&pending)).unwrap_err();
+        assert!(err.contains("aborted"), "{err}");
+    }
+
+    /// #229: the pre-review verdict passes a round with nothing handed, but
+    /// still fails a merge left open from outside the handoff.
+    #[test]
+    fn pre_review_verdict_passes_a_round_with_nothing_handed() {
+        let fx = setup();
+        assert_eq!(pre_review_merge_verdict(&fx.run, "main", None), Ok(None));
+        std::fs::write(fx.run.join("file.txt"), "run side\n").unwrap();
+        tgit(&fx.run, &["add", "."]);
+        tgit(&fx.run, &["commit", "-q", "-m", "run work"]);
+        advance_origin(&fx, "base side\n");
+        let conflicted = crate::worktree::merge_base_forward(&fx.run, Some("main")).unwrap();
+        assert!(matches!(
+            conflicted,
+            crate::worktree::BaseMerge::Conflict { .. }
+        ));
+        let err = pre_review_merge_verdict(&fx.run, "main", None).unwrap_err();
+        assert!(err.contains("unresolved"), "{err}");
+    }
+
     /// #229: `[rounds] merge_base = false` keeps the run on its creation base.
     #[test]
     fn disabled_merge_base_skips_the_forward_merge() {
@@ -1591,6 +1658,16 @@ fn run_from_approved(
         }
         state.error = None;
         state.set_phase(Phase::PrepareIsolation);
+    }
+    // Resuming a run parked by a conflicted pre-ship base merge: the remedy
+    // round supersedes the park, so drop its flag and error now. A stale park
+    // error would otherwise outlive the resolution and misdirect the next gate
+    // (the same hazard the round-gate lift below guards against, #229).
+    if state.gates.ship_parked {
+        state.gates.ship_parked = false;
+        if state.phase == Phase::AwaitingShipConfirm {
+            state.error = None;
+        }
     }
     // `-t` on an approved run is a directive for THIS round only. It never rewrites
     // the run's task; absent `-t`, any prior amendment is cleared so it never silently
@@ -3850,9 +3927,16 @@ pub fn execute_loop(
         // Round 2+ opens by merging the base forward, after the previous
         // round's leftovers were committed (#229). A conflicted merge stays in
         // progress and is handed to this round's implementer via its prompt.
-        let merge_conflict_section = match merge_base_at_round_start(state, paths, cfg) {
-            Ok(section) => section,
-            Err(e) => return fail(state, paths, e, false),
+        // A `--re-review` pass sends the current HEAD straight to the panel
+        // unchanged (O180), so it merges nothing: the next implementer round
+        // re-merges whatever moved meanwhile.
+        let merge_conflict_section = if panel_direct {
+            None
+        } else {
+            match merge_base_at_round_start(state, paths, cfg) {
+                Ok(section) => section,
+                Err(e) => return fail(state, paths, e, false),
+            }
         };
 
         if let Some(id) = state
@@ -4252,11 +4336,13 @@ pub fn execute_loop(
         // here rather than go to review. A resolution the implementer committed
         // advances `merged_base` to the pending tip (#229).
         let impl_workdir = impl_cwd(state, &impl_slot);
-        let resolution = merge_conflict_section
-            .as_ref()
-            .map(|(_, tip)| (tip.clone(), base_merge_resolution(&impl_workdir, tip)));
-        match resolution {
-            Some((tip, BaseMergeResolution::Resolved)) => {
+        let pending_tip = merge_conflict_section.as_ref().map(|(_, tip)| tip.as_str());
+        match pre_review_merge_verdict(
+            &impl_workdir,
+            state.base_ref.as_deref().unwrap_or("branch"),
+            pending_tip,
+        ) {
+            Ok(Some(tip)) => {
                 state.merged_base = Some(tip.clone());
                 state.save(paths)?;
                 let _ = crate::events::append(
@@ -4269,33 +4355,8 @@ pub fn execute_loop(
                     )),
                 );
             }
-            Some((_, BaseMergeResolution::Aborted)) => {
-                return fail(
-                    state,
-                    paths,
-                    anyhow::anyhow!(
-                        "base {} merge aborted: the implementer did not commit a resolution \
-                         (the base is unmerged again); resolve it in the implementer worktree and resume",
-                        state.base_ref.as_deref().unwrap_or("branch")
-                    ),
-                    false,
-                );
-            }
-            _ => {
-                if worktree::merge_in_progress(&impl_workdir) {
-                    let files = worktree::conflicted_files(&impl_workdir).join(", ");
-                    return fail(
-                        state,
-                        paths,
-                        anyhow::anyhow!(
-                            "base {} merge unresolved: the implementer did not commit a resolution \
-                             (conflicting files: {files}); resolve it in the implementer worktree and resume",
-                            state.base_ref.as_deref().unwrap_or("branch")
-                        ),
-                        false,
-                    );
-                }
-            }
+            Ok(None) => {}
+            Err(msg) => return fail(state, paths, anyhow::anyhow!(msg), false),
         }
 
         // Suite channel: cheap model runs full suites; reviewers must not re-run them.
@@ -5512,6 +5573,36 @@ fn base_merge_resolution(cwd: &std::path::Path, tip: &str) -> BaseMergeResolutio
         BaseMergeResolution::Resolved
     } else {
         BaseMergeResolution::Aborted
+    }
+}
+
+/// The pre-review verdict on the base merge handed to this round: the pending
+/// tip to record when the implementer committed a resolution, `None` when
+/// there is nothing to verify, or the message the round fails with when the
+/// merge is still open or was aborted instead (#229).
+fn pre_review_merge_verdict(
+    cwd: &std::path::Path,
+    base: &str,
+    pending: Option<&str>,
+) -> Result<Option<String>, String> {
+    let unresolved = || {
+        let files = worktree::conflicted_files(cwd).join(", ");
+        format!(
+            "base {base} merge unresolved: the implementer did not commit a resolution \
+             (conflicting files: {files}); resolve it in the implementer worktree and resume"
+        )
+    };
+    match pending {
+        Some(tip) => match base_merge_resolution(cwd, tip) {
+            BaseMergeResolution::Resolved => Ok(Some(tip.to_string())),
+            BaseMergeResolution::Aborted => Err(format!(
+                "base {base} merge aborted: the implementer did not commit a resolution \
+                 (the base is unmerged again); resolve it in the implementer worktree and resume"
+            )),
+            BaseMergeResolution::InProgress => Err(unresolved()),
+        },
+        None if worktree::merge_in_progress(cwd) => Err(unresolved()),
+        None => Ok(None),
     }
 }
 
