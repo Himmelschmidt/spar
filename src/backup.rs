@@ -100,19 +100,11 @@ pub fn seat_quota_key(provider: &str, codex_profile: Option<&str>) -> String {
         format!("cli:{provider}")
     };
     crate::provider_ref::ProviderRef::parse(&candidate)
-        .map(|p| p.quota_key_with_codex_profile(codex_profile))
+        .map(|p| p.quota_key(codex_profile))
         .unwrap_or_else(|_| provider.to_string())
 }
 
 pub fn is_provider_eligible(
-    provider: &str,
-    store: &QuotaStore,
-    available: Option<&std::collections::HashSet<String>>,
-) -> bool {
-    is_provider_eligible_with_profile(provider, store, available, None)
-}
-
-pub fn is_provider_eligible_with_profile(
     provider: &str,
     store: &QuotaStore,
     available: Option<&std::collections::HashSet<String>>,
@@ -149,19 +141,9 @@ pub fn backup_eligible(
     available: Option<&std::collections::HashSet<String>>,
     paths: &crate::paths::SparPaths,
     dry: bool,
-) -> bool {
-    backup_eligible_with_profile(backup, store, available, paths, dry, None)
-}
-
-pub fn backup_eligible_with_profile(
-    backup: &str,
-    store: &QuotaStore,
-    available: Option<&std::collections::HashSet<String>>,
-    paths: &crate::paths::SparPaths,
-    dry: bool,
     codex_profile: Option<&str>,
 ) -> bool {
-    if is_provider_eligible_with_profile(backup, store, available, codex_profile) {
+    if is_provider_eligible(backup, store, available, codex_profile) {
         return true;
     }
     let key = seat_quota_key(backup, codex_profile);
@@ -176,7 +158,7 @@ pub fn backup_eligible_with_profile(
         );
     }
     let fresh = QuotaStore::load(paths).unwrap_or_default();
-    is_provider_eligible_with_profile(backup, &fresh, available, codex_profile)
+    is_provider_eligible(backup, &fresh, available, codex_profile)
 }
 
 static PROBED_BACKUPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
@@ -227,6 +209,7 @@ pub fn resolve_with_backup(
     available: Option<&std::collections::HashSet<String>>,
     paths: &crate::paths::SparPaths,
     dry: bool,
+    codex_profile: Option<&str>,
 ) -> Option<(String, crate::state::SeatSource)> {
     let primary = crate::workflow::roles_resolve::resolve_seat(
         role,
@@ -238,11 +221,11 @@ pub fn resolve_with_backup(
     );
     let (prov, src) = primary?;
     let seat = crate::provider_ref::ProviderRef::for_seat(&prov, primary_model).display();
-    if is_provider_eligible(&seat, store, available) {
+    if is_provider_eligible(&seat, store, available, codex_profile) {
         return Some((prov, src));
     }
     let backup_raw = backup_for_role(role, role_index, cfg)?;
-    if !backup_eligible(&backup_raw, store, available, paths, dry) {
+    if !backup_eligible(&backup_raw, store, available, paths, dry, codex_profile) {
         return Some((prov, src));
     }
     let parsed = crate::provider_ref::Pin::parse(&backup_raw).ok()?;
@@ -253,22 +236,11 @@ pub fn dispatch_stop_cause(
     slot: &SlotState,
     store: &QuotaStore,
     available: Option<&std::collections::HashSet<String>>,
-) -> StopCause {
-    dispatch_stop_cause_with_profile(slot, store, available, None)
-}
-
-pub fn dispatch_stop_cause_with_profile(
-    slot: &SlotState,
-    store: &QuotaStore,
-    available: Option<&std::collections::HashSet<String>>,
     codex_profile: Option<&str>,
 ) -> StopCause {
     let seat_key = || {
         let seat = slot.provider_ref();
-        (
-            seat.quota_key_with_codex_profile(codex_profile),
-            seat.storage_key(),
-        )
+        (seat.quota_key(codex_profile), seat.storage_key())
     };
     if slot.status != crate::state::SlotStatus::Failed {
         return StopCause::Work;
@@ -353,7 +325,7 @@ mod tests {
         let mut slot = slot_with_quota(true);
         slot.status = SlotStatus::Failed;
         assert_eq!(
-            dispatch_stop_cause(&slot, &store, None),
+            dispatch_stop_cause(&slot, &store, None, None),
             StopCause::Environmental
         );
     }
@@ -366,7 +338,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("rate limit exceeded".into());
         assert_eq!(
-            dispatch_stop_cause(&slot, &store, None),
+            dispatch_stop_cause(&slot, &store, None, None),
             StopCause::Environmental
         );
     }
@@ -380,29 +352,29 @@ mod tests {
         let mut store = QuotaStore::default();
         store.pause_quota("cli:codex@openrouter", "test");
         assert!(
-            !is_provider_eligible("cli:codex@openai/gpt-5", &store, None),
+            !is_provider_eligible("cli:codex@openai/gpt-5", &store, None, None),
             "the OpenRouter route is benched"
         );
         assert!(
-            is_provider_eligible("cli:codex@gpt-5.2-codex", &store, None),
+            is_provider_eligible("cli:codex@gpt-5.2-codex", &store, None, None),
             "an explicit bare model omits -p, so it bills native and keeps running"
         );
         assert!(
-            is_provider_eligible("cli:codex@native", &store, None),
+            is_provider_eligible("cli:codex@native", &store, None, None),
             "a native seat keeps running while the OpenRouter bucket is paused"
         );
         let mut store = QuotaStore::default();
         store.pause_quota("cli:codex@native", "test");
         assert!(
-            !is_provider_eligible("cli:codex@native", &store, None),
+            !is_provider_eligible("cli:codex@native", &store, None, None),
             "the paused native bucket benches its own seats"
         );
         assert!(
-            is_provider_eligible("cli:codex@openai/gpt-5", &store, None),
+            is_provider_eligible("cli:codex@openai/gpt-5", &store, None, None),
             "a native pause leaves an OpenRouter seat eligible"
         );
         assert!(
-            is_provider_eligible("cli:grok@grok-4-1-fast", &store, None),
+            is_provider_eligible("cli:grok@grok-4-1-fast", &store, None, None),
             "another login is unaffected"
         );
     }
@@ -411,13 +383,18 @@ mod tests {
     fn api_pause_benches_only_its_own_model() {
         let mut store = QuotaStore::default();
         store.pause_quota("api:openai@gpt-5", "test");
-        assert!(!is_provider_eligible("api:openai@gpt-5", &store, None));
+        assert!(!is_provider_eligible(
+            "api:openai@gpt-5",
+            &store,
+            None,
+            None
+        ));
         assert!(
-            is_provider_eligible("api:openai@gpt-4o", &store, None),
+            is_provider_eligible("api:openai@gpt-4o", &store, None, None),
             "another model on the same api login keeps running"
         );
         assert!(
-            is_provider_eligible("api:openai", &store, None),
+            is_provider_eligible("api:openai", &store, None, None),
             "a model-less api seat keys the login, not the paused model"
         );
     }
@@ -431,7 +408,7 @@ mod tests {
         let mut set = std::collections::HashSet::new();
         set.insert("cli:grok".to_string());
         assert_eq!(
-            dispatch_stop_cause(&slot, &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set), None),
             StopCause::Environmental
         );
     }
@@ -442,7 +419,10 @@ mod tests {
         store.pause_quota("cli:claude", "test");
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Done;
-        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
+        assert_eq!(
+            dispatch_stop_cause(&slot, &store, None, None),
+            StopCause::Work
+        );
     }
 
     #[test]
@@ -453,7 +433,7 @@ mod tests {
         let mut set = std::collections::HashSet::new();
         set.insert("cli:grok".to_string());
         assert_eq!(
-            dispatch_stop_cause(&slot, &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set), None),
             StopCause::Work
         );
     }
@@ -466,7 +446,7 @@ mod tests {
         let mut set = std::collections::HashSet::new();
         set.insert("cli:claude".to_string());
         assert_eq!(
-            dispatch_stop_cause(&slot, &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set), None),
             StopCause::Work
         );
     }
@@ -476,15 +456,18 @@ mod tests {
         let store = QuotaStore::default();
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
-        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
+        assert_eq!(
+            dispatch_stop_cause(&slot, &store, None, None),
+            StopCause::Work
+        );
     }
 
     #[test]
     fn is_provider_eligible_respects_quota() {
         let mut store = QuotaStore::default();
         store.pause_quota("cli:claude", "q");
-        assert!(!is_provider_eligible("cli:claude", &store, None));
-        assert!(is_provider_eligible("cli:grok", &store, None));
+        assert!(!is_provider_eligible("cli:claude", &store, None, None));
+        assert!(is_provider_eligible("cli:grok", &store, None, None));
     }
 
     #[test]
@@ -492,8 +475,8 @@ mod tests {
         let store = QuotaStore::default();
         let mut set = std::collections::HashSet::new();
         set.insert("cli:claude".to_string());
-        assert!(is_provider_eligible("cli:claude", &store, Some(&set)));
-        assert!(!is_provider_eligible("cli:grok", &store, Some(&set)));
+        assert!(is_provider_eligible("cli:claude", &store, Some(&set), None));
+        assert!(!is_provider_eligible("cli:grok", &store, Some(&set), None));
     }
 
     #[test]
@@ -501,9 +484,14 @@ mod tests {
         let store = QuotaStore::default();
         let mut set = std::collections::HashSet::new();
         set.insert("cli:claude".to_string());
-        assert!(is_provider_eligible("api:openai@gpt-5", &store, Some(&set)));
+        assert!(is_provider_eligible(
+            "api:openai@gpt-5",
+            &store,
+            Some(&set),
+            None
+        ));
         assert_eq!(
-            dispatch_stop_cause(&api_slot(), &store, Some(&set)),
+            dispatch_stop_cause(&api_slot(), &store, Some(&set), None),
             StopCause::Work
         );
     }
@@ -517,13 +505,14 @@ mod tests {
         assert!(!is_provider_eligible(
             "api:openai@gpt-5",
             &store,
-            Some(&set)
+            Some(&set),
+            None
         ));
         let mut slot = api_slot();
         slot.status = SlotStatus::Failed;
         slot.error = Some("rate limit exceeded".into());
         assert_eq!(
-            dispatch_stop_cause(&slot, &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set), None),
             StopCause::Environmental
         );
     }
@@ -537,7 +526,7 @@ mod tests {
         let mut set = std::collections::HashSet::new();
         set.insert("cli:claude".to_string());
         assert_eq!(
-            dispatch_stop_cause(&slot, &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set), None),
             StopCause::Work
         );
     }
@@ -551,7 +540,7 @@ mod tests {
         let mut set = std::collections::HashSet::new();
         set.insert("cli:claude".to_string());
         assert_eq!(
-            dispatch_stop_cause(&slot, &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set), None),
             StopCause::Work
         );
     }
@@ -565,7 +554,7 @@ mod tests {
         let mut set = std::collections::HashSet::new();
         set.insert("cli:claude".to_string());
         assert_eq!(
-            dispatch_stop_cause(&slot, &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set), None),
             StopCause::Work
         );
     }
@@ -579,14 +568,14 @@ mod tests {
         set.insert("cli:claude".to_string());
         // If Work branch were neutralized to Environmental, this would be Environmental
         assert_eq!(
-            dispatch_stop_cause(&slot, &store, Some(&set)),
+            dispatch_stop_cause(&slot, &store, Some(&set), None),
             StopCause::Work
         );
         // Verify environmental still distinct
         let mut env_slot = slot_with_quota(true);
         env_slot.status = SlotStatus::Failed;
         assert_eq!(
-            dispatch_stop_cause(&env_slot, &store, Some(&set)),
+            dispatch_stop_cause(&env_slot, &store, Some(&set), None),
             StopCause::Environmental
         );
     }
@@ -598,7 +587,10 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         slot.error = Some("hard ceiling: slot timed out after 10s".into());
-        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
+        assert_eq!(
+            dispatch_stop_cause(&slot, &store, None, None),
+            StopCause::Work
+        );
     }
 
     #[test]
@@ -608,7 +600,10 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         slot.error = Some("missing expected artifact: summary-impl.md".into());
-        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
+        assert_eq!(
+            dispatch_stop_cause(&slot, &store, None, None),
+            StopCause::Work
+        );
     }
 
     #[test]
@@ -618,7 +613,10 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         slot.error = Some("review verdict: request_changes".into());
-        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
+        assert_eq!(
+            dispatch_stop_cause(&slot, &store, None, None),
+            StopCause::Work
+        );
     }
 
     #[test]
@@ -628,7 +626,10 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         slot.error = Some("some other failure".into());
-        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
+        assert_eq!(
+            dispatch_stop_cause(&slot, &store, None, None),
+            StopCause::Work
+        );
     }
 
     #[test]
@@ -638,12 +639,15 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         slot.error = Some("exit code 1".into());
-        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
+        assert_eq!(
+            dispatch_stop_cause(&slot, &store, None, None),
+            StopCause::Work
+        );
         // Neutralisation: if paused check were leak, this would be Environmental
         let mut env_slot = slot_with_quota(true);
         env_slot.status = SlotStatus::Failed;
         assert_eq!(
-            dispatch_stop_cause(&env_slot, &store, None),
+            dispatch_stop_cause(&env_slot, &store, None, None),
             StopCause::Environmental
         );
     }
@@ -703,7 +707,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.auth_fault = true;
         slot.error = Some("exit 1".into());
-        let cause = dispatch_stop_cause(&slot, &store, None);
+        let cause = dispatch_stop_cause(&slot, &store, None, None);
         assert_eq!(cause, StopCause::Auth);
         assert!(cause.engages_backup());
         assert!(StopCause::Environmental.engages_backup());
@@ -724,17 +728,24 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = crate::paths::SparPaths::new(tmp.path());
         let mut store = QuotaStore::default();
-        assert!(backup_eligible("cli:codex", &store, None, &paths, false));
+        assert!(backup_eligible(
+            "cli:codex",
+            &store,
+            None,
+            &paths,
+            false,
+            None
+        ));
 
         store.pause_quota("cli:codex", "possible quota signal: quota");
         assert!(
-            !backup_eligible("cli:codex", &store, None, &paths, true),
+            !backup_eligible("cli:codex", &store, None, &paths, true, None),
             "dry-run decides on the file alone"
         );
 
         store.pause_manual("cli:grok", None);
         assert!(
-            !backup_eligible("cli:grok", &store, None, &paths, false),
+            !backup_eligible("cli:grok", &store, None, &paths, false, None),
             "a manual pause is never probed past"
         );
         assert!(
@@ -750,7 +761,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("rate limit seven_day rejected".into());
         assert_eq!(
-            dispatch_stop_cause(&slot, &store, None),
+            dispatch_stop_cause(&slot, &store, None, None),
             StopCause::Environmental
         );
     }
@@ -764,25 +775,25 @@ mod tests {
             "agy individual quota reached",
         );
         store.mark_strong("cli:agy@flash");
-        assert!(!is_provider_eligible("cli:agy@flash", &store, None));
+        assert!(!is_provider_eligible("cli:agy@flash", &store, None, None));
         assert!(store.blocks_live_dispatch("cli:agy@flash"));
-        assert!(is_provider_eligible("cli:agy@pro", &store, None));
+        assert!(is_provider_eligible("cli:agy@pro", &store, None, None));
         assert!(!store.blocks_live_dispatch("cli:agy@pro"));
 
         let mut store = QuotaStore::default();
         store.pause_quota("cli:agy@pro", "pro limit");
         store.mark_strong("cli:agy@pro");
-        assert!(!is_provider_eligible("cli:agy@pro", &store, None));
-        assert!(is_provider_eligible("cli:agy@flash", &store, None));
+        assert!(!is_provider_eligible("cli:agy@pro", &store, None, None));
+        assert!(is_provider_eligible("cli:agy@flash", &store, None, None));
     }
 
     #[test]
     fn agy_cli_level_pause_holds_every_model() {
         let mut store = QuotaStore::default();
         store.pause_manual("cli:agy", None);
-        assert!(!is_provider_eligible("cli:agy@flash", &store, None));
-        assert!(!is_provider_eligible("cli:agy@pro", &store, None));
-        assert!(!is_provider_eligible("cli:agy", &store, None));
+        assert!(!is_provider_eligible("cli:agy@flash", &store, None, None));
+        assert!(!is_provider_eligible("cli:agy@pro", &store, None, None));
+        assert!(!is_provider_eligible("cli:agy", &store, None, None));
 
         let mut legacy = QuotaStore::default();
         legacy.pause_quota_until(
@@ -791,8 +802,8 @@ mod tests {
             "legacy record",
         );
         legacy.mark_strong("cli:agy");
-        assert!(!is_provider_eligible("cli:agy@flash", &legacy, None));
-        assert!(!is_provider_eligible("cli:agy@pro", &legacy, None));
+        assert!(!is_provider_eligible("cli:agy@flash", &legacy, None, None));
+        assert!(!is_provider_eligible("cli:agy@pro", &legacy, None, None));
         assert!(legacy.blocks_live_dispatch("cli:agy@flash"));
         assert!(legacy.blocks_live_dispatch("cli:agy@pro"));
     }
@@ -819,6 +830,7 @@ mod tests {
                 None,
                 &paths,
                 true,
+                None,
             )
             .unwrap()
             .0
@@ -835,10 +847,13 @@ mod tests {
         slot.error = Some("no capacity".into());
         let mut store = QuotaStore::default();
         store.pause_quota("cli:agy@pro", "limit");
-        assert_eq!(dispatch_stop_cause(&slot, &store, None), StopCause::Work);
+        assert_eq!(
+            dispatch_stop_cause(&slot, &store, None, None),
+            StopCause::Work
+        );
         store.pause_quota("cli:agy@flash", "limit");
         assert_eq!(
-            dispatch_stop_cause(&slot, &store, None),
+            dispatch_stop_cause(&slot, &store, None, None),
             StopCause::Environmental
         );
     }
@@ -863,10 +878,15 @@ mod tests {
             Some(chrono::Utc::now() + chrono::Duration::hours(1)),
             "opus window",
         );
-        assert!(!is_provider_eligible("cli:claude@opus", &store, None));
-        assert!(is_provider_eligible("cli:claude@sonnet", &store, None));
-        assert!(is_provider_eligible("cli:claude@haiku", &store, None));
-        assert!(is_provider_eligible("cli:claude", &store, None));
+        assert!(!is_provider_eligible("cli:claude@opus", &store, None, None));
+        assert!(is_provider_eligible(
+            "cli:claude@sonnet",
+            &store,
+            None,
+            None
+        ));
+        assert!(is_provider_eligible("cli:claude@haiku", &store, None, None));
+        assert!(is_provider_eligible("cli:claude", &store, None, None));
     }
 
     #[test]
@@ -882,7 +902,7 @@ mod tests {
             let mut store = QuotaStore::default();
             store.pause_quota(&crate::quota::quota_key(seat), "limit");
             assert!(
-                !is_provider_eligible(other, &store, None),
+                !is_provider_eligible(other, &store, None, None),
                 "{seat} must hold {other}"
             );
             assert_eq!(
@@ -898,8 +918,18 @@ mod tests {
         store.pause_quota("cli:agy@flash", "flash limit");
         let mut set = std::collections::HashSet::new();
         set.insert("cli:agy".to_string());
-        assert!(!is_provider_eligible("cli:agy@flash", &store, Some(&set)));
-        assert!(is_provider_eligible("cli:agy@pro", &store, Some(&set)));
-        assert!(!is_provider_eligible("cli:codex", &store, Some(&set)));
+        assert!(!is_provider_eligible(
+            "cli:agy@flash",
+            &store,
+            Some(&set),
+            None
+        ));
+        assert!(is_provider_eligible(
+            "cli:agy@pro",
+            &store,
+            Some(&set),
+            None
+        ));
+        assert!(!is_provider_eligible("cli:codex", &store, Some(&set), None));
     }
 }

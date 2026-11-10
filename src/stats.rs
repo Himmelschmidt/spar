@@ -467,7 +467,7 @@ pub fn report(
                 quota_row(
                     &mut quota,
                     crate::provider_ref::ProviderRef::for_seat(&r.provider, r.model.as_deref())
-                        .quota_key(),
+                        .quota_key(None),
                 )
                 .backup_engagements += 1;
             }
@@ -481,7 +481,7 @@ pub fn report(
                 .filter(|r| r.parked_run)
                 .map(|r| {
                     crate::provider_ref::ProviderRef::for_seat(&r.provider, r.model.as_deref())
-                        .quota_key()
+                        .quota_key(None)
                 })
                 .collect();
             hit.sort();

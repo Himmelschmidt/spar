@@ -1026,7 +1026,7 @@ pub fn quota_key(raw: &str) -> String {
         format!("cli:{raw}")
     };
     crate::provider_ref::ProviderRef::parse(&candidate)
-        .map(|p| p.quota_key())
+        .map(|p| p.quota_key(None))
         .unwrap_or_else(|_| raw.to_string())
 }
 
@@ -1045,7 +1045,7 @@ pub fn operator_key(raw: &str) -> String {
             if p.model.is_none() {
                 p.storage_key()
             } else {
-                p.quota_key()
+                p.quota_key(None)
             }
         })
         .unwrap_or_else(|_| raw.to_string())

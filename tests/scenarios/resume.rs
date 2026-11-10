@@ -129,6 +129,49 @@ fn a_stopped_run_resumes_and_advances() {
     );
 }
 
+/// `continue_run` re-stamps the dispatch horizon when a stopped run resumes: a
+/// weak pause written while the run was parked is pre-existing to the new
+/// dispatch, so the seat steers instead of trusting it as its own fresh
+/// signal. Without the re-stamp the pause postdates the stale horizon and the
+/// seat re-dispatches onto its paused provider. A stopped review run resumes
+/// through `continue_run` directly (unlike a stopped loop run, which re-enters
+/// through `run_from_approved`); the review workflow never stamps on entry, so
+/// the refresh here is `continue_run`'s alone.
+#[test]
+fn a_resume_restamps_the_horizon_past_an_interim_weak_pause() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_repo(&proj);
+
+    let run_id = review_dry_run(&proj);
+    let path = state_path(&proj, &run_id);
+
+    let paused_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    std::fs::write(
+        proj.join(".spar/quota.json"),
+        format!(
+            r#"{{"providers":{{"cli:claude":{{"name":"cli:claude","status":"PausedQuota","hint":"possible quota signal: 429","updated_at":"{paused_at}"}}}}}}"#
+        ),
+    )
+    .unwrap();
+    set_phase(&proj, &run_id, "stopped");
+
+    let _ = spar_cmd()
+        .current_dir(&proj)
+        .args(["resume", &run_id])
+        .assert();
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let restamped = after["round_started_at"]
+        .as_str()
+        .expect("resume must stamp the dispatch horizon");
+    assert!(
+        restamped > paused_at.as_str(),
+        "resume must re-stamp the horizon past the interim pause"
+    );
+}
+
 /// The same hazard `Phase::Quota` was fixed for: `spar stop` can park a plan run at
 /// `Stopped` before it was ever approved (mid-dispatch, before it ever reached its own
 /// gate). `spar resume` must refuse it explicitly, naming the human command, rather than

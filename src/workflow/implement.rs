@@ -961,7 +961,12 @@ fn prepare_implement_slots(
         let mut seat_id = seat.seat.clone();
         let seat_ref =
             crate::provider_ref::ProviderRef::for_seat(&provider, model.as_deref()).display();
-        if !crate::backup::is_provider_eligible(&seat_ref, &store, available.as_ref()) {
+        if !crate::backup::is_provider_eligible(
+            &seat_ref,
+            &store,
+            available.as_ref(),
+            state.codex_profile.as_deref(),
+        ) {
             let ordinal = if seat.role == SlotRole::Reviewer {
                 reviewer_ordinal(&seat.seat).unwrap_or(0)
             } else {
@@ -974,6 +979,7 @@ fn prepare_implement_slots(
                     available.as_ref(),
                     paths,
                     dry,
+                    state.codex_profile.as_deref(),
                 ) {
                     if let Ok(pin) = crate::provider_ref::Pin::parse(&backup_raw) {
                         provider = pin.display();
@@ -2267,7 +2273,7 @@ pub fn execute_loop(
                         .find(|s| s.id == impl_job.slot_id)
                         .cloned()
                         .unwrap();
-                    let cause = crate::backup::dispatch_stop_cause_with_profile(
+                    let cause = crate::backup::dispatch_stop_cause(
                         &slot_state,
                         &store,
                         available.as_ref(),
@@ -2281,7 +2287,7 @@ pub fn execute_loop(
                             .map(|r| r.storage_key())
                             .unwrap_or_else(|_| impl_slot.provider.clone());
                         if backup_key != cur_key
-                            && crate::backup::backup_eligible_with_profile(
+                            && crate::backup::backup_eligible(
                                 &backup_raw,
                                 &store,
                                 available.as_ref(),
@@ -2358,7 +2364,7 @@ pub fn execute_loop(
                     .find(|s| s.id == impl_job.slot_id)
                     .cloned()
                     .unwrap();
-                let cause = crate::backup::dispatch_stop_cause_with_profile(
+                let cause = crate::backup::dispatch_stop_cause(
                     &slot_state,
                     &store,
                     available.as_ref(),
@@ -2368,7 +2374,7 @@ pub fn execute_loop(
                     if let Some(backup_raw) =
                         crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
                     {
-                        if crate::backup::backup_eligible_with_profile(
+                        if crate::backup::backup_eligible(
                             &backup_raw,
                             &store,
                             available.as_ref(),
@@ -3404,7 +3410,7 @@ fn gate_implementer_seat(
                     .iter()
                     .find(|s| s.id == id)
                     .filter(|s| {
-                        !crate::backup::is_provider_eligible_with_profile(
+                        !crate::backup::is_provider_eligible(
                             &s.provider_ref().display(),
                             &store,
                             available.as_ref(),
@@ -3447,7 +3453,7 @@ fn recheck_seat(
     }
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     let seat = slot.provider_ref();
-    let key = seat.quota_key_with_codex_profile(state.codex_profile.as_deref());
+    let key = seat.quota_key(state.codex_profile.as_deref());
     let sub = seat.storage_key();
     // A live run trusts only pauses it can trust: manual and strong (O106). A
     // weak heuristic pause ("429" in "429 passed") written by this very dispatch
@@ -3476,7 +3482,7 @@ fn recheck_seat(
         .and_then(|o| crate::backup::backup_for_role(slot.role, o, cfg))
         .filter(|b| crate::quota::sub_key(b) != sub)
         .filter(|b| {
-            crate::backup::backup_eligible_with_profile(
+            crate::backup::backup_eligible(
                 b,
                 &store,
                 None,
@@ -3537,7 +3543,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                     Some(detected)
                 }
             };
-        let cause = crate::backup::dispatch_stop_cause_with_profile(
+        let cause = crate::backup::dispatch_stop_cause(
             &slot_state,
             &store,
             available_opt.as_ref(),
@@ -3558,7 +3564,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                             == backup_key
                     });
                     if !used_contains_backup
-                        && crate::backup::backup_eligible_with_profile(
+                        && crate::backup::backup_eligible(
                             &backup_raw,
                             &store,
                             available_opt.as_ref(),
@@ -3777,7 +3783,7 @@ fn try_rotate_reviewer_provider(
             .and_then(|o| crate::backup::backup_for_role(SlotRole::Reviewer, o, cfg))
             .filter(|b| crate::quota::sub_key(b) != crate::quota::sub_key(&cur))
             .filter(|b| {
-                crate::backup::backup_eligible_with_profile(
+                crate::backup::backup_eligible(
                     b,
                     &store,
                     None,
@@ -3797,13 +3803,7 @@ fn try_rotate_reviewer_provider(
     }
     let codex_profile = state.codex_profile.clone();
     let eligible = |p: &String| -> bool {
-        *p != cur
-            && crate::backup::is_provider_eligible_with_profile(
-                p,
-                &store,
-                None,
-                codex_profile.as_deref(),
-            )
+        *p != cur && crate::backup::is_provider_eligible(p, &store, None, codex_profile.as_deref())
     };
     let reviewer_role_source = if cfg
         .cli_role_keys
@@ -5438,6 +5438,11 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
         return crate::workflow::plan::continue_run(paths, cfg, run_id);
     }
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+    // A resume is a new dispatch in this process: re-stamp the horizon and the
+    // profile so a pause written before this resume steers the seat, and reads
+    // key the seats this process actually dispatches. Fix passes inside the
+    // loop below never re-stamp; see `stamp_dispatch`.
+    state.stamp_dispatch();
     match state.workflow {
         crate::cli::WorkflowKind::Loop => {
             // A daemon/`continue` resume is nobody's deliberate amendment, so it never

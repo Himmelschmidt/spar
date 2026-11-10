@@ -50,12 +50,15 @@ pub fn probe(paths: &SparPaths, provider: &str, dry: bool) -> ProbeReport {
         Ok(pref) if out.verdict == Verdict::Quota => {
             // Window and text always travel together now: one vote each,
             // broadest wins, resolved against the probed seat.
-            pref.rejection_key(crate::providers::QuotaSignal {
-                window: out.window,
-                text: out.output.as_deref().unwrap_or(""),
-            })
+            pref.rejection_key(
+                crate::providers::QuotaSignal {
+                    window: out.window,
+                    text: out.output.as_deref().unwrap_or(""),
+                },
+                None,
+            )
         }
-        Ok(pref) => pref.quota_key(),
+        Ok(pref) => pref.quota_key(None),
         Err(_) => quota::operator_key(provider),
     };
     let mut store = QuotaStore::load(paths).unwrap_or_default();
@@ -436,17 +439,19 @@ mod tests {
         assert!(!crate::backup::is_provider_eligible(
             "cli:codex",
             &store,
+            None,
             None
         ));
         let seat = crate::provider_ref::ProviderRef::parse("cli:codex")
             .unwrap()
-            .quota_key();
+            .quota_key(None);
         assert_eq!(seat, "cli:codex@openrouter");
         let c = apply(&mut store, &seat, Verdict::Healthy, None, None);
         assert!(c.written);
         assert!(crate::backup::is_provider_eligible(
             "cli:codex",
             &store,
+            None,
             None
         ));
     }
@@ -548,12 +553,13 @@ mod tests {
     fn quota_key_selection_follows_the_output_named_bucket() {
         use crate::providers::{QuotaSignal, RateLimitWindow};
         let key_for = |provider: &str, window: Option<RateLimitWindow>, output: &str| {
-            ProviderRef::parse(provider)
-                .unwrap()
-                .rejection_key(QuotaSignal {
+            ProviderRef::parse(provider).unwrap().rejection_key(
+                QuotaSignal {
                     window,
                     text: output,
-                })
+                },
+                None,
+            )
         };
         assert_eq!(
             key_for("cli:claude@opus", None, "You've hit your weekly limit"),

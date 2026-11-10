@@ -102,15 +102,28 @@ impl ProviderRef {
     /// keys there (`cli:agy@flash`, `cli:claude@opus` for `claude-opus-5-5` too);
     /// everything else keys per login, exactly `storage_key()`. The scope is declared
     /// on the adapter type. Idempotent on its own output.
-    pub fn quota_key(&self) -> String {
-        self.quota_key_with_codex_profile(None)
+    ///
+    /// `codex_profile` is the dispatch profile recorded in run state. A model-less
+    /// `cli:codex` seat dispatches under that profile, not under whatever
+    /// `SPAR_CODEX_PROFILE` the keying process happens to hold; `None` means no
+    /// recorded dispatch, so the seat keys from this process's environment
+    /// (operator tools, history readers). Every other ref ignores the profile.
+    /// Bucket for a model-less codex seat under its recorded dispatch profile:
+    /// the profile's bucket, or the login when the profile names no verified
+    /// route. `None` means no recorded dispatch, so the seat keys from this
+    /// process instead (the adapter's ambient default). Every other ref keys
+    /// exactly as its adapter declares.
+    fn recorded_codex_bucket(&self, codex_profile: Option<&str>) -> Option<Option<&'static str>> {
+        if self.storage_key() == "cli:codex" && self.model.is_none() {
+            if let Some(recorded) = codex_profile {
+                let profile = (!recorded.is_empty()).then_some(recorded);
+                return Some(crate::providers::default_bucket_for_profile(profile));
+            }
+        }
+        None
     }
 
-    /// `quota_key` for a codex seat whose dispatch profile was recorded in state.
-    /// A model-less `cli:codex` seat dispatches under that profile, not under
-    /// whatever `SPAR_CODEX_PROFILE` the keying process happens to hold; every
-    /// other ref ignores the profile and keys exactly as `quota_key`.
-    pub fn quota_key_with_codex_profile(&self, codex_profile: Option<&str>) -> String {
+    pub fn quota_key(&self, codex_profile: Option<&str>) -> String {
         // api providers have no adapter; every model bills separately, so the
         // model is its own bucket and a model-less seat keys at the login.
         if self.backend == ExecBackend::ApiSdk {
@@ -123,14 +136,11 @@ impl ProviderRef {
         // one the seat keys at the login (O151). A model-less codex seat with a
         // recorded profile uses that profile's bucket (`""` records a set-but-empty
         // `SPAR_CODEX_PROFILE`, the native route).
-        if self.storage_key() == "cli:codex" && self.model.is_none() {
-            if let Some(recorded) = codex_profile {
-                let profile = (!recorded.is_empty()).then_some(recorded);
-                return match crate::providers::default_bucket_for_profile(profile) {
-                    Some(bucket) => format!("{}@{bucket}", self.storage_key()),
-                    None => self.storage_key(),
-                };
-            }
+        if let Some(recorded) = self.recorded_codex_bucket(codex_profile) {
+            return match recorded {
+                Some(bucket) => format!("{}@{bucket}", self.storage_key()),
+                None => self.storage_key(),
+            };
         }
         let bucket = match self.model.as_deref() {
             Some(model) => crate::providers::adapter_named(&self.storage_key())
@@ -148,29 +158,20 @@ impl ProviderRef {
     /// Where a rejection's pause lives, from the signal resolved against this seat:
     /// the bucket the adapter names, or the login when it names none (no votes, a
     /// login-wide vote, disagreeing votes, or a vote for another seat's family).
-    /// No adapter means the login.
-    pub fn rejection_key(&self, signal: crate::providers::QuotaSignal<'_>) -> String {
-        self.rejection_key_with_codex_profile(signal, None)
-    }
-
-    /// `rejection_key` for a codex seat whose dispatch profile was recorded in
-    /// state; see `quota_key_with_codex_profile`.
-    pub fn rejection_key_with_codex_profile(
+    /// No adapter means the login. See `quota_key` for what `codex_profile` means.
+    pub fn rejection_key(
         &self,
         signal: crate::providers::QuotaSignal<'_>,
         codex_profile: Option<&str>,
     ) -> String {
-        if self.storage_key() == "cli:codex" && self.model.is_none() {
-            if let Some(recorded) = codex_profile {
-                let profile = (!recorded.is_empty()).then_some(recorded);
-                return match crate::providers::default_bucket_for_profile(profile) {
-                    Some(bucket) => format!("{}@{bucket}", self.storage_key()),
-                    None => self.storage_key(),
-                };
-            }
+        if let Some(recorded) = self.recorded_codex_bucket(codex_profile) {
+            return match recorded {
+                Some(bucket) => format!("{}@{bucket}", self.storage_key()),
+                None => self.storage_key(),
+            };
         }
         if self.backend != ExecBackend::NativeCli {
-            return self.quota_key();
+            return self.quota_key(codex_profile);
         }
         match crate::providers::adapter_named(&self.storage_key())
             .and_then(|a| a.rejection_scope(self.model.as_deref(), signal))
@@ -305,25 +306,27 @@ mod tests {
     #[test]
     fn quota_key_is_the_adapters_bucket() {
         let agy = ProviderRef::parse("cli:agy@gemini-3-flash").unwrap();
-        assert_eq!(agy.quota_key(), "cli:agy@gemini-3-flash");
+        assert_eq!(agy.quota_key(None), "cli:agy@gemini-3-flash");
         let bare = ProviderRef::parse("cli:agy").unwrap();
-        assert_eq!(bare.quota_key(), "cli:agy");
+        assert_eq!(bare.quota_key(None), "cli:agy");
         let opus = ProviderRef::parse("cli:claude@opus").unwrap();
-        assert_eq!(opus.quota_key(), "cli:claude@opus");
+        assert_eq!(opus.quota_key(None), "cli:claude@opus");
         let full = ProviderRef::parse("cli:claude@claude-opus-5-5").unwrap();
-        assert_eq!(full.quota_key(), "cli:claude@opus");
+        assert_eq!(full.quota_key(None), "cli:claude@opus");
         let haiku = ProviderRef::parse("cli:claude@haiku").unwrap();
-        assert_eq!(haiku.quota_key(), "cli:claude");
+        assert_eq!(haiku.quota_key(None), "cli:claude");
         let full_haiku = ProviderRef::parse("cli:claude@claude-haiku-5-5").unwrap();
-        assert_eq!(full_haiku.quota_key(), "cli:claude");
+        assert_eq!(full_haiku.quota_key(None), "cli:claude");
         let api = ProviderRef::parse("api:openai@gpt-5").unwrap();
-        assert_eq!(api.quota_key(), "api:openai@gpt-5");
+        assert_eq!(api.quota_key(None), "api:openai@gpt-5");
         let api_bare = ProviderRef::parse("api:openai").unwrap();
-        assert_eq!(api_bare.quota_key(), "api:openai");
+        assert_eq!(api_bare.quota_key(None), "api:openai");
         let unknown = ProviderRef::parse("cli:nothing@x").unwrap();
-        assert_eq!(unknown.quota_key(), "cli:nothing");
+        assert_eq!(unknown.quota_key(None), "cli:nothing");
         assert_eq!(
-            ProviderRef::parse(&opus.quota_key()).unwrap().quota_key(),
+            ProviderRef::parse(&opus.quota_key(None))
+                .unwrap()
+                .quota_key(None),
             "cli:claude@opus"
         );
     }
@@ -334,7 +337,7 @@ mod tests {
         let key = |seat: &str, window: Option<W>, text: &str| {
             ProviderRef::parse(seat)
                 .unwrap()
-                .rejection_key(QuotaSignal { window, text })
+                .rejection_key(QuotaSignal { window, text }, None)
         };
         assert_eq!(
             key("cli:claude@opus", Some(W::SevenDayOpus), ""),
@@ -404,10 +407,13 @@ mod tests {
         );
         let agy = ProviderRef::parse("cli:agy@flash").unwrap();
         assert_eq!(
-            agy.rejection_key(QuotaSignal {
-                window: Some(W::FiveHour),
-                text: ""
-            }),
+            agy.rejection_key(
+                QuotaSignal {
+                    window: Some(W::FiveHour),
+                    text: ""
+                },
+                None
+            ),
             "cli:agy@flash",
             "agy always writes the seat"
         );
@@ -415,10 +421,13 @@ mod tests {
         std::env::remove_var("SPAR_CODEX_PROFILE");
         let codex = ProviderRef::parse("cli:codex@gpt-5").unwrap();
         assert_eq!(
-            codex.rejection_key(QuotaSignal {
-                window: Some(W::SevenDayOpus),
-                text: ""
-            }),
+            codex.rejection_key(
+                QuotaSignal {
+                    window: Some(W::SevenDayOpus),
+                    text: ""
+                },
+                None
+            ),
             "cli:codex@native",
             "codex ignores the signal window; the seat's own route decides"
         );
@@ -432,33 +441,33 @@ mod tests {
         std::env::remove_var("SPAR_CODEX_PROFILE");
         let routed = ProviderRef::parse("cli:codex@gpt-5.2-codex").unwrap();
         assert_eq!(
-            routed.quota_key(),
+            routed.quota_key(None),
             "cli:codex@native",
             "an explicit model omits -p, so a bare model bills codex's own default"
         );
         let via_openrouter = ProviderRef::parse("cli:codex@openai/gpt-5").unwrap();
-        assert_eq!(via_openrouter.quota_key(), "cli:codex@openrouter");
+        assert_eq!(via_openrouter.quota_key(None), "cli:codex@openrouter");
         let bare = ProviderRef::parse("cli:codex").unwrap();
         assert_eq!(
-            bare.quota_key(),
+            bare.quota_key(None),
             "cli:codex@openrouter",
             "a model-less seat dispatches under the default profile, which layers OpenRouter"
         );
         let native = ProviderRef::parse("cli:codex@native").unwrap();
-        assert_eq!(native.quota_key(), "cli:codex@native");
+        assert_eq!(native.quota_key(None), "cli:codex@native");
         std::env::set_var("SPAR_CODEX_PROFILE", "");
         assert_eq!(
-            routed.quota_key(),
+            routed.quota_key(None),
             "cli:codex@native",
             "an explicit model omits -p under any profile"
         );
         assert_eq!(
-            bare.quota_key(),
+            bare.quota_key(None),
             "cli:codex@native",
             "without -p a model-less seat runs native too"
         );
         assert_eq!(
-            via_openrouter.quota_key(),
+            via_openrouter.quota_key(None),
             "cli:codex@openrouter",
             "an explicit slug forces OpenRouter under any profile"
         );
@@ -474,33 +483,33 @@ mod tests {
         std::env::set_var("SPAR_CODEX_PROFILE", "");
         let bare = ProviderRef::parse("cli:codex").unwrap();
         assert_eq!(
-            bare.quota_key(),
+            bare.quota_key(None),
             "cli:codex@native",
             "ambient empty profile runs native"
         );
         assert_eq!(
-            bare.quota_key_with_codex_profile(Some("muse")),
+            bare.quota_key(Some("muse")),
             "cli:codex@openrouter",
             "the recorded dispatch profile decides, not the keying process's env"
         );
         assert_eq!(
-            bare.quota_key_with_codex_profile(Some("")),
+            bare.quota_key(Some("")),
             "cli:codex@native",
             "a recorded set-but-empty profile is the native route"
         );
         assert_eq!(
-            bare.quota_key_with_codex_profile(Some("plain")),
+            bare.quota_key(Some("plain")),
             "cli:codex",
             "an unverified profile keys the login"
         );
         assert_eq!(
-            bare.quota_key_with_codex_profile(None),
+            bare.quota_key(None),
             "cli:codex@native",
             "no recorded profile falls back to the ambient env"
         );
         let modeled = ProviderRef::parse("cli:codex@gpt-5").unwrap();
         assert_eq!(
-            modeled.quota_key_with_codex_profile(Some("muse")),
+            modeled.quota_key(Some("muse")),
             "cli:codex@native",
             "an explicit model runs without -p regardless of profile"
         );
@@ -509,7 +518,7 @@ mod tests {
             text: "",
         };
         assert_eq!(
-            bare.rejection_key_with_codex_profile(signal, Some("muse")),
+            bare.rejection_key(signal, Some("muse")),
             "cli:codex@openrouter",
             "rejections land in the recorded bucket too"
         );
@@ -519,27 +528,27 @@ mod tests {
     #[test]
     fn quota_key_splits_pi_by_upstream() {
         let slug = ProviderRef::parse("cli:pi@google/gemini-2.5-flash").unwrap();
-        assert_eq!(slug.quota_key(), "cli:pi@openrouter");
+        assert_eq!(slug.quota_key(None), "cli:pi@openrouter");
         let explicit = ProviderRef::parse("cli:pi@openrouter/anthropic/claude").unwrap();
-        assert_eq!(explicit.quota_key(), "cli:pi@openrouter");
+        assert_eq!(explicit.quota_key(None), "cli:pi@openrouter");
         let direct = ProviderRef::parse("cli:pi@direct:anthropic/claude-sonnet-4-5").unwrap();
-        assert_eq!(direct.quota_key(), "cli:pi@direct:anthropic");
+        assert_eq!(direct.quota_key(None), "cli:pi@direct:anthropic");
         let bare_word = ProviderRef::parse("cli:pi@gemini-2.5-flash").unwrap();
         assert_eq!(
-            bare_word.quota_key(),
+            bare_word.quota_key(None),
             "cli:pi",
             "pi's own resolution keys the login"
         );
         let bare = ProviderRef::parse("cli:pi").unwrap();
-        assert_eq!(bare.quota_key(), "cli:pi");
+        assert_eq!(bare.quota_key(None), "cli:pi");
     }
 
     #[test]
     fn quota_key_splits_api_per_model() {
         let modeled = ProviderRef::parse("api:anthropic@claude-opus-4-6").unwrap();
-        assert_eq!(modeled.quota_key(), "api:anthropic@claude-opus-4-6");
+        assert_eq!(modeled.quota_key(None), "api:anthropic@claude-opus-4-6");
         let bare = ProviderRef::parse("api:anthropic").unwrap();
-        assert_eq!(bare.quota_key(), "api:anthropic");
+        assert_eq!(bare.quota_key(None), "api:anthropic");
     }
 
     #[test]
@@ -573,8 +582,8 @@ mod tests {
             "cli:claude@claude-haiku-5-5",
             "cli:agy@flash",
         ] {
-            let once = ProviderRef::parse(seat).unwrap().quota_key();
-            let twice = ProviderRef::parse(&once).unwrap().quota_key();
+            let once = ProviderRef::parse(seat).unwrap().quota_key(None);
+            let twice = ProviderRef::parse(&once).unwrap().quota_key(None);
             assert_eq!(twice, once, "{seat} does not round-trip");
         }
     }
@@ -588,7 +597,7 @@ mod tests {
             "cli:muse@auto",
         ] {
             assert_eq!(
-                ProviderRef::parse(seat).unwrap().quota_key(),
+                ProviderRef::parse(seat).unwrap().quota_key(None),
                 seat.split('@').next().unwrap(),
                 "{seat} has no separate windows"
             );
@@ -603,7 +612,7 @@ mod tests {
         let key = |seat: &str, window: Option<W>, text: &str| {
             ProviderRef::parse(seat)
                 .unwrap()
-                .rejection_key(QuotaSignal { window, text })
+                .rejection_key(QuotaSignal { window, text }, None)
         };
         assert_eq!(
             key("cli:codex@openai/gpt-5", Some(W::RateLimit), "rate limit"),

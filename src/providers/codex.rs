@@ -288,9 +288,9 @@ impl ProviderAdapter for CodexAdapter {
 
     /// The model-less seat's bucket: the profile it dispatches under. `None`
     /// (an emptied `SPAR_CODEX_PROFILE`) drops `-p`, running codex's own
-    /// default, the native login; any set profile is treated as its own
-    /// billing route, keyed by name, since only `muse` is verified to layer
-    /// OpenRouter.
+    /// default, the native login; only the `muse` profile is verified to
+    /// layer OpenRouter, and any other set profile keys at the login rather
+    /// than in a bucket it might not share.
     fn default_bucket(&self) -> Option<&'static str> {
         default_bucket_for_profile(codex_profile().as_deref())
     }

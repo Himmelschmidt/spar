@@ -922,9 +922,10 @@ impl RunState {
 
     /// Mark the start of the current dispatch: the instant quota pauses are read
     /// against, and the codex profile this dispatch's seats run under. Called by
-    /// the implement entry points, never by an in-process fix pass: a fix pass is
-    /// a continuation of the same dispatch, and re-stamping it would turn this
-    /// run's own pauses into pre-existing ones and park the run on its own fumes.
+    /// the implement entry points and by `continue_run` resumption, never by an
+    /// in-process fix pass: a fix pass is a continuation of the same dispatch,
+    /// and re-stamping it would turn this run's own pauses into pre-existing
+    /// ones and park the run on its own fumes.
     pub fn stamp_dispatch(&mut self) {
         self.round_started_at = Some(chrono::Utc::now());
         self.codex_profile = Some(crate::providers::codex::codex_profile().unwrap_or_default());
