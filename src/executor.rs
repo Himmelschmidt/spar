@@ -95,6 +95,7 @@ pub fn run_slots_parallel(
                     s.quota_hit = false;
                     s.auth_fault = false;
                     s.timeout_cause = None;
+                    s.dispatch_head = None;
                     s.classifier = None;
                 }
                 let _ =
@@ -155,6 +156,10 @@ struct PreparedSlot {
     owns_cwd: bool,
     /// The run's base, for deciding whether a slot missing its artifact left work behind.
     base_commit: Option<String>,
+    /// HEAD of the slot's worktree when this dispatch started. Work is measured
+    /// against it (never re-derived later): from round 2 on the base predates
+    /// earlier rounds' commits, so the base always reads as work.
+    dispatch_head: Option<String>,
     round: u32,
     /// The native session/thread id an earlier round of this same slot captured
     /// (`markers::read_session_id`), if any. `execute_prepared` passes it to the
@@ -369,6 +374,7 @@ fn prepare_slot_execution(
     reset_slot_log(&log_path);
     let round = state.round;
     state.dispatched_round = round;
+    let run_id = state.id.clone();
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.status = SlotStatus::Running;
         // A dispatch's outcome fields describe *that* dispatch. Carried into the next
@@ -383,6 +389,13 @@ fn prepare_slot_execution(
         s.quota_hit = false;
         s.auth_fault = false;
         s.timeout_cause = None;
+        // This dispatch's start HEAD: work is measured against it, never the run
+        // base, so a fix round that commits nothing reads as no work even though
+        // the base predates earlier rounds' commits.
+        s.dispatch_head = role_is_recoverable(job.role)
+            .then(|| git_output(&cwd, &["rev-parse", "HEAD"]))
+            .flatten();
+        clear_expected_artifact(paths, &run_id, &job);
         s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
@@ -423,6 +436,11 @@ fn prepare_slot_execution(
         prior_session_for_role(paths, &state.id, &job.slot_id, &session_provider, job.role);
     let fleet_lease = crate::fleet::SlotLease::start(paths, &state.id, &job.slot_id, &job.provider);
 
+    let dispatch_head = state
+        .slots
+        .iter()
+        .find(|s| s.id == job.slot_id)
+        .and_then(|s| s.dispatch_head.clone());
     Ok(PreparedSlot {
         job,
         cwd,
@@ -434,6 +452,7 @@ fn prepare_slot_execution(
         paths: paths.clone(),
         run_id: state.id.clone(),
         base_commit: state.base_commit.clone(),
+        dispatch_head,
         owns_cwd,
         round,
         prior_session_id,
@@ -1268,9 +1287,9 @@ fn execute_prepared(
     // retry or transient retry inside `dispatch_with_resume_recovery` is still
     // this dispatch, and its write lands after this capture either way.
     let dispatch_start = SystemTime::now();
-    let dispatch_head = role_is_recoverable(prep.job.role)
-        .then(|| git_output(&prep.cwd, &["rev-parse", "HEAD"]))
-        .flatten();
+    // Carried from prepare, never re-derived here: from round 2 on the run base
+    // predates earlier rounds' commits, so the base always reads as work.
+    let dispatch_head = prep.dispatch_head.clone();
     let mut res = dispatch_with_resume_recovery(
         adapter.as_ref(),
         &bin,
@@ -1341,6 +1360,7 @@ fn execute_prepared(
                     env: &prep.env,
                     isolation,
                     base_commit: prep.base_commit.as_deref(),
+                    dispatch_head: prep.dispatch_head.as_deref(),
                     artifact: &prep.paths.artifact(&prep.run_id, name),
                 },
                 dispatch_head.as_deref(),
@@ -1521,6 +1541,7 @@ fn execute_prepared(
                 env: &prep.env,
                 isolation,
                 base_commit: prep.base_commit.as_deref(),
+                dispatch_head: prep.dispatch_head.as_deref(),
                 artifact: &path,
             });
             if !recovered {
@@ -1588,6 +1609,11 @@ struct ArtifactRecovery<'a> {
     env: &'a [(String, String)],
     isolation: crate::config::IsolationMode,
     base_commit: Option<&'a str>,
+    /// HEAD when this dispatch started. Work is measured against it; `base_commit`
+    /// is only the fallback for dispatches that predated it. Without this, from
+    /// round 2 on the base predates earlier rounds' commits and always reads as
+    /// work, so a fix round that did nothing still earns a recovery turn.
+    dispatch_head: Option<&'a str>,
     artifact: &'a Path,
 }
 
@@ -1646,10 +1672,11 @@ fn ceiling_kill_kept_work(
     kept
 }
 
-/// Work the slot left behind: uncommitted changes, or commits past the run's base.
+/// Work the slot left behind: uncommitted changes, or commits past `base_commit`.
 ///
-/// `base_commit` is `None` for pre-O26 runs and when git couldn't answer; there the
-/// dirty check stands alone rather than guessing at HEAD.
+/// Pass the dispatch's start HEAD: from round 2 on the run base predates earlier
+/// rounds' commits, so the base always reads as work. `None` (pre-O26 runs, or git
+/// couldn't answer) leaves only the dirty check rather than guessing at HEAD.
 pub fn slot_has_work(cwd: &Path, base_commit: Option<&str>) -> bool {
     let git = |args: &[&str]| {
         std::process::Command::new("git")
@@ -1679,7 +1706,11 @@ pub fn slot_has_work(cwd: &Path, base_commit: Option<&str>) -> bool {
 /// Only fires for the implementer, and only when the tree actually holds work — a slot
 /// that did nothing still fails.
 fn recover_artifact(r: &ArtifactRecovery) -> bool {
-    if !role_is_recoverable(r.role) || !r.owns_cwd || !slot_has_work(r.cwd, r.base_commit) {
+    // This dispatch's start HEAD first, the run base only for dispatches that
+    // predated it: measuring against the base lets a fix round that did nothing
+    // read earlier rounds' commits as its own work.
+    let since = r.dispatch_head.or(r.base_commit);
+    if !role_is_recoverable(r.role) || !r.owns_cwd || !slot_has_work(r.cwd, since) {
         return false;
     }
     let Some(adapter) = providers::adapter_named(r.provider) else {
@@ -1853,6 +1884,18 @@ fn artifact_fresh_since(path: &Path, since: SystemTime) -> bool {
         return false;
     };
     mtime >= markers::freshness_floor(since)
+}
+
+/// A dispatch starts with no artifact of its own. The previous attempt's file is
+/// still on disk — a salvage write from seconds ago included — and the freshness
+/// gate above would otherwise credit it to this dispatch: a fix round killed at
+/// its ceiling reads kept on the round before's salvaged summary and the panel
+/// re-judges an already-rejected HEAD. The agent, the recovery turn, and the next
+/// salvage each rewrite what they are owed; nothing reads the removed file back.
+fn clear_expected_artifact(paths: &SparPaths, run_id: &str, job: &SlotJob) {
+    if let Some(name) = &job.expected_artifact {
+        let _ = std::fs::remove_file(paths.artifact(run_id, name));
+    }
 }
 
 /// Whether a native-CLI judging dispatch produced no judgment at all. A
@@ -2467,6 +2510,7 @@ pub fn run_slot(
     reset_slot_log(&log_path);
     let round = state.round;
     state.dispatched_round = round;
+    let run_id = state.id.clone();
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.status = SlotStatus::Running;
         // A dispatch's outcome fields describe *that* dispatch. Carried into the next
@@ -2481,6 +2525,13 @@ pub fn run_slot(
         s.quota_hit = false;
         s.auth_fault = false;
         s.timeout_cause = None;
+        // This dispatch's start HEAD: work is measured against it, never the run
+        // base, so a fix round that commits nothing reads as no work even though
+        // the base predates earlier rounds' commits.
+        s.dispatch_head = role_is_recoverable(job.role)
+            .then(|| git_output(&cwd, &["rev-parse", "HEAD"]))
+            .flatten();
+        clear_expected_artifact(paths, &run_id, job);
         s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
@@ -4073,9 +4124,12 @@ fn run_headless(
     // See `execute_prepared`: the artifact gate below only counts a write from
     // this dispatch.
     let dispatch_start = SystemTime::now();
-    let dispatch_head = role_is_recoverable(job.role)
-        .then(|| git_output(cwd, &["rev-parse", "HEAD"]))
-        .flatten();
+    // Carried from `run_slot`'s dispatch record, never re-derived here.
+    let dispatch_head = state
+        .slots
+        .iter()
+        .find(|s| s.id == job.slot_id)
+        .and_then(|s| s.dispatch_head.clone());
     let mut res = dispatch_with_resume_recovery(
         adapter.as_ref(),
         &bin,
@@ -4140,6 +4194,7 @@ fn run_headless(
                     env,
                     isolation: state.isolation,
                     base_commit: state.base_commit.as_deref(),
+                    dispatch_head: dispatch_head.as_deref(),
                     artifact: &paths.artifact(&state.id, name),
                 },
                 dispatch_head.as_deref(),
@@ -4300,6 +4355,7 @@ fn run_headless(
                 env,
                 isolation: state.isolation,
                 base_commit: state.base_commit.as_deref(),
+                dispatch_head: dispatch_head.as_deref(),
                 artifact: &path,
             });
             if !recovered {
@@ -4803,6 +4859,7 @@ pub fn init_slot_model(
         source: None,
         auth_fault: false,
         timeout_cause: None,
+        dispatch_head: None,
         build_cache: None,
         former_ids: Vec::new(),
         classifier: None,

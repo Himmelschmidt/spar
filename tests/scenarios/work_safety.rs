@@ -609,7 +609,13 @@ echo '{"schema_version":1,"stream":{"kind":"session","id":"sess-c"},"record_type
 case "$NAME" in
   impl)
     echo ceiling >> "$SPAR_TEST_MUSE_STATE/calls"
-    echo work > work.txt
+    if [ -f "$SPAR_TEST_MUSE_STATE/impl-rounds" ]; then
+      n=$(cat "$SPAR_TEST_MUSE_STATE/impl-rounds")
+    else
+      n=0
+    fi
+    echo "$((n + 1))" > "$SPAR_TEST_MUSE_STATE/impl-rounds"
+    echo "work round $n" > work.txt
     sleep 60
     ;;
   *)
@@ -720,6 +726,111 @@ fn ceiling_cut_notice_survives_the_round_ceiling_gate() {
     assert!(
         prompt.contains("cut short at its hard time ceiling"),
         "rebuilt round-2 prompt carries the cut-short notice"
+    );
+}
+
+/// A fake `muse` for the #228 dispatch-HEAD regression test. The first
+/// implementer dispatch leaves an edit uncommitted and hangs past the hard
+/// ceiling, so round 1 becomes a WIP round; every later implementer dispatch
+/// hangs with no edits at all. The first review requests changes, the rest
+/// approve whatever HEAD they are shown.
+fn install_ceiling_idle_fix_round_muse(bin: &Path) {
+    std::fs::create_dir_all(bin).unwrap();
+    let p = bin.join("muse");
+    std::fs::write(
+        &p,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "fake-muse 0"; exit 0; fi
+PROMPT_FILE=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--prompt-file" ]; then PROMPT_FILE="$a"; fi
+  prev="$a"
+done
+NAME=$(basename "$PROMPT_FILE" .md)
+NAME=${NAME#prompt-}
+ART="$(dirname "$PROMPT_FILE")/artifacts"
+mkdir -p "$ART"
+echo '{"schema_version":1,"stream":{"kind":"session","id":"sess-c"},"record_type":"event","payload_type":"run.model.configured","payload":{"kind":"run_model_configured","model_id":"m"}}'
+case "$NAME" in
+  impl)
+    echo ceiling >> "$SPAR_TEST_MUSE_STATE/calls"
+    if [ -f "$SPAR_TEST_MUSE_STATE/impl-rounds" ]; then
+      n=$(cat "$SPAR_TEST_MUSE_STATE/impl-rounds")
+    else
+      n=0
+    fi
+    echo "$((n + 1))" > "$SPAR_TEST_MUSE_STATE/impl-rounds"
+    if [ "$n" = "0" ]; then echo work > work.txt; fi
+    sleep 60
+    ;;
+  *)
+    echo "review-$NAME" >> "$SPAR_TEST_MUSE_STATE/calls"
+    n=$(cat "$SPAR_TEST_MUSE_STATE/reviews" 2>/dev/null || echo 0)
+    n=$((n + 1))
+    echo "$n" > "$SPAR_TEST_MUSE_STATE/reviews"
+    CWD=$(sed -n 's/.*Code under review (worktree): \([^ ]*\).*/\1/p' "$PROMPT_FILE" | head -n 1)
+    SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null)
+    if [ "$n" = "1" ]; then
+      printf '## Verdict\nrequest_changes\n\nReviewed-Commit: %s\n' "$SHA" > "$ART/review-$NAME.md"
+    else
+      printf '## Verdict\napprove\n\nReviewed-Commit: %s\n' "$SHA" > "$ART/review-$NAME.md"
+    fi
+    ;;
+esac
+exit 0
+"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// #228 follow-up: work is measured against the dispatch's own start HEAD, not
+/// the run's base commit. Round 1 dies at the ceiling with an edit (WIP round),
+/// the review requests changes, and the round 2 implementer hangs with no edits
+/// at all. The run must fail; measuring against the base commit would see round
+/// 1's WIP commit as work, let the empty round go on, and end at
+/// awaiting_ship_confirm on a verdict for HEAD the panel already rejected.
+#[test]
+fn a_second_round_ceiling_kill_with_no_new_edits_fails_the_run() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    std::fs::write(
+        proj.join("spar.toml"),
+        "[suite]\nenabled = false\n[rounds]\nmax = 2\n[timeouts]\nslot_secs = 2\nhard_ceiling_multiple = 1.5\n",
+    )
+    .unwrap();
+    let bin = tmp.path().join("bin");
+    install_ceiling_idle_fix_round_muse(&bin);
+    let calls_dir = tmp.path().join("muse-state");
+    std::fs::create_dir_all(&calls_dir).unwrap();
+
+    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
+    let st = read_state(&proj, &run_id);
+    assert_eq!(st["phase"], "failed", "{st}");
+    assert_eq!(st["round"], 2, "{st}");
+    let calls = std::fs::read_to_string(calls_dir.join("calls")).unwrap();
+    assert_eq!(
+        calls.lines().filter(|l| *l == "ceiling").count(),
+        2,
+        "both rounds died at the ceiling: {calls}"
+    );
+    assert_eq!(
+        calls.lines().filter(|l| l.starts_with("review-")).count(),
+        1,
+        "the empty round-2 kill never reached review: {calls}"
+    );
+    assert!(!calls.contains("recovery"), "no recovery turn: {calls}");
+    let branch = format!("spar/{run_id}/impl");
+    let log = git(&proj, &["log", &branch, "--format=%s"]);
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.contains("cut short at hard ceiling"))
+            .count(),
+        1,
+        "only round 1 left a WIP commit: {log}"
     );
 }
 

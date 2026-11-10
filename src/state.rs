@@ -208,11 +208,36 @@ pub struct RunState {
     /// the previous pass never finished (`blockers_from_disk` rebuilds the note).
     #[serde(default)]
     pub ceiling_partial_rounds: Vec<u32>,
+    /// How each recorded ceiling-cut round left its work. Empty for runs recorded
+    /// before the distinction existed; those rebuild with the WIP wording they
+    /// were recorded with.
+    #[serde(default)]
+    pub ceiling_partial_kinds: Vec<CeilingPartialRound>,
     /// Set while `spar amend` has the test author out, cleared when it settles. Found
     /// set by a later `amend`, `resume` or `approve`, it means the amend was killed: the
     /// run is put back exactly as this records (O137).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amend_in_progress: Option<AmendInProgress>,
+}
+
+/// How a ceiling-cut partial round left its work, so a rebuilt notice words the
+/// WIP commit honestly: the claim "saved as a WIP commit" is only true for `Wip`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CeilingPartialKind {
+    /// Leftovers committed as a WIP commit on the branch.
+    Wip,
+    /// Killed after committing; tree clean, no WIP commit written.
+    Clean,
+    /// Leftovers could not be committed; judged from the dirty tree as-is.
+    Refused,
+}
+
+/// A recorded ceiling-cut round and how it left its work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CeilingPartialRound {
+    pub round: u32,
+    pub kind: CeilingPartialKind,
 }
 
 /// What an interrupted `spar amend` must put back.
@@ -561,6 +586,12 @@ pub struct SlotState {
     /// Reset at the start of every dispatch, like `quota_hit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_cause: Option<crate::executor::TimeoutCause>,
+    /// HEAD of this slot's worktree when the current dispatch started. Work is
+    /// measured against it (dirty tree, or commits past it), never against the
+    /// run base: from round 2 on the base predates earlier rounds' commits, so
+    /// the base always reads as work. Recorded at dispatch, like `timeout_cause`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_head: Option<String>,
     /// The build-cache pool directory this implementer leased (O143). Kept after the
     /// dispatch ends so the next one prefers the same warm directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -617,6 +648,7 @@ impl SlotState {
         self.quota_hit = false;
         self.auth_fault = false;
         self.timeout_cause = None;
+        self.dispatch_head = None;
         self.classifier = None;
     }
 }
@@ -883,6 +915,7 @@ impl RunState {
             seat_reassignments: Vec::new(),
             contract_amendments: Vec::new(),
             ceiling_partial_rounds: Vec::new(),
+            ceiling_partial_kinds: Vec::new(),
             amend_in_progress: None,
             pr_state: None,
         }

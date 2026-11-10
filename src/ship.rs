@@ -176,9 +176,33 @@ fn pr_body(paths: &SparPaths, state: &RunState, branch: &str, cwd: &Path) -> Str
             body.push('\n');
         }
     }
+    if !state.ceiling_partial_rounds.is_empty() {
+        let mut rounds = state.ceiling_partial_rounds.clone();
+        rounds.sort_unstable();
+        rounds.dedup();
+        let list = rounds
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        body.push_str("\n## Partial work\n\n");
+        body.push_str(&format!(
+            "Rounds {list} were cut short at their hard ceiling; the branch carries \
+             their partial work. Judge the diff as unfinished work continued by later rounds.\n"
+        ));
+    }
+    // A round cut short at its own hard ceiling never finishes its summary: the
+    // file on disk is the previous round's, salvaged from the log, or missing,
+    // and presenting it as this round's would ship someone else's words (or the
+    // orchestrator's) under the implementer's name. Say so instead.
+    let final_partial = state.ceiling_partial_rounds.contains(&state.round);
     body.push_str("\n## Implementer summary\n\n");
     match &summary {
-        Some((_, text)) => body.push_str(text.trim()),
+        Some((_, text)) if !final_partial => body.push_str(text.trim()),
+        Some(_) => body.push_str(
+            "_No finished implementer summary exists for this round: it was cut short \
+             at its hard ceiling (see Partial work above)._",
+        ),
         None => body.push_str("_No implementer summary was written._"),
     }
     body.push('\n');
@@ -1206,6 +1230,54 @@ mod tests {
         assert!(!body.contains("## Review"), "{body}");
         assert!(!body.contains("## Open questions"), "{body}");
         assert!(!body.contains("## Open findings"), "{body}");
+    }
+
+    #[test]
+    fn pr_body_marks_ceiling_cut_rounds_as_partial_work() {
+        let tmp = tempdir().unwrap();
+        let (paths, mut state) = body_state(tmp.path());
+        state.round = 2;
+        state.ceiling_partial_rounds = vec![1];
+        std::fs::write(
+            paths.artifact("rb1", "summary-impl.md"),
+            "Did the follow-up.\n",
+        )
+        .unwrap();
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
+        assert!(
+            body.contains("## Partial work\n\nRounds 1 were cut short"),
+            "{body}"
+        );
+        assert!(
+            body.contains("Did the follow-up."),
+            "the finished round's summary still ships: {body}"
+        );
+    }
+
+    #[test]
+    fn pr_body_does_not_ship_a_stale_summary_for_a_cut_short_final_round() {
+        let tmp = tempdir().unwrap();
+        let (paths, mut state) = body_state(tmp.path());
+        state.round = 2;
+        state.ceiling_partial_rounds = vec![1, 2];
+        std::fs::write(
+            paths.artifact("rb1", "summary-impl.md"),
+            "The previous round's words.\n",
+        )
+        .unwrap();
+        let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
+        assert!(
+            body.contains("## Partial work\n\nRounds 1, 2 were cut short"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("The previous round's words."),
+            "a stale summary never ships as the round's: {body}"
+        );
+        assert!(
+            body.contains("_No finished implementer summary exists for this round"),
+            "{body}"
+        );
     }
 
     #[test]
