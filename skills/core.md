@@ -100,7 +100,11 @@ probe <ref>` (or `--all` for every installed CLI) makes one tiny real call throu
 adapter (`Reply with the single word OK`, the ref's `@model` if any, 120s cap) and
 writes the answer: `healthy` clears a quota pause, `quota` pauses (until the stated
 reset when claude states one), `auth` and `failed` leave the store alone. A manual pause
-is never cleared by a probe. `--dry-run` (or `SPAR_DRY_RUN=1`) prints the call each
+is never cleared by a probe. A bare `provider probe cli:codex` keys the ambient route's
+bucket (an ambient model names its own bucket, so `SPAR_CODEX_MODEL=gpt-5` probes
+`cli:codex@native`; only a model-less seat under the default profile probes
+`cli:codex@openrouter`); `provider probe --run <id>` keys that run's recorded dispatch
+route instead, replaying its recorded model (O154, O168). `--dry-run` (or `SPAR_DRY_RUN=1`) prints the call each
 probe would make and spawns nothing. Exit is `0` whatever the verdicts; read them from
 `--json`. A declared `--backup` held on a quota pause gets the same probe before a run
 skips it (O106): a stale pause no longer benches a working backup. A manually paused
@@ -110,7 +114,7 @@ a run is live moves its next seat to the declared backup (a reviewer seat is ren
 the new vendor) or parks the run at `quota` (exit `4`) when there is none. Only a manual
 pause or a trusted quota pause (a typed or clear rejection line) does this; a heuristic
 pause from a stray "429" or "quota" in a failed log steers the next run but never parks
-or reseats a live one. Like the run-start gate, this is skipped under `--dry-run`. Pauses are per quota bucket where billing is separate (O153): codex `openrouter` vs `native`, pi `openrouter` vs each `direct:<provider>`, `api:` per model; grok and muse stay login-wide. A pre-dispatch pause moves the seat to its backup when it has one, else a paused reviewer stands down with a warning and the run carries on (it parks at `quota` only when no reviewer can run), while a paused implementer or tester parks the run. A stood-down reviewer records no new verdict, but a `request_changes` it already recorded on the head being shipped still blocks the ship gate, and the ship body marks stood-down seats instead of printing their verdicts. A bare `provider pause <ref>` holds the whole account; naming a model pauses just that bucket.
+or reseats a live one. Like the run-start gate, this is skipped under `--dry-run`. Pauses are per quota bucket where billing is separate (O153): codex `openrouter` vs `native`, pi `openrouter` vs each `direct:<provider>`, `api:` per model; grok and muse stay login-wide. A pre-dispatch pause moves the seat to its backup when it has one, else a paused reviewer stands down with a warning and the run carries on (it parks at `quota` only when no reviewer can run), while a paused implementer or tester parks the run. A stood-down reviewer records no new verdict, but a `request_changes` it already recorded on the head being shipped still blocks the ship gate, and the ship body marks stood-down seats instead of printing their verdicts. A bare `provider pause <ref>` holds the whole account; naming a model pauses just that bucket, and resuming names the same scope. Probes key what the seat would bill, never the whole login.
 
 **Auth faults (O104).** A dispatch that dies on a refused credential (claude's `401 ...
 OAuth access token has been revoked` or `Please run /login`, codex `Not logged in`, muse
@@ -979,8 +983,8 @@ slot is stuck on.**
   during this dispatch keeps the slot `done`; new commits since the round began earn the
   same artifact-only recovery turn a clean exit without its artifact gets (below). Either
   way the slot note reads `killed at the hard ceiling after finishing its work; kept as
-  done` and the round goes on to review. Work left since the round started — a tree
-  changed past its round-start snapshot, or commits the recovery turn could not keep —
+  done` and the round goes on to review. Work left since the round started (a tree
+  changed past its round-start snapshot, or commits the recovery turn could not keep)
   is committed as partial work instead of failing the round: a
   `chore(spar): partial work, implementer cut short at hard ceiling (round N)` commit
   lands on the run branch and the suite and the panel judge it like any round, with the

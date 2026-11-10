@@ -326,8 +326,14 @@ pub struct Reassignment {
 
 /// Parse `--reassign` and refuse a provider the run could not dispatch anyway: unknown,
 /// manually paused, or paused on a trusted quota signal (O106, O136). Read before the run
-/// lock, so a typo costs nothing.
-pub fn parse_reassignments(raw: &[String], paths: &SparPaths) -> Result<Vec<Reassignment>> {
+/// lock, so a typo costs nothing. The pause check keys the route the next dispatch will
+/// stamp (this process's environment): a model-less codex seat reassigned onto a paused
+/// ambient bucket is refused even when the run's stale record would key elsewhere.
+pub fn parse_reassignments(
+    raw: &[String],
+    paths: &SparPaths,
+    route: crate::providers::RecordedRoute<'_>,
+) -> Result<Vec<Reassignment>> {
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     let mut out = Vec::new();
     for r in raw {
@@ -346,7 +352,8 @@ pub fn parse_reassignments(raw: &[String], paths: &SparPaths) -> Result<Vec<Reas
                 bail!("--reassign {r:?}: no adapter named {cli}");
             }
         }
-        let key = crate::quota::quota_key(&pin.display());
+        let seat = crate::provider_ref::ProviderRef::for_seat(&pin.provider, pin.model.as_deref());
+        let key = seat.quota_key(route);
         if store.blocks_live_dispatch(&key) {
             bail!(
                 "--reassign {r:?}: {key} is paused; resume it with `spar provider resume {key}` \
@@ -586,7 +593,14 @@ fn run_from_approved(
     // a run directory for it. Everything below mutates the run, so it all happens under
     // the lock: a live orchestrator refuses us before its state.json can be overwritten.
     let unlocked = RunState::load(paths, run_id)?;
-    let reassignments = parse_reassignments(&opts.reassign, paths)?;
+    // Key the route this process's dispatch will stamp (continuing entries
+    // stamp on resumption), not the previous record: a stale record would
+    // accept a bucket the dispatch now bills, or refuse one it no longer does.
+    let reassignments = parse_reassignments(
+        &opts.reassign,
+        paths,
+        crate::providers::codex::dispatch_route().as_recorded(),
+    )?;
     let mut patient = None;
     if let Some(mr) = opts.max_rounds {
         let target = mr.resolve(unlocked.round);
@@ -969,7 +983,7 @@ fn prepare_implement_slots(
             &seat_ref,
             &store,
             available.as_ref(),
-            state.codex_profile.as_deref(),
+            state.recorded_route(),
         ) {
             let ordinal = if seat.role == SlotRole::Reviewer {
                 reviewer_ordinal(&seat.seat).unwrap_or(0)
@@ -983,7 +997,7 @@ fn prepare_implement_slots(
                     available.as_ref(),
                     paths,
                     dry,
-                    state.codex_profile.as_deref(),
+                    state.recorded_route(),
                 ) {
                     if let Ok(pin) = crate::provider_ref::Pin::parse(&backup_raw) {
                         provider = pin.display();
@@ -2311,7 +2325,7 @@ pub fn execute_loop(
                             &slot_state,
                             &store,
                             available.as_ref(),
-                            state.codex_profile.as_deref(),
+                            state.recorded_route(),
                         );
                         if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
                             let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
@@ -2328,7 +2342,7 @@ pub fn execute_loop(
                                     available.as_ref(),
                                     paths,
                                     state.dry_run,
-                                    state.codex_profile.as_deref(),
+                                    state.recorded_route(),
                                 )
                             {
                                 if let Some(s) = state.slot_mut(&impl_job.slot_id) {
@@ -2410,7 +2424,7 @@ pub fn execute_loop(
                         &slot_state,
                         &store,
                         available.as_ref(),
-                        state.codex_profile.as_deref(),
+                        state.recorded_route(),
                     );
                     if cause.engages_backup() {
                         if let Some(backup_raw) =
@@ -2422,7 +2436,7 @@ pub fn execute_loop(
                                 available.as_ref(),
                                 paths,
                                 state.dry_run,
-                                state.codex_profile.as_deref(),
+                                state.recorded_route(),
                             ) && slot_state.source != Some(SeatSource::Backup)
                             {
                                 let backup_key =
@@ -3540,7 +3554,7 @@ fn handle_retry_err(
 /// Drop this round's ceiling-cut mark when its implementer finishes without a
 /// ceiling kill: the round is no longer cut short, so ship judges the real
 /// summary and the next round gets no stale notice. Keyed on the dispatch, not
-/// the verdict — a finished round the panel rejects still finished. Older
+/// the verdict (a finished round the panel rejects still finished). Older
 /// rounds keep their marks for the PR's Partial work section.
 fn clear_finished_round_partial_mark(state: &mut RunState, paths: &SparPaths) -> Result<()> {
     let before = state.ceiling_partial_rounds.len();
@@ -3553,8 +3567,8 @@ fn clear_finished_round_partial_mark(state: &mut RunState, paths: &SparPaths) ->
     Ok(())
 }
 
-/// Record a ceiling-cut partial round: the killed slot reads done — the kill stays
-/// in the event log, not as a failure string on a done slot — and the round is
+/// Record a ceiling-cut partial round: the killed slot reads done (the kill stays
+/// in the event log, not as a failure string on a done slot) and the round is
 /// remembered on the run so a fresh process rebuilds the cut-short notice from
 /// disk for the next round's implementer. The kind records how the work was left
 /// so the rebuilt notice words the WIP commit honestly.
@@ -3803,7 +3817,7 @@ fn gate_implementer_seat(
                     Some(detected)
                 };
                 let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-                let codex_profile = state.codex_profile.clone();
+                let route = state.recorded_route();
                 let missing = state
                     .slots
                     .iter()
@@ -3813,7 +3827,7 @@ fn gate_implementer_seat(
                             &s.provider_ref().display(),
                             &store,
                             available.as_ref(),
-                            codex_profile.as_deref(),
+                            route,
                         )
                     })
                     .map(|s| s.provider.clone());
@@ -3852,7 +3866,7 @@ fn recheck_seat(
     }
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     let seat = slot.provider_ref();
-    let key = seat.quota_key(state.codex_profile.as_deref());
+    let key = seat.quota_key(state.recorded_route());
     let sub = seat.storage_key();
     // A live run trusts only pauses it can trust: manual and strong (O106). A
     // weak heuristic pause ("429" in "429 passed") written by this very dispatch
@@ -3876,20 +3890,11 @@ fn recheck_seat(
         SlotRole::Reviewer => reviewer_ordinal(slot_id),
         _ => Some(0),
     };
-    let codex_profile = state.codex_profile.clone();
+    let route = state.recorded_route();
     let backup = ordinal
         .and_then(|o| crate::backup::backup_for_role(slot.role, o, cfg))
         .filter(|b| crate::quota::sub_key(b) != sub)
-        .filter(|b| {
-            crate::backup::backup_eligible(
-                b,
-                &store,
-                None,
-                paths,
-                state.dry_run,
-                codex_profile.as_deref(),
-            )
-        });
+        .filter(|b| crate::backup::backup_eligible(b, &store, None, paths, state.dry_run, route));
     let Some(backup_raw) = backup else {
         return Ok(SeatCheck::Park(format!(
             "provider {key} is paused or on cooldown and `{slot_id}` has no eligible backup. \
@@ -3946,7 +3951,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
             &slot_state,
             &store,
             available_opt.as_ref(),
-            state.codex_profile.as_deref(),
+            state.recorded_route(),
         );
         if has_backup {
             if cause.engages_backup() {
@@ -3969,7 +3974,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                             available_opt.as_ref(),
                             paths,
                             state.dry_run,
-                            state.codex_profile.as_deref(),
+                            state.recorded_route(),
                         )
                         && slot_state.source != Some(SeatSource::Backup)
                     {
@@ -4177,19 +4182,12 @@ fn try_rotate_reviewer_provider(
     let cur = slot.provider.clone();
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     if infra && slot.source != Some(SeatSource::Backup) {
-        let codex_profile = state.codex_profile.clone();
+        let route = state.recorded_route();
         let backup = reviewer_ordinal(rev_id)
             .and_then(|o| crate::backup::backup_for_role(SlotRole::Reviewer, o, cfg))
             .filter(|b| crate::quota::sub_key(b) != crate::quota::sub_key(&cur))
             .filter(|b| {
-                crate::backup::backup_eligible(
-                    b,
-                    &store,
-                    None,
-                    paths,
-                    state.dry_run,
-                    codex_profile.as_deref(),
-                )
+                crate::backup::backup_eligible(b, &store, None, paths, state.dry_run, route)
             });
         if let Some(raw) = backup {
             let id = move_seat_to_backup(state, paths, rev_id, &raw)?;
@@ -4200,9 +4198,9 @@ fn try_rotate_reviewer_provider(
             return Ok(Some(id));
         }
     }
-    let codex_profile = state.codex_profile.clone();
+    let route = state.recorded_route();
     let eligible = |p: &String| -> bool {
-        *p != cur && crate::backup::is_provider_eligible(p, &store, None, codex_profile.as_deref())
+        *p != cur && crate::backup::is_provider_eligible(p, &store, None, route)
     };
     let reviewer_role_source = if cfg
         .cli_role_keys

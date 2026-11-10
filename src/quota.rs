@@ -1026,7 +1026,7 @@ pub fn quota_key(raw: &str) -> String {
         format!("cli:{raw}")
     };
     crate::provider_ref::ProviderRef::parse(&candidate)
-        .map(|p| p.quota_key(None))
+        .map(|p| p.quota_key(crate::providers::RecordedRoute::ambient()))
         .unwrap_or_else(|_| raw.to_string())
 }
 
@@ -1045,7 +1045,7 @@ pub fn operator_key(raw: &str) -> String {
             if p.model.is_none() {
                 p.storage_key()
             } else {
-                p.quota_key(None)
+                p.quota_key(crate::providers::RecordedRoute::ambient())
             }
         })
         .unwrap_or_else(|_| raw.to_string())
@@ -1631,8 +1631,7 @@ mod tests {
     fn quota_key_splits_model_scoped_providers_only() {
         // Codex buckets read the profile route from process env, so pin it:
         // every other test thread shares this process.
-        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
+        let _pin = crate::providers::codex::pin_codex_env();
         assert_eq!(quota_key("claude"), "cli:claude");
         assert_eq!(quota_key("cli:claude@opus"), "cli:claude@opus");
         assert_eq!(quota_key("cli:claude@claude-opus-5-5"), "cli:claude@opus");
