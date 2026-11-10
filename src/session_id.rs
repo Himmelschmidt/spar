@@ -38,6 +38,20 @@ pub fn derive_recovery(run_id: &str, slot_id: &str, round: u32) -> String {
     )
 }
 
+/// Name a same-dispatch retry's session (`executor::build_retry_command`). The
+/// attempt that is being retried already created its session vendor-side, so the
+/// retry needs a session no earlier attempt of this round has carried: distinct
+/// from `derive` (no attempt has carried the cold id again since) and from
+/// `derive_recovery` (the artifact-recovery turn owns that id in the same
+/// round) by construction, and distinct across attempts of the round via the
+/// count of retries already issued.
+pub fn derive_retry(run_id: &str, slot_id: &str, round: u32, attempt: u32) -> String {
+    v5(
+        &SESSION_NAMESPACE,
+        &format!("spar:{run_id}:{slot_id}:{round}:retry:{attempt}"),
+    )
+}
+
 /// RFC 4122 section 4.3 v5 UUID, hyphenated lowercase. SHA-1 is embedded rather
 /// than a new dependency: it is only a name hash here, and the two test vectors
 /// below pin it byte for byte.
@@ -206,5 +220,23 @@ mod tests {
         let rec = derive_recovery("8506ddde", "impl", 1);
         assert_ne!(base, rec);
         assert!(is_uuid_shape(&rec), "not a v5 UUID: {rec}");
+    }
+
+    #[test]
+    fn retry_ids_are_fresh_per_attempt_and_collide_with_nothing() {
+        let base = derive("8506ddde", "impl", 1);
+        let rec = derive_recovery("8506ddde", "impl", 1);
+        let first = derive_retry("8506ddde", "impl", 1, 0);
+        let second = derive_retry("8506ddde", "impl", 1, 1);
+        assert_ne!(first, base);
+        assert_ne!(first, rec);
+        assert_ne!(first, second);
+        assert_ne!(second, base);
+        assert_ne!(second, rec);
+        assert_eq!(first, derive_retry("8506ddde", "impl", 1, 0));
+        assert_ne!(first, derive_retry("8506ddde", "impl", 2, 0));
+        for id in [first, second] {
+            assert!(is_uuid_shape(&id), "not a v5 UUID: {id}");
+        }
     }
 }

@@ -611,6 +611,37 @@ fn build_dispatch_command(
     (adapter.build_headless(bin, opts), false)
 }
 
+/// Build the command for a same-dispatch retry: the transient retry inside
+/// `dispatch_with_resume_recovery` and the credential-refresh retry below it.
+/// A retry that resolves to a resume keeps the captured session, so the work
+/// the failed attempt did stays in context. A retry that stays cold must never
+/// reuse the session id the attempt it follows carried: that attempt already
+/// created the session vendor-side, and the vendor refuses the id as already
+/// in use (#241). `attempt` counts the retries this dispatch already issued,
+/// so every attempt of the round carries a distinct id.
+#[allow(clippy::too_many_arguments)]
+fn build_retry_command(
+    adapter: &dyn providers::ProviderAdapter,
+    bin: &Path,
+    opts: &mut SpawnOpts,
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+    session_provider: &str,
+    round: u32,
+    attempt: u32,
+    prior_session_id: Option<&str>,
+) -> (std::process::Command, bool) {
+    let (cmd, used_resume) = build_dispatch_command(adapter, bin, opts, prior_session_id);
+    if used_resume || !adapter.capabilities().assigns_session_id {
+        return (cmd, used_resume);
+    }
+    let id = session_id::derive_retry(run_id, slot_id, round, attempt);
+    opts.session_id = Some(id.clone());
+    let _ = markers::write_session_id(paths, run_id, slot_id, session_provider, &id);
+    (adapter.build_headless(bin, opts), false)
+}
+
 /// True when a resume dispatch exited without ever establishing a session (no
 /// `thread.started` captured). Necessary but not sufficient evidence that the vendor's
 /// rollout is gone (pruned, a different `CODEX_HOME`, a moved box) — plenty of other
@@ -895,11 +926,23 @@ fn dispatch_with_resume_recovery(
         );
         sleep(wait);
         let prior = markers::read_session_id(paths, run_id, slot_id, session_provider);
-        // D2 is enforced inside `build_dispatch_command`: a retry that resolves
-        // to a resume drops the cold dispatch's assigned id there, so muse can
-        // never emit `--session-id` twice.
-        let (cmd, retry_used_resume) =
-            build_dispatch_command(adapter, bin, &mut *opts, prior.as_deref());
+        // D2 is enforced inside `build_dispatch_command` (via
+        // `build_retry_command`): a retry that resolves to a resume drops the
+        // cold dispatch's assigned id there, so muse can never emit
+        // `--session-id` twice; a retry that stays cold takes a fresh
+        // `derive_retry` id instead of reusing the refused one.
+        let (cmd, retry_used_resume) = build_retry_command(
+            adapter,
+            bin,
+            &mut *opts,
+            paths,
+            run_id,
+            slot_id,
+            session_provider,
+            round,
+            retries as u32,
+            prior.as_deref(),
+        );
         let (program, args) = providers::command_to_parts(&cmd);
         let (program, args) = sandbox::maybe_wrap(isolation, &cwd, &program, &args);
         let req = SpawnRequest {
@@ -984,7 +1027,22 @@ fn dispatch_with_resume_recovery(
         );
         sleep(wait);
         let prior = markers::read_session_id(paths, run_id, slot_id, session_provider);
-        let (cmd, _) = build_dispatch_command(adapter, bin, &mut *opts, prior.as_deref());
+        // Same rule as the transient retry above: a resume keeps the captured
+        // session, a cold retry takes a fresh `derive_retry` id (#241). `retries`
+        // counts the transient retries already issued, so the auth retry's id
+        // is distinct from every attempt before it.
+        let (cmd, _) = build_retry_command(
+            adapter,
+            bin,
+            &mut *opts,
+            paths,
+            run_id,
+            slot_id,
+            session_provider,
+            round,
+            retries as u32,
+            prior.as_deref(),
+        );
         let (program, args) = providers::command_to_parts(&cmd);
         let (program, args) = sandbox::maybe_wrap(isolation, &cwd, &program, &args);
         let req = SpawnRequest {
@@ -5276,6 +5334,44 @@ mod tests {
         }
     }
 
+    /// An adapter that names its own sessions (claude/grok) but cannot resume
+    /// them: every dispatch incl. retries builds cold.
+    struct AssigningColdAdapter {
+        script: String,
+        transient_marker: Option<String>,
+    }
+
+    impl providers::ProviderAdapter for AssigningColdAdapter {
+        fn name(&self) -> &'static str {
+            "assigning-cold"
+        }
+        fn binary_names(&self) -> &[&'static str] {
+            &["sh"]
+        }
+        fn capabilities(&self) -> providers::Capabilities {
+            providers::Capabilities {
+                assigns_session_id: true,
+                ..providers::Capabilities::default()
+            }
+        }
+        fn permission_args(&self, _policy: TrustPolicy) -> Vec<String> {
+            Vec::new()
+        }
+        fn build_headless(&self, _bin: &Path, _opts: &SpawnOpts) -> std::process::Command {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg(&self.script);
+            cmd
+        }
+        fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> std::process::Command {
+            self.build_headless(bin, opts)
+        }
+        fn dispatch_failure_is_transient(&self, log_text: &str) -> bool {
+            self.transient_marker
+                .as_deref()
+                .is_some_and(|m| log_text.contains(m))
+        }
+    }
+
     fn refused_result() -> process::SpawnResult {
         process::SpawnResult {
             exit_code: Some(1),
@@ -5473,6 +5569,125 @@ mod tests {
             err.contains("provider usage error") && err.contains("remediation"),
             "usage-error shape with remediation: {err}"
         );
+    }
+
+    /// #241: the credential-refresh retry on an adapter that names its own
+    /// sessions but cannot resume them (claude/grok) must not reuse the first
+    /// attempt's id: the vendor already created that session and refuses the
+    /// id as already in use. The retry takes a fresh `derive_retry` id instead.
+    #[test]
+    fn auth_retry_on_an_assigning_adapter_without_resume_uses_a_fresh_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("run1").unwrap();
+        let log_path = tmp.path().join("slot.log");
+        let ctr = tmp.path().join("attempts");
+        let adapter = AssigningColdAdapter {
+            script: format!(
+                r#"n=$(cat "{ctr}" 2>/dev/null || echo 0); echo $((n+1)) > "{ctr}"; if [ "$n" -lt 1 ]; then echo '{CLAUDE_REVOKED}'; exit 1; fi; echo ok; exit 0"#,
+                ctr = ctr.display()
+            ),
+            transient_marker: None,
+        };
+        let cold = session_id::derive("run1", "slotA", 1);
+        markers::write_session_id(&paths, "run1", "slotA", "assigning-cold", &cold).unwrap();
+        let mut opts = dispatch_opts("go");
+        opts.session_id = Some(cold);
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &mut opts,
+            None,
+            crate::config::IsolationMode::None,
+            shell_req(&adapter.script, &log_path),
+            &paths,
+            "run1",
+            "slotA",
+            "assigning-cold",
+            1,
+            &|_pid| {},
+            &|| {},
+            &|d| {
+                waits.borrow_mut().push(d);
+            },
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, Some(0), "the retry has the refreshed token");
+        assert_eq!(
+            *waits.borrow(),
+            vec![Duration::from_secs(AUTH_RETRY_WAIT_SECS)]
+        );
+        let fresh = session_id::derive_retry("run1", "slotA", 1, 0);
+        assert_eq!(
+            opts.session_id.as_deref(),
+            Some(fresh.as_str()),
+            "the retry carries a fresh id, never the refused one"
+        );
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotA", "assigning-cold").as_deref(),
+            Some(fresh.as_str()),
+            "the marker follows the retry's id"
+        );
+    }
+
+    /// #241, second half: the same rule covers the transient retry. An
+    /// assigning adapter without resume support (claude/grok) fails the same
+    /// "already in use" refusal when the retry reuses the cold id, so the
+    /// retry takes a fresh `derive_retry` id; resume-capable adapters still
+    /// resume (see the test below) and are untouched.
+    #[test]
+    fn transient_retry_on_an_assigning_adapter_without_resume_uses_a_fresh_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("run1").unwrap();
+        let log_path = tmp.path().join("slot.log");
+        let ctr = tmp.path().join("attempts");
+        let adapter = AssigningColdAdapter {
+            script: format!(
+                concat!(
+                    r#"n=$(cat "{ctr}" 2>/dev/null || echo 0); echo $((n+1)) > "{ctr}"; "#,
+                    r#"if [ "$n" -lt 1 ]; then "#,
+                    r#"echo '{{"type":"thread.started","thread_id":"sess-9"}}'; "#,
+                    r#"echo '{{"type":"tool_call","name":"edit"}}'; "#,
+                    r#"echo 'TRANSIENT-BOOM' >&2; exit 1; fi; echo ok; exit 0"#,
+                ),
+                ctr = ctr.display()
+            ),
+            transient_marker: Some("TRANSIENT-BOOM".into()),
+        };
+        let cold = session_id::derive("run1", "slotT", 1);
+        markers::write_session_id(&paths, "run1", "slotT", "assigning-cold", &cold).unwrap();
+        let mut opts = dispatch_opts("go");
+        opts.session_id = Some(cold);
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_with_resume_recovery(
+            &adapter,
+            Path::new("/bin/sh"),
+            &mut opts,
+            None,
+            crate::config::IsolationMode::None,
+            shell_req(&adapter.script, &log_path),
+            &paths,
+            "run1",
+            "slotT",
+            "assigning-cold",
+            1,
+            &|_pid| {},
+            &|| {},
+            &|d| {
+                waits.borrow_mut().push(d);
+            },
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, Some(0), "the retry runs past the transient");
+        let fresh = session_id::derive_retry("run1", "slotT", 1, 0);
+        assert_eq!(
+            opts.session_id.as_deref(),
+            Some(fresh.as_str()),
+            "the retry carries a fresh id, never the refused one"
+        );
+        assert!(!waits.borrow().is_empty());
     }
 
     /// The transient-retry double-flag regression: a retry that resolves to a

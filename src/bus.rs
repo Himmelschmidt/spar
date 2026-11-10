@@ -50,18 +50,6 @@ pub fn agent_ref(run: Option<&str>, slot: &str) -> String {
     }
 }
 
-/// Resolve a directed address (`to`, or a `from` for self-exclusion) to the unique
-/// inbox/presence id it targets. Reserved sinks and already-qualified (`run:slot`) ids
-/// pass through untouched; a short slot id is qualified with the message's `run`.
-/// Idempotent, so it is safe to hand an id that may already be qualified (e.g. a
-/// `SPAR_AGENT_ID` a slot self-drains with, or a composer-resolved mention).
-/// Resolve an address to a unique bus id. A reserved sink or an already-qualified id
-/// (`run:slot`, containing `:`) passes through; a short id is qualified with `run`.
-///
-/// Invariant for callers: a **short** (colon-less) `to`/holder is qualified with the
-/// message's `run`. To address an agent in a *different* scope — e.g. a run slot DMing a
-/// bare agent — pass that agent's already-unique id (bare ids are colon-less, so send it
-/// with `run = None`) or its fully-qualified `run:slot`. `send_mention` does exactly this.
 /// One spelling for the human seat: `human` (the CLI `--from` default) and
 /// `@human` (prompts, docs, the notifier) are one role. `send` canonicalises,
 /// so everything built from here on sees `@human`; `resolve_addr`
@@ -75,6 +63,18 @@ pub(crate) fn canonical_addr(id: &str) -> &str {
     }
 }
 
+/// Resolve a directed address (`to`, or a `from` for self-exclusion) to the unique
+/// inbox/presence id it targets. Reserved sinks and already-qualified (`run:slot`) ids
+/// pass through untouched; a short slot id is qualified with the message's `run`.
+/// Idempotent, so it is safe to hand an id that may already be qualified (e.g. a
+/// `SPAR_AGENT_ID` a slot self-drains with, or a composer-resolved mention).
+/// Resolve an address to a unique bus id. A reserved sink or an already-qualified id
+/// (`run:slot`, containing `:`) passes through; a short id is qualified with `run`.
+///
+/// Invariant for callers: a **short** (colon-less) `to`/holder is qualified with the
+/// message's `run`. To address an agent in a *different* scope — e.g. a run slot DMing a
+/// bare agent — pass that agent's already-unique id (bare ids are colon-less, so send it
+/// with `run = None`) or its fully-qualified `run:slot`. `send_mention` does exactly this.
 pub fn resolve_addr(run: Option<&str>, id: &str) -> String {
     let id = canonical_addr(id);
     if is_reserved_sink(id) || id.contains(':') {
@@ -1691,8 +1691,8 @@ struct RenderProbe {
 /// What one poll-file render needs from the logs: the message ids each listed
 /// slot acked (a slot that acked is done with it) and the ids a later logged
 /// message supersedes (sharing `persisted_for`'s derivation). One streaming
-/// pass per file: the run's event mirror (`Some(run)`) for acks — slot acks
-/// carry the run tag — and the workspace log for supersedes, which are
+/// pass per file: the run's event mirror (`Some(run)`) for acks (slot acks
+/// carry the run tag) and the workspace log for supersedes, which are
 /// workspace-wide (a `--supersedes` without `--run` is stored untagged yet
 /// still withdraws). `None` reads the workspace log once for both.
 pub(crate) struct RenderScan {

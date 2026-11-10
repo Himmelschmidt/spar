@@ -1483,6 +1483,8 @@ fn human_spelling_supersede_and_shared_inbox() {
         dir,
         &run_id,
         &[
+            "--from",
+            "human",
             "--to",
             &agent,
             "--supersedes",
@@ -1492,6 +1494,10 @@ fn human_spelling_supersede_and_shared_inbox() {
         ],
     );
     let new_id = new["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        new["from"], "@human",
+        "a bare human --from is stored canonical"
+    );
 
     let poll = poll_body(dir, &run_id, &agent);
     assert!(
