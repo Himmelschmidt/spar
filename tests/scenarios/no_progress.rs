@@ -35,6 +35,10 @@ fn git(dir: &Path, args: &[&str]) {
 /// A clean git repo: `spar.toml` committed, so a dry-run implementer that writes
 /// nothing really leaves HEAD and the tree exactly as the review judged them.
 fn project_with_clean_tree(dir: &Path, max: u32) {
+    project_with_clean_tree_budget(dir, max, 800);
+}
+
+fn project_with_clean_tree_budget(dir: &Path, max: u32, chars: usize) {
     for args in [
         vec!["init"],
         vec!["config", "user.email", "test@example.com"],
@@ -45,7 +49,7 @@ fn project_with_clean_tree(dir: &Path, max: u32) {
     std::fs::write(dir.join("README.md"), "test\n").unwrap();
     std::fs::write(
         dir.join("spar.toml"),
-        format!("[rounds]\nmax = {max}\ncarry_forward_chars = 800\n"),
+        format!("[rounds]\nmax = {max}\ncarry_forward_chars = {chars}\n"),
     )
     .unwrap();
     git(dir, &["add", "."]);
@@ -190,6 +194,49 @@ fn two_empty_rounds_park_at_the_human_gate() {
     assert!(
         escalation.contains("## No-progress warning"),
         "the escalation carries the warning for the human:\n{escalation}"
+    );
+}
+
+/// #236, and not the warning: the carry-forward section itself names the round
+/// that wrote each blocking review, the commit it judged, and its open
+/// findings, so a round that never stalls still learns what blocked the ship.
+/// A generous budget keeps clamping out of what this asserts.
+#[test]
+fn the_carry_forward_section_names_round_commit_and_findings() {
+    let tmp = tempdir().unwrap();
+    project_with_clean_tree_budget(tmp.path(), 8, 4000);
+    let run_id = planned_run(tmp.path());
+
+    implement_noop(tmp.path(), &run_id, "all", &[]).code(2);
+
+    let slot = implementer_slot(tmp.path(), &run_id);
+    let prompt =
+        std::fs::read_to_string(run_dir(tmp.path(), &run_id).join(format!("prompt-{slot}.md")))
+            .unwrap();
+    let carry = prompt
+        .split_once("## Carry-forward")
+        .map(|(_, rest)| rest)
+        .expect("a carry-forward section in the re-dispatched prompt");
+    assert!(
+        carry.contains("What blocked the ship last round"),
+        "the verdicts render as carry-forward, not only as warning:\n{carry}"
+    );
+    assert!(
+        carry.contains("(round 2, Reviewed-Commit"),
+        "each blocking review names the round that wrote it and the commit it judged:\n{carry}"
+    );
+    assert!(
+        carry.contains("requested changes"),
+        "the section says what the reviews did:\n{carry}"
+    );
+    assert!(
+        carry.contains("dry-run forced finding"),
+        "the open findings ride along, severity and line:\n{carry}"
+    );
+    assert_eq!(
+        carry.matches("current verdict").count(),
+        1,
+        "the verdict sentence renders once per section:\n{carry}"
     );
 }
 

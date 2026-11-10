@@ -803,6 +803,11 @@ fn run_from_approved(
     // instead of shipping.
     if from_round_gate {
         state.error = None;
+        // A stale stall count must not survive the gate: a lift grants fresh
+        // rounds, so the next stall warns again instead of parking on a count
+        // from before the lift. Clamped to one, not zero, so a re-entry into a
+        // still-unchanged tree parks again at once instead of buying a review.
+        state.no_progress_rounds = state.no_progress_rounds.min(1);
     }
     let round = if reuse_round {
         state.round
@@ -3073,10 +3078,11 @@ pub fn execute_loop(
                 }
                 if res.blocks(cfg.review.block_on) {
                     any_request_changes = true;
-                    blockers.push(format!(
-                        "review `{}` requested changes: {}",
-                        rev.id,
-                        review_path.display()
+                    blockers.push(verdict_blocker(
+                        state,
+                        &rev,
+                        &res,
+                        &acceptance_block_reasons(&criteria, &res, cfg),
                     ));
                 } else if !res.approves() {
                     let _ = crate::events::append(
@@ -3096,9 +3102,14 @@ pub fn execute_loop(
                     let reasons = acceptance_block_reasons(&criteria, &res, cfg);
                     // Into the next round's prompt, not only onto the bus: without this
                     // the fix round's implementer prompt is byte-identical to round 1's
-                    // and never learns which criterion it failed.
-                    for r in &reasons {
-                        blockers.push(format!("acceptance (review `{}`): {r}", rev.id));
+                    // and never learns which criterion it failed. A review that already
+                    // carries these lines in its own verdict bullet does not repeat them
+                    // as separate bullets: one bullet per review keeps a multi-seat panel
+                    // inside the carry-forward budget.
+                    if !res.blocks(cfg.review.block_on) {
+                        for r in &reasons {
+                            blockers.push(format!("acceptance (review `{}`): {r}", rev.id));
+                        }
                     }
                     let _ = crate::bus::broadcast(
                         paths,
@@ -5076,11 +5087,13 @@ fn blockers_from_disk(
             scoped,
             ..review_result::parse_review(&text)
         };
+        let reasons = acceptance_block_reasons(criteria, &res, cfg);
         if res.blocks(cfg.review.block_on) {
-            out.push(verdict_blocker(state, rev, &res));
-        }
-        for r in acceptance_block_reasons(criteria, &res, cfg) {
-            out.push(format!("acceptance (review `{}`): {r}", rev.id));
+            out.push(verdict_blocker(state, rev, &res, &reasons));
+        } else {
+            for r in &reasons {
+                out.push(format!("acceptance (review `{}`): {r}", rev.id));
+            }
         }
     }
     out
@@ -5112,37 +5125,56 @@ fn take_carry_forward(paths: &SparPaths, run_id: &str, slot_id: &str) -> Option<
 }
 
 /// One blocking review, described the way #236 requires the next implementer to see
-/// it: the round that wrote it and the commit it judged, a plain statement that it
-/// is the current verdict on the implementer's HEAD rather than a stale note, and
-/// the open findings as severity plus one line each, bounded in size.
-fn verdict_blocker(state: &RunState, rev: &SlotState, res: &ReviewResult) -> String {
+/// it: that it requested changes, the round that wrote it and the commit it
+/// judged, then the open findings as severity plus one line each, followed by
+/// that review's failing criteria. One bullet per review: a panel that repeats
+/// the same criterion failure in every review would otherwise pay the line once
+/// per seat and squeeze the slot's own brief out of the budget. The plain
+/// statement that these reviews are the current verdict lives once in
+/// `carry_forward_section`, not in every bullet, for the same reason.
+fn verdict_blocker(
+    state: &RunState,
+    rev: &SlotState,
+    res: &ReviewResult,
+    acceptance: &[String],
+) -> String {
     let (round, commit) = blocking_review_anchor(state, rev, res);
     let mut s = format!("review `{}` requested changes", rev.id);
     match (round, commit) {
-        (Some(r), Some(c)) => s.push_str(&format!(" (round {r}, Reviewed-Commit {c})")),
-        (None, Some(c)) => s.push_str(&format!(" (Reviewed-Commit {c})")),
+        (Some(r), Some(c)) => {
+            s.push_str(&format!(
+                " (round {r}, Reviewed-Commit {})",
+                short_commit(&c)
+            ));
+        }
+        (None, Some(c)) => s.push_str(&format!(" (Reviewed-Commit {})", short_commit(&c))),
         (Some(r), None) => s.push_str(&format!(" (round {r}, no Reviewed-Commit recorded)")),
         (None, None) => {}
     }
-    s.push_str(
-        ": the current verdict on the implementer's HEAD, \
-         superseding the previous round's own notes.",
-    );
-    let open: Vec<String> = res
+    let mut items: Vec<String> = res
         .findings
         .iter()
         .filter(|f| !f.synthetic)
         .map(open_finding_line)
         .collect();
-    if open.is_empty() {
-        s.push_str(
-            " Open findings: none recorded; \
-             the review blocks on acceptance criteria or untagged items, see below.",
-        );
+    items.extend(
+        acceptance
+            .iter()
+            .map(|a| a.split_whitespace().collect::<Vec<_>>().join(" ")),
+    );
+    if items.is_empty() {
+        s.push_str(": no open findings recorded; see the review artifact.");
     } else {
-        s.push_str(&format!(" Open findings: {}.", list_findings(&open)));
+        s.push_str(&format!(": {}.", list_findings(&items)));
     }
     s
+}
+
+/// Display form of a reviewed commit: twelve hex digits name it the way short
+/// SHAs do, so the anchor stays a fixed small size under tight budgets. The
+/// full value stays in state and on the review artifact.
+fn short_commit(c: &str) -> &str {
+    c.get(..12).unwrap_or(c)
 }
 
 /// At most this many findings print; the count after names the rest.
@@ -5217,9 +5249,7 @@ fn carry_forward_section(
     }
     let mut out = format!(
         "## Carry-forward (you already ran on this worktree — this is round {round})\n\
-         Context from the previous round, not a verdict. It is here so you do not spend \
-         this round re-deriving what the last one already learned. The acceptance gate \
-         never reads it.\n\n"
+         Context from the previous round, not a verdict.\n\n"
     );
     if !persisted.is_empty() {
         // First, so the cap cannot cut an operator ruling; these stand until the sender
@@ -5234,12 +5264,19 @@ fn carry_forward_section(
     }
     if !blockers.is_empty() {
         out.push_str("### What blocked the ship last round\n");
+        // Once per section, not once per bullet: the sentence is the same for every
+        // review below, and repeating it per bullet costs a multi-review panel its
+        // brief under a tight budget.
+        out.push_str(
+            "These reviews are the current verdict on the implementer's HEAD, not \
+             stale notes: they supersede the previous round's own notes.\n",
+        );
         for b in blockers {
             // Clamped per bullet, not just in aggregate. A reviewer that pastes a stack
             // trace as its evidence produces one line longer than the whole budget, and
             // the line-boundary truncation below would drop it whole — rendering an
             // empty heading, which reads as "nothing blocked".
-            out.push_str(&format!("- {}\n", clamp_line(b, max_chars / 4)));
+            out.push_str(&format!("- {}\n", clamp_line(b, max_chars / 5)));
         }
         out.push('\n');
     }
@@ -6177,7 +6214,11 @@ mod carry_forward_tests {
             .map(|(_, rest)| rest.trim().to_string())
             .unwrap_or_default();
         assert!(
-            after_heading.starts_with("- acceptance"),
+            after_heading.starts_with("These reviews are the current verdict"),
+            "the sentence renders once under the heading:\n{out}"
+        );
+        assert!(
+            after_heading.contains("- acceptance"),
             "the heading must still carry its bullet:\n{out}"
         );
         assert!(after_heading.contains("AC-2: fail"), "{out}");
@@ -6257,8 +6298,12 @@ mod carry_forward_tests {
             "{out:?}"
         );
         assert!(
-            out.iter().any(|b| b.contains("requested changes")),
-            "{out:?}"
+            out.iter().any(|b| b.contains("requested changes")
+                && b.contains("(round ")
+                && b.contains("no Reviewed-Commit recorded")
+                && b.contains("AC-1: fail — no guard exists")),
+            "a verdict with no findings still anchors round and commit state, \
+             carrying its failing criterion: {out:?}"
         );
     }
 
@@ -6331,7 +6376,9 @@ mod carry_forward_tests {
 
     /// #236: the carry-forward names the round that wrote the blocking review, the
     /// commit it judged, and its open findings — not just the review's file path —
-    /// and says plainly the review is the current verdict, not a stale note.
+    /// and says plainly the reviews are the current verdict, not stale notes. The
+    /// sentence lives once in the section, the anchor and findings in each bullet,
+    /// so a multi-review panel fits under a tight budget with the brief.
     #[test]
     fn verdict_blocker_names_round_commit_and_findings() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6357,22 +6404,72 @@ mod carry_forward_tests {
         .unwrap();
 
         let out = blockers_from_disk(&state, &paths, &["AC-1".to_string()], &Config::default());
+        assert_eq!(out.len(), 1, "one bullet per review: {out:?}");
         let verdict = out
             .iter()
-            .find(|b| b.contains("requested changes"))
+            .find(|b| b.contains("(round 3, Reviewed-Commit"))
             .expect("a verdict blocker: {out:?}");
+        assert!(verdict.contains("requested changes"), "{verdict}");
         assert!(
-            verdict.contains("(round 3, Reviewed-Commit abcdef1234567)"),
-            "{verdict}"
-        );
-        assert!(verdict.contains("current verdict"), "{verdict}");
-        assert!(
-            verdict.contains("superseding the previous round's own notes"),
+            verdict.contains("(round 3, Reviewed-Commit abcdef123456)"),
             "{verdict}"
         );
         assert!(
             verdict.contains("major — the retry at src/net.rs:40 never stops"),
             "{verdict}"
+        );
+        assert!(
+            verdict.contains("AC-1: fail — no guard exists"),
+            "the review's failing criterion rides in its own bullet: {verdict}"
+        );
+
+        let section = carry_forward_section(4, &[], &out, None, 4000);
+        assert!(
+            section.contains("current verdict on the implementer's HEAD"),
+            "{section}"
+        );
+        assert!(
+            section.contains("supersede the previous round's own notes"),
+            "{section}"
+        );
+        assert_eq!(
+            section.matches("current verdict").count(),
+            1,
+            "the sentence renders once per section, not per bullet:\n{section}"
+        );
+    }
+
+    /// The in-loop gate feeds the just-parsed review straight into the same
+    /// builder the disk path uses: with no history entry yet, the anchor falls
+    /// back to the slot's own round and the review's own commit.
+    #[test]
+    fn verdict_blocker_falls_back_to_slot_anchor_without_history() {
+        let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, "/nonexistent".into());
+        state.slots.push(crate::executor::init_slot(
+            "rev-1",
+            "cli:claude",
+            SlotRole::Reviewer,
+        ));
+        let res = review_result::parse_review(
+            "## Verdict\nrequest_changes\n\nReviewed-Commit: 1234567890abcdef1234\n\n## Findings\n- severity: major — nothing was changed at src/main.rs:9\n",
+        );
+        let rev = state.slots[0].clone();
+        let out = verdict_blocker(&state, &rev, &res, &["AC-9: fail — seized".to_string()]);
+        assert!(out.contains("requested changes"), "{out}");
+        assert!(
+            out.contains(&format!(
+                "(round {}, Reviewed-Commit 1234567890ab)",
+                rev.round
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("major — nothing was changed at src/main.rs:9"),
+            "{out}"
+        );
+        assert!(
+            out.contains("AC-9: fail — seized"),
+            "the review's failing criterion rides in its own bullet: {out}"
         );
     }
 
@@ -6395,7 +6492,7 @@ mod carry_forward_tests {
         }
         let res = review_result::parse_review(&body);
         let rev = state.slots[0].clone();
-        let out = verdict_blocker(&state, &rev, &res);
+        let out = verdict_blocker(&state, &rev, &res, &[]);
         assert_eq!(out.matches("finding number").count(), 5, "{out}");
         assert!(out.contains("(+2 more)"), "{out}");
         assert!(!out.contains('\n'), "one line per finding: {out:?}");
