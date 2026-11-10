@@ -410,6 +410,7 @@ fn run() -> Result<ExitCode> {
             backup,
             effort,
             fleet,
+            one_pass,
             without,
             suite_command,
             reload_config,
@@ -450,7 +451,9 @@ fn run() -> Result<ExitCode> {
                 // Seat shapers ride along into the dispatch: a bound run amends under
                 // its own lock, after the preconditions below pass. The
                 // preset parses here, so a `--fleet` typo fails at the pre-check
-                // instead of after the dispatch acquired its lock.
+                // instead of after the dispatch acquired its lock. `--one-pass`
+                // implies the small preset; an explicit `--fleet` still wins.
+                let implied_small = one_pass && fleet.is_none();
                 let amend = workflow::implement::BoundAmendInputs {
                     role,
                     backup,
@@ -459,11 +462,14 @@ fn run() -> Result<ExitCode> {
                     fleet: fleet
                         .as_deref()
                         .map(config::FleetPreset::parse)
-                        .transpose()?,
+                        .transpose()?
+                        .or(implied_small.then_some(config::FleetPreset::Small)),
                     suite_command,
                     recapture_env,
+                    one_pass,
                 };
-                let (paths, cfg, preselected_pool) = implement_ctx(
+                let implied_fleet: Option<String> = implied_small.then(|| "small".to_string());
+                let (paths, mut cfg, preselected_pool) = implement_ctx(
                     run_id.as_deref(),
                     &amend.role,
                     &amend.backup,
@@ -474,10 +480,13 @@ fn run() -> Result<ExitCode> {
                     &urgency,
                     dry_run,
                     &amend.suite_command,
-                    fleet.as_deref(),
+                    fleet.as_deref().or(implied_fleet.as_deref()),
                     reload_config,
                     amend.recapture_env,
                 )?;
+                if one_pass {
+                    cfg.one_pass = true;
+                }
                 let opts = CommonOpts {
                     task: task.clone(),
                     providers,
@@ -703,6 +712,7 @@ fn run() -> Result<ExitCode> {
             backup,
             effort,
             fleet,
+            one_pass,
             without,
             key,
             key_scope,
@@ -752,8 +762,21 @@ fn run() -> Result<ExitCode> {
                 );
                 }
                 let (paths, mut cfg) = project_ctx()?;
+                if one_pass && !matches!(workflow, crate::cli::WorkflowKind::Loop) {
+                    anyhow::bail!("--one-pass is only supported for the loop workflow");
+                }
+                // `--one-pass` implies the small preset; an explicit `--fleet`
+                // still wins.
+                let fleet = if one_pass && fleet.is_none() {
+                    Some("small".to_string())
+                } else {
+                    fleet
+                };
                 if let Some(preset) = &fleet {
                     cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
+                }
+                if one_pass {
+                    cfg.one_pass = true;
                 }
                 let preselected_pool = fresh_seat_shapers(
                     &mut cfg, &providers, &select, &urgency, dry_run, &without, &role, &backup,

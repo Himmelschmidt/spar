@@ -74,6 +74,12 @@ pub struct Config {
     /// reviewer=…` panel always outranks this — see `roles_resolve::panel_size`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet_reviewer_override: Option<usize>,
+    /// `--one-pass`: one implementer pass, one review pass, then ship — a passed
+    /// gate ships, and a failed gate ships anyway when no open finding reaches
+    /// `[review] block_on` (O196). Frozen into the run config like the other CLI
+    /// seat shapers, so re-entries and `--reload-config` keep it.
+    #[serde(default)]
+    pub one_pass: bool,
     /// Round-loop economy: the ceiling on re-dispatch and the carry-forward budget.
     #[serde(default)]
     pub rounds: RoundsConfig,
@@ -1324,6 +1330,7 @@ impl Default for Config {
             critic: CriticConfig::default(),
             cli_role_keys: std::collections::BTreeSet::new(),
             fleet_reviewer_override: None,
+            one_pass: false,
             rounds: RoundsConfig::default(),
             checkpoint: CheckpointConfig::default(),
             gates: GatesConfig::default(),
@@ -2159,6 +2166,7 @@ impl Config {
         self.cli_effort_keys
             .extend(frozen.cli_effort_keys.iter().cloned());
         self.fleet_reviewer_override = frozen.fleet_reviewer_override;
+        self.one_pass = frozen.one_pass;
         // The preset's own shutdowns are re-derived rather than recorded, so a file
         // that gained a `[suite].command` since launch keeps its suite on.
         if self.fleet_reviewer_override.is_some() {

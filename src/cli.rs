@@ -205,6 +205,14 @@ pub enum Command {
         /// file disabled). Composes with `--without` and `--role`: explicit flags win.
         #[arg(long, value_name = "PRESET")]
         fleet: Option<String>,
+        /// One pass and ship: imply `--fleet small`, cap the run at one round, and
+        /// ship at the end of it — a passed gate ships, and a failed gate ships
+        /// anyway when no open finding reaches `[review] block_on` (the findings
+        /// ride along as follow-ups). A finding at or above `block_on` parks at
+        /// the existing gate (exit 2). Frozen into the run's config; an explicit
+        /// `--fleet` still wins over the implied preset.
+        #[arg(long = "one-pass")]
+        one_pass: bool,
         /// Drop seats for THIS run only, comma-separated: `critic`, `spec`, `suite`,
         /// plus reviewer seats as `reviewer[N]` (0-based panel ordinal) or an existing
         /// seat id (`review-1-cli-claude`). Dropping a reviewer removes the seat and
@@ -336,6 +344,15 @@ pub enum Command {
         /// file disabled). Composes with `--without` and `--role`: explicit flags win.
         #[arg(long, value_name = "PRESET")]
         fleet: Option<String>,
+        /// One pass and ship, for the `loop` workflow: imply `--fleet small`, cap
+        /// the run at one round, and ship at the end of it — a passed gate ships,
+        /// and a failed gate ships anyway when no open finding reaches `[review]
+        /// block_on` (the findings ride along as follow-ups). A finding at or
+        /// above `block_on` parks at the existing gate (exit 2). Frozen into the
+        /// run's config; an explicit `--fleet` still wins over the implied preset.
+        /// Refused for other workflows.
+        #[arg(long = "one-pass")]
+        one_pass: bool,
         /// Drop seats for THIS run only, comma-separated: `critic`, `spec`, `suite`,
         /// plus reviewer seats as `reviewer[N]` (0-based panel ordinal). Dropping a
         /// reviewer removes the seat and its verdicts stop gating the ship. A bound
