@@ -215,7 +215,7 @@ pub fn resolve_order_rung(
         .map(|p| (p, SeatSource::ProvidersOrder))
 }
 
-fn seated(used: &[String], candidate: &str) -> bool {
+pub(crate) fn seated(used: &[String], candidate: &str) -> bool {
     used.iter().any(|u| {
         crate::provider_ref::ProviderRef::parse(u)
             .map(|r| r.storage_key())
@@ -299,6 +299,7 @@ pub fn build_implement_seats(
     model_for: &dyn Fn(usize) -> Option<String>,
 ) -> anyhow::Result<Vec<FleetSeat>> {
     let mut out = Vec::new();
+    let mut used: Vec<String> = Vec::new();
     let model = model_for(0);
     match crate::backup::resolve_with_backup(
         SlotRole::Implementer,
@@ -314,10 +315,11 @@ pub fn build_implement_seats(
         dry,
         None,
         health,
-        &[],
+        &used,
     ) {
         Some((raw, source)) => {
             let (provider, model) = split_model(&raw, model_for(0));
+            used.push(provider.clone());
             out.push(FleetSeat {
                 seat: "impl".into(),
                 role: SlotRole::Implementer,
@@ -353,11 +355,12 @@ pub fn build_implement_seats(
             dry,
             None,
             health,
-            &[],
+            &used,
         ) else {
             continue;
         };
         let (provider, model) = split_model(&raw, model_for(pool_index));
+        used.push(provider.clone());
         out.push(FleetSeat {
             seat: format!("review-{r}-{}", sanitize_slot(&provider)),
             role: SlotRole::Reviewer,
@@ -520,6 +523,7 @@ pub fn launch_fleet(
             opts.dry_run,
             None,
         )?;
+        let used: Vec<String> = out.iter().map(|s| s.provider.clone()).collect();
         out.extend(crate::workflow::implement::project_tester_seat(
             cfg,
             opts.dry_run,
@@ -528,6 +532,7 @@ pub fn launch_fleet(
             origin,
             None,
             None,
+            &used,
         ));
         for s in &mut out {
             s.projected = projected;

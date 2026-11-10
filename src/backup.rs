@@ -323,10 +323,15 @@ pub fn resolve_with_backup(
         }
     }
     if unhealthy_auto {
-        if role == crate::state::SlotRole::Reviewer {
-            return None;
-        }
-        let (order_prov, order_src) = rr::resolve_order_rung(role, pool_index, cfg, health, used)?;
+        // Reviewers key the rung by their own ordinal, exactly as the launch
+        // step-4 rung does: a sick file seat yields to the next healthy order
+        // entry, and `None` past its end still narrows the panel (Bug A).
+        let rung_idx = if role == crate::state::SlotRole::Reviewer {
+            role_index
+        } else {
+            pool_index
+        };
+        let (order_prov, order_src) = rr::resolve_order_rung(role, rung_idx, cfg, health, used)?;
         return Some((order_prov, order_src));
     }
     Some((prov, src))

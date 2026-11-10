@@ -140,24 +140,27 @@ fn synthesize_from_roles(
             health,
             &out,
         );
-        let (p, _source) = match seat {
-            Some(seat) => seat,
-            None => {
-                let skips = crate::workflow::roles_resolve::health_skips_for_seat(
-                    role,
-                    ridx,
-                    &[],
-                    crate::state::PoolOrigin::Synth,
-                    cfg,
-                    health,
-                );
-                if let Some(err) = crate::backup::readiness_error(&skips) {
-                    return Err(err.context(format!("slot {i} (role '{label}')")));
-                }
-                anyhow::bail!(
-                    "slot {i} (role '{label}'): no usable provider in [roles] or [providers].order"
-                );
+        let Some((p, _source)) = seat else {
+            // A reviewer past the usable entries narrows the panel instead of
+            // failing the launch, exactly as `build_implement_seats` drops it.
+            // Only a missing non-reviewer seat fails readiness here.
+            if role == SlotRole::Reviewer {
+                continue;
             }
+            let skips = crate::workflow::roles_resolve::health_skips_for_seat(
+                role,
+                ridx,
+                &[],
+                crate::state::PoolOrigin::Synth,
+                cfg,
+                health,
+            );
+            if let Some(err) = crate::backup::readiness_error(&skips) {
+                return Err(err.context(format!("slot {i} (role '{label}')")));
+            }
+            anyhow::bail!(
+                "slot {i} (role '{label}'): no usable provider in [roles] or [providers].order"
+            );
         };
         out.push(p);
     }

@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
-use crate::providers;
+use crate::providers::{self, HealthSource};
 use crate::state::{
     FleetSeat, Phase, PoolOrigin, RunState, SeatSource, SlotRole, SlotState, SlotStatus,
     SuiteOutcome,
@@ -951,6 +951,15 @@ fn prepare_implement_slots(
     let health = providers::LiveHealth::for_dry(dry);
     state.providers = providers::pick_providers(req, n, Some(req), dry, state.pool_origin, &health);
     if state.providers.is_empty() {
+        // A pool emptied by failed readiness probes fails naming them (exit 1):
+        // there is nothing paused, so the quota-only exit 4 must not fire.
+        let skips: Vec<(String, String)> = req
+            .iter()
+            .filter_map(|p| health.check(p).probe_message.map(|m| (p.clone(), m)))
+            .collect();
+        if let Some(err) = crate::backup::readiness_error(&skips) {
+            return Err(err);
+        }
         bail!("no usable providers (pass --providers, set a [roles] block, or --select)");
     }
     let pool = state.providers.clone();
@@ -1043,6 +1052,7 @@ fn ensure_suite_slot(
     if state.slots.iter().any(|s| s.role == SlotRole::Tester) {
         return Ok(());
     }
+    let used: Vec<String> = state.slots.iter().map(|s| s.provider.clone()).collect();
     let (suite_prov, suite_model, source) = resolve_suite_provider(
         cfg,
         dry,
@@ -1051,6 +1061,7 @@ fn ensure_suite_slot(
         state.pool_origin,
         Some(paths),
         Some(&state.id),
+        &used,
     )?;
     let mut slot = executor::init_slot_model(
         format!("suite-{}", sanitize_slot(&suite_prov)),
@@ -1076,6 +1087,7 @@ fn ensure_suite_slot(
 /// model or mutate the artifact as a side effect of showing a gate, so a run with no
 /// prior tester choice still reports the same `SuitePreferences` guess dispatch would
 /// fall back to, honestly labelled as not yet decided.
+#[allow(clippy::too_many_arguments)]
 pub fn project_tester_seat(
     cfg: &Config,
     dry: bool,
@@ -1084,6 +1096,7 @@ pub fn project_tester_seat(
     pool_origin: PoolOrigin,
     paths: Option<&SparPaths>,
     run_id: Option<&str>,
+    used: &[String],
 ) -> Option<FleetSeat> {
     if cfg.suite.is_builtin() || !cfg.suite.enabled {
         return None;
@@ -1107,7 +1120,7 @@ pub fn project_tester_seat(
         }
     }
     let (provider, model, source) =
-        resolve_suite_provider(cfg, dry, health, pool, pool_origin, None, None).ok()?;
+        resolve_suite_provider(cfg, dry, health, pool, pool_origin, None, None, used).ok()?;
     Some(FleetSeat {
         seat: format!("suite-{}", sanitize_slot(&provider)),
         role: SlotRole::Tester,
@@ -1119,9 +1132,10 @@ pub fn project_tester_seat(
 }
 
 /// Cheap suite-channel provider: config override, model-select (tester/fast), prefs, fleet.
-/// Returns the provider, an optional explicit model, and the honest source of the pick —
+/// Returns the provider, an optional explicit model, and the honest source of the pick:
 /// the fleet fallback is `state.providers`, so its source follows `pool_origin` rather
 /// than an unconditional `ProvidersOrder`.
+#[allow(clippy::too_many_arguments)]
 fn resolve_suite_provider(
     cfg: &Config,
     dry: bool,
@@ -1130,6 +1144,7 @@ fn resolve_suite_provider(
     pool_origin: PoolOrigin,
     paths: Option<&SparPaths>,
     run_id: Option<&str>,
+    used: &[String],
 ) -> Result<(String, Option<String>, SeatSource)> {
     if let Some(p) = &cfg.roles.tester {
         crate::provider_ref::ProviderRef::parse(p)
@@ -1183,19 +1198,28 @@ fn resolve_suite_provider(
     if dry {
         return Ok((PREFS[0].into(), None, SeatSource::SuitePreferences));
     }
-    if let Some(p) = PREFS
+    // Parallel singletons spread: prefer a usable entry no seated slot holds,
+    // collapsing onto the first usable one only when all are seated.
+    let usable_prefs: Vec<String> = PREFS
         .iter()
-        .find(|p| health.check(p).usable)
+        .filter(|p| health.check(p).usable)
         .map(|s| (*s).to_string())
+        .collect();
+    if let Some(p) = usable_prefs
+        .iter()
+        .find(|p| !crate::workflow::roles_resolve::seated(used, p))
+        .or_else(|| usable_prefs.first())
     {
-        return Ok((p, None, SeatSource::SuitePreferences));
+        return Ok((p.clone(), None, SeatSource::SuitePreferences));
     }
     // A `--providers` pool is pinned member-by-member; every other pool stays a
-    // constrained auto-pick, like the spec resolver's explicit pool.
+    // constrained auto-pick, like the spec resolver's explicit pool. Only the
+    // auto-pick spreads across unseated providers; a pinned pool keeps its
+    // positional first pick exactly as before.
     let pool_pinned = matches!(pool_origin, PoolOrigin::CliProviders);
-    if let Some(p) = fleet
+    let usable_fleet: Vec<String> = fleet
         .iter()
-        .find(|p| {
+        .filter(|p| {
             if pool_pinned {
                 providers::is_provider_present(p, false)
             } else {
@@ -1203,8 +1227,13 @@ fn resolve_suite_provider(
             }
         })
         .cloned()
+        .collect();
+    if let Some(p) = usable_fleet
+        .iter()
+        .find(|p| pool_pinned || !crate::workflow::roles_resolve::seated(used, p))
+        .or_else(|| usable_fleet.first())
     {
-        return Ok((p, None, pool_origin.as_seat_source()));
+        return Ok((p.clone(), None, pool_origin.as_seat_source()));
     }
     let probes = PREFS
         .iter()
@@ -3118,10 +3147,26 @@ pub fn execute_loop(
                 }
             }
         }
-        // Every reviewer stood down: the panel has no usable seat, so the run
-        // parks exactly as a lone reviewer with no backup always has.
+        // Every reviewer stood down: the panel has no usable seat. A panel
+        // stood down for readiness (no healthy provider left for any
+        // reviewer) fails naming the failed probes; a quota stand-down parks
+        // the run exactly as a lone reviewer with no backup always has.
         if !reviewers.is_empty() && stood_down.len() == reviewers.len() {
-            return fail(state, paths, anyhow::anyhow!(stood_down.join("; ")), true);
+            let health = crate::providers::LiveHealth::for_dry(state.dry_run);
+            let readiness = reviewers.iter().all(|rev| {
+                state
+                    .slots
+                    .iter()
+                    .find(|s| s.id == rev.id)
+                    .map(|s| !health.check(&s.provider).usable)
+                    .unwrap_or(true)
+            });
+            return fail(
+                state,
+                paths,
+                anyhow::anyhow!(stood_down.join("; ")),
+                !readiness,
+            );
         }
         // A stood-down seat's recorded veto still blocks when it rejects the
         // head about to ship: judged, unanswered, and unable to re-judge. The
@@ -3607,34 +3652,32 @@ fn recheck_seat_health(
         return Ok(SeatCheck::Ready(slot.id.clone()));
     }
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-    let fresh = match role {
-        SlotRole::Implementer => crate::backup::resolve_with_backup(
-            role,
-            pool_idx,
-            role_idx,
-            &state.providers,
-            state.pool_origin,
-            cfg,
-            slot.model.as_deref(),
-            &store,
-            None,
-            paths,
-            state.dry_run,
-            state.codex_profile.as_deref(),
-            health,
-            &[],
-        ),
-        _ => crate::workflow::roles_resolve::resolve_seat(
-            role,
-            pool_idx,
-            role_idx,
-            &state.providers,
-            state.pool_origin,
-            cfg,
-            health,
-            &[],
-        ),
-    };
+    // Sibling seats hold their providers: a re-seated singleton must not land
+    // on one a sibling still holds while a distinct usable one stands idle.
+    let used: Vec<String> = state
+        .slots
+        .iter()
+        .filter(|s| s.id != slot.id)
+        .map(|s| s.provider.clone())
+        .collect();
+    // Every role re-resolves through the same point as launch: a file seat on
+    // a provider that went unhealthy yields to its backup, then the order rung.
+    let fresh = crate::backup::resolve_with_backup(
+        role,
+        pool_idx,
+        role_idx,
+        &state.providers,
+        state.pool_origin,
+        cfg,
+        slot.model.as_deref(),
+        &store,
+        None,
+        paths,
+        state.dry_run,
+        state.codex_profile.as_deref(),
+        health,
+        &used,
+    );
     let Some((fresh_raw, fresh_src)) = fresh else {
         let skips = crate::workflow::roles_resolve::health_skips_for_seat(
             role,
@@ -3644,6 +3687,17 @@ fn recheck_seat_health(
             cfg,
             health,
         );
+        // A reviewer with nothing healthy left stands down and the panel keeps
+        // running, mirroring the launch narrowing. The probe detail travels
+        // with the message so a panel with no usable seat left fails readiness
+        // naming the failed probes, never a quota park.
+        if role == SlotRole::Reviewer {
+            let detail = match crate::backup::readiness_error(&skips) {
+                Some(err) => format!("{err:#}"),
+                None => format!("no provider resolved for `{}`", slot.id),
+            };
+            return Ok(SeatCheck::Park(detail));
+        }
         if let Some(err) = crate::backup::readiness_error(&skips) {
             return Err(err);
         }
@@ -4286,6 +4340,80 @@ mod recheck_seat_tests {
         let got = recheck_seat_health(&mut st, &paths, &cfg, &slot, &health).unwrap();
         assert!(matches!(got, SeatCheck::Ready(id) if id == "impl"));
         assert_eq!(st.slots[0].provider, "cli:codex");
+    }
+
+    /// A continued reviewer file seat on a provider that went unhealthy yields
+    /// to its backup, exactly as the launch resolution would seat it.
+    #[test]
+    fn a_continued_run_moves_a_sick_auto_reviewer_onto_its_backup() {
+        use crate::providers::StubHealth;
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with("review-0-cli-codex", "cli:codex", SlotRole::Reviewer);
+        st.providers = vec!["cli:codex".into()];
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:codex".into()];
+        cfg.providers.order = vec!["cli:codex".into()];
+        cfg.backups.reviewer = vec!["cli:claude".into()];
+        let health = StubHealth::refuse("cli:codex", "probe `codex login status` failed");
+        let slot = st.slots[0].clone();
+        let got = recheck_seat_health(&mut st, &paths, &cfg, &slot, &health).unwrap();
+        assert!(matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-claude"));
+        let slot = st
+            .slots
+            .iter()
+            .find(|s| s.id == "review-0-cli-claude")
+            .unwrap();
+        assert_eq!(slot.provider, "cli:claude");
+        assert_eq!(slot.source, Some(SeatSource::Backup));
+    }
+
+    /// A continued tester file seat on a provider that went unhealthy also
+    /// yields to its backup instead of dispatching the sick provider.
+    #[test]
+    fn a_continued_run_moves_a_sick_auto_tester_onto_its_backup() {
+        use crate::providers::StubHealth;
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with("test", "cli:codex", SlotRole::Tester);
+        st.providers = vec!["cli:codex".into()];
+        let mut cfg = Config::default();
+        cfg.roles.tester = Some("cli:codex".into());
+        cfg.providers.order = vec!["cli:codex".into()];
+        cfg.backups.tester = Some("cli:claude".into());
+        let health = StubHealth::refuse("cli:codex", "probe `codex login status` failed");
+        let slot = st.slots[0].clone();
+        let got = recheck_seat_health(&mut st, &paths, &cfg, &slot, &health).unwrap();
+        assert!(matches!(got, SeatCheck::Ready(id) if id == "suite-cli-claude"));
+        let slot = st
+            .slots
+            .iter()
+            .find(|s| s.id == "suite-cli-claude")
+            .unwrap();
+        assert_eq!(slot.provider, "cli:claude");
+        assert_eq!(slot.source, Some(SeatSource::Backup));
+    }
+
+    /// A continued reviewer with nothing healthy left stands down and the panel
+    /// keeps running, mirroring the launch narrowing: never a readiness error
+    /// for a reviewer, and never a quota park.
+    #[test]
+    fn a_continued_reviewer_with_nothing_healthy_stands_down() {
+        use crate::providers::StubHealth;
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with("review-0-cli-codex", "cli:codex", SlotRole::Reviewer);
+        st.providers = vec!["cli:codex".into()];
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:codex".into()];
+        cfg.providers.order = vec!["cli:codex".into()];
+        let health = StubHealth::refuse("cli:codex", "probe `codex login status` failed");
+        let slot = st.slots[0].clone();
+        let got = recheck_seat_health(&mut st, &paths, &cfg, &slot, &health).unwrap();
+        assert!(
+            matches!(got, SeatCheck::Park(_)),
+            "a reviewer with no healthy seat stands down"
+        );
     }
 
     #[test]

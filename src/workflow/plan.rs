@@ -278,7 +278,7 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> anyhow::Result<Vec<PlanSea
         }
     };
     let mut out: Vec<PlanSeat> = Vec::with_capacity(specs.len());
-    let mut skips: Vec<(String, String)> = Vec::new();
+    let mut planner_skips: Vec<(String, String)> = Vec::new();
     let mut planner_failed = false;
     for (idx, (role, prefix, template)) in specs.into_iter().enumerate() {
         let selected = art.as_ref().and_then(|a| {
@@ -318,15 +318,15 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> anyhow::Result<Vec<PlanSea
         }) else {
             if idx == 0 {
                 planner_failed = true;
+                planner_skips.extend(crate::workflow::roles_resolve::health_skips_for_seat(
+                    role,
+                    idx,
+                    &state.providers,
+                    state.pool_origin,
+                    cfg,
+                    &health,
+                ));
             }
-            skips.extend(crate::workflow::roles_resolve::health_skips_for_seat(
-                role,
-                idx,
-                &state.providers,
-                state.pool_origin,
-                cfg,
-                &health,
-            ));
             continue;
         };
         let model = (!source.is_backup()).then_some(selected).flatten();
@@ -342,10 +342,13 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> anyhow::Result<Vec<PlanSea
     }
     // The planner is the run's first seat: a missing planner fails even when a
     // critic resolved, so a gate rejection never reads as a planner-less plan.
-    if planner_failed || out.is_empty() {
-        if let Some(err) = crate::backup::readiness_error(&skips) {
+    // The bail is unconditional: a planner that resolved `None` for a
+    // non-health reason leaves no skips, and must still not emit a plan.
+    if planner_failed {
+        if let Some(err) = crate::backup::readiness_error(&planner_skips) {
             return Err(err);
         }
+        anyhow::bail!("no provider resolved for planner");
     }
     Ok(out)
 }
@@ -591,6 +594,11 @@ pub fn execute_plan(
         Some(&state.id),
     )
     .unwrap_or_default();
+    let used: Vec<String> = state
+        .projected_fleet
+        .iter()
+        .map(|s| s.provider.clone())
+        .collect();
     if let Some(seat) = crate::workflow::implement::project_tester_seat(
         cfg,
         state.dry_run,
@@ -599,6 +607,7 @@ pub fn execute_plan(
         state.pool_origin,
         Some(paths),
         Some(state.id.as_str()),
+        &used,
     ) {
         state.projected_fleet.push(seat);
     }
