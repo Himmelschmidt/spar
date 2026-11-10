@@ -232,10 +232,10 @@ pub struct SpawnOpts {
     /// (`SparPaths::sessions_dir`), for an adapter whose CLI otherwise keeps sessions
     /// in the user's home. Stable across rounds, so a resume finds what the cold
     /// dispatch wrote. `None` outside a run.
+    pub session_dir: Option<PathBuf>,
     /// Recorded `SPAR_CODEX_PROFILE` from run state (`RunState::codex_profile`).
     /// `None` means no recorded dispatch, so the adapter reads this process's
     /// ambient value. Only codex reads this field.
-    pub session_dir: Option<PathBuf>,
     pub codex_profile: Option<String>,
 }
 
