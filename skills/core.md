@@ -1255,6 +1255,7 @@ run's messages, and a bare agent and a run slot can directed-message each other 
 ```bash
 spar bus send -m "hello" [--from <agent>] [--to broadcast|agent|impl] [--run <id>]
               [--requires-ack] [--persist] [--supersedes <msg_id>] [--expires-after-round [N]]
+              [--urgent]
 spar bus log [--run <id>] [--json]                 # each message with per-recipient receipts
 spar bus presence [--run <id>]
 spar bus inbox <agent> [--claim] [--run <id>] [--json]
@@ -1294,6 +1295,13 @@ spar bus ack <msg_id> [--from <agent>] [--run <id>]  # stop a requires_ack redel
   the run passes round `N` the message is never delivered. A claim withdraws it, `inbox`
   hides it, the poll file drops it on its next render, redelivery stops, and a persisted
   one leaves the carry-forward.
+- `--urgent` (with `--run`, to a single slot) interrupts a mid-turn slot: the orchestrator
+  stops the turn's process group and resumes the same session with this message first, ahead
+  of the normal continuation. The interrupt is not a failure, timeout, ceiling kill or quota
+  event: it costs no rotation and no round, and the slot keeps its worktree. An idle slot, an
+  unknown slot, a broadcast, or a provider without resume (agy) delivers normally instead and
+  the send says so. Needs a resumable provider: resume exists for codex, pi, muse, claude
+  (`-r`) and grok (`--resume`).
 
 **Receipts (O134).** `.spar/bus/receipts.jsonl` gets a line per recipient as a message
 moves: `queued` (written to the inbox), `delivered` (claimed into the agent's channel or

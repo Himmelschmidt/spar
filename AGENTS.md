@@ -75,8 +75,10 @@ ignores user-config `[quota] shared_path` and `[registry] remotes`.
 
 Don't extend `mailbox.rs`. `bus.rs` replaced it.
 
-You cannot interrupt a working CLI agent. Deliver only at turn
-boundaries, when it's idle.
+Only an urgent bus send (`spar bus send --urgent --run <id> --to <slot>`) interrupts a
+working CLI agent mid-turn: the orchestrator stops the turn and resumes the same
+session with the message first. Everything else delivers only at turn boundaries,
+when the slot is idle.
 
 ## Docs
 
