@@ -1301,7 +1301,7 @@ A landing the model already saw, any `Read` receipt, from a prompt inclusion,
 a Stop-hook injection, an inbox claim or an ack, stays `delivered` under a
 later withdrawal. It is derived at read time from the inbox directories, the receipts and the
 ack events, never stored, so there is no second copy of the state to drift. A slot's
-poll file (agy, pi) renders its inbox, not an append-only log (O158–O163, O165–O166): every filing,
+poll file (agy, pi) renders its inbox, not an append-only log (O158–O166): every filing,
 withdrawal and round start rewrites it from the pending messages, so a withdrawn or
 expired message disappears from the file. A superseding send skips its own filing
 render; the withdrawal renders holders of the old message and the send path then
