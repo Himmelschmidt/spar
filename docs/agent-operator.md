@@ -206,7 +206,8 @@ without dropping the slot's file copy and without flipping the log word; it is t
 escape hatch for a wedged slot. To take the item back entirely, withdraw the message
 instead. `spar bus send --urgent --run <id> --to <slot>` interrupts a mid-turn slot instead
 of waiting for the turn boundary: the orchestrator stops the turn and resumes the same
-session with the message first, at no rotation or round cost. Idle slots and providers
+session with the message first, at no rotation or round cost. A turn killed before it
+established any session restarts cold under a fresh id. Idle slots and providers
 without resume (agy) get a normal delivery, and the send says so.
 
 ## Event feed

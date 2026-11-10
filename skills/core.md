@@ -1301,7 +1301,8 @@ spar bus ack <msg_id> [--from <agent>] [--run <id>]  # stop a requires_ack redel
   event: it costs no rotation and no round, and the slot keeps its worktree. An idle slot, an
   unknown slot, a broadcast, or a provider without resume (agy) delivers normally instead and
   the send says so. Needs a resumable provider: resume exists for codex, pi, muse, claude
-  (`-r`) and grok (`--resume`).
+  (`-r`) and grok (`--resume`). A turn killed before it established any session restarts
+  cold under a fresh id, never the killed turn's id.
 
 **Receipts (O134).** `.spar/bus/receipts.jsonl` gets a line per recipient as a message
 moves: `queued` (written to the inbox), `delivered` (claimed into the agent's channel or

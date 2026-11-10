@@ -1521,10 +1521,11 @@ fn urgent_send(
         },
     )?;
     // Only the turn's process group stops here; the orchestrator resumes the
-    // same session with this message first when the dispatch returns. Pid-based
-    // (no Child handle survives the process boundary), group-scoped: the same
-    // SIGTERM-then-SIGKILL the executor applies to a process group.
-    process::terminate_tree(token.pid, true);
+    // same session with this message first when the dispatch returns.
+    // Token-gated (the starttime the filter above just validated), group-scoped:
+    // the same SIGTERM-then-SIGKILL the executor applies to a process group. No
+    // Child handle survives the process boundary, so the token stands in.
+    process::terminate_token_tree(&token, true);
     interrupt(format!(
         "stopped {}'s turn; resuming the same session with your message first",
         short

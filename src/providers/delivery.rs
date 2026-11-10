@@ -111,10 +111,17 @@ pub fn deliver(
     // The PollFile drain claims only what the render would list: `Ack`/`System`
     // copies stay pending, so `delivered` keeps meaning "posted into the live
     // poll file" instead of "claimed by a file-time drain the slot never reads".
+    // Copies with an urgent interrupt pending for the live dispatch stay pending
+    // under every strategy: the resume-time claim is their only delivery, so no
+    // file-time drain or turn-boundary pulse presents them before the resume
+    // prompt does.
+    let deferred = deferred_for(paths, run, agent);
     let msgs = if strategy == DeliveryStrategy::PollFile {
-        bus::inbox_claim(paths, agent, via, |m| bus::poll_lists(m, agent))?
+        bus::inbox_claim(paths, agent, via, |m| {
+            bus::poll_lists(m, agent) && !deferred.contains(&m.id)
+        })?
     } else {
-        bus::inbox_claim(paths, agent, via, |_| true)?
+        bus::inbox_claim(paths, agent, via, |m| !deferred.contains(&m.id))?
     };
     if msgs.is_empty() {
         if strategy == DeliveryStrategy::PollFile
@@ -215,8 +222,20 @@ fn escape_poll_markers(body: &str) -> String {
 /// mid-turn never drops what the slot may not have opened. `requires-ack`
 /// items survive until the slot acks them. Acks and system control traffic
 /// never list.
+/// Msg ids the renders and claims must skip: urgent requests filed for the live
+/// dispatch stay inbox-pending until the resume-time claim consumes them.
+fn deferred_for(paths: &SparPaths, run: Option<&str>, agent: &str) -> HashSet<String> {
+    let Some(r) = run else {
+        return HashSet::new();
+    };
+    crate::markers::urgent_deferred_msg_ids(paths, r, slot_part(r, agent))
+        .into_iter()
+        .collect()
+}
+
 pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str) -> Result<usize> {
     let _lock = lock_poll_file(paths, run, agent)?;
+    let deferred = deferred_for(paths, run, agent);
     // The ack scan runs under the poll-file lock: an ack filed between the scan
     // and the write would otherwise lose to a stale render.
     let mut scan = bus::scan_for_render(paths, run, &HashSet::from([agent.to_string()]));
@@ -235,6 +254,9 @@ pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str
                 return false;
             }
             if !bus::poll_lists(m, agent) {
+                return false;
+            }
+            if deferred.contains(&m.id) {
                 return false;
             }
             if superseded.contains(&m.id) {
@@ -743,6 +765,68 @@ mod tests {
         .unwrap();
         assert_eq!(again.action, DeliveryAction::Empty);
         assert_eq!(again.delivered, 0);
+    }
+
+    #[test]
+    fn poll_file_drain_defers_copies_with_a_pending_urgent() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, Some("r1"), "p", Some("cli:pi"), Some("native-cli")).unwrap();
+        let live = crate::process::PidToken {
+            pid: 4242,
+            starttime: Some(9),
+        };
+        crate::markers::write_pid(&paths, "r1", "p", live).unwrap();
+        // The urgent request is filed before the message, the way the sender
+        // orders it: the file-time drain must skip the copy, never claim or
+        // render it, and leave it for the resume-time claim.
+        let id = bus::new_id();
+        crate::markers::write_urgent_interrupt(
+            &paths,
+            "r1",
+            "p",
+            &crate::markers::UrgentInterrupt {
+                msg_id: id.clone(),
+                from: "@human".into(),
+                body: "now-now".into(),
+                ts: chrono::Utc::now(),
+                target_pid: live.pid,
+                target_starttime: live.starttime,
+            },
+        )
+        .unwrap();
+        bus::send(
+            &paths,
+            bus::BusMessage {
+                id: id.clone(),
+                ts: chrono::Utc::now(),
+                from: "a".into(),
+                to: "p".into(),
+                kind: bus::MsgKind::Chat,
+                body: "now-now".into(),
+                run: Some("r1".into()),
+                subject: None,
+                refs: Default::default(),
+                requires_ack: false,
+                persist: false,
+                expires_after_round: None,
+                filed_round: None,
+                meta: Default::default(),
+            },
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+
+        let agent = agent_ref(Some("r1"), "p");
+        assert_eq!(bus::inbox(&paths, &agent).unwrap().len(), 1);
+        let file = poll_file(&paths, Some("r1"), &agent);
+        assert!(
+            !file.exists() || !std::fs::read_to_string(&file).unwrap().contains("now-now"),
+            "the urgent body must not reach the poll file"
+        );
+        let claimed = bus::inbox_claim(&paths, &agent, "urgent", |m| m.id == id).unwrap();
+        assert_eq!(claimed.len(), 1, "the resume-time claim consumes it once");
+        assert!(bus::inbox(&paths, &agent).unwrap().is_empty());
     }
 
     #[test]

@@ -1591,6 +1591,14 @@ pub fn withdraw(paths: &SparPaths, msg_id: &str) -> Result<Withdrawal> {
         };
         let pending = named(&dir);
         let claimed = named(&dir.join("claimed"));
+        // A withdrawn message must never lead a resumed turn: drop its pending
+        // `--urgent` interrupt alongside the inbox copies. Runs before every
+        // branch below: the poll early-continue skips the rest of the loop, and
+        // a superseding send skips the file-time fan-out, so for an urgent
+        // replacement the marker may be all there is.
+        if let Some((run, short)) = agent.split_once(':') {
+            let _ = crate::markers::remove_urgent_interrupt(paths, run, short, msg_id);
+        }
         let is_poll = agent
             .split_once(':')
             .map(|(run, short)| {
@@ -2203,9 +2211,35 @@ mod tests {
             .unwrap()
             .contains("old instruction"));
 
+        crate::markers::write_urgent_interrupt(
+            &paths,
+            "r1",
+            "p",
+            &crate::markers::UrgentInterrupt {
+                msg_id: sent.id.clone(),
+                from: "a".into(),
+                body: "old instruction".into(),
+                ts: chrono::Utc::now(),
+                target_pid: 4242,
+                target_starttime: Some(99),
+            },
+        )
+        .unwrap();
+        let token = crate::process::PidToken {
+            pid: 4242,
+            starttime: Some(99),
+        };
+        assert!(
+            crate::markers::has_pending_urgent(&paths, "r1", "p", Some(&token)),
+            "the urgent marker lands before the withdrawal"
+        );
         let w = withdraw(&paths, &sent.id).unwrap();
         assert_eq!(w.withdrawn_from, vec![agent.clone()]);
         assert!(w.already_delivered.is_empty());
+        assert!(
+            !crate::markers::has_pending_urgent(&paths, "r1", "p", Some(&token)),
+            "withdrawn urgent marker is gone"
+        );
         assert!(
             !fs::read_to_string(&poll)
                 .unwrap()
