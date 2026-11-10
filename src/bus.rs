@@ -130,8 +130,8 @@ pub struct BusMessage {
     pub expires_after_round: Option<u32>,
     /// The run round the message was filed in, stamped by [`send`] for run-tagged
     /// messages. The poll-file render drops a non-`requires_ack` message once its
-    /// slot has dispatched in a later round, so the file cannot grow without bound
-    /// yet nothing leaves before the slot had a turn with it in the file (O160).
+    /// slot has finished a dispatch that started after that round, so the file
+    /// cannot grow without bound yet nothing leaves mid-turn, unread (O161).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filed_round: Option<u32>,
     #[serde(default)]
@@ -491,12 +491,11 @@ pub fn send(paths: &SparPaths, mut msg: BusMessage, budget: MessageBudget) -> Re
     // choke point covers every producer (chat, broadcast, workflows, tasks) uniformly.
     if msg.kind == MsgKind::Ack {
         if let Some(target) = msg.refs.reply_to.as_deref() {
-            // Only the recipient's ack stops the redelivery and records the `read`
-            // receipt: a stranger's ack is filed but the slot still needs its
-            // reminder, and the log word must not flip on it.
-            let counts = find_event(paths, target)?.is_none_or(|t| ack_counts(&msg, &t));
-            if counts {
-                clear_pending_ack(paths, target)?;
+            // Every ack stops the redelivery: the operator's is the escape hatch
+            // for a wedged or gone slot. Only the recipient's ack records the
+            // `read` receipt, so a stranger's never flips the log word.
+            clear_pending_ack(paths, target)?;
+            if find_event(paths, target)?.is_none_or(|t| ack_counts(&msg, &t)) {
                 record_receipt(
                     paths,
                     target,
@@ -637,11 +636,11 @@ pub fn message_targets(paths: &SparPaths, msg: &BusMessage) -> Result<Vec<String
 }
 
 /// The qualified targets known to poll their slot file instead of reading the
-/// inbox. `Ack`/`System` copies never render there, so filing them only piles
-/// them up and lets `bus log` report `queued` for control traffic the slot never
+/// inbox, for a message the file will never render. Filing those copies only
+/// piles them up and lets `bus log` report `queued` for traffic the slot never
 /// reads; the workspace log still records them. Runs without a readable live
 /// (non-`dry_run`) state file as usual: the drain filters stay the backstop.
-fn unrendered_targets(paths: &SparPaths, targets: &[String]) -> HashSet<String> {
+fn unrendered_targets(paths: &SparPaths, msg: &BusMessage, targets: &[String]) -> HashSet<String> {
     let mut out = HashSet::new();
     let mut by_run: HashMap<&str, Vec<&str>> = HashMap::new();
     for t in targets {
@@ -660,6 +659,7 @@ fn unrendered_targets(paths: &SparPaths, targets: &[String]) -> HashSet<String> 
             if let Some(short) = agent.strip_prefix(&format!("{run}:")) {
                 if crate::providers::delivery::strategy_for_slot(&state, short)
                     == crate::providers::DeliveryStrategy::PollFile
+                    && !poll_lists(msg, agent)
                 {
                     out.insert((*agent).to_string());
                 }
@@ -671,11 +671,7 @@ fn unrendered_targets(paths: &SparPaths, targets: &[String]) -> HashSet<String> 
 
 fn deliver_inbox(paths: &SparPaths, msg: &BusMessage) -> Result<()> {
     let targets = message_targets(paths, msg)?;
-    let unrendered = if matches!(msg.kind, MsgKind::Ack | MsgKind::System) {
-        unrendered_targets(paths, &targets)
-    } else {
-        HashSet::new()
-    };
+    let unrendered = unrendered_targets(paths, msg, &targets);
     for t in &targets {
         if unrendered.contains(t) {
             continue;
@@ -1190,7 +1186,14 @@ pub fn record_receipt(
 #[derive(Default)]
 struct RunRounds {
     rounds: HashMap<String, Option<u32>>,
-    dispatched: HashMap<String, Option<u32>>,
+    turns: HashMap<String, Option<SlotTurn>>,
+}
+
+/// The last dispatch a slot started, and whether that turn is over.
+#[derive(Clone, Copy)]
+struct SlotTurn {
+    round: u32,
+    settled: bool,
 }
 
 impl RunRounds {
@@ -1202,22 +1205,39 @@ impl RunRounds {
         })
     }
 
-    /// The round `agent` last dispatched in, or `None` when the run state is
-    /// unreadable or names no such slot. Slot ids arrive in either spelling —
-    /// the short state id or the qualified inbox id — so both match.
-    fn slot_round(&mut self, paths: &SparPaths, run: &str, agent: &str) -> Option<u32> {
+    /// Whether `agent` finished a dispatch that started after `filed`: the turn
+    /// it had with the message is over. A slot still mid-turn, or one that
+    /// never dispatched past the filing round, keeps the item listed, so a
+    /// render during its turn never drops what it may not have opened yet.
+    /// Settled mirrors the run loop's own finished set. Slot ids arrive in
+    /// either spelling, the short state id or the qualified inbox id.
+    fn turn_finished_after(
+        &mut self,
+        paths: &SparPaths,
+        run: &str,
+        agent: &str,
+        filed: u32,
+    ) -> bool {
         let key = agent.to_string();
-        if let Some(hit) = self.dispatched.get(&key) {
-            return *hit;
+        if let Some(hit) = self.turns.get(&key) {
+            return matches!(hit, Some(t) if t.settled && t.round > filed);
         }
         let found = crate::state::RunState::load(paths, run).ok().and_then(|s| {
             s.slots
                 .iter()
                 .find(|sl| sl.id == agent || agent_ref(Some(run), &sl.id) == agent)
-                .map(|sl| sl.round)
+                .map(|sl| SlotTurn {
+                    round: sl.round,
+                    settled: matches!(
+                        sl.status,
+                        crate::state::SlotStatus::Done
+                            | crate::state::SlotStatus::Failed
+                            | crate::state::SlotStatus::Stuck
+                    ),
+                })
         });
-        self.dispatched.insert(key, found);
-        found
+        self.turns.insert(key, found);
+        matches!(found, Some(t) if t.settled && t.round > filed)
     }
 
     fn expired(&mut self, paths: &SparPaths, msg: &BusMessage) -> bool {
@@ -1714,8 +1734,14 @@ impl ExpiryGate {
         self.rounds.expired(paths, msg)
     }
 
-    pub(crate) fn slot_round(&mut self, paths: &SparPaths, run: &str, agent: &str) -> Option<u32> {
-        self.rounds.slot_round(paths, run, agent)
+    pub(crate) fn turn_finished_after(
+        &mut self,
+        paths: &SparPaths,
+        run: &str,
+        agent: &str,
+        filed: u32,
+    ) -> bool {
+        self.rounds.turn_finished_after(paths, run, agent, filed)
     }
 }
 

@@ -208,12 +208,12 @@ fn escape_poll_markers(body: &str) -> String {
 /// Returns how many messages are listed, so delivery counts what the slot can
 /// actually read rather than what was claimed.
 ///
-/// A message leaves the file once the slot acks it, and — unless it asks for an
-/// ack — once the slot has dispatched in a round past the one it was filed in
-/// (`filed_round` vs the slot's last-dispatched round), so the file cannot grow
-/// without bound yet a round bump alone never removes what the slot has not had
-/// a turn with. `requires-ack` items survive round bumps until the slot acks
-/// them. Acks and system control traffic never list.
+/// A message leaves the file once the slot acks it. Without `requires-ack` it
+/// also leaves once the slot has finished a dispatch that started after the
+/// round it was filed in, so the file cannot grow without bound yet a render
+/// mid-turn never drops what the slot may not have opened. `requires-ack`
+/// items survive until the slot acks them. Acks and system control traffic
+/// never list.
 pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str) -> Result<usize> {
     let _lock = lock_poll_file(paths, run, agent)?;
     // The ack scan runs under the poll-file lock: an ack filed between the scan
@@ -241,12 +241,9 @@ pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str
             }
             if !m.requires_ack {
                 if let (Some(filed), Some(r)) = (m.filed_round, m.run.as_deref()) {
-                    // The slot had a turn with the item in its file once it
-                    // dispatched past the filing round; only then may it leave.
-                    if gate
-                        .slot_round(paths, r, agent)
-                        .is_some_and(|last| last > filed)
-                    {
+                    // The item may leave once the slot finished a dispatch that
+                    // started after it was filed. A running slot keeps it.
+                    if gate.turn_finished_after(paths, r, agent, filed) {
                         return false;
                     }
                 }
@@ -272,7 +269,7 @@ pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str
             section.push_str(&format!(
                 "\n- [{:?}] from {} ({}): {}",
                 m.kind,
-                m.from,
+                escape_poll_markers(&m.from),
                 m.id,
                 escape_poll_markers(&m.body)
             ));
