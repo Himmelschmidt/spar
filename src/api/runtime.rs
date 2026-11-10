@@ -33,6 +33,17 @@ pub struct ApiSlotRequest<'a> {
     pub dry_run: bool,
     /// Override model from env default (model-select).
     pub model_override: Option<String>,
+    pub role: crate::state::SlotRole,
+    pub credentials: ApiCredentialOverride,
+}
+
+/// Key and base URL passed in through the call, so tests never mutate process
+/// env to point a dispatch at a fake server. Production passes the default
+/// (resolve from config and env as before); the override wins when set.
+#[derive(Debug, Clone, Default)]
+pub struct ApiCredentialOverride {
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
 }
 
 /// What one api-sdk dispatch produced. The hard ceiling is reported with the
@@ -94,7 +105,19 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<ApiSlotOutcome> {
         return Ok(ApiSlotOutcome::done(usage));
     }
 
-    let mut cfg = ApiProviderConfig::resolve(req.provider_name)?;
+    let mut cfg = ApiProviderConfig::resolve_with(
+        req.provider_name,
+        req.credentials.api_key.as_deref(),
+        req.credentials.base_url.as_deref(),
+    )?;
+    // The expected artifact is cleared only once the dispatch actually starts:
+    // a resolve failure above must leave the previous round's file alone, and
+    // the dry-run arm above returns before any clear the same way.
+    if crate::executor::role_is_recoverable(req.role) {
+        if let Some(artifact) = req.expected_artifact {
+            let _ = std::fs::remove_file(artifact);
+        }
+    }
     if let Some(m) = &req.model_override {
         if !m.is_empty() {
             cfg.model = m.clone();
@@ -422,13 +445,11 @@ mod tests {
     /// The api-sdk backend reports the typed hard-ceiling cause the same way
     /// the native-cli path does, so the workflow treats both backends
     /// identically. A zero timeout reaches the ceiling arm before any network
-    /// call. The credential comes from the environment like every other
-    /// caller. Fails on the old untyped timeout error, which carried
-    /// `timeout_cause: None` and failed the round empty.
+    /// call. The credential rides the request so the test never touches
+    /// process env.
     #[test]
     fn hard_ceiling_reports_a_typed_cause() {
         let tmp = tempdir().unwrap();
-        let _key = crate::util::EnvRestore::set("OPENAI_API_KEY", "test-key");
         let outcome = run_api_slot(&ApiSlotRequest {
             provider_name: "openai",
             prompt: "hello",
@@ -438,6 +459,11 @@ mod tests {
             timeout: std::time::Duration::ZERO,
             dry_run: false,
             model_override: None,
+            role: crate::state::SlotRole::Implementer,
+            credentials: ApiCredentialOverride {
+                api_key: Some("test-key".into()),
+                base_url: None,
+            },
         })
         .unwrap();
         assert!(!outcome.ok, "a ceiling kill is not a success");
