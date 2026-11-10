@@ -434,7 +434,16 @@ pub fn report(
             if since.is_some_and(|s| ev.ts < s) {
                 continue;
             }
-            let q = quota_row(&mut quota, crate::quota::quota_key(&ev.provider));
+            // A stored quota key already names where the pause lived: report it
+            // verbatim. Re-deriving it through `quota_key` treats a bucket as a
+            // seat ref and moves legacy login pauses into the default bucket.
+            // Only legacy bare names (`codex`) gain their `cli:` prefix.
+            let name = if ev.provider.contains(':') {
+                ev.provider.clone()
+            } else {
+                format!("cli:{}", ev.provider)
+            };
+            let q = quota_row(&mut quota, name);
             if ev.manual {
                 q.manual_pauses += 1;
             } else {
@@ -458,7 +467,7 @@ pub fn report(
                 quota_row(
                     &mut quota,
                     crate::provider_ref::ProviderRef::for_seat(&r.provider, r.model.as_deref())
-                        .quota_key(),
+                        .quota_key(None),
                 )
                 .backup_engagements += 1;
             }
@@ -472,7 +481,7 @@ pub fn report(
                 .filter(|r| r.parked_run)
                 .map(|r| {
                     crate::provider_ref::ProviderRef::for_seat(&r.provider, r.model.as_deref())
-                        .quota_key()
+                        .quota_key(None)
                 })
                 .collect();
             hit.sort();
@@ -885,6 +894,10 @@ mod tests {
 
     #[test]
     fn groups_by_provider_without_mixing_context_semantics() {
+        // Park attribution resolves the null-model history role through the
+        // profile route, which is process env shared with every test thread.
+        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
         let tmp = fixture();
         let now = DateTime::parse_from_rfc3339("2026-10-30T00:00:00Z")
             .unwrap()
@@ -925,7 +938,21 @@ mod tests {
         let q = r.quota.iter().find(|q| q.provider == "cli:codex").unwrap();
         assert_eq!(
             (q.pauses, q.manual_pauses, q.parks, q.backup_engagements),
-            (1, 1, 2, 2)
+            (1, 1, 0, 0)
+        );
+        let bucket = r
+            .quota
+            .iter()
+            .find(|q| q.provider == "cli:codex@openrouter")
+            .unwrap();
+        assert_eq!(
+            (
+                bucket.pauses,
+                bucket.manual_pauses,
+                bucket.parks,
+                bucket.backup_engagements
+            ),
+            (0, 0, 2, 2)
         );
     }
 

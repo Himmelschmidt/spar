@@ -384,7 +384,7 @@ fn seed_quota_pause(fx: &Fixture, key: &str, days_ago: i64) {
 fn a_probe_that_gets_an_answer_clears_a_stale_quota_pause() {
     let fx = Fixture::new();
     fx.cli("codex", &counted("codex", "echo OK\nexit 0"));
-    seed_quota_pause(&fx, "cli:codex", 13);
+    seed_quota_pause(&fx, "cli:codex@openrouter", 13);
     let out = fx
         .spar()
         .args(["provider", "probe", "cli:codex", "--json"])
@@ -396,8 +396,15 @@ fn a_probe_that_gets_an_answer_clears_a_stale_quota_pause() {
     let r: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(r[0]["verdict"], "healthy", "{r}");
     assert_eq!(r[0]["store"], "cleared quota pause");
+    assert_eq!(r[0]["provider"], "cli:codex@openrouter", "{r}");
     assert_eq!(fx.count("codex"), 1, "one call");
     assert_eq!(list_entry(&fx, "codex")["quota_status"], "available");
+    assert_eq!(
+        fx.quota()["providers"]["cli:codex@openrouter"]["status"],
+        "available",
+        "the healthy probe retires the bucket the seat reads: {}",
+        fx.quota()
+    );
 }
 
 #[test]
@@ -424,7 +431,18 @@ fn a_probe_that_hits_the_limit_pauses_and_one_that_is_refused_reports_auth() {
         .clone();
     let r: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(r[0]["verdict"], "quota", "{r}");
-    assert_eq!(list_entry(&fx, "codex")["quota_status"], "paused_quota");
+    assert_eq!(r[0]["provider"], "cli:codex@openrouter", "{r}");
+    assert_eq!(
+        fx.quota()["providers"]["cli:codex@openrouter"]["status"],
+        "paused_quota",
+        "the quota verdict lands on the bucket the seat reads: {}",
+        fx.quota()
+    );
+    assert_eq!(
+        list_entry(&fx, "codex")["quota_status"],
+        "available",
+        "the login still serves the sibling bucket"
+    );
 
     let out = fx
         .spar()
@@ -445,7 +463,7 @@ fn a_probe_never_clears_a_manual_pause() {
     let fx = Fixture::new();
     fx.cli("codex", &counted("codex", "echo OK\nexit 0"));
     fx.spar()
-        .args(["provider", "pause", "cli:codex"])
+        .args(["provider", "pause", "cli:codex@openrouter"])
         .assert()
         .success();
     let out = fx
@@ -459,7 +477,12 @@ fn a_probe_never_clears_a_manual_pause() {
     let r: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(r[0]["verdict"], "healthy");
     assert_eq!(r[0]["store"], "manual pause kept");
-    assert_eq!(list_entry(&fx, "codex")["quota_status"], "paused_manual");
+    assert_eq!(
+        fx.quota()["providers"]["cli:codex@openrouter"]["status"],
+        "paused_manual",
+        "the operator's bucket pause survives the probe: {}",
+        fx.quota()
+    );
 }
 
 /// #153's second half: the Sonnet backup sat `paused_quota` from 09-20 while 13 runs
@@ -503,6 +526,53 @@ fn a_quota_paused_backup_is_probed_and_used_when_it_answers() {
         fx.quota()["providers"].get("cli:codex").is_none()
             || fx.quota()["providers"]["cli:codex"]["status"] == "available",
         "the probe cleared the stale pause: {}",
+        fx.quota()
+    );
+}
+
+/// The #233 follow-up: the pause sat on the bucket the seat reads
+/// (`cli:codex@openrouter`), not the login. A login-keyed probe cleared nothing
+/// and the recovered backup stayed benched; the seat-keyed probe retires the
+/// bucket and the backup runs.
+#[test]
+fn a_bucket_paused_codex_backup_is_probed_and_used_when_it_answers() {
+    let fx = Fixture::new();
+    fx.cli(
+        "claude",
+        &counted("claude", &format!("echo '{CLAUDE_REVOKED}'\nexit 1")),
+    );
+    // The probe's one-word prompt gets an answer; the dispatch itself fails, so the
+    // run ends there: exactly one probe plus one dispatch.
+    fx.cli(
+        "codex",
+        &counted(
+            "codex",
+            "case \"$*\" in *\"single word OK\"*) echo OK; exit 0;; esac\necho boom >&2\nexit 1",
+        ),
+    );
+    seed_quota_pause(&fx, "cli:codex@openrouter", 13);
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:claude",
+            "--backup",
+            "implementer=cli:codex",
+            "--without",
+            "suite",
+        ])
+        .assert()
+        .code(1);
+    let slot = fx.slot("implementer");
+    assert_eq!(slot["provider"], "cli:codex", "{slot}");
+    assert_eq!(slot["source"], "backup");
+    assert_eq!(fx.count("codex"), 2, "one probe, one dispatch");
+    assert_eq!(
+        fx.quota()["providers"]["cli:codex@openrouter"]["status"],
+        "available",
+        "the probe cleared the bucket pause: {}",
         fx.quota()
     );
 }
@@ -792,10 +862,12 @@ fn a_tester_log_saying_429_passed_neither_parks_the_run_nor_moves_a_seat() {
     assert_ne!(state["phase"], "quota", "{state}");
     let quota = fx.quota();
     assert_eq!(
-        quota["providers"]["cli:codex"]["status"], "paused_quota",
-        "the broad scrape did pause codex, weakly: {quota}"
+        quota["providers"]["cli:codex@openrouter"]["status"], "paused_quota",
+        "the broad scrape did pause the seat's openrouter bucket, weakly: {quota}"
     );
-    assert!(quota["providers"]["cli:codex"].get("strong").is_none());
+    assert!(quota["providers"]["cli:codex@openrouter"]
+        .get("strong")
+        .is_none());
     let rev = fx.slot("reviewer");
     assert_eq!(rev["id"], "review-0-cli-codex", "{rev}");
     assert_eq!(rev["provider"], "cli:codex");

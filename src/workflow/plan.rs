@@ -115,7 +115,7 @@ pub fn run(
         Some(crate::runlock::RunLock::acquire(paths, &state.id)?)
     };
     let _ = bus::ensure_bus(paths);
-    let _ = bus::join(paths, Some(&state.id), "orchestrator", None, None);
+    let _ = bus::join(paths, Some(&state.id), bus::ORCHESTRATOR_SEAT, None, None);
     state.save(paths)?;
 
     let mut jobs = Vec::new();
@@ -152,11 +152,33 @@ pub fn run(
     // remain ineligible with no eligible backup should park.
     if !dry {
         let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+        let has_backup = cfg.backups.planner.is_some()
+            || cfg.backups.plan_critic.is_some()
+            || cfg.backups.test_author.is_some();
+        let available: Option<std::collections::HashSet<String>> = if !has_backup {
+            None
+        } else {
+            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                .into_iter()
+                .filter(|r| r.is_available())
+                .map(|r| format!("cli:{}", r.name))
+                .collect();
+            if detected.is_empty() {
+                None
+            } else {
+                Some(detected)
+            }
+        };
         let mut still_paused: Vec<String> = Vec::new();
         for job in &jobs {
             let seat = job.provider_ref().display();
-            if !crate::backup::seat_eligible(&seat, &store) {
-                let key = job.provider_ref().quota_key();
+            if !crate::backup::is_provider_eligible(
+                &seat,
+                &store,
+                available.as_ref(),
+                state.codex_profile.as_deref(),
+            ) {
+                let key = job.provider_ref().quota_key(state.codex_profile.as_deref());
                 if !still_paused.contains(&key) {
                     still_paused.push(key);
                 }
@@ -238,6 +260,24 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> anyhow::Result<Vec<PlanSea
         .ok()
         .flatten();
     let health = providers::LiveHealth::for_dry(state.dry_run);
+    let has_backup = cfg.backups.planner.is_some()
+        || cfg.backups.plan_critic.is_some()
+        || cfg.backups.test_author.is_some();
+    let available: Option<std::collections::HashSet<String>> =
+        if state.dry_run || !has_backup {
+            None
+        } else {
+            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                .into_iter()
+                .filter(|r| r.is_available())
+                .map(|r| format!("cli:{}", r.name))
+                .collect();
+            if detected.is_empty() {
+                None
+            } else {
+                Some(detected)
+            }
+        };
     let mut out = Vec::with_capacity(specs.len());
     let mut skips: Vec<(String, String)> = Vec::new();
     for (idx, (role, prefix, template)) in specs.into_iter().enumerate() {
@@ -256,10 +296,23 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> anyhow::Result<Vec<PlanSea
             cfg,
             selected.as_deref(),
             &store,
+            available.as_ref(),
             &paths,
             state.dry_run,
+            state.codex_profile.as_deref(),
             &health,
-        ) else {
+        )
+        .or_else(|| {
+            crate::workflow::roles_resolve::resolve_seat(
+                role,
+                idx,
+                idx,
+                &state.providers,
+                state.pool_origin,
+                cfg,
+                &health,
+            )
+        }) else {
             skips.extend(crate::workflow::roles_resolve::health_skips_for_seat(
                 role,
                 &state.providers,
@@ -318,18 +371,46 @@ pub fn execute_plan(
             let slot_state = state.slots.iter().find(|s| s.id == job.slot_id).cloned();
             let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
             let health = providers::LiveHealth::for_dry(state.dry_run);
+            let has_backup_global = cfg.backups.planner.is_some()
+                || cfg.backups.plan_critic.is_some()
+                || cfg.backups.test_author.is_some();
+            let available: Option<std::collections::HashSet<String>> =
+                if state.dry_run || !has_backup_global {
+                    None
+                } else {
+                    let detected: std::collections::HashSet<String> =
+                        crate::providers::detect_all()
+                            .into_iter()
+                            .filter(|r| r.is_available())
+                            .map(|r| format!("cli:{}", r.name))
+                            .collect();
+                    if detected.is_empty() {
+                        None
+                    } else {
+                        Some(detected)
+                    }
+                };
             let mut handled_via_backup = false;
             if let Some(slot_state) = slot_state {
-                let cause = crate::backup::dispatch_stop_cause(&slot_state, &store);
-                if cause.engages_backup() && !slot_state.source.is_some_and(SeatSource::is_backup) {
+                let cause = crate::backup::dispatch_stop_cause(
+                    &slot_state,
+                    &store,
+                    available.as_ref(),
+                    state.codex_profile.as_deref(),
+                );
+                if cause.engages_backup()
+                    && !slot_state.source.is_some_and(SeatSource::is_backup)
+                {
                     if let Some(raw) = crate::backup::backup_for_role(job.role, 0, cfg) {
                         if let Some(source) = crate::backup::takeover(
                             &raw,
                             job.role,
                             cfg,
                             &store,
+                            available.as_ref(),
                             paths,
                             state.dry_run,
+                            state.codex_profile.as_deref(),
                             &health,
                         ) {
                             let cur_key = crate::provider_ref::ProviderRef::parse(&job.provider)
@@ -520,7 +601,7 @@ pub fn execute_plan(
         let _ = bus::broadcast(
             paths,
             Some(&state.id),
-            "orchestrator",
+            bus::ORCHESTRATOR_SEAT,
             "plan auto-approved (autonomy)",
             state.message_budget,
         );
@@ -561,17 +642,40 @@ fn resolve_test_author(
                 .and_then(|c| c.model.clone())
         });
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+    let has_backup = cfg.backups.test_author.is_some();
+    let available: Option<std::collections::HashSet<String>> =
+        if state.dry_run || !has_backup {
+            None
+        } else {
+            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                .into_iter()
+                .filter(|r| r.is_available())
+                .map(|r| format!("cli:{}", r.name))
+                .collect();
+            if detected.is_empty() {
+                None
+            } else {
+                Some(detected)
+            }
+        };
     let seat_ref =
         crate::provider_ref::ProviderRef::for_seat(&provider, model.as_deref()).display();
-    if !crate::backup::seat_eligible(&seat_ref, &store) {
+    if !crate::backup::is_provider_eligible(
+        &seat_ref,
+        &store,
+        available.as_ref(),
+        state.codex_profile.as_deref(),
+    ) {
         if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg) {
             if let Some(takeover) = crate::backup::takeover(
                 &backup_raw,
                 SlotRole::TestAuthor,
                 cfg,
                 &store,
+                available.as_ref(),
                 paths,
                 state.dry_run,
+                state.codex_profile.as_deref(),
                 &health,
             ) {
                 if let Ok(pin) = crate::provider_ref::Pin::parse(&backup_raw) {
@@ -663,9 +767,31 @@ fn run_test_author(
         let slot_state = state.slots.iter().find(|s| s.id == id).cloned();
         let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
         let health = providers::LiveHealth::for_dry(state.dry_run);
+        let has_backup = cfg.backups.test_author.is_some();
+        let available: Option<std::collections::HashSet<String>> =
+            if state.dry_run || !has_backup {
+                None
+            } else {
+                let detected: std::collections::HashSet<String> =
+                    crate::providers::detect_all()
+                        .into_iter()
+                        .filter(|r| r.is_available())
+                        .map(|r| format!("cli:{}", r.name))
+                        .collect();
+                if detected.is_empty() {
+                    None
+                } else {
+                    Some(detected)
+                }
+            };
         let mut handled = false;
         if let Some(slot_state) = slot_state {
-            let cause = crate::backup::dispatch_stop_cause(&slot_state, &store);
+            let cause = crate::backup::dispatch_stop_cause(
+                &slot_state,
+                &store,
+                available.as_ref(),
+                state.codex_profile.as_deref(),
+            );
             if cause.engages_backup()
                 && !slot_state
                     .source
@@ -677,8 +803,10 @@ fn run_test_author(
                         SlotRole::TestAuthor,
                         cfg,
                         &store,
+                        available.as_ref(),
                         paths,
                         state.dry_run,
+                        state.codex_profile.as_deref(),
                         &health,
                     ) {
                         let cur_key = crate::provider_ref::ProviderRef::parse(&job.provider)
@@ -754,7 +882,7 @@ fn run_test_author(
     let _ = bus::broadcast(
         paths,
         Some(&state.id),
-        "orchestrator",
+        bus::ORCHESTRATOR_SEAT,
         "test-author finished; acceptance contract ready for plan approval",
         state.message_budget,
     );
@@ -777,7 +905,13 @@ fn seed_spec_bus(
          Planner `{planner_slot}`{critic_clause}: reply on bus if still available; \
          otherwise the author uses plan + critique artifacts."
     );
-    let _ = bus::broadcast(paths, Some(&state.id), "orchestrator", &body, budget);
+    let _ = bus::broadcast(
+        paths,
+        Some(&state.id),
+        bus::ORCHESTRATOR_SEAT,
+        &body,
+        budget,
+    );
 
     let coordinate_with = critic_slot
         .map(|c| format!(" and `{c}`"))
@@ -806,7 +940,7 @@ fn seed_spec_bus(
             bus::BusMessage {
                 id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
                 ts: chrono::Utc::now(),
-                from: "orchestrator".into(),
+                from: bus::ORCHESTRATOR_SEAT.into(),
                 to: to.into(),
                 kind: MsgKind::Hello,
                 body: note,
@@ -819,6 +953,7 @@ fn seed_spec_bus(
                 requires_ack: false,
                 persist: false,
                 expires_after_round: None,
+                filed_round: None,
                 meta: HashMap::new(),
             },
             budget,
@@ -1138,6 +1273,7 @@ pub fn replan(
     state.contract_fingerprint = None;
     state.set_phase(Phase::Init);
     state.save(paths)?;
+    crate::providers::delivery::refresh_run_poll_files(paths, run_id);
     if !json {
         eprintln!("replanning run {run_id} (round {round})");
     }
@@ -1222,17 +1358,34 @@ fn amend_author_seat(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> R
         return Ok(seat.id);
     }
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-    if crate::backup::seat_eligible(&seat.provider_ref().display(), &store) {
+    if crate::backup::is_provider_eligible(
+        &seat.provider_ref().display(),
+        &store,
+        None,
+        state.codex_profile.as_deref(),
+    ) {
         return Ok(seat.id);
     }
-    let health = providers::LiveHealth::probing();
-    let key = seat.provider_ref().quota_key();
+    let key = seat
+        .provider_ref()
+        .quota_key(state.codex_profile.as_deref());
     let sub = crate::quota::sub_key(&seat.provider);
+    let health = providers::LiveHealth::probing();
     let backup = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg)
         .filter(|b| crate::quota::sub_key(b) != sub)
         .and_then(|b| {
-            crate::backup::takeover(&b, SlotRole::TestAuthor, cfg, &store, paths, false, &health)
-                .map(|source| (b, source))
+            crate::backup::takeover(
+                &b,
+                SlotRole::TestAuthor,
+                cfg,
+                &store,
+                None,
+                paths,
+                false,
+                state.codex_profile.as_deref(),
+                &health,
+            )
+            .map(|source| (b, source))
         });
     let Some((raw, source)) = backup else {
         anyhow::bail!(
@@ -1328,6 +1481,9 @@ pub fn amend_contract(
         .contract_fingerprint
         .clone()
         .unwrap_or_else(|| on_disk_fp.clone());
+    // The author dispatches now: re-stamp the horizon and the profile so its
+    // quota reads and its spawn key this amend, not an earlier dispatch.
+    state.stamp_dispatch();
     let author = amend_author_seat(&mut state, paths, cfg)?;
     let mut n = state.contract_amendments.len() + 1;
     while paths
@@ -1497,6 +1653,11 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
 /// `continue_run`'s body, for callers that already hold the run lock.
 fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
+    // Re-entering an existing run is a new dispatch: re-stamp the horizon and
+    // the profile before any seat reads quota, so a weak pause written before
+    // this entry steers instead of being trusted. Both callers (replan and
+    // `plan::continue_run`) hold the run lock here.
+    state.stamp_dispatch();
     let amendment_section = plan_amendment_section(&state);
     let mut jobs = Vec::new();
     for slot in &state.slots {

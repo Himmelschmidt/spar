@@ -262,8 +262,10 @@ pub fn build_implement_seats(
         cfg,
         model.as_deref(),
         store,
+        None,
         paths,
         dry,
+        None,
         health,
     ) {
         Some((raw, source)) => {
@@ -298,8 +300,10 @@ pub fn build_implement_seats(
             cfg,
             model.as_deref(),
             store,
+            None,
             paths,
             dry,
+            None,
             health,
         ) else {
             continue;
@@ -484,7 +488,19 @@ pub fn launch_fleet(
             let mut skips = Vec::new();
             for (idx, (role, prefix)) in specs.into_iter().enumerate() {
                 match crate::backup::resolve_with_backup(
-                    role, idx, idx, &pool, origin, cfg, None, &store, paths, dry, health,
+                    role,
+                    idx,
+                    idx,
+                    &pool,
+                    origin,
+                    cfg,
+                    None,
+                    &store,
+                    None,
+                    paths,
+                    dry,
+                    None,
+                    health,
                 ) {
                     Some((raw, source)) => {
                         let id = format!("{prefix}-{}", sanitize_slot(&raw));
