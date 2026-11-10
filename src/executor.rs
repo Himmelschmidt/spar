@@ -3733,9 +3733,8 @@ fn run_dry(
 /// every dispatch. `0`, `false`, and unset mean a normal dry-run stamp. Both the
 /// dispatch and the no-progress check read the same run-dir counter file, so
 /// they agree on whether this dispatch was noop'd. The counter lives outside
-/// `RunState` because only the dry-run hook uses it.
-/// The hook is armed by any other value, including `all`: only then does the
-/// dispatch counter move, so real dry runs leave the file missing.
+/// `RunState` because only the dry-run hook uses it, and it moves only while
+/// the hook is armed, so real dry runs leave the file missing.
 fn dry_impl_hook_armed(raw: &str) -> bool {
     !(raw.is_empty() || raw == "0" || raw == "false")
 }
@@ -5240,7 +5239,7 @@ mod tests {
     #[test]
     fn build_dispatch_command_resumes_codex_when_a_prior_session_id_is_known() {
         // build_resume (opts.model: None) falls through to profile_model_args, which
-        // reads $CODEX_HOME/<profile>.config.toml — lock and isolate CODEX_HOME so this
+        // reads $CODEX_HOME/<profile>.config.toml: lock and isolate CODEX_HOME so this
         // doesn't read the machine's real ~/.codex or race codex.rs's own env-mutating
         // tests, matching neither of which this test's assertions depend on.
         let _guard = providers::codex::ENV_LOCK.lock().unwrap();
