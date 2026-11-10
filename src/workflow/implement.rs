@@ -5764,18 +5764,26 @@ fn carry_forward_section(
     if !persisted.is_empty() {
         // First, so the cap cannot cut an operator ruling; these stand until the sender
         // withdraws them, which is the point of `--persist`. The phase is capped so
-        // the reservation below always fits: withheld messages redeliver next round.
+        // the reservation below always fits; over-budget messages are marked withheld,
+        // never silently dropped.
         out.push_str(
             "### Operator messages (they stand until withdrawn; follow them over your own notes)\n",
         );
+        let phase_budget = max_chars / 4;
         let phase_start = out.chars().count();
         let mut withheld = 0;
+        let mut first = true;
         for m in persisted {
-            let line = format!("- {}\n", clamp_line(m, max_chars / 4));
-            if out.chars().count() - phase_start + line.chars().count() > max_chars / 4 {
-                withheld += 1;
-            } else {
+            // Clamp to the phase budget minus the bullet overhead, so a long
+            // message renders clamped instead of missing the budget outright.
+            // The first message always renders: an operator ruling must never
+            // be silently absent from the round it was written for.
+            let line = format!("- {}\n", clamp_line(m, phase_budget.saturating_sub(3)));
+            if first || out.chars().count() - phase_start + line.chars().count() <= phase_budget {
                 out.push_str(&line);
+                first = false;
+            } else {
+                withheld += 1;
             }
         }
         if withheld > 0 {
@@ -5811,12 +5819,17 @@ fn carry_forward_section(
         let total_ac: usize = verdicts.iter().map(|v| v.acceptance.len()).sum();
         let heads_len: usize = verdicts.iter().map(|v| v.head.chars().count()).sum();
         let ac_budget = (max_chars / 2).min(max_chars.saturating_sub(out.chars().count()));
+        // Bullets pay their own punctuation: the "- " prefix, the "; " joins
+        // and the newline come out of the same reservation, or the share math
+        // promises lines that do not fit and the tail cut eats a whole review.
+        let manifest_overhead = verdicts.len() * 3;
+        let joins_overhead = total_ac * 2;
         let share = ac_budget
-            .saturating_sub(heads_len)
+            .saturating_sub(heads_len + manifest_overhead + joins_overhead)
             .checked_div(total_ac.max(1))
             .unwrap_or(0)
             .clamp(MIN_AC_SHARE, MAX_AC_LINE);
-        let manifest_only = heads_len + MIN_AC_SHARE * total_ac > ac_budget;
+        let manifest_only = heads_len + manifest_overhead + MIN_AC_SHARE * total_ac > ac_budget;
         for v in &verdicts {
             let mut items = vec![v.head.clone()];
             if !manifest_only {
@@ -7251,6 +7264,14 @@ mod carry_forward_tests {
             .map(|m| format!("from human (message {m}): {}", "o".repeat(2000)))
             .collect::<Vec<_>>();
         let out = carry_forward_section(3, &persisted, &blockers, None, 4000);
+        assert!(
+            out.contains("from human (message m1)"),
+            "the first operator message renders clamped, never withheld:\n{out}"
+        );
+        assert!(
+            out.contains("+1 more operator messages withheld"),
+            "the over-budget message is marked withheld, not silently dropped:\n{out}"
+        );
         for r in 1..=5 {
             for n in 1..=5 {
                 assert!(
@@ -7264,6 +7285,18 @@ mod carry_forward_tests {
             5,
             "every review keeps its manifest beside operator messages:\n{out}"
         );
+    }
+
+    /// A single operator message longer than the phase budget renders clamped:
+    /// the bullet overhead used to push it over the budget outright.
+    #[test]
+    fn a_single_long_operator_message_renders_clamped() {
+        let out = carry_forward_section(3, &["o".repeat(1200)], &[], None, 4000);
+        assert!(
+            out.contains(&"o".repeat(994)),
+            "the message head survives the phase clamp:\n{out}"
+        );
+        assert!(!out.contains("withheld"), "nothing is withheld:\n{out}");
     }
 
     /// The per-line share floors at 32 characters; when even floored lines do
