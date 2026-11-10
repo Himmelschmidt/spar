@@ -430,7 +430,7 @@ fn run() -> Result<ExitCode> {
                     None => task,
                 };
                 // Seat shapers ride along into the dispatch: a bound run amends under
-                // its own lock, after the preconditions below pass (O170). The
+                // its own lock, after the preconditions below pass. The
                 // preset parses here, so a `--fleet` typo fails at the pre-check
                 // instead of after the dispatch acquired its lock.
                 let amend = workflow::implement::BoundAmendInputs {
@@ -600,7 +600,7 @@ fn run() -> Result<ExitCode> {
             // A round extension refused or found busy after the pre-check is still a
             // refusal: nothing was dispatched, so `--json` gets the same shape. An
             // amend refusal is one too: the frozen config and run state were left
-            // untouched under the dispatch's lock (O170).
+            // untouched under the dispatch's lock.
             workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg, amend)
                 .or_else(|e| {
                     if e.is::<workflow::implement::RoundExtensionRefused>()
@@ -1380,7 +1380,7 @@ fn bus_deliver(
 
 /// Seat shapers for a fresh launch: pool resolution, drops, and role/backup/
 /// effort overrides, in launch order. A surviving drop records without pinning
-/// the panel (O178).
+/// the panel (O181).
 #[allow(clippy::too_many_arguments)]
 fn fresh_seat_shapers(
     cfg: &mut Config,
@@ -1400,7 +1400,7 @@ fn fresh_seat_shapers(
         let dropped = cfg.apply_without(&[], state::PoolOrigin::Synth, dry_run, without)?;
         cfg.apply_role_overrides(role)?;
         cfg.refuse_emptied_reviewer_panel(&dropped)?;
-        config::warn_if_role_discards_reviewer_drop(role, &dropped);
+        config::warn_if_role_supersedes_reviewer_drop(role, &dropped, false);
         cfg.apply_backup_overrides(backup)?;
         cfg.apply_effort_overrides(effort)?;
         return Ok(None);
@@ -1410,7 +1410,7 @@ fn fresh_seat_shapers(
     let dropped = cfg.apply_without(&resolved.providers, origin, dry_run, without)?;
     cfg.apply_role_overrides(role)?;
     // Record after the drops and role overrides shaped the panel, so the
-    // stored width and roles are the question the dispatch asks (O179). The
+    // stored width and roles are the question the dispatch asks (O181). The
     // providers stay the pre-shape resolution the ordinals indexed.
     let preselected = if selected {
         Some(workflow::roles_resolve::PreselectedPool::for_shaped_panel(
@@ -1420,7 +1420,7 @@ fn fresh_seat_shapers(
         None
     };
     cfg.refuse_emptied_reviewer_panel(&dropped)?;
-    config::warn_if_role_discards_reviewer_drop(role, &dropped);
+    config::warn_if_role_supersedes_reviewer_drop(role, &dropped, false);
     cfg.apply_backup_overrides(backup)?;
     cfg.apply_effort_overrides(effort)?;
     Ok(preselected)
@@ -1434,7 +1434,7 @@ fn fresh_seat_shapers(
 /// `--reload-config` is the deliberate way out: it re-reads the file and re-freezes the
 /// run against it. A bound run amends under the dispatch's own lock, after every
 /// launch precondition passes. Nothing here amends anything before those checks,
-/// so a refused launch changes nothing (O170); this context returns the frozen
+/// so a refused launch changes nothing; this context returns the frozen
 /// config untouched.
 #[allow(clippy::too_many_arguments)]
 fn implement_ctx(

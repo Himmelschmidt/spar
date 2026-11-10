@@ -62,11 +62,15 @@ caught, which is what the sweep is for.
   resume's frozen config directly (only `--suite-command` still needs `--reload-config`).
   `--without reviewer[N]` (or an existing seat id) drops a reviewer seat outright: the
   seat, its review history, and its verdicts stop gating the ship. The ordinal indexes
-  the panel the dispatch would use, and dropping the last reviewer is refused. A
-  widened `-wide` extra holds no ordinal (an ordinal past the panel is refused) and
-  keeps reviewing outside the config when the pin it duplicated is dropped. The
-  amend applies only once every launch precondition passes, so a refused launch changes
-  nothing.
+  the live panel positions at the moment `--without` is parsed. Dropping the last
+  reviewer is refused, unless `--role reviewer=` in the same amend re-seats the panel
+  to its pin; a run with no live panel seats left fails before dispatch (exit 1) and
+  never reaches the ship gate unreviewed. A bound `--role reviewer=` pin moves, mints
+  or retires live seats to match it, so the panel the dispatch reviews with is the
+  panel the frozen config names. A widened `-wide` extra holds no ordinal (an ordinal
+  past the panel is refused) and keeps reviewing outside the config when the pin it
+  duplicated is dropped. The amend applies only once every launch precondition passes,
+  so a refused launch changes nothing.
 - **`--reassign <role|seat>=<provider>`** on `implement --run <id>` moves a seat that already
   exists to another provider on the same worktree and branch (a reload only changes a
   seat's model). Operator-only; refused while the run's orchestrator is alive and onto a

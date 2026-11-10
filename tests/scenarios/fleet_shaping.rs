@@ -2417,7 +2417,7 @@ fn reconcile_seats_report_the_rung_their_pool_came_from() {
     }
 }
 
-/// #234 follow-up (item 1): a refused launch changes nothing. The run below is a
+/// A refused launch changes nothing. The run below is a
 /// plan that was never approved, so `implement --run` is not resumable; the
 /// `--without reviewer[0]` it carries must not shrink the panel, and retrying
 /// the same refused command must not shrink it again.
@@ -2469,7 +2469,7 @@ fn refused_without_drop_leaves_panel_and_state_unchanged() {
     }
 }
 
-/// #234 follow-up (item 2a): on a fresh launch an explicit `--providers` pool
+/// On a fresh launch an explicit `--providers` pool
 /// beats a `[roles].reviewer` file pin, so `reviewer[0]` indexes the pool panel
 /// (`cli:codex`), not the file panel (`api:openai`).
 #[test]
@@ -2502,7 +2502,7 @@ fn fresh_without_ordinal_ignores_a_file_pin_for_an_explicit_pool() {
     );
 }
 
-/// #234 follow-up (item 2b): a bound-run amend on a run with no reviewer slots
+/// A bound-run amend on a run with no reviewer slots
 /// yet (a plan continuation) resolves the ordinal against the recorded pool via
 /// `--reload-config`, never against a file pin edited in after the freeze.
 #[test]
@@ -2553,7 +2553,7 @@ fn bound_amend_without_slots_replays_the_recorded_pool() {
     );
 }
 
-/// #234 follow-up (item 3): `--without` refuses to drop the last reviewer seat,
+/// `--without` refuses to drop the last reviewer seat,
 /// and the refusal leaves the frozen config and the state alone.
 #[test]
 fn without_refuses_to_drop_the_last_reviewer_seat() {
@@ -2621,7 +2621,7 @@ fn without_refuses_to_drop_the_last_reviewer_seat() {
     );
 }
 
-/// #234 follow-up (item 6): `--validate-only` with `--without reviewer[N]`
+/// `--validate-only` with `--without reviewer[N]`
 /// shows the fleet after the drop. The surviving seat keeps its id.
 #[test]
 fn validate_only_shows_the_fleet_after_the_drop() {
@@ -2688,10 +2688,9 @@ fn snapshot_run_dir(dir: &std::path::Path, run_id: &str) -> Vec<(String, Vec<u8>
     out
 }
 
-/// #234 follow-up (item 1c): a refused amend after a valid reassign changes
-/// nothing. The reassign resolves, then the out-of-range `--without` refuses;
-/// the old code applied the reassign (renamed artifact, cleared marker, event)
-/// before the amend ran. The run dir is byte-identical afterwards.
+/// A refused amend after a valid reassign changes nothing. The reassign
+/// resolves, then the out-of-range `--without` refuses; the run dir is
+/// byte-identical afterwards.
 #[test]
 fn refused_amend_after_a_reassign_changes_nothing() {
     let tmp = project("[suite]\nenabled = false\n");
@@ -2750,7 +2749,7 @@ fn refused_amend_after_a_reassign_changes_nothing() {
     );
 }
 
-/// #234 follow-up: the frozen pin records providers by panel ordinal, and a
+/// The frozen pin records providers by panel ordinal, and a
 /// `--reassign` moves seats after the preview pinned them. A successful amend
 /// with both must freeze the moved panel, not the pre-move one.
 #[test]
@@ -2811,10 +2810,9 @@ fn amend_after_a_reassign_freezes_the_moved_panel() {
     );
 }
 
-/// #234 follow-up: on a bound run, `--role reviewer=...` replaces the panel
-/// outright, so a reassign that runs after the preview must not refresh the
-/// live-slot pin back over it. The frozen config keeps the role panel, the
-/// dropped seat still leaves the run, and the warning says exactly that.
+/// On a bound run the live panel and the frozen config panel are one fact:
+/// dropping a seat while pinning `--role reviewer=` still removes the seat,
+/// then re-seats the live panel to match the pin.
 #[test]
 fn bound_drop_with_role_pin_freezes_the_role_panel() {
     let tmp = project("[suite]\nenabled = false\n");
@@ -2836,24 +2834,12 @@ fn bound_drop_with_role_pin_freezes_the_role_panel() {
     let state = read_state(tmp.path(), &run_id);
     let ids = slot_ids_for(&state, "reviewer");
     assert!(ids.len() > 1, "the dispatch seated a panel: {ids:?}");
-    let seat = ids[0].clone();
-    let current = providers_for(&state, "reviewer")[0].clone();
-    // A moved seat keeps its ordinal, so any other provider's id is free.
-    let other = ["cli:claude", "cli:codex", "cli:grok"]
-        .into_iter()
-        .map(str::to_string)
-        .find(|p| *p != current)
-        .expect("a provider to move the seat to");
-    let survivor = ids[1].clone();
-    let survivor_provider = providers_for(&state, "reviewer")[1].clone();
     spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",
             "--run",
             &run_id,
-            "--reassign",
-            &format!("{seat}={other}"),
             "--without",
             "reviewer[0]",
             "--role",
@@ -2864,7 +2850,7 @@ fn bound_drop_with_role_pin_freezes_the_role_panel() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains(
-            "still removes its seat but does not narrow the frozen panel",
+            "replaces the reviewer panel, so the live panel is re-seated to match it",
         ));
     let cfg = read_run_config(tmp.path(), &run_id);
     let panel: Vec<&str> = cfg["roles"]["reviewer"]
@@ -2876,26 +2862,88 @@ fn bound_drop_with_role_pin_freezes_the_role_panel() {
     assert_eq!(
         panel,
         vec!["cli:codex"],
-        "the frozen config keeps the role panel, not the refreshed pin: {panel:?}"
+        "the frozen config keeps the role panel: {panel:?}"
     );
     let state = read_state(tmp.path(), &run_id);
     assert_eq!(
-        slot_ids_for(&state, "reviewer"),
-        vec![survivor],
-        "the drop still removes its seat while the role pin wins the panel: {:?}",
-        state["slots"]
-    );
-    assert_eq!(
         providers_for(&state, "reviewer"),
-        vec![survivor_provider],
-        "the surviving seat keeps its provider: {:?}",
+        vec!["cli:codex".to_string()],
+        "the live panel is re-seated to the pin: {:?}",
         state["slots"]
     );
 }
 
-/// #234 follow-up (item 2): `--role` on a bound run without `--reload-config` amends
-/// the frozen config, and the existing seats track it. Before this, the amend wrote
-/// `config.json` and stopped: the live seat kept whatever model it was minted with.
+/// Dropping the whole reviewer panel while pinning `--role reviewer=`
+/// re-seats the live panel to the pin instead of idling at ship confirm
+/// with zero reviewers.
+#[test]
+fn bound_drop_all_with_role_pin_reseats_the_live_panel() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(tmp.path(), &["--providers", "cli:claude,cli:grok"]);
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        2,
+    );
+    let ids = slot_ids_for(&read_state(tmp.path(), &run_id), "reviewer");
+    assert_eq!(ids.len(), 2, "two reviewer seats: {ids:?}");
+    let without: Vec<String> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("reviewer[{i}]"))
+        .collect();
+    let mut cmd = spar_cmd();
+    cmd.current_dir(tmp.path()).args([
+        "implement",
+        "--run",
+        &run_id,
+        "--without",
+        &without[0],
+        "--without",
+        &without[1],
+        "--role",
+        "reviewer=cli:codex",
+        "--dry-run",
+        "--json",
+    ]);
+    cmd.assert().code(2).stderr(predicate::str::contains(
+        "replaces the reviewer panel, so the live panel is re-seated to match it",
+    ));
+    let cfg = read_run_config(tmp.path(), &run_id);
+    let panel: Vec<&str> = cfg["roles"]["reviewer"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        panel,
+        vec!["cli:codex"],
+        "the frozen config keeps the role panel: {panel:?}"
+    );
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        providers_for(&state, "reviewer"),
+        vec!["cli:codex".to_string()],
+        "the live panel is re-seated to the pin: {:?}",
+        state["slots"]
+    );
+    assert_eq!(
+        state["phase"].as_str().unwrap_or_default(),
+        "awaiting_ship_confirm",
+        "the re-seated panel reviews before the run can ship: {:?}",
+        state["phase"]
+    );
+}
+
+/// `--role` on a bound run without `--reload-config` amends the frozen
+/// config, and the existing seats track it.
 #[test]
 fn role_amend_repoints_existing_seats_without_reload_config() {
     let tmp = project("[suite]\nenabled = false\n");
@@ -2949,8 +2997,6 @@ fn role_amend_repoints_existing_seats_without_reload_config() {
 
 /// `--role implementer=<other provider>` on an existing run re-points the live
 /// seat: the `impl` seat id names no provider, so there is nothing to contradict.
-/// Before, the amend saved the pin and then refused, leaving config and state
-/// disagreeing and every later amend on the run failing the same way.
 #[test]
 fn role_amend_with_new_implementer_provider_repoints_the_live_seat() {
     let tmp = project("[suite]\nenabled = false\n");

@@ -243,6 +243,7 @@ mod tests {
             auth_fault: false,
             build_cache: None,
             classifier: None,
+            reviewer_kind: None,
         }
     }
 

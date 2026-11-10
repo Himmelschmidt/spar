@@ -4844,6 +4844,7 @@ pub fn init_slot_model(
         auth_fault: false,
         build_cache: None,
         classifier: None,
+        reviewer_kind: None,
     }
 }
 

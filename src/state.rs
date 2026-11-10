@@ -583,6 +583,11 @@ pub struct SlotState {
     /// for state written before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SeatSource>,
+    /// What kind of reviewer seat this slot holds, recorded when the seat is
+    /// minted. `None` for non-reviewer slots and for state written before this
+    /// field existed (those ids still parse, so the kind is inferred).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_kind: Option<ReviewerSeatKind>,
     /// Set when this dispatch's failure was the provider refusing its credential (401,
     /// a revoked token, "not logged in") after spar's one short-wait retry (O104). An
     /// infrastructure fault, not a verdict on the work: it engages the declared backup
@@ -715,6 +720,13 @@ pub struct FleetSeat {
 
 fn one_round() -> u32 {
     1
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerSeatKind {
+    Panel,
+    Wide,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
