@@ -38,15 +38,19 @@ pub struct ProbeReport {
 }
 
 /// Probe one provider and write the verdict into the quota store. Under `dry` nothing
-/// is spawned and nothing is written. A bare ref names no model, so it names the
-/// login: `provider probe cli:codex` reads and clears the whole login, while a
-/// modeled probe resolves through the seat's keys (a quota verdict on the
-/// rejection key the output names, any other verdict on the seat's own quota
-/// key), so it reads and clears only the bucket the seat dispatches under.
-pub fn probe(paths: &SparPaths, provider: &str, dry: bool) -> ProbeReport {
-    let out = call(paths, provider, dry);
+/// is spawned and nothing is written. The probe keys exactly the way a seat
+/// reads: a quota verdict lands on the seat's `rejection_key`, any other verdict
+/// on its `quota_key` (with the run's recorded profile, ambient from the
+/// operator CLI), so `provider probe cli:codex` reads and clears the bucket the
+/// seat dispatches under, never the whole login.
+pub fn probe(
+    paths: &SparPaths,
+    provider: &str,
+    dry: bool,
+    codex_profile: Option<&str>,
+) -> ProbeReport {
+    let out = call(paths, provider, dry, codex_profile);
     let key = match ProviderRef::parse(provider) {
-        Ok(pref) if pref.model.is_none() => quota::operator_key(provider),
         Ok(pref) if out.verdict == Verdict::Quota => {
             // Window and text always travel together now: one vote each,
             // broadest wins, resolved against the probed seat.
@@ -55,10 +59,10 @@ pub fn probe(paths: &SparPaths, provider: &str, dry: bool) -> ProbeReport {
                     window: out.window,
                     text: out.output.as_deref().unwrap_or(""),
                 },
-                None,
+                codex_profile,
             )
         }
-        Ok(pref) => pref.quota_key(None),
+        Ok(pref) => pref.quota_key(codex_profile),
         Err(_) => quota::operator_key(provider),
     };
     let mut store = QuotaStore::load(paths).unwrap_or_default();
@@ -158,7 +162,7 @@ fn apply(
     }
 }
 
-fn call(paths: &SparPaths, provider: &str, dry: bool) -> CallOutcome {
+fn call(paths: &SparPaths, provider: &str, dry: bool, codex_profile: Option<&str>) -> CallOutcome {
     let Ok(pref) = ProviderRef::parse(provider) else {
         return CallOutcome::without_output(
             Verdict::Skipped,
@@ -175,7 +179,7 @@ fn call(paths: &SparPaths, provider: &str, dry: bool) -> CallOutcome {
         return CallOutcome::without_output(Verdict::Skipped, Some("not on PATH".into()));
     };
     let opts = SpawnOpts {
-        codex_profile: None,
+        codex_profile: codex_profile.map(str::to_string),
         prompt: PROBE_PROMPT.into(),
         prompt_file: None,
         cwd: paths.project_root.clone(),
@@ -594,11 +598,95 @@ mod tests {
         );
     }
 
+    /// A fake `codex` answering every call with `body`, with the ambient profile
+    /// at its default so a bare ref keys the `openrouter` bucket. Holds the
+    /// shared env lock and restores `PATH` and `SPAR_CODEX_PROFILE` after.
+    fn with_fake_codex(body: &str, f: impl FnOnce(&SparPaths)) {
+        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
+        let old_profile = std::env::var("SPAR_CODEX_PROFILE").ok();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(tmp.path().join("proj")).unwrap();
+        std::fs::write(bin.join("codex"), format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        f(&SparPaths::new(tmp.path().join("proj")));
+        match old_profile {
+            Some(v) => std::env::set_var("SPAR_CODEX_PROFILE", v),
+            None => std::env::remove_var("SPAR_CODEX_PROFILE"),
+        }
+        std::env::set_var("PATH", old_path);
+    }
+
+    #[test]
+    fn a_bare_codex_probe_clears_the_paused_bucket_the_seat_reads() {
+        with_fake_codex("echo OK", |paths| {
+            let mut store = QuotaStore::default();
+            store.pause_quota("cli:codex@openrouter", "possible quota signal: usage limit");
+            store.save(paths).unwrap();
+            let loaded = QuotaStore::load(paths).unwrap();
+            assert!(
+                !crate::backup::is_provider_eligible("cli:codex", &loaded, None, None),
+                "the bucket pause benches the bare seat"
+            );
+
+            let r = probe(paths, "cli:codex", false, None);
+            assert_eq!(r.verdict, Verdict::Healthy);
+            assert_eq!(r.provider, "cli:codex@openrouter");
+            assert_eq!(r.store, "cleared quota pause");
+
+            let fresh = QuotaStore::load(paths).unwrap();
+            assert!(
+                crate::backup::is_provider_eligible("cli:codex", &fresh, None, None),
+                "the recovered bucket serves the seat again"
+            );
+            assert!(
+                fresh.is_usable("cli:codex@native"),
+                "the sibling bucket was never touched"
+            );
+        });
+    }
+
+    #[test]
+    fn a_bare_codex_quota_probe_pauses_only_the_bucket() {
+        with_fake_codex(
+            "echo \"You've hit your usage limit. Try again later.\" >&2\nexit 1",
+            |paths| {
+                let r = probe(paths, "cli:codex", false, None);
+                assert_eq!(r.verdict, Verdict::Quota);
+                assert_eq!(r.provider, "cli:codex@openrouter");
+
+                let fresh = QuotaStore::load(paths).unwrap();
+                assert!(!fresh.is_usable("cli:codex@openrouter"));
+                assert!(
+                    fresh.is_usable("cli:codex"),
+                    "the login still serves the other bucket"
+                );
+                assert!(
+                    fresh.is_usable("cli:codex@native"),
+                    "the sibling bucket was never touched"
+                );
+                assert!(
+                    !crate::backup::is_provider_eligible("cli:codex", &fresh, None, None),
+                    "the seat that hit the wall stays benched"
+                );
+            },
+        );
+    }
+
     #[test]
     fn a_dry_probe_spawns_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
-        let r = probe(&paths, "cli:claude", true);
+        let r = probe(&paths, "cli:claude", true, None);
         assert_eq!(r.verdict, Verdict::Skipped);
         assert_eq!(r.store, "unchanged");
         assert!(!paths.quota_file().exists());

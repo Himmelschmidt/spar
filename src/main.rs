@@ -3651,7 +3651,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
             };
             let reports: Vec<probe::ProbeReport> = targets
                 .iter()
-                .map(|t| probe::probe(&paths, t, dry))
+                .map(|t| probe::probe(&paths, t, dry, None))
                 .collect();
             if json {
                 println!("{}", serde_json::to_string_pretty(&reports)?);
