@@ -2181,6 +2181,7 @@ fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
             "brief": brief_text,
             "base_ref": state.base_ref,
             "base_commit": state.base_commit,
+            "merged_base": state.merged_base,
             "worktrees": state.worktrees,
             "fleet": executor::role_assignments(&state),
             "gates": state.gates,

@@ -611,6 +611,12 @@ pub fn ship(
         }
         return Ok(ExitCode::Success);
     }
+    // The run branch last saw its base when it was cut or merged; pushing a
+    // stale branch lands the PR behind and conflicting, so the base merges
+    // forward here too (#229). A conflict parks the run at the ship gate.
+    if let Some(code) = merge_base_before_push(paths, &mut state, cfg, &cwd, json)? {
+        return Ok(code);
+    }
     let remote = "origin";
     let title = pr_title(state.task.as_deref(), cfg.ship.title_max);
     let body_file = paths.artifact(run_id, "pr-body.md");
@@ -791,6 +797,83 @@ pub fn ship(
 /// rather than rewind a remote branch (O10): a lease against the local tracking ref alone
 /// passes after any fetch, which is how a hand-pushed branch got reset. With
 /// `adopt_remote`, a remote tip ahead of HEAD is fast-forwarded into the worktree first.
+/// Merge the run's base branch forward before pushing (#229). Clean (or
+/// already current): record the tip and proceed. A branch base with no remote
+/// is skipped with an event. Conflict: abort the merge and park the run at
+/// the ship-confirm gate (exit 2) naming the conflict and the remedy, so
+/// `spar implement --run <id>` can hand the resolution to the next round's
+/// implementer. Returns `Some` exit code when the run parked.
+fn merge_base_before_push(
+    paths: &SparPaths,
+    state: &mut RunState,
+    cfg: &Config,
+    cwd: &Path,
+    json: bool,
+) -> Result<Option<ExitCode>> {
+    if state.dry_run || !cfg.rounds.merge_base {
+        return Ok(None);
+    }
+    let Some(base_ref) = state.base_ref.clone() else {
+        return Ok(None);
+    };
+    match worktree::merge_base_forward(cwd, Some(&base_ref))? {
+        worktree::BaseMerge::Clean { merged } => {
+            state.merged_base = Some(merged.clone());
+            state.save(paths)?;
+            crate::events::append(
+                paths,
+                &state.id,
+                &crate::events::Event::info(format!(
+                    "merged base {base_ref} forward ({}) before ship push",
+                    merged.chars().take(8).collect::<String>(),
+                )),
+            )?;
+            Ok(None)
+        }
+        worktree::BaseMerge::AlreadyCurrent { tip } => {
+            state.merged_base = Some(tip);
+            state.save(paths)?;
+            Ok(None)
+        }
+        worktree::BaseMerge::Skipped(skip) => {
+            crate::events::append(
+                paths,
+                &state.id,
+                &crate::events::Event::info(format!(
+                    "skipping base forward merge before ship push: {skip}"
+                )),
+            )?;
+            Ok(None)
+        }
+        worktree::BaseMerge::Conflict { files } => {
+            worktree::abort_base_merge(cwd);
+            let files = if files.is_empty() {
+                "run `git status` for the list".to_string()
+            } else {
+                files.join(", ")
+            };
+            let msg = format!(
+                "base {base_ref} conflicts with the run branch ({files}); resolve it with \
+                 `spar implement --run {}` then ship again",
+                state.id
+            );
+            state.error = Some(msg.clone());
+            state.save(paths)?;
+            crate::events::append(
+                paths,
+                &state.id,
+                &crate::events::Event::info(format!("ship parked: {msg}")),
+            )?;
+            if json {
+                executor::emit_run_json(state)?;
+            } else {
+                eprintln!("ship parked: {msg}");
+            }
+            Ok(Some(ExitCode::HumanGate))
+        }
+    }
+}
+
 fn push_args(
     cwd: &Path,
     remote: &str,

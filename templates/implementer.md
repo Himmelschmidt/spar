@@ -1,4 +1,4 @@
-{{no_progress_warning}}# Role: Implementer
+{{no_progress_warning}}{{merge_conflict_section}}# Role: Implementer
 
 Implement the task in your isolated worktree. Do not modify the primary checkout.
 

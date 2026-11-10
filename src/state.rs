@@ -55,6 +55,12 @@ pub struct RunState {
     /// Commit `base_ref` resolved to. This is what worktrees actually branch from.
     #[serde(default)]
     pub base_commit: Option<String>,
+    /// Last upstream base commit merged into the run branch (#229). Starts at
+    /// `base_commit` and advances on every clean forward merge; diffs that mean
+    /// "the run's change relative to now" (`base..HEAD` review ranges, added-file
+    /// detection) read this, while `base_commit` stays the creation cut (O26).
+    #[serde(default)]
+    pub merged_base: Option<String>,
     /// Commits the invoking HEAD was behind its upstream tracking branch when the base
     /// was taken from it (no `--base`). `None` when `--base` was given or there is no
     /// upstream to compare against.
@@ -1044,6 +1050,7 @@ impl RunState {
             project_root,
             base_ref: None,
             base_commit: None,
+            merged_base: None,
             base_behind: None,
             config_source_drift: false,
             backend: Backend::Auto,
