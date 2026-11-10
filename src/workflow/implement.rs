@@ -5603,6 +5603,7 @@ fn take_carry_forward(paths: &SparPaths, run_id: &str, slot_id: &str) -> Option<
 struct VerdictBlocker {
     review_id: String,
     head: String,
+    compact: String,
     acceptance: Vec<String>,
     findings: Vec<String>,
     dropped_findings: usize,
@@ -5649,6 +5650,16 @@ fn verdict_blocker(
     if !ids.is_empty() {
         head.push_str(&format!(": failing {ids}"));
     }
+    // Degraded form for caps even the full heads exceed: keeps the review id,
+    // the round, and the failing-ids manifest, which is what the next round
+    // must fix. The commit anchor stays in state and on the review artifact.
+    let mut compact = format!("review `{}`", rev.id);
+    if let Some(r) = round {
+        compact.push_str(&format!(" (round {r})"));
+    }
+    if !ids.is_empty() {
+        compact.push_str(&format!(": failing {ids}"));
+    }
     let lines: Vec<String> = acceptance
         .iter()
         .map(|a| {
@@ -5677,6 +5688,7 @@ fn verdict_blocker(
     VerdictBlocker {
         review_id: rev.id.clone(),
         head,
+        compact,
         acceptance: lines,
         findings,
         dropped_findings,
@@ -5824,14 +5836,26 @@ fn carry_forward_section(
         // promises lines that do not fit and the tail cut eats a whole review.
         let manifest_overhead = verdicts.len() * 3;
         let joins_overhead = total_ac * 2;
+        // When even the full heads exceed the reservation, degrade to compact
+        // heads that keep every review id and manifest rather than dropping
+        // whole reviews. Below that, the tail cut discloses the loss.
+        let compact_len: usize = verdicts.iter().map(|v| v.compact.chars().count()).sum();
+        let compact = heads_len + manifest_overhead > ac_budget
+            && compact_len + manifest_overhead <= ac_budget;
+        let rendered_heads = if compact { compact_len } else { heads_len };
         let share = ac_budget
-            .saturating_sub(heads_len + manifest_overhead + joins_overhead)
+            .saturating_sub(rendered_heads + manifest_overhead + joins_overhead)
             .checked_div(total_ac.max(1))
             .unwrap_or(0)
             .clamp(MIN_AC_SHARE, MAX_AC_LINE);
-        let manifest_only = heads_len + manifest_overhead + MIN_AC_SHARE * total_ac > ac_budget;
+        let manifest_only =
+            rendered_heads + manifest_overhead + MIN_AC_SHARE * total_ac > ac_budget;
         for v in &verdicts {
-            let mut items = vec![v.head.clone()];
+            let mut items = vec![if compact {
+                v.compact.clone()
+            } else {
+                v.head.clone()
+            }];
             if !manifest_only {
                 items.extend(v.acceptance.iter().map(|a| clamp_line(a, share)));
             }
@@ -7206,6 +7230,9 @@ mod carry_forward_tests {
                     head: format!(
                         "review `rev-{r}` requested changes (round 2, Reviewed-Commit abcdef123456): failing AC-1, AC-2, AC-3, AC-4, AC-5"
                     ),
+                    compact: format!(
+                        "review `rev-{r}` (round 2): failing AC-1, AC-2, AC-3, AC-4, AC-5"
+                    ),
                     acceptance: (1..=5)
                         .map(|n| format!("AC-{n}: fail: evid-r{r}c{n} {}", "e".repeat(300)))
                         .collect(),
@@ -7238,6 +7265,10 @@ mod carry_forward_tests {
             review_id: format!("rev-{review}"),
             head: format!(
                 "review `rev-{review}` requested changes (round 2, Reviewed-Commit abcdef123456): failing {}",
+                ids.join(", ")
+            ),
+            compact: format!(
+                "review `rev-{review}` (round 2): failing {}",
                 ids.join(", ")
             ),
             acceptance: (1..=criteria)
@@ -7297,6 +7328,25 @@ mod carry_forward_tests {
             "the message head survives the phase clamp:\n{out}"
         );
         assert!(!out.contains("withheld"), "nothing is withheld:\n{out}");
+    }
+
+    /// When even manifest-only full heads exceed the reservation, the block
+    /// degrades to compact heads that keep every review id, round, and
+    /// failing-ids manifest, rather than dropping whole reviews to the tail
+    /// cut. Five reviews keep all five manifests at a cap of 800.
+    #[test]
+    fn heads_beyond_the_reservation_degrade_to_compact() {
+        let blockers: Vec<Blocker> = (1..=5).map(|r| verdict_with_ac(r, 5, 300)).collect();
+        let out = carry_forward_section(3, &[], &blockers, None, 800);
+        assert_eq!(
+            out.matches("failing AC-1, AC-2, AC-3, AC-4, AC-5").count(),
+            5,
+            "every review keeps its manifest at a small cap:\n{out}"
+        );
+        assert!(
+            out.contains("review `rev-5` (round 2)"),
+            "the last review degrades instead of dropping:\n{out}"
+        );
     }
 
     /// The per-line share floors at 32 characters; when even floored lines do
