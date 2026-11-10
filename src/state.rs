@@ -95,9 +95,10 @@ pub struct RunState {
     #[serde(default)]
     pub no_progress_rounds: u32,
     /// One-shot operator override set by `implement --run <id> --re-review`: the
-    /// next no-progress dispatch sends the unchanged HEAD back to the panel
-    /// instead of counting toward a stall park (O171). Consumed (cleared) at the
-    /// stall branch whether or not it fires, so it never leaks into a later stall.
+    /// next loop pass skips the implementer dispatch and sends the unchanged
+    /// HEAD straight to the suite and panel (O171). Consumed (cleared) at the
+    /// top of the loop whether or not it fires, so it never leaks into a later
+    /// round.
     #[serde(default)]
     pub panel_rerun: bool,
     /// The warning a no-progress round put at the top of the next implementer

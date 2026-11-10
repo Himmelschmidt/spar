@@ -807,8 +807,15 @@ fn run_from_approved(
     // still counts; an explicit flag on this re-entry outranks it.
     apply_queued_round_extension(&mut state, paths);
     if let Some(mr) = opts.max_rounds {
-        state.max_rounds =
-            gate_max_rounds(state.max_rounds, mr.resolve(state.round), from_round_gate);
+        let target = mr.resolve(state.round);
+        let kept = gate_max_rounds(state.max_rounds, target, state.round > 0);
+        if kept != target && !opts.json {
+            println!(
+                "note: --max-rounds {target} is at or under the current ceiling {}; keeping it",
+                state.max_rounds
+            );
+        }
+        state.max_rounds = kept;
     }
     // A round that never dispatched is still the current round, not a spent one: an
     // orchestrator killed between opening it and spawning anything (a launching shell
@@ -1511,12 +1518,20 @@ pub(crate) fn acceptance_blocks_ship(
     res: &ReviewResult,
     cfg: &Config,
 ) -> bool {
+    !failing_acceptance_ids(criteria, res, cfg).is_empty()
+}
+
+/// The unwaived criteria that keep this review blocking the ship: missing from
+/// the report, failed, or unverified when the project requires every criterion
+/// verified. One expression behind both the stall detector and the warning, so
+/// the warning can name the same criteria that fired the stall.
+fn failing_acceptance_ids(criteria: &[String], res: &ReviewResult, cfg: &Config) -> Vec<String> {
     if criteria.is_empty() {
-        return false;
+        return Vec::new();
     }
     criteria
         .iter()
-        .any(|id| match res.acceptance.iter().find(|a| &a.id == id) {
+        .filter(|id| match res.acceptance.iter().find(|a| &a.id == *id) {
             None => true,
             Some(a) => match a.status {
                 AcStatus::Fail => true,
@@ -1524,6 +1539,8 @@ pub(crate) fn acceptance_blocks_ship(
                 AcStatus::Pass => false,
             },
         })
+        .cloned()
+        .collect()
 }
 
 /// One failing acceptance criterion: its id plus the reason it blocked, not one
@@ -2309,59 +2326,170 @@ pub fn execute_loop(
             s.error = None;
         }
 
-        let brief = take_carry_forward(paths, &state.id, &impl_slot.id);
-        let persisted =
-            crate::bus::persisted_for(paths, &state.id, &impl_slot.id).unwrap_or_default();
-        let unique = crate::bus::agent_ref(Some(&state.id), &impl_slot.id);
-        for m in &persisted {
-            for event in [
-                crate::bus::ReceiptEvent::Delivered,
-                crate::bus::ReceiptEvent::Read,
-            ] {
-                crate::bus::record_receipt(paths, &m.id, &unique, event, "carry_forward");
-            }
+        // `--re-review`: the operator judged the blocking review wrong, so this
+        // pass sends the current HEAD straight to the suite and panel below
+        // without dispatching the implementer. One-shot: the arm is consumed
+        // here, and a still-blocking panel re-arms the normal stall cycle.
+        let panel_direct = take_panel_rerun(state);
+        if panel_direct {
+            let head = worktree::git_out(&impl_cwd(state, &impl_slot), &["rev-parse", "HEAD"])
+                .unwrap_or_default();
+            let _ = crate::events::append(
+                paths,
+                &state.id,
+                &crate::events::Event::info(format!(
+                    "operator override (--re-review): skipping the implementer dispatch, \
+                     sending HEAD `{head}` straight to the suite and panel"
+                )),
+            );
+            state.save(paths)?;
         }
-        let persisted: Vec<String> = persisted
-            .iter()
-            .map(|m| format!("from {} (message {}): {}", m.from, m.id, m.body))
-            .collect();
         let round_start_head =
             worktree::git_out(&impl_cwd(state, &impl_slot), &["rev-parse", "HEAD"]);
-        let mut extra = HashMap::new();
-        extra.insert("plan_body".into(), plan_body.clone());
-        extra.insert("test_contract_body".into(), test_contract_body.clone());
-        extra.insert("amendment_section".into(), amendment_section.clone());
-        extra.insert(
-            "no_progress_warning".into(),
-            state.no_progress_warning.clone().unwrap_or_default(),
-        );
-        extra.insert(
-            "carry_forward_section".into(),
-            carry_forward_section(
-                state.round,
-                &persisted,
-                &blockers,
-                brief.as_deref(),
-                cfg.rounds.carry_forward_chars,
-            ),
-        );
-        let impl_model = impl_slot.model.clone();
-        let impl_job = SlotJob {
-            slot_id: impl_slot.id.clone(),
-            provider: impl_slot.provider.clone(),
-            role: SlotRole::Implementer,
-            template: "implementer".into(),
-            extra_vars: extra.clone(),
-            expected_artifact: Some(format!("summary-{}.md", impl_slot.id)),
-            model: impl_model,
-            effort: None,
-        };
-        if let Err(e) = executor::run_slot(state, paths, cfg, &impl_job) {
-            let quota_hit = executor::slot_parks_on_quota(state, &impl_job.slot_id);
-            if quota_hit {
-                if let Some(backup_raw) =
-                    crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
-                {
+        if !panel_direct {
+            let brief = take_carry_forward(paths, &state.id, &impl_slot.id);
+            let persisted =
+                crate::bus::persisted_for(paths, &state.id, &impl_slot.id).unwrap_or_default();
+            let unique = crate::bus::agent_ref(Some(&state.id), &impl_slot.id);
+            for m in &persisted {
+                for event in [
+                    crate::bus::ReceiptEvent::Delivered,
+                    crate::bus::ReceiptEvent::Read,
+                ] {
+                    crate::bus::record_receipt(paths, &m.id, &unique, event, "carry_forward");
+                }
+            }
+            let persisted: Vec<String> = persisted
+                .iter()
+                .map(|m| format!("from {} (message {}): {}", m.from, m.id, m.body))
+                .collect();
+            let mut extra = HashMap::new();
+            extra.insert("plan_body".into(), plan_body.clone());
+            extra.insert("test_contract_body".into(), test_contract_body.clone());
+            extra.insert("amendment_section".into(), amendment_section.clone());
+            extra.insert(
+                "no_progress_warning".into(),
+                state.no_progress_warning.clone().unwrap_or_default(),
+            );
+            extra.insert(
+                "carry_forward_section".into(),
+                carry_forward_section(
+                    state.round,
+                    &persisted,
+                    &blockers,
+                    brief.as_deref(),
+                    cfg.rounds.carry_forward_chars,
+                ),
+            );
+            let impl_model = impl_slot.model.clone();
+            let impl_job = SlotJob {
+                slot_id: impl_slot.id.clone(),
+                provider: impl_slot.provider.clone(),
+                role: SlotRole::Implementer,
+                template: "implementer".into(),
+                extra_vars: extra.clone(),
+                expected_artifact: Some(format!("summary-{}.md", impl_slot.id)),
+                model: impl_model,
+                effort: None,
+            };
+            if let Err(e) = executor::run_slot(state, paths, cfg, &impl_job) {
+                let quota_hit = executor::slot_parks_on_quota(state, &impl_job.slot_id);
+                if quota_hit {
+                    if let Some(backup_raw) =
+                        crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
+                    {
+                        let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+                        let has_backup = cfg.backups.implementer.is_some();
+                        let available: Option<std::collections::HashSet<String>> =
+                            if state.dry_run || !has_backup {
+                                None
+                            } else {
+                                let detected: std::collections::HashSet<String> =
+                                    crate::providers::detect_all()
+                                        .into_iter()
+                                        .filter(|r| r.available)
+                                        .map(|r| format!("cli:{}", r.name))
+                                        .collect();
+                                if detected.is_empty() {
+                                    None
+                                } else {
+                                    Some(detected)
+                                }
+                            };
+                        let slot_state = state
+                            .slots
+                            .iter()
+                            .find(|s| s.id == impl_job.slot_id)
+                            .cloned()
+                            .unwrap();
+                        let cause = crate::backup::dispatch_stop_cause(
+                            &slot_state,
+                            &store,
+                            available.as_ref(),
+                            state.recorded_route(),
+                        );
+                        if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
+                            let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
+                                .map(|r| r.storage_key())
+                                .unwrap_or_else(|_| backup_raw.clone());
+                            let cur_key =
+                                crate::provider_ref::ProviderRef::parse(&impl_slot.provider)
+                                    .map(|r| r.storage_key())
+                                    .unwrap_or_else(|_| impl_slot.provider.clone());
+                            if backup_key != cur_key
+                                && crate::backup::backup_eligible(
+                                    &backup_raw,
+                                    &store,
+                                    available.as_ref(),
+                                    paths,
+                                    state.dry_run,
+                                    state.recorded_route(),
+                                )
+                            {
+                                if let Some(s) = state.slot_mut(&impl_job.slot_id) {
+                                    let pin = crate::provider_ref::Pin::parse(&backup_raw)
+                                        .map(|p| p.display())
+                                        .unwrap_or(backup_raw.clone());
+                                    s.point_at(&pin);
+                                    s.source = Some(SeatSource::Backup);
+                                }
+                                state.save(paths)?;
+                                // Retry the implementer with backup in the same round
+                                let retry_impl_slot = state
+                                    .slots
+                                    .iter()
+                                    .find(|s| s.id == impl_job.slot_id)
+                                    .cloned()
+                                    .unwrap();
+                                let retry_job = SlotJob {
+                                    slot_id: retry_impl_slot.id.clone(),
+                                    provider: retry_impl_slot.provider.clone(),
+                                    role: SlotRole::Implementer,
+                                    template: "implementer".into(),
+                                    extra_vars: extra.clone(),
+                                    expected_artifact: Some(format!(
+                                        "summary-{}.md",
+                                        retry_impl_slot.id
+                                    )),
+                                    model: retry_impl_slot.model.clone(),
+                                    effort: None,
+                                };
+                                if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
+                                    let quota_hit2 =
+                                        executor::slot_parks_on_quota(state, &retry_job.slot_id);
+                                    return fail(state, paths, e2, quota_hit2);
+                                }
+                                // Retry succeeded, continue to review phase
+                            } else {
+                                return fail(state, paths, e, quota_hit);
+                            }
+                        } else {
+                            return fail(state, paths, e, quota_hit);
+                        }
+                    } else {
+                        return fail(state, paths, e, quota_hit);
+                    }
+                } else {
                     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
                     let has_backup = cfg.backups.implementer.is_some();
                     let available: Option<std::collections::HashSet<String>> =
@@ -2392,149 +2520,66 @@ pub fn execute_loop(
                         available.as_ref(),
                         state.recorded_route(),
                     );
-                    if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
-                        let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
-                            .map(|r| r.storage_key())
-                            .unwrap_or_else(|_| backup_raw.clone());
-                        let cur_key = crate::provider_ref::ProviderRef::parse(&impl_slot.provider)
-                            .map(|r| r.storage_key())
-                            .unwrap_or_else(|_| impl_slot.provider.clone());
-                        if backup_key != cur_key
-                            && crate::backup::backup_eligible(
+                    if cause.engages_backup() {
+                        if let Some(backup_raw) =
+                            crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
+                        {
+                            if crate::backup::backup_eligible(
                                 &backup_raw,
                                 &store,
                                 available.as_ref(),
                                 paths,
                                 state.dry_run,
                                 state.recorded_route(),
-                            )
-                        {
-                            if let Some(s) = state.slot_mut(&impl_job.slot_id) {
-                                let pin = crate::provider_ref::Pin::parse(&backup_raw)
-                                    .map(|p| p.display())
-                                    .unwrap_or(backup_raw.clone());
-                                s.point_at(&pin);
-                                s.source = Some(SeatSource::Backup);
-                            }
-                            state.save(paths)?;
-                            // Retry the implementer with backup in the same round
-                            let retry_impl_slot = state
-                                .slots
-                                .iter()
-                                .find(|s| s.id == impl_job.slot_id)
-                                .cloned()
-                                .unwrap();
-                            let retry_job = SlotJob {
-                                slot_id: retry_impl_slot.id.clone(),
-                                provider: retry_impl_slot.provider.clone(),
-                                role: SlotRole::Implementer,
-                                template: "implementer".into(),
-                                extra_vars: extra.clone(),
-                                expected_artifact: Some(format!(
-                                    "summary-{}.md",
-                                    retry_impl_slot.id
-                                )),
-                                model: retry_impl_slot.model.clone(),
-                                effort: None,
-                            };
-                            if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
-                                let quota_hit2 =
-                                    executor::slot_parks_on_quota(state, &retry_job.slot_id);
-                                return fail(state, paths, e2, quota_hit2);
-                            }
-                            // Retry succeeded, continue to review phase
-                        } else {
-                            return fail(state, paths, e, quota_hit);
-                        }
-                    } else {
-                        return fail(state, paths, e, quota_hit);
-                    }
-                } else {
-                    return fail(state, paths, e, quota_hit);
-                }
-            } else {
-                let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-                let has_backup = cfg.backups.implementer.is_some();
-                let available: Option<std::collections::HashSet<String>> =
-                    if state.dry_run || !has_backup {
-                        None
-                    } else {
-                        let detected: std::collections::HashSet<String> =
-                            crate::providers::detect_all()
-                                .into_iter()
-                                .filter(|r| r.available)
-                                .map(|r| format!("cli:{}", r.name))
-                                .collect();
-                        if detected.is_empty() {
-                            None
-                        } else {
-                            Some(detected)
-                        }
-                    };
-                let slot_state = state
-                    .slots
-                    .iter()
-                    .find(|s| s.id == impl_job.slot_id)
-                    .cloned()
-                    .unwrap();
-                let cause = crate::backup::dispatch_stop_cause(
-                    &slot_state,
-                    &store,
-                    available.as_ref(),
-                    state.recorded_route(),
-                );
-                if cause.engages_backup() {
-                    if let Some(backup_raw) =
-                        crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
-                    {
-                        if crate::backup::backup_eligible(
-                            &backup_raw,
-                            &store,
-                            available.as_ref(),
-                            paths,
-                            state.dry_run,
-                            state.recorded_route(),
-                        ) && slot_state.source != Some(SeatSource::Backup)
-                        {
-                            let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
-                                .map(|r| r.storage_key())
-                                .unwrap_or_else(|_| backup_raw.clone());
-                            let cur_key =
-                                crate::provider_ref::ProviderRef::parse(&impl_slot.provider)
-                                    .map(|r| r.storage_key())
-                                    .unwrap_or_else(|_| impl_slot.provider.clone());
-                            if backup_key != cur_key {
-                                if let Some(s) = state.slot_mut(&impl_job.slot_id) {
-                                    let pin = crate::provider_ref::Pin::parse(&backup_raw)
-                                        .map(|p| p.display())
-                                        .unwrap_or(backup_raw);
-                                    s.point_at(&pin);
-                                    s.source = Some(SeatSource::Backup);
-                                }
-                                state.save(paths)?;
-                                let retry_impl_slot = state
-                                    .slots
-                                    .iter()
-                                    .find(|s| s.id == impl_job.slot_id)
-                                    .cloned()
-                                    .unwrap();
-                                let retry_job = SlotJob {
-                                    slot_id: retry_impl_slot.id.clone(),
-                                    provider: retry_impl_slot.provider.clone(),
-                                    role: SlotRole::Implementer,
-                                    template: "implementer".into(),
-                                    extra_vars: extra.clone(),
-                                    expected_artifact: Some(format!(
-                                        "summary-{}.md",
-                                        retry_impl_slot.id
-                                    )),
-                                    model: retry_impl_slot.model.clone(),
-                                    effort: None,
-                                };
-                                if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
-                                    let quota_hit2 =
-                                        executor::slot_parks_on_quota(state, &retry_job.slot_id);
-                                    return fail(state, paths, e2, quota_hit2);
+                            ) && slot_state.source != Some(SeatSource::Backup)
+                            {
+                                let backup_key =
+                                    crate::provider_ref::ProviderRef::parse(&backup_raw)
+                                        .map(|r| r.storage_key())
+                                        .unwrap_or_else(|_| backup_raw.clone());
+                                let cur_key =
+                                    crate::provider_ref::ProviderRef::parse(&impl_slot.provider)
+                                        .map(|r| r.storage_key())
+                                        .unwrap_or_else(|_| impl_slot.provider.clone());
+                                if backup_key != cur_key {
+                                    if let Some(s) = state.slot_mut(&impl_job.slot_id) {
+                                        let pin = crate::provider_ref::Pin::parse(&backup_raw)
+                                            .map(|p| p.display())
+                                            .unwrap_or(backup_raw);
+                                        s.point_at(&pin);
+                                        s.source = Some(SeatSource::Backup);
+                                    }
+                                    state.save(paths)?;
+                                    let retry_impl_slot = state
+                                        .slots
+                                        .iter()
+                                        .find(|s| s.id == impl_job.slot_id)
+                                        .cloned()
+                                        .unwrap();
+                                    let retry_job = SlotJob {
+                                        slot_id: retry_impl_slot.id.clone(),
+                                        provider: retry_impl_slot.provider.clone(),
+                                        role: SlotRole::Implementer,
+                                        template: "implementer".into(),
+                                        extra_vars: extra.clone(),
+                                        expected_artifact: Some(format!(
+                                            "summary-{}.md",
+                                            retry_impl_slot.id
+                                        )),
+                                        model: retry_impl_slot.model.clone(),
+                                        effort: None,
+                                    };
+                                    if let Err(e2) =
+                                        executor::run_slot(state, paths, cfg, &retry_job)
+                                    {
+                                        let quota_hit2 = executor::slot_parks_on_quota(
+                                            state,
+                                            &retry_job.slot_id,
+                                        );
+                                        return fail(state, paths, e2, quota_hit2);
+                                    }
+                                } else {
+                                    return fail(state, paths, e, quota_hit);
                                 }
                             } else {
                                 return fail(state, paths, e, quota_hit);
@@ -2545,8 +2590,6 @@ pub fn execute_loop(
                     } else {
                         return fail(state, paths, e, quota_hit);
                     }
-                } else {
-                    return fail(state, paths, e, quota_hit);
                 }
             }
         }
@@ -2569,44 +2612,37 @@ pub fn execute_loop(
         // count and the warning and flows to the suite and panel below.
         let criteria =
             crate::rules::unwaived(&frozen.criteria, &crate::rules::for_run(paths, &state.id));
-        if let Some(stalled) = detect_no_progress(
-            state,
-            paths,
-            cfg,
-            &criteria,
-            &review_cwd,
-            round_start_head.as_deref(),
-        ) {
-            if take_panel_rerun(state) {
-                let _ = crate::events::append(
-                    paths,
-                    &state.id,
-                    &crate::events::Event::info(format!(
-                        "operator override (--re-review): unchanged HEAD `{}` goes back \
-                         to the panel instead of counting no-progress round {}",
-                        stalled.head, state.round
-                    )),
-                );
-                state.save(paths)?;
-            } else {
-                state.no_progress_rounds += 1;
-                if state.no_progress_rounds >= 2 {
-                    return park_no_progress(state, paths, &stalled);
-                }
-                let open: Vec<&str> = stalled.reviews.iter().map(|r| r.slot_id.as_str()).collect();
-                let note = format!(
-                    "no-progress round {}: HEAD `{}` unchanged with {open:?} still blocking; \
-                     re-dispatching the implementer with a warning instead of a full review",
-                    state.round, stalled.head,
-                );
-                let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
-                state.no_progress_warning = Some(stalled.prompt());
-                state.save(paths)?;
-                continue;
+        // A direct-to-panel pass neither counts nor warns: it already sent this
+        // HEAD to the panel without dispatching the implementer.
+        let stalled = if panel_direct {
+            None
+        } else {
+            detect_no_progress(
+                state,
+                paths,
+                cfg,
+                &criteria,
+                &review_cwd,
+                round_start_head.as_deref(),
+            )
+        };
+        if let Some(stalled) = stalled {
+            state.no_progress_rounds += 1;
+            if state.no_progress_rounds >= 2 {
+                return park_no_progress(state, paths, &stalled);
             }
+            let open: Vec<&str> = stalled.reviews.iter().map(|r| r.slot_id.as_str()).collect();
+            let note = format!(
+                "no-progress dispatch {}: HEAD `{}` unchanged with {open:?} still blocking; \
+                 re-dispatching the implementer with a warning instead of a full review",
+                state.round, stalled.head,
+            );
+            let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
+            state.no_progress_warning = Some(stalled.prompt());
+            state.save(paths)?;
+            continue;
         }
-        if state.no_progress_rounds > 0 || state.no_progress_warning.is_some() || state.panel_rerun
-        {
+        if state.no_progress_rounds > 0 || state.no_progress_warning.is_some() {
             state.no_progress_rounds = 0;
             state.no_progress_warning = None;
             state.panel_rerun = false;
@@ -3326,19 +3362,22 @@ pub fn execute_loop(
     }
 }
 
-/// One open `request_changes` review against the unchanged HEAD, with the
-/// findings the warning and the park reason name.
+/// One still-blocking review against the unchanged HEAD, with the findings the
+/// warning and the park reason name: a `request_changes` verdict, or an
+/// approval with failing acceptance criteria.
 struct NoProgressReview {
     slot_id: String,
     round: u32,
     reviewed_commit: String,
+    acceptance: Vec<String>,
     findings: Vec<String>,
 }
 
 /// Operator override for the reviewer-is-wrong stall (O171): `--re-review` on
-/// re-entry sends the unchanged HEAD back to the panel instead of counting
-/// another no-progress dispatch. Consumed here, and the stall counter restarts
-/// from zero, so a still-blocking re-review parks on its own two dispatches.
+/// re-entry sends the unchanged HEAD back to the panel instead of dispatching
+/// the implementer. Consumed at the top of the loop, and the stall counter
+/// restarts from zero, so a still-blocking re-review parks on its own two
+/// dispatches.
 fn take_panel_rerun(state: &mut RunState) -> bool {
     if !state.panel_rerun {
         return false;
@@ -3371,9 +3410,13 @@ impl NoProgress {
         );
         for r in &self.reviews {
             out.push_str(&format!(
-                "\nUnaddressed review `{}` (round {}, Reviewed-Commit `{}`):",
+                "\nUnaddressed review `{}` (round {}, Reviewed-Commit `{}`)",
                 r.slot_id, r.round, r.reviewed_commit
             ));
+            if !r.acceptance.is_empty() {
+                out.push_str(&format!(": failing {}", r.acceptance.join(", ")));
+            }
+            out.push(':');
             if r.findings.is_empty() {
                 out.push_str(
                     "\n- no findings recorded; the review blocks without naming a \
@@ -3461,6 +3504,7 @@ fn detect_no_progress(
             slot_id: e.slot_id.clone(),
             round: e.round,
             reviewed_commit: e.review.reviewed_commit.clone().unwrap_or_default(),
+            acceptance: failing_acceptance_ids(criteria, &e.review, cfg),
             findings: e
                 .review
                 .findings
@@ -3483,7 +3527,7 @@ fn detect_no_progress(
     Some(NoProgress { head: end, reviews })
 }
 
-/// Second consecutive no-progress round: park at the round-extension gate (the
+/// Second consecutive no-progress dispatch: park at the round-extension gate (the
 /// existing human gate, exit 2) instead of paying for another full review of a
 /// commit the panel already judged. The message names the unaddressed findings so
 /// the human knows what the implementer would not touch.
@@ -3515,8 +3559,10 @@ fn park_no_progress(state: &mut RunState, paths: &SparPaths, stalled: &NoProgres
     // instead of parking silently.
     state.no_progress_warning = Some(stalled.prompt());
     // At the ceiling a bare re-entry would hit the ceiling gate before the
-    // stall logic, so the message names the flag that re-entry needs.
-    let reentry = if state.round_ceiling_reached() {
+    // stall logic, so the message names the flag that re-entry needs; the
+    // reviewer-is-wrong exit needs it too.
+    let at_ceiling = state.round_ceiling_reached();
+    let reentry = if at_ceiling {
         format!(
             "`spar implement --run {} --max-rounds {}`",
             state.id,
@@ -3525,6 +3571,11 @@ fn park_no_progress(state: &mut RunState, paths: &SparPaths, stalled: &NoProgres
     } else {
         format!("`spar implement --run {}`", state.id)
     };
+    let re_review = if at_ceiling {
+        format!("`--re-review --max-rounds {}`", state.max_rounds + 2)
+    } else {
+        "`--re-review`".to_string()
+    };
     let msg = format!(
         "no progress in two consecutive implementer dispatches: HEAD `{}` and the worktree \
          are unchanged and the blocking {} ({}). The run is parked \
@@ -3532,7 +3583,7 @@ fn park_no_progress(state: &mut RunState, paths: &SparPaths, stalled: &NoProgres
          re-enter with {reentry}; re-entering with nothing changed dispatches the \
          implementer once more with the warning and parks again with no panel. \
          If the review is wrong, rule it out with `spar rule add` and re-enter with \
-         `--re-review` to send the unchanged HEAD back to the panel.",
+         {re_review} to send the unchanged HEAD back to the panel.",
         stalled.head,
         if stalled.reviews.len() == 1 {
             "review still stands"
@@ -5307,12 +5358,14 @@ pub struct RoundExtensionRefused {
     floor: u32,
 }
 
-/// Gate-scoped ceiling update: through the extension gate `--max-rounds` only
-/// ever raises. A stall park reuses this gate below the ceiling, and resolving
-/// `+N` there must not drop the ceiling it never reached, or install one on an
-/// uncapped run. A fresh launch sets its own ceiling, so the guard is gate-scoped.
-fn gate_max_rounds(current: u32, target: u32, from_gate: bool) -> u32 {
-    if from_gate && (current == 0 || target <= current) {
+/// Re-entry ceiling update: on any re-entry `--max-rounds` only ever raises. A
+/// stall park reuses the extension gate below the ceiling, and resolving `+N`
+/// there must not drop the ceiling it never reached, or install one on an
+/// uncapped run; the same holds for a stopped or failed run re-entered below
+/// its ceiling. A fresh launch sets its own ceiling, so the guard is scoped to
+/// re-entries (rounds already opened).
+fn gate_max_rounds(current: u32, target: u32, reentry: bool) -> u32 {
+    if reentry && (current == 0 || target <= current) {
         current
     } else {
         target
@@ -5934,6 +5987,14 @@ fn carry_forward_section(
         // promises lines that do not fit and the tail cut eats a whole review.
         let manifest_overhead = verdicts.len() * 3;
         let joins_overhead = total_ac * 2;
+        // The `full review:` path lines ride the same reservation: they render
+        // once per review, and an absolute artifact path is ~100 chars in a
+        // real project, so sizing acceptance lines without them pushes later
+        // reviews' bullets past the tail cut.
+        let paths_overhead: usize = verdicts
+            .iter()
+            .map(|v| v.review_path.chars().count() + "  full review: ``\n".chars().count())
+            .sum();
         // When even the full heads exceed the reservation, degrade to compact
         // heads that keep every review id and manifest rather than dropping
         // whole reviews. Below that, the tail cut discloses the loss.
@@ -5944,13 +6005,16 @@ fn carry_forward_section(
         // No fixed ceiling: with budget left, an acceptance line renders whole.
         // The tail truncation below still caps the section.
         let share = ac_budget
-            .saturating_sub(rendered_heads + manifest_overhead + joins_overhead)
+            .saturating_sub(rendered_heads + manifest_overhead + joins_overhead + paths_overhead)
             .checked_div(total_ac.max(1))
             .unwrap_or(0)
             .max(MIN_AC_SHARE);
-        let manifest_only =
-            rendered_heads + manifest_overhead + joins_overhead + MIN_AC_SHARE * total_ac
-                > ac_budget;
+        let manifest_only = rendered_heads
+            + manifest_overhead
+            + joins_overhead
+            + paths_overhead
+            + MIN_AC_SHARE * total_ac
+            > ac_budget;
         for (i, v) in verdicts.iter().enumerate() {
             let head = if compact {
                 v.compact.clone()
@@ -7543,6 +7607,49 @@ mod carry_forward_tests {
         );
     }
 
+    /// The `full review:` path lines count against the reservation: with
+    /// realistic absolute artifact paths, five blocking reviews with two
+    /// failing criteria each keep every manifest and artifact line at a
+    /// 2000-char cap beside a persisted operator message.
+    #[test]
+    fn absolute_review_paths_do_not_evict_manifests() {
+        let blockers: Vec<Blocker> = (1..=5)
+            .map(|r| {
+                let mut b = verdict_with_ac(r, 2, 300);
+                if let Blocker::Verdict(v) = &mut b {
+                    v.review_path = format!(
+                        "/home/operator/projects/acme-widget-factory/.spar/runs/3dd3f29d-01kn6v/artifacts/review-rev-{r}.md"
+                    );
+                }
+                b
+            })
+            .collect();
+        assert!(
+            blockers.iter().all(|b| match b {
+                Blocker::Verdict(v) => v.review_path.chars().count() > 90,
+                _ => false,
+            }),
+            "the test paths must stay realistic"
+        );
+        let persisted = vec![format!("from human (message m1): {}", "o".repeat(400))];
+        let out = carry_forward_section(3, &persisted, &blockers, None, 2000);
+        assert_eq!(
+            out.matches("failing AC-1, AC-2").count(),
+            5,
+            "every review keeps its manifest beside absolute paths:\n{out}"
+        );
+        for r in 1..=5 {
+            assert!(
+                out.contains(&format!("artifacts/review-rev-{r}.md`")),
+                "review {r} keeps its artifact line:\n{out}"
+            );
+        }
+        assert!(
+            out.chars().count() <= 2000,
+            "the section honors its cap:\n{out}"
+        );
+    }
+
     /// The per-line share floors at 32 characters; when even floored lines do
     /// not fit the reservation, the block degrades to manifest-only heads
     /// rather than dropping whole reviews. Five reviews with twenty failing
@@ -7784,6 +7891,7 @@ mod carry_forward_tests {
                 slot_id: "rev-1".to_string(),
                 round: 1,
                 reviewed_commit: "abcdef1234567".to_string(),
+                acceptance: vec![],
                 findings: vec!["major - the retry never stops".to_string()],
             }],
         };
@@ -7821,6 +7929,7 @@ mod carry_forward_tests {
                 slot_id: "rev-1".to_string(),
                 round: 1,
                 reviewed_commit: "abcdef1234567".to_string(),
+                acceptance: vec![],
                 findings: vec!["major - the retry never stops".to_string()],
             }],
         };
