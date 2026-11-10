@@ -78,7 +78,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
 
     paths.ensure_run_dirs(&state.id)?;
     bus::ensure_bus(paths)?;
-    bus::join(paths, Some(&state.id), "orchestrator", None, None)?;
+    bus::join(paths, Some(&state.id), bus::ORCHESTRATOR_SEAT, None, None)?;
     bus::join(paths, Some(&state.id), &id_a, Some(&a), Some("native-cli"))?;
     bus::join(paths, Some(&state.id), &id_b, Some(&b), Some("native-cli"))?;
     bus::send(
@@ -86,7 +86,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         bus::BusMessage {
             id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
             ts: chrono::Utc::now(),
-            from: "orchestrator".into(),
+            from: bus::ORCHESTRATOR_SEAT.into(),
             to: id_a.clone(),
             kind: MsgKind::Hello,
             body: "You are peer A. Coordinate with peer B via the swarm bus.".into(),
@@ -96,6 +96,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             requires_ack: false,
             persist: false,
             expires_after_round: None,
+            filed_round: None,
             meta: HashMap::new(),
         },
         MessageBudget::Normal,
@@ -105,7 +106,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         bus::BusMessage {
             id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
             ts: chrono::Utc::now(),
-            from: "orchestrator".into(),
+            from: bus::ORCHESTRATOR_SEAT.into(),
             to: id_b.clone(),
             kind: MsgKind::Hello,
             body: "You are peer B. Coordinate with peer A via the swarm bus.".into(),
@@ -115,6 +116,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             requires_ack: false,
             persist: false,
             expires_after_round: None,
+            filed_round: None,
             meta: HashMap::new(),
         },
         MessageBudget::Normal,

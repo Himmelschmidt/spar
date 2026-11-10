@@ -7,7 +7,8 @@
 //!   - Grok    → `StopHookInject`       (same turn-boundary injection as Claude: grok's
 //!     Stop hook honors the same `{"decision":"block",…}` payload per docs ch. 10;
 //!     the end-to-end re-drive is not yet observed live, see O90)
-//!   - agy     → `None`                 (inbox left untouched for the agent's next turn)
+//!   - agy     → `PollFile`             (fanned out on send into the poll file its
+//!     prompt tells it to read before any new major step)
 //!   - muse    → `StopHookInject`       (same turn-boundary injection as Claude: muse's
 //!     Stop hook honors the same `{"decision":"block",…}` payload, probed live)
 
@@ -315,41 +316,952 @@ fn muse_stop_hook_inject_claims_and_builds_block_payload() {
     );
 }
 
-/// agy: no injection channel, so deliver must NOT consume the inbox — the agent reads
-/// it itself on its next turn. `--claim` afterwards still returns the message.
+/// agy: no push channel into the running process, so a send fans the slot's inbox
+/// straight into its poll file, the file every role prompt (agy's included)
+/// tells the agent to read before starting any new major step. No explicit `bus
+/// deliver`: the body is in the file, the log reads delivered, and a later
+/// deliver drains nothing (exactly-once).
 #[test]
-fn none_leaves_inbox_for_agent_to_claim() {
+fn agy_send_fans_out_to_the_poll_file() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
     let run_id = plan_and_approve(tmp.path());
     let agent = slot_for_provider(tmp.path(), &run_id, "cli:agy");
 
+    // Dry runs stub the poll-file write; flip the run live so this exercises the
+    // real fan-out path. Nothing else in this test dispatches, so nothing else
+    // can observe the flip.
+    set_dry_run(tmp.path(), &run_id, false);
+
     send(tmp.path(), &run_id, &agent, "write the acceptance test");
 
-    let d = deliver_json(tmp.path(), &run_id, &agent);
-    assert_eq!(d["strategy"], "none");
-    assert_eq!(d["action"], "left_for_inbox");
-    assert_eq!(d["delivered"], 0);
-    assert!(d["pending"].as_u64().unwrap() >= 1, "{d}");
+    let poll = std::fs::read_to_string(
+        tmp.path()
+            .join(".spar/runs")
+            .join(&run_id)
+            .join("logs")
+            .join(format!("nudges-{agent}.md")),
+    )
+    .unwrap();
+    assert!(
+        poll.contains("write the acceptance test"),
+        "sent body is in the poll file with no explicit deliver"
+    );
 
-    // The agent's own claim still finds the message (deliver did not strand it). The
-    // slot scopes the claim to its run (`--run`), matching how a run slot self-drains.
-    let claimed = spar_cmd()
+    let log = spar_cmd()
+        .current_dir(tmp.path())
+        .args(["bus", "log", "--run", &run_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let entries: Value = serde_json::from_slice(&log).unwrap();
+    assert!(
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["body"] == "write the acceptance test" && e["delivery"] == "delivered"),
+        "{entries}"
+    );
+
+    // Exactly-once: a later deliver drains nothing.
+    let d = deliver_json(tmp.path(), &run_id, &agent);
+    assert_eq!(d["strategy"], "poll_file");
+    assert_eq!(d["action"], "empty");
+    assert_eq!(d["delivered"], 0);
+
+    // The slot's prompt names its poll file, so the fanned-out batch is where the
+    // agent is told to look before its next major step.
+    let prompt = std::fs::read_to_string(
+        tmp.path()
+            .join(".spar/runs")
+            .join(&run_id)
+            .join(format!("prompt-{agent}.md")),
+    )
+    .unwrap();
+    assert!(
+        prompt.contains(&format!("nudges-{agent}.md")),
+        "agy prompt names its poll file"
+    );
+}
+
+/// A `requires_ack` redelivery reaches the agy poll file too: the tick re-files
+/// the message into the inbox, and file-time fan-out drains it like any other
+/// producer's filing, no explicit `bus deliver` needed for the copy to land.
+#[test]
+fn agy_redelivery_reaches_the_poll_file() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run_id = plan_and_approve(tmp.path());
+    let agent = slot_for_provider(tmp.path(), &run_id, "cli:agy");
+    set_dry_run(tmp.path(), &run_id, false);
+
+    let out = spar_cmd()
         .current_dir(tmp.path())
         .args([
-            "bus", "inbox", &agent, "--claim", "--run", &run_id, "--json",
+            "bus",
+            "send",
+            "--run",
+            &run_id,
+            "--to",
+            &agent,
+            "--requires-ack",
+            "-m",
+            "confirm the migration plan",
+            "--json",
         ])
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
-    let msgs: Value = serde_json::from_slice(&claimed).unwrap();
+    let sent: Value = serde_json::from_slice(&out).unwrap();
+    let msg_id = sent["id"].as_str().unwrap().to_string();
+
+    let poll_path = tmp
+        .path()
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("logs")
+        .join(format!("nudges-{agent}.md"));
+    let poll = || std::fs::read_to_string(&poll_path).unwrap();
+    assert_eq!(
+        poll().matches("confirm the migration plan").count(),
+        1,
+        "the send itself fans out exactly one copy"
+    );
+
+    // Make the redelivery due now by backdating its pending_ack record; the
+    // message JSON comes straight from the send above.
+    let pending = tmp
+        .path()
+        .join(".spar/bus/pending_ack")
+        .join(format!("{msg_id}.json"));
+    let record = serde_json::json!({
+        "msg": sent,
+        "attempts": 0,
+        "next_at": "2000-01-01T00:00:00Z",
+    });
+    std::fs::write(&pending, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+
+    // `bus deliver` ticks acks before draining: the due redelivery re-files and
+    // fans straight out to the poll file. The poll file renders the inbox, so the
+    // same message still lists once, redelivery refreshes, never duplicates.
+    deliver_json(tmp.path(), &run_id, &agent);
+    assert_eq!(
+        poll().matches("confirm the migration plan").count(),
+        1,
+        "the redelivered copy refreshes the poll file with no explicit drain"
+    );
+
+    let log = spar_cmd()
+        .current_dir(tmp.path())
+        .args(["bus", "log", "--run", &run_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let entries: Value = serde_json::from_slice(&log).unwrap();
     assert!(
-        msgs.as_array()
+        entries
+            .as_array()
             .unwrap()
             .iter()
-            .any(|m| m["body"] == "write the acceptance test"),
-        "{msgs}"
+            .any(|e| e["id"] == msg_id && e["delivery"] == "delivered"),
+        "{entries}"
     );
+}
+
+/// Flip a run between dry-run and live by editing its state file. Only for tests
+/// that need the real write path (dry runs stub poll-file writes).
+fn set_dry_run(dir: &std::path::Path, run_id: &str, dry_run: bool) {
+    let path = dir.join(".spar/runs").join(run_id).join("state.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut state: Value = serde_json::from_str(&text).unwrap();
+    state["dry_run"] = Value::Bool(dry_run);
+    std::fs::write(&path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+}
+
+/// A live run with one PollFile slot for `provider` (`cli:agy` or `cli:pi`).
+fn live_poll_run(dir: &std::path::Path, provider: &str) -> (String, String) {
+    let run_id = plan_and_approve_with_providers(dir, &format!("cli:claude,cli:grok,{provider}"));
+    let agent = slot_for_provider(dir, &run_id, provider);
+    set_dry_run(dir, &run_id, false);
+    (run_id, agent)
+}
+
+fn poll_body(dir: &std::path::Path, run_id: &str, agent: &str) -> String {
+    std::fs::read_to_string(
+        dir.join(".spar/runs")
+            .join(run_id)
+            .join("logs")
+            .join(format!("nudges-{agent}.md")),
+    )
+    .unwrap()
+}
+
+fn send_json(dir: &std::path::Path, run_id: &str, extra: &[&str]) -> Value {
+    let mut args = vec!["bus", "send", "--run", run_id, "--json"];
+    args.extend(extra);
+    let out = spar_cmd()
+        .current_dir(dir)
+        .args(&args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&out).unwrap()
+}
+
+fn log_entries(dir: &std::path::Path, run_id: &str) -> Value {
+    let out = spar_cmd()
+        .current_dir(dir)
+        .args(["bus", "log", "--run", run_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&out).unwrap()
+}
+
+fn log_entry(entries: &Value, id: &str) -> Value {
+    entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == id)
+        .unwrap_or_else(|| panic!("{id} in {entries}"))
+        .clone()
+}
+
+/// Withdrawing a superseded message takes it back from a PollFile slot: the
+/// withdrawal reports the slot as withdrawn (not already delivered) and the
+/// old body disappears from the poll file, leaving only the superseding one.
+fn poll_file_supersede_withdraws(provider: &str) {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), provider);
+    let dir = tmp.path();
+
+    let old = send_json(
+        dir,
+        &run_id,
+        &["--to", &agent, "-m", "old instruction alpha"],
+    );
+    let old_id = old["id"].as_str().unwrap().to_string();
+    assert!(
+        poll_body(dir, &run_id, &agent).contains("old instruction alpha"),
+        "the send itself fans out to the poll file"
+    );
+
+    let new = send_json(
+        dir,
+        &run_id,
+        &[
+            "--to",
+            &agent,
+            "--supersedes",
+            &old_id,
+            "-m",
+            "new instruction beta",
+        ],
+    );
+    let new_id = new["id"].as_str().unwrap().to_string();
+    let withdrawal = &new["withdrawal"];
+    assert_eq!(
+        withdrawal["withdrawn_from"],
+        serde_json::json!([format!("{run_id}:{agent}")]),
+        "{withdrawal}"
+    );
+    assert_eq!(
+        withdrawal["already_delivered"],
+        serde_json::json!([]),
+        "{withdrawal}"
+    );
+
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        !poll.contains("old instruction alpha"),
+        "withdrawn body leaves the file:\n{poll}"
+    );
+    assert!(poll.contains("new instruction beta"), "{poll}");
+
+    let entries = log_entries(dir, &run_id);
+    let old_entry = log_entry(&entries, &old_id);
+    assert_eq!(old_entry["superseded_by"], new_id, "{old_entry}");
+    assert_eq!(
+        old_entry["delivery"], "withdrawn",
+        "the withdrawal postdates the only landing and no copy remains: {old_entry}"
+    );
+}
+
+#[test]
+fn poll_file_supersede_withdraws_for_agy() {
+    poll_file_supersede_withdraws("cli:agy");
+}
+
+#[test]
+fn poll_file_supersede_withdraws_for_pi() {
+    poll_file_supersede_withdraws("cli:pi");
+}
+
+/// A superseding send that fails leaves the old instruction untouched: the send
+/// runs before the withdrawal, so a rejected replacement never takes the
+/// original out of the inbox, the poll file or the log.
+fn failed_superseding_send_keeps_old(provider: &str) {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), provider);
+    let dir = tmp.path();
+
+    let old = send_json(
+        dir,
+        &run_id,
+        &["--to", &agent, "-m", "standing instruction"],
+    );
+    let old_id = old["id"].as_str().unwrap().to_string();
+    assert!(
+        poll_body(dir, &run_id, &agent).contains("standing instruction"),
+        "the send itself fans out to the poll file"
+    );
+
+    let big = "x".repeat(70_000);
+    let err = spar_cmd()
+        .current_dir(dir)
+        .args([
+            "bus",
+            "send",
+            "--run",
+            &run_id,
+            "--to",
+            &agent,
+            "--supersedes",
+            &old_id,
+            "-m",
+            &big,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&err).contains("too large"),
+        "the oversized replacement is rejected: {}",
+        String::from_utf8_lossy(&err)
+    );
+
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        poll.contains("standing instruction"),
+        "the old instruction survives the failed supersede:\n{poll}"
+    );
+
+    let entries = log_entries(dir, &run_id);
+    let old_entry = log_entry(&entries, &old_id);
+    assert_eq!(old_entry["delivery"], "delivered", "{old_entry}");
+    assert!(
+        old_entry["superseded_by"].is_null(),
+        "no replacement took it: {old_entry}"
+    );
+}
+
+#[test]
+fn failed_superseding_send_keeps_old_for_agy() {
+    failed_superseding_send_keeps_old("cli:agy");
+}
+
+#[test]
+fn failed_superseding_send_keeps_old_for_pi() {
+    failed_superseding_send_keeps_old("cli:pi");
+}
+
+/// A superseding send to a different slot renders the new message: the
+/// withdrawal only refreshes holders of the old message, so the send path
+/// renders the new message's own targets after the withdrawal returns.
+fn poll_file_supersede_retargets(provider: &str) {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), provider);
+    let dir = tmp.path();
+    let claude = slot_for_provider(dir, &run_id, "cli:claude");
+
+    let old = send_json(
+        dir,
+        &run_id,
+        &["--to", &claude, "-m", "old instruction alpha"],
+    );
+    let old_id = old["id"].as_str().unwrap().to_string();
+
+    let new = send_json(
+        dir,
+        &run_id,
+        &[
+            "--to",
+            &agent,
+            "--supersedes",
+            &old_id,
+            "-m",
+            "new instruction beta",
+        ],
+    );
+    let new_id = new["id"].as_str().unwrap().to_string();
+    let withdrawal = &new["withdrawal"];
+    assert_eq!(
+        withdrawal["withdrawn_from"],
+        serde_json::json!([format!("{run_id}:{claude}")]),
+        "{withdrawal}"
+    );
+    assert_eq!(
+        withdrawal["already_delivered"],
+        serde_json::json!([]),
+        "{withdrawal}"
+    );
+
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        poll.contains("new instruction beta"),
+        "retargeted replacement reaches the new slot's poll file:\n{poll}"
+    );
+    assert!(
+        !poll.contains("old instruction alpha"),
+        "the old slot's body never lists here:\n{poll}"
+    );
+
+    let entries = log_entries(dir, &run_id);
+    let old_entry = log_entry(&entries, &old_id);
+    assert_eq!(old_entry["superseded_by"], new_id, "{old_entry}");
+    let new_entry = log_entry(&entries, &new_id);
+    assert_eq!(new_entry["delivery"], "delivered", "{new_entry}");
+}
+
+#[test]
+fn poll_file_supersede_retargets_for_agy() {
+    poll_file_supersede_retargets("cli:agy");
+}
+
+#[test]
+fn poll_file_supersede_retargets_for_pi() {
+    poll_file_supersede_retargets("cli:pi");
+}
+
+/// A message filed in its last valid round leaves the poll file once the run
+/// moves past it: the next filing re-renders, and the expired body is gone.
+fn poll_file_expiry_drops(provider: &str) {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), provider);
+    let dir = tmp.path();
+
+    let expiring = send_json(
+        dir,
+        &run_id,
+        &[
+            "--to",
+            &agent,
+            "--expires-after-round",
+            "-m",
+            "limited-time ruling",
+        ],
+    );
+    let expiring_id = expiring["id"].as_str().unwrap().to_string();
+    let last_round = expiring["expires_after_round"].as_u64().unwrap();
+    assert!(
+        poll_body(dir, &run_id, &agent).contains("limited-time ruling"),
+        "filed in its last valid round, so it lists"
+    );
+
+    let state_path = dir.join(".spar/runs").join(&run_id).join("state.json");
+    let text = std::fs::read_to_string(&state_path).unwrap();
+    let mut state: Value = serde_json::from_str(&text).unwrap();
+    state["round"] = serde_json::json!(last_round + 1);
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    send_json(dir, &run_id, &["--to", &agent, "-m", "later note"]);
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        !poll.contains("limited-time ruling"),
+        "expired body leaves the file:\n{poll}"
+    );
+    assert!(poll.contains("later note"), "{poll}");
+
+    let entries = log_entries(dir, &run_id);
+    let entry = log_entry(&entries, &expiring_id);
+    assert_eq!(entry["expired"], true, "{entry}");
+}
+
+#[test]
+fn poll_file_expiry_drops_for_agy() {
+    poll_file_expiry_drops("cli:agy");
+}
+
+#[test]
+fn poll_file_expiry_drops_for_pi() {
+    poll_file_expiry_drops("cli:pi");
+}
+
+/// What becomes a poll-file action item: messages addressed to the slot, plus
+/// chat broadcasts from humans, peer slots and the orchestrator (the default
+/// `--to` reaches every slot through here). Acks and system prompts stay in
+/// the inbox and the bus log but never render; an acked message leaves the file
+/// too, and the ack filing re-renders the acker's own file at once.
+fn poll_file_lists_directed_and_human_broadcasts(provider: &str) {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), provider);
+    let dir = tmp.path();
+
+    let needy = send_json(
+        dir,
+        &run_id,
+        &[
+            "--to",
+            &agent,
+            "--requires-ack",
+            "-m",
+            "confirm the migration plan",
+        ],
+    );
+    let needy_id = needy["id"].as_str().unwrap().to_string();
+    assert!(poll_body(dir, &run_id, &agent).contains("confirm the migration plan"));
+
+    // No `--to`: the send default is broadcast, and a human broadcast lists.
+    send_json(dir, &run_id, &["-m", "all hands notice"]);
+    assert!(
+        poll_body(dir, &run_id, &agent).contains("all hands notice"),
+        "a human broadcast is a poll-file action item"
+    );
+
+    let orch = send_json(
+        dir,
+        &run_id,
+        &[
+            "--from",
+            "orchestrator",
+            "--to",
+            "broadcast",
+            "-m",
+            "orchestrator says hi",
+        ],
+    );
+    let orch_id = orch["id"].as_str().unwrap().to_string();
+
+    spar_cmd()
+        .current_dir(dir)
+        .args(["bus", "ack", &needy_id, "--from", &agent, "--run", &run_id])
+        .assert()
+        .success();
+
+    // No manual `bus deliver`: the ack filing re-renders the acker's own poll
+    // file, so the item is already gone.
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        poll.contains("all hands notice"),
+        "the human broadcast stays:\n{poll}"
+    );
+    assert!(
+        poll.contains("orchestrator says hi"),
+        "an orchestrator chat broadcast reaches the slot:\n{poll}"
+    );
+    assert!(
+        poll.contains(&format!("spar bus ack <id> --run {run_id}")),
+        "the heading names the exact ack command:\n{poll}"
+    );
+    assert!(
+        !poll.contains("[Ack]"),
+        "acks are not action items:\n{poll}"
+    );
+    assert!(
+        !poll.contains("confirm the migration plan"),
+        "an acked message leaves the file with no second deliver:\n{poll}"
+    );
+
+    let entries = log_entries(dir, &run_id);
+    assert!(
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "ack" && e["refs"]["reply_to"] == needy_id),
+        "the ack stays in the bus log even though it never renders: {entries}"
+    );
+    let orch_entry = log_entry(&entries, &orch_id);
+    assert_eq!(
+        orch_entry["delivery"], "delivered",
+        "the orchestrator broadcast is listed in the file, so delivered means posted: {orch_entry}"
+    );
+    let ack_entry = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "ack" && e["refs"]["reply_to"] == needy_id)
+        .unwrap();
+    assert_eq!(
+        ack_entry["delivery"], "queued",
+        "nobody reads the ack, so no claim makes it delivered: {ack_entry}"
+    );
+    let systems: Vec<_> = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "system")
+        .collect();
+    assert!(
+        !systems.is_empty(),
+        "the joins file system broadcasts: {entries}"
+    );
+    for s in systems {
+        assert_ne!(
+            s["delivery"], "delivered",
+            "a system copy never posted into the live poll file is never delivered: {s}"
+        );
+    }
+}
+
+#[test]
+fn poll_file_lists_directed_and_human_broadcasts_for_agy() {
+    poll_file_lists_directed_and_human_broadcasts("cli:agy");
+}
+
+#[test]
+fn poll_file_lists_directed_and_human_broadcasts_for_pi() {
+    poll_file_lists_directed_and_human_broadcasts("cli:pi");
+}
+
+/// A slot's bare `spar bus ack <id>` resolves the caller from the slot env:
+/// `SPAR_AGENT_ID`/`SPAR_RUN_ID` default `--from`/`--run`, so the ack records
+/// the slot instead of the human. A stranger's ack is filed and stops the
+/// redelivery, but the item stays listed and the word stays delivered until
+/// the slot acks: the operator's ack is the escape hatch for a wedged slot,
+/// not a read receipt.
+fn slot_env_ack_resolves_caller(provider: &str) {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), provider);
+    let dir = tmp.path();
+
+    let needy = send_json(
+        dir,
+        &run_id,
+        &[
+            "--to",
+            &agent,
+            "--requires-ack",
+            "-m",
+            "confirm the migration plan",
+        ],
+    );
+    let needy_id = needy["id"].as_str().unwrap().to_string();
+    assert!(poll_body(dir, &run_id, &agent).contains("confirm the migration plan"));
+    let pending = |id: &str| {
+        dir.join(".spar/bus/pending_ack")
+            .join(format!("{id}.json"))
+            .exists()
+    };
+    assert!(
+        pending(&needy_id),
+        "a requires-ack send records a pending redelivery"
+    );
+
+    // The operator's ack is a stranger's: filed, stops the redelivery, but the
+    // item stays listed until the slot acks.
+    spar_cmd()
+        .current_dir(dir)
+        .args(["bus", "ack", &needy_id, "--run", &run_id])
+        .assert()
+        .success();
+    assert!(
+        poll_body(dir, &run_id, &agent).contains("confirm the migration plan"),
+        "a stranger's ack leaves the item listed"
+    );
+    assert!(
+        !pending(&needy_id),
+        "the operator's ack stops the redelivery"
+    );
+    assert_eq!(
+        log_entry(&log_entries(dir, &run_id), &needy_id)["delivery"],
+        "delivered",
+        "a stranger's ack does not flip the word"
+    );
+
+    // The slot's bare ack resolves the caller from the slot env and drops the
+    // item with no second deliver.
+    spar_cmd()
+        .current_dir(dir)
+        .env("SPAR_AGENT_ID", &agent)
+        .env("SPAR_RUN_ID", &run_id)
+        .args(["bus", "ack", &needy_id])
+        .assert()
+        .success();
+    assert!(
+        !poll_body(dir, &run_id, &agent).contains("confirm the migration plan"),
+        "the slot's ack clears its own file at once"
+    );
+    assert!(
+        !pending(&needy_id),
+        "the recipient's ack stops the redelivery"
+    );
+    assert_eq!(
+        log_entry(&log_entries(dir, &run_id), &needy_id)["delivery"],
+        "acknowledged",
+        "the recipient's ack flips the word"
+    );
+}
+
+#[test]
+fn slot_env_ack_resolves_caller_for_agy() {
+    slot_env_ack_resolves_caller("cli:agy");
+}
+
+#[test]
+fn slot_env_ack_resolves_caller_for_pi() {
+    slot_env_ack_resolves_caller("cli:pi");
+}
+
+/// The file stops growing without bound, but nothing leaves mid-turn unread: a
+/// claimed message without `requires-ack` drops out once its slot has finished
+/// a dispatch that started after the filing round. A `requires-ack` item
+/// survives until the slot acks it. Aging out of the file is not unread: the
+/// log still reads delivered.
+fn poll_file_ages_out_last_round_non_ack(provider: &str) {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), provider);
+    let dir = tmp.path();
+
+    let stale = send_json(dir, &run_id, &["--to", &agent, "-m", "yesterday's news"]);
+    let stale_id = stale["id"].as_str().unwrap().to_string();
+    let stale2 = send_json(dir, &run_id, &["--to", &agent, "-m", "second stale note"]);
+    let stale2_id = stale2["id"].as_str().unwrap().to_string();
+    let needy = send_json(
+        dir,
+        &run_id,
+        &["--to", &agent, "--requires-ack", "-m", "still needs eyes"],
+    );
+    let needy_id = needy["id"].as_str().unwrap().to_string();
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(poll.contains("yesterday's news"), "{poll}");
+    assert!(poll.contains("second stale note"), "{poll}");
+    assert!(poll.contains("still needs eyes"), "{poll}");
+
+    let state_path = dir.join(".spar/runs").join(&run_id).join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let round = state["round"].as_u64().unwrap();
+    state["round"] = serde_json::Value::from(round + 1);
+    std::fs::write(&state_path, state.to_string()).unwrap();
+
+    // The round bumped but the slot has not dispatched since the filing: the
+    // items stay, so the next turn can still read them.
+    deliver_json(dir, &run_id, &agent);
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        poll.contains("yesterday's news"),
+        "a round bump alone never removes what the slot has not had a turn with:\n{poll}"
+    );
+    assert!(
+        poll.contains("second stale note"),
+        "a round bump alone never removes what the slot has not had a turn with:\n{poll}"
+    );
+    assert!(
+        poll.contains("still needs eyes"),
+        "a requires-ack item survives the round bump until acked:\n{poll}"
+    );
+
+    // The slot's turn starts in the new round. Its own ack re-renders the file
+    // mid-turn: the acked item leaves, but the stale sibling stays listed even
+    // though its filing round has passed.
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let slot = state["slots"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["id"] == agent)
+        .unwrap();
+    slot["round"] = serde_json::Value::from(round + 1);
+    slot["status"] = serde_json::Value::from("running");
+    std::fs::write(&state_path, state.to_string()).unwrap();
+    spar_cmd()
+        .current_dir(dir)
+        .env("SPAR_AGENT_ID", &agent)
+        .env("SPAR_RUN_ID", &run_id)
+        .args(["bus", "ack", &stale_id])
+        .assert()
+        .success();
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        !poll.contains("yesterday's news"),
+        "the slot's own ack clears the item at once:\n{poll}"
+    );
+    assert!(
+        poll.contains("second stale note"),
+        "a render mid-turn never drops what the slot may not have opened:\n{poll}"
+    );
+    assert!(
+        poll.contains("still needs eyes"),
+        "a requires-ack item survives the slot's turn until acked:\n{poll}"
+    );
+
+    // The turn finishes: the stale sibling leaves on the next render.
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let slot = state["slots"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["id"] == agent)
+        .unwrap();
+    slot["status"] = serde_json::Value::from("done");
+    std::fs::write(&state_path, state.to_string()).unwrap();
+
+    deliver_json(dir, &run_id, &agent);
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        !poll.contains("second stale note"),
+        "last round's non-ack message ages out after the slot's finished turn:\n{poll}"
+    );
+    assert!(
+        poll.contains("still needs eyes"),
+        "a requires-ack item survives the slot's turn until acked:\n{poll}"
+    );
+    let entries = log_entries(dir, &run_id);
+    assert_eq!(
+        log_entry(&entries, &stale_id)["delivery"],
+        "acknowledged",
+        "the slot-acked item reads acknowledged: {entries}"
+    );
+    assert_eq!(
+        log_entry(&entries, &stale2_id)["delivery"],
+        "delivered",
+        "aging out of the file is not unread: {entries}"
+    );
+    assert_eq!(
+        log_entry(&entries, &needy_id)["delivery"],
+        "delivered",
+        "the surviving item is still delivered: {entries}"
+    );
+}
+
+#[test]
+fn poll_file_ages_out_last_round_non_ack_for_agy() {
+    poll_file_ages_out_last_round_non_ack("cli:agy");
+}
+
+#[test]
+fn poll_file_ages_out_last_round_non_ack_for_pi() {
+    poll_file_ages_out_last_round_non_ack("cli:pi");
+}
+
+/// A body containing the section markers cannot corrupt the file: the markers
+/// render escaped, the file keeps exactly one section pair, and the next
+/// filing re-renders cleanly.
+fn poll_file_escapes_section_markers_in_bodies(provider: &str) {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), provider);
+    let dir = tmp.path();
+
+    send_json(
+        dir,
+        &run_id,
+        &[
+            "--to",
+            &agent,
+            "-m",
+            "note the literal <!-- spar:poll:end --> marker inline",
+        ],
+    );
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(poll.contains("marker inline"), "{poll}");
+    assert_eq!(
+        poll.matches("<!-- spar:poll:start -->").count(),
+        1,
+        "one real section start: {poll}"
+    );
+    assert_eq!(
+        poll.matches("<!-- spar:poll:end -->").count(),
+        1,
+        "the body marker renders escaped, leaving one real section end: {poll}"
+    );
+
+    send_json(dir, &run_id, &["--to", &agent, "-m", "second note"]);
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(poll.contains("second note"), "{poll}");
+    assert!(poll.contains("marker inline"), "{poll}");
+    assert_eq!(
+        poll.matches("<!-- spar:poll:end -->").count(),
+        1,
+        "the next render still parses one section pair: {poll}"
+    );
+}
+
+#[test]
+fn poll_file_escapes_section_markers_in_bodies_for_agy() {
+    poll_file_escapes_section_markers_in_bodies("cli:agy");
+}
+
+#[test]
+fn poll_file_escapes_section_markers_in_bodies_for_pi() {
+    poll_file_escapes_section_markers_in_bodies("cli:pi");
+}
+
+/// The round-start sweep drops an expired message with no new filing: bumping
+/// the round then running the turn-boundary `bus deliver` re-renders, and the
+/// expired body is gone.
+fn poll_file_round_start_refresh_drops_expired(provider: &str) {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), provider);
+    let dir = tmp.path();
+
+    let expiring = send_json(
+        dir,
+        &run_id,
+        &[
+            "--to",
+            &agent,
+            "--expires-after-round",
+            "-m",
+            "limited-time ruling",
+        ],
+    );
+    let expiring_id = expiring["id"].as_str().unwrap().to_string();
+    let last_round = expiring["expires_after_round"].as_u64().unwrap();
+    assert!(
+        poll_body(dir, &run_id, &agent).contains("limited-time ruling"),
+        "filed in its last valid round, so it lists"
+    );
+
+    let state_path = dir.join(".spar/runs").join(&run_id).join("state.json");
+    let text = std::fs::read_to_string(&state_path).unwrap();
+    let mut state: Value = serde_json::from_str(&text).unwrap();
+    state["round"] = serde_json::json!(last_round + 1);
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    deliver_json(dir, &run_id, &agent);
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        !poll.contains("limited-time ruling"),
+        "expired body leaves the file on the round-start sweep:\n{poll}"
+    );
+
+    let entries = log_entries(dir, &run_id);
+    let entry = log_entry(&entries, &expiring_id);
+    assert_eq!(entry["expired"], true, "{entry}");
+}
+
+#[test]
+fn poll_file_round_start_refresh_drops_expired_for_agy() {
+    poll_file_round_start_refresh_drops_expired("cli:agy");
+}
+
+#[test]
+fn poll_file_round_start_refresh_drops_expired_for_pi() {
+    poll_file_round_start_refresh_drops_expired("cli:pi");
 }
