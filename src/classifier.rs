@@ -8,8 +8,9 @@ use crate::paths::SparPaths;
 use crate::providers::failure_question::{self, Questions, QUESTION_ID};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const LOG_TAIL_BYTES: usize = 4096;
@@ -161,66 +162,6 @@ pub fn decide(cfg: &ClassifierConfig, site: Site, regex: RegexVerdict, answer: &
     }
 }
 
-/// Asks the classifier, decides, and appends the `classifier` event. `None` when the
-/// classifier is off; otherwise the record, whose `action` is `None` on any error.
-#[allow(clippy::too_many_arguments)]
-pub fn consult(
-    cfg: &ClassifierConfig,
-    paths: &SparPaths,
-    run_id: &str,
-    slot_id: &str,
-    adapter: &str,
-    state: &FailureState,
-    site: Site,
-    regex: RegexVerdict,
-) -> Option<Record> {
-    if !cfg.enabled {
-        return None;
-    }
-    let started = Instant::now();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        classify(cfg, adapter, state)
-    }))
-    .unwrap_or_else(|_| Err(anyhow::anyhow!("classifier panicked")));
-    let record = match outcome {
-        Ok(answer) => {
-            let action = decide(cfg, site, regex, &answer);
-            Record {
-                model: cfg.model.clone(),
-                choice: Some(answer.choice),
-                probability: Some(answer.probability),
-                probabilities: answer.probabilities,
-                acted: action != Action::None,
-                action,
-                regex_verdict: regex,
-                latency_ms: answer.latency_ms,
-                cost_usd: answer.cost_usd,
-                cached: answer.cached,
-                error: None,
-            }
-        }
-        Err(e) => Record {
-            model: cfg.model.clone(),
-            choice: None,
-            probability: None,
-            probabilities: BTreeMap::new(),
-            acted: false,
-            action: Action::None,
-            regex_verdict: regex,
-            latency_ms: started.elapsed().as_millis() as u64,
-            cost_usd: None,
-            cached: false,
-            error: Some(format!("{e:#}")),
-        },
-    };
-    let _ = crate::events::append(
-        paths,
-        run_id,
-        &crate::events::Event::classifier(slot_id, record.clone()),
-    );
-    Some(record)
-}
-
 /// Where the key comes from, for `doctor`. Never returns the key.
 pub fn key_source(cfg: &ClassifierConfig) -> Result<String> {
     read_key(cfg).map(|_| match &cfg.key_file {
@@ -303,13 +244,47 @@ impl<E: std::fmt::Display> From<E> for CallError {
     }
 }
 
-type Memo = std::sync::Mutex<std::collections::HashMap<u64, std::result::Result<Answer, String>>>;
+/// Advisory classifier with its own memo, breakers and transport. Production runs
+/// one shared instance ([`Classifier::live`]); every test builds its own, so no
+/// test shares answers, breaker state or network timing with another.
+pub struct Classifier {
+    memo: Mutex<HashMap<u64, Result<Answer, String>>>,
+    breakers: Mutex<HashMap<String, Breaker>>,
+    post: PostFn,
+}
 
-/// Answers (and deterministic refusals) by request, so the dispatch and verdict sites
-/// asking about the same failure pay for one call.
-fn memo() -> &'static Memo {
-    static MEMO: std::sync::OnceLock<Memo> = std::sync::OnceLock::new();
-    MEMO.get_or_init(Default::default)
+/// One HTTP POST to the System One endpoint: the URL, the key, the request
+/// body and the per-attempt timeout. Returns the status with the response
+/// text, or a transport failure. Production posts over the network; tests
+/// answer in process so no timing outside the test can add or drop a request.
+type PostFn =
+    Arc<dyn Fn(&str, &str, &str, Duration) -> Result<(u16, String), String> + Send + Sync>;
+
+fn live_post(
+    url: &str,
+    api_key: &str,
+    body: &str,
+    timeout: Duration,
+) -> Result<(u16, String), String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    match agent
+        .post(url)
+        .header("Authorization", &format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .header("X-OpenRouter-Title", "spar")
+        .send(body)
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let text = resp.into_body().read_to_string().unwrap_or_default();
+            Ok((status, text))
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 const BREAKER_OPEN: Duration = Duration::from_secs(300);
@@ -320,46 +295,6 @@ enum Breaker {
     Open(Instant),
     /// The window lapsed and one consult is probing the endpoint; the rest skip.
     Probing(Instant),
-}
-
-type Breakers = std::sync::Mutex<std::collections::HashMap<String, Breaker>>;
-
-fn breakers() -> &'static Breakers {
-    static B: std::sync::OnceLock<Breakers> = std::sync::OnceLock::new();
-    B.get_or_init(Default::default)
-}
-
-/// Whether this consult may call `base_url`. Checked and updated under one lock, so
-/// during an outage at most one consult at a time is waiting on the endpoint. A probe
-/// that never reported back (a panic) stops blocking after one more window.
-fn breaker_admits(base_url: &str, budget: Duration) -> bool {
-    let Ok(mut m) = breakers().lock() else {
-        return true;
-    };
-    let now = Instant::now();
-    match m.get(base_url).copied() {
-        None => true,
-        Some(Breaker::Open(until)) if now < until => false,
-        Some(Breaker::Probing(since)) if now < since + budget + BREAKER_OPEN => false,
-        Some(_) => {
-            m.insert(base_url.to_string(), Breaker::Probing(now));
-            true
-        }
-    }
-}
-
-fn breaker_report(base_url: &str, tripped: bool) {
-    let Ok(mut m) = breakers().lock() else {
-        return;
-    };
-    if tripped {
-        m.insert(
-            base_url.to_string(),
-            Breaker::Open(Instant::now() + BREAKER_OPEN),
-        );
-    } else {
-        m.remove(base_url);
-    }
 }
 
 fn memo_key(cfg: &ClassifierConfig, adapter: &str, state: &FailureState) -> u64 {
@@ -379,134 +314,248 @@ fn budget(cfg: &ClassifierConfig) -> Duration {
     Duration::from_secs(cfg.timeout_secs) + Duration::from_secs(1)
 }
 
-/// One System One call (`POST <base_url>/systemone`, pi-ai's `typesafe-system-one`
-/// shape). Retries a transport error, 408, 409, 429 or 5xx while the total budget
-/// (`timeout_secs` + 1) lasts, at most `MAX_RETRIES` times; when they run out the
-/// endpoint's breaker opens for `BREAKER_OPEN`.
-pub fn classify(cfg: &ClassifierConfig, adapter: &str, state: &FailureState) -> Result<Answer> {
-    let key = (!state.log_tail.is_empty()).then(|| memo_key(cfg, adapter, state));
-    if let Some(hit) = key.and_then(|k| memo().lock().ok().and_then(|m| m.get(&k).cloned())) {
-        return match hit {
-            Ok(a) => Ok(Answer {
-                cached: true,
-                latency_ms: 0,
-                cost_usd: None,
-                ..a
-            }),
-            Err(e) => bail!("{e} (cached)"),
-        };
-    }
-    if !breaker_admits(&cfg.base_url, budget(cfg)) {
-        bail!("classifier skipped: endpoint failing, retried after 5 minutes");
-    }
-    let result = call(cfg, adapter, state);
-    let remember = match &result {
-        Ok(a) => Some(Ok(a.clone())),
-        Err(e) if e.deterministic => Some(Err(e.message.clone())),
-        Err(_) => None,
-    };
-    breaker_report(
-        &cfg.base_url,
-        result.as_ref().err().is_some_and(|e| e.trips),
-    );
-    if let (Some(k), Some(r)) = (key, remember) {
-        if let Ok(mut m) = memo().lock() {
-            m.insert(k, r);
+impl Classifier {
+    /// Asks the classifier, decides, and appends the `classifier` event. `None` when the
+    /// classifier is off; otherwise the record, whose `action` is `None` on any error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn consult(
+        &self,
+        cfg: &ClassifierConfig,
+        paths: &SparPaths,
+        run_id: &str,
+        slot_id: &str,
+        adapter: &str,
+        state: &FailureState,
+        site: Site,
+        regex: RegexVerdict,
+    ) -> Option<Record> {
+        if !cfg.enabled {
+            return None;
         }
-    }
-    result.map_err(|e| anyhow::anyhow!(e.message))
-}
-
-fn call(
-    cfg: &ClassifierConfig,
-    adapter: &str,
-    state: &FailureState,
-) -> std::result::Result<Answer, CallError> {
-    let body = serde_json::to_string(&Request {
-        model: &cfg.model,
-        state,
-        questions: failure_question::questions(adapter),
-    })?;
-    let api_key = read_key(cfg).map_err(|e| CallError::from(format!("{e:#}")))?;
-    let url = format!("{}/systemone", cfg.base_url.trim_end_matches('/'));
-    let per_attempt = Duration::from_secs(cfg.timeout_secs);
-    let budget = budget(cfg);
-    let started = Instant::now();
-    let mut attempt = 0;
-    let text = loop {
-        let left = budget.saturating_sub(started.elapsed());
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(per_attempt.min(left)))
-            .http_status_as_error(false)
-            .build()
-            .into();
-        let sent = agent
-            .post(&url)
-            .header("Authorization", &format!("Bearer {api_key}"))
-            .header("Content-Type", "application/json")
-            .header("X-OpenRouter-Title", "spar")
-            .send(&body);
-        let reason = match sent {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let text = resp.into_body().read_to_string().unwrap_or_default();
-                if (200..300).contains(&status) {
-                    break text;
+        let started = Instant::now();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.classify(cfg, adapter, state)
+        }))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("classifier panicked")));
+        let record = match outcome {
+            Ok(answer) => {
+                let action = decide(cfg, site, regex, &answer);
+                Record {
+                    model: cfg.model.clone(),
+                    choice: Some(answer.choice),
+                    probability: Some(answer.probability),
+                    probabilities: answer.probabilities,
+                    acted: action != Action::None,
+                    action,
+                    regex_verdict: regex,
+                    latency_ms: answer.latency_ms,
+                    cost_usd: answer.cost_usd,
+                    cached: answer.cached,
+                    error: None,
                 }
-                if !matches!(status, 408 | 409 | 429 | 500..=599) {
-                    return Err(CallError::fixed(format!(
-                        "classifier returned HTTP {status}: {}",
-                        truncate(&text, 200)
-                    )));
-                }
-                format!("HTTP {status}")
             }
-            Err(e) => e.to_string(),
+            Err(e) => Record {
+                model: cfg.model.clone(),
+                choice: None,
+                probability: None,
+                probabilities: BTreeMap::new(),
+                acted: false,
+                action: Action::None,
+                regex_verdict: regex,
+                latency_ms: started.elapsed().as_millis() as u64,
+                cost_usd: None,
+                cached: false,
+                error: Some(format!("{e:#}")),
+            },
         };
-        let backoff = Duration::from_millis(250 << attempt);
-        let out_of_time = started.elapsed() + backoff + Duration::from_millis(250) >= budget;
-        if attempt >= MAX_RETRIES || out_of_time {
-            return Err(CallError {
-                message: format!(
-                    "classifier unreachable after {} attempts: {reason}",
-                    attempt + 1
-                ),
-                deterministic: false,
-                trips: true,
-            });
-        }
-        std::thread::sleep(backoff);
-        attempt += 1;
-    };
-    let latency_ms = started.elapsed().as_millis() as u64;
-    let parsed: Response = serde_json::from_str(&text)
-        .map_err(|e| CallError::fixed(format!("parse classifier response: {e}")))?;
-    let wire = parsed
-        .answers
-        .get(QUESTION_ID)
-        .ok_or_else(|| CallError::fixed("classifier returned no failure_class answer"))?;
-    if wire.kind != "choice" {
-        return Err(CallError::fixed(format!(
-            "classifier returned a {} answer, not a choice",
-            wire.kind
-        )));
+        let _ = crate::events::append(
+            paths,
+            run_id,
+            &crate::events::Event::classifier(slot_id, record.clone()),
+        );
+        Some(record)
     }
-    let choice: FailureClass =
-        serde_json::from_value(serde_json::Value::String(wire.choice.clone())).map_err(|_| {
+
+    /// The process-wide instance production paths consult.
+    pub fn live() -> &'static Self {
+        static LIVE: std::sync::LazyLock<Classifier> = std::sync::LazyLock::new(|| Classifier {
+            memo: Mutex::new(HashMap::new()),
+            breakers: Mutex::new(HashMap::new()),
+            post: Arc::new(live_post),
+        });
+        &LIVE
+    }
+
+    /// A classifier no test may consult: any post panics. Tests that need a
+    /// `&Classifier` with the classifier disabled use this, so the type — not
+    /// a config default — keeps them off the shared live instance.
+    #[cfg(test)]
+    pub fn inert() -> Self {
+        Classifier {
+            memo: Mutex::new(HashMap::new()),
+            breakers: Mutex::new(HashMap::new()),
+            post: Arc::new(|_, _, _, _| panic!("classifier consulted in a test")),
+        }
+    }
+
+    /// Whether this consult may call `base_url`. Checked and updated under one lock, so
+    /// during an outage at most one consult at a time is waiting on the endpoint. A probe
+    /// that never reported back (a panic) stops blocking after one more window.
+    fn breaker_admits(&self, base_url: &str, budget: Duration) -> bool {
+        let Ok(mut m) = self.breakers.lock() else {
+            return true;
+        };
+        let now = Instant::now();
+        match m.get(base_url).copied() {
+            None => true,
+            Some(Breaker::Open(until)) if now < until => false,
+            Some(Breaker::Probing(since)) if now < since + budget + BREAKER_OPEN => false,
+            Some(_) => {
+                m.insert(base_url.to_string(), Breaker::Probing(now));
+                true
+            }
+        }
+    }
+
+    fn breaker_report(&self, base_url: &str, tripped: bool) {
+        let Ok(mut m) = self.breakers.lock() else {
+            return;
+        };
+        if tripped {
+            m.insert(
+                base_url.to_string(),
+                Breaker::Open(Instant::now() + BREAKER_OPEN),
+            );
+        } else {
+            m.remove(base_url);
+        }
+    }
+
+    /// One System One call (`POST <base_url>/systemone`, pi-ai's `typesafe-system-one`
+    /// shape). Retries a transport error, 408, 409, 429 or 5xx while the total budget
+    /// (`timeout_secs` + 1) lasts, at most `MAX_RETRIES` times; when they run out the
+    /// endpoint's breaker opens for `BREAKER_OPEN`.
+    pub fn classify(
+        &self,
+        cfg: &ClassifierConfig,
+        adapter: &str,
+        state: &FailureState,
+    ) -> Result<Answer> {
+        let key = (!state.log_tail.is_empty()).then(|| memo_key(cfg, adapter, state));
+        if let Some(hit) = key.and_then(|k| self.memo.lock().ok().and_then(|m| m.get(&k).cloned()))
+        {
+            return match hit {
+                Ok(a) => Ok(Answer {
+                    cached: true,
+                    latency_ms: 0,
+                    cost_usd: None,
+                    ..a
+                }),
+                Err(e) => bail!("{e} (cached)"),
+            };
+        }
+        if !self.breaker_admits(&cfg.base_url, budget(cfg)) {
+            bail!("classifier skipped: endpoint failing, retried after 5 minutes");
+        }
+        let result = self.call(cfg, adapter, state);
+        let remember = match &result {
+            Ok(a) => Some(Ok(a.clone())),
+            Err(e) if e.deterministic => Some(Err(e.message.clone())),
+            Err(_) => None,
+        };
+        self.breaker_report(
+            &cfg.base_url,
+            result.as_ref().err().is_some_and(|e| e.trips),
+        );
+        if let (Some(k), Some(r)) = (key, remember) {
+            if let Ok(mut m) = self.memo.lock() {
+                m.insert(k, r);
+            }
+        }
+        result.map_err(|e| anyhow::anyhow!(e.message))
+    }
+
+    fn call(
+        &self,
+        cfg: &ClassifierConfig,
+        adapter: &str,
+        state: &FailureState,
+    ) -> std::result::Result<Answer, CallError> {
+        let body = serde_json::to_string(&Request {
+            model: &cfg.model,
+            state,
+            questions: failure_question::questions(adapter),
+        })?;
+        let api_key = read_key(cfg).map_err(|e| CallError::from(format!("{e:#}")))?;
+        let url = format!("{}/systemone", cfg.base_url.trim_end_matches('/'));
+        let per_attempt = Duration::from_secs(cfg.timeout_secs);
+        let budget = budget(cfg);
+        let started = Instant::now();
+        let mut attempt = 0;
+        let text = loop {
+            let left = budget.saturating_sub(started.elapsed());
+            let reason = match (self.post)(&url, &api_key, &body, per_attempt.min(left)) {
+                Ok((status, text)) => {
+                    if (200..300).contains(&status) {
+                        break text;
+                    }
+                    if !matches!(status, 408 | 409 | 429 | 500..=599) {
+                        return Err(CallError::fixed(format!(
+                            "classifier returned HTTP {status}: {}",
+                            truncate(&text, 200)
+                        )));
+                    }
+                    format!("HTTP {status}")
+                }
+                Err(e) => e,
+            };
+            let backoff = Duration::from_millis(250 << attempt);
+            let out_of_time = started.elapsed() + backoff + Duration::from_millis(250) >= budget;
+            if attempt >= MAX_RETRIES || out_of_time {
+                return Err(CallError {
+                    message: format!(
+                        "classifier unreachable after {} attempts: {reason}",
+                        attempt + 1
+                    ),
+                    deterministic: false,
+                    trips: true,
+                });
+            }
+            std::thread::sleep(backoff);
+            attempt += 1;
+        };
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let parsed: Response = serde_json::from_str(&text)
+            .map_err(|e| CallError::fixed(format!("parse classifier response: {e}")))?;
+        let wire = parsed
+            .answers
+            .get(QUESTION_ID)
+            .ok_or_else(|| CallError::fixed("classifier returned no failure_class answer"))?;
+        if wire.kind != "choice" {
+            return Err(CallError::fixed(format!(
+                "classifier returned a {} answer, not a choice",
+                wire.kind
+            )));
+        }
+        let choice: FailureClass = serde_json::from_value(serde_json::Value::String(
+            wire.choice.clone(),
+        ))
+        .map_err(|_| {
             CallError::fixed(format!(
                 "classifier returned unknown label {:?}",
                 wire.choice
             ))
         })?;
-    let probability = wire.probabilities.get(&wire.choice).copied().unwrap_or(0.0);
-    Ok(Answer {
-        choice,
-        probability,
-        probabilities: wire.probabilities.clone(),
-        cost_usd: parsed.usage.and_then(|u| u.cost),
-        latency_ms,
-        cached: false,
-    })
+        let probability = wire.probabilities.get(&wire.choice).copied().unwrap_or(0.0);
+        Ok(Answer {
+            choice,
+            probability,
+            probabilities: wire.probabilities.clone(),
+            cost_usd: parsed.usage.and_then(|u| u.cost),
+            latency_ms,
+            cached: false,
+        })
+    }
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -927,64 +976,57 @@ fn redact_tokens(chars: &[char]) -> String {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
-    /// A one-endpoint HTTP server: answers every request with `status` and `body`,
-    /// after `delay`, and records request bodies. Never touches the network.
-    pub struct FakeSystemOne {
+    /// An in-process System One endpoint: answers every request with `status`
+    /// and `body`, after `delay`, and records request bodies and auth headers.
+    /// Never touches the network, so a loaded machine cannot add or drop a
+    /// request through a transport retry. Each stub comes with its own
+    /// classifier, so no test shares memo or breaker state with another.
+    pub struct StubSystemOne {
         pub base_url: String,
         pub bodies: Arc<Mutex<Vec<String>>>,
         pub auth_headers: Arc<Mutex<Vec<String>>>,
     }
 
-    pub fn fake_system_one(status: u16, body: String, delay: Duration) -> FakeSystemOne {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
+    pub fn stub_system_one(
+        status: u16,
+        body: String,
+        delay: Duration,
+    ) -> (Classifier, StubSystemOne) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let auth_headers = Arc::new(Mutex::new(Vec::new()));
         let (b, a) = (bodies.clone(), auth_headers.clone());
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let (b, a, body) = (b.clone(), a.clone(), body.clone());
-                std::thread::spawn(move || {
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut len = 0usize;
-                    let mut line = String::new();
-                    loop {
-                        line.clear();
-                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                            break;
-                        }
-                        let lower = line.to_ascii_lowercase();
-                        if let Some(v) = lower.strip_prefix("content-length:") {
-                            len = v.trim().parse().unwrap_or(0);
-                        }
-                        if lower.starts_with("authorization:") {
-                            a.lock().unwrap().push(line.trim().to_string());
-                        }
-                    }
-                    let mut buf = vec![0u8; len];
-                    let _ = reader.read_exact(&mut buf);
-                    b.lock()
-                        .unwrap()
-                        .push(String::from_utf8_lossy(&buf).into_owned());
+        let post: PostFn = Arc::new(
+            move |_url: &str, api_key: &str, req: &str, timeout: Duration| {
+                b.lock().unwrap().push(req.to_string());
+                a.lock()
+                    .unwrap()
+                    .push(format!("Authorization: Bearer {api_key}"));
+                if delay > timeout {
+                    std::thread::sleep(timeout);
+                    return Err(format!("stub timed out after {timeout:?}"));
+                }
+                if !delay.is_zero() {
                     std::thread::sleep(delay);
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                });
-            }
-        });
-        FakeSystemOne {
-            base_url: format!("http://{addr}/api/v1"),
-            bodies,
-            auth_headers,
-        }
+                }
+                Ok((status, body.clone()))
+            },
+        );
+        (
+            Classifier {
+                memo: Mutex::new(HashMap::new()),
+                breakers: Mutex::new(HashMap::new()),
+                post,
+            },
+            StubSystemOne {
+                base_url: format!("stub://classifier-{n}"),
+                bodies,
+                auth_headers,
+            },
+        )
     }
 
     pub fn answer_body(choice: &str, p: f64) -> String {
@@ -1021,6 +1063,71 @@ pub mod tests {
             // slow round trip as a timeout that retries or ends the budget early.
             timeout_secs: 30,
             ..Default::default()
+        }
+    }
+
+    struct Loopback {
+        base_url: String,
+        request_lines: Arc<Mutex<Vec<String>>>,
+        auth_values: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// A loopback HTTP server for `live_post`: records the request line and
+    /// the `authorization` value of every connection, answers each with
+    /// `status`/`body` after `delay`. Assertions on it stay retry-insensitive
+    /// (first values, outcomes only) so loaded-machine timing cannot fail
+    /// the test.
+    fn loopback(status: u16, body: &str, delay: Duration) -> Loopback {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let auth = Arc::new(Mutex::new(Vec::new()));
+        let (l, a) = (lines.clone(), auth.clone());
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let (l, a, body) = (l.clone(), a.clone(), body.clone());
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request = String::new();
+                    if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    l.lock().unwrap().push(request.trim().to_string());
+                    let mut len = 0usize;
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        let lower = line.to_ascii_lowercase();
+                        if lower.starts_with("authorization:") {
+                            a.lock()
+                                .unwrap()
+                                .push(line["authorization:".len()..].trim().to_string());
+                        } else if let Some(v) = lower.strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut buf = vec![0u8; len];
+                    let _ = reader.read_exact(&mut buf);
+                    std::thread::sleep(delay);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        Loopback {
+            base_url: format!("http://{addr}"),
+            request_lines: lines,
+            auth_values: auth,
         }
     }
 
@@ -1124,13 +1231,15 @@ pub mod tests {
     #[test]
     fn classify_posts_the_system_one_shape_and_parses_the_answer() {
         let tmp = tempfile::tempdir().unwrap();
-        let fake = fake_system_one(
+        let (cls, fake) = stub_system_one(
             200,
             answer_body("quota_or_rate_limit", 0.91),
             Duration::ZERO,
         );
         let cfg = enabled_cfg(&fake.base_url, &tmp.path().join("key"));
-        let a = classify(&cfg, "claude", &state("credits are gone for today")).unwrap();
+        let a = cls
+            .classify(&cfg, "claude", &state("credits are gone for today"))
+            .unwrap();
         assert_eq!(a.choice, FailureClass::QuotaOrRateLimit);
         assert!((a.probability - 0.91).abs() < 1e-9);
         assert_eq!(a.cost_usd, Some(0.00005));
@@ -1145,9 +1254,71 @@ pub mod tests {
             fake.auth_headers.lock().unwrap()[0].to_ascii_lowercase(),
             "authorization: bearer sk-or-v1-test-key-not-real"
         );
-        let again = classify(&cfg, "claude", &state("credits are gone for today")).unwrap();
+        let again = cls
+            .classify(&cfg, "claude", &state("credits are gone for today"))
+            .unwrap();
         assert!(again.cached);
         assert_eq!(fake.bodies.lock().unwrap().len(), 1, "memoized");
+    }
+
+    #[test]
+    fn live_post_sends_auth_passes_status_through_and_honors_timeout() {
+        let server = loopback(200, &answer_body("auth", 0.99), Duration::ZERO);
+        let (status, text) = live_post(
+            &format!("{}/systemone", server.base_url),
+            "test-key",
+            "{}",
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+        assert!(text.contains("\"auth\""), "{text}");
+        assert!(
+            server
+                .request_lines
+                .lock()
+                .unwrap()
+                .first()
+                .is_some_and(|l| l.starts_with("POST /systemone ")),
+            "posts the systemone path"
+        );
+        assert_eq!(
+            server
+                .auth_values
+                .lock()
+                .unwrap()
+                .first()
+                .map(String::as_str),
+            Some(concat!("Bearer ", "test-key")),
+            "sends the bearer key"
+        );
+
+        for status in [400, 503] {
+            let server = loopback(status, "{}", Duration::ZERO);
+            let (got, _) = live_post(
+                &format!("{}/systemone", server.base_url),
+                "test-key",
+                "{}",
+                Duration::from_secs(30),
+            )
+            .unwrap();
+            assert_eq!(got, status, "{status} passes through, not an error");
+        }
+
+        let server = loopback(200, &answer_body("auth", 0.99), Duration::from_secs(30));
+        let started = Instant::now();
+        let err = live_post(
+            &format!("{}/systemone", server.base_url),
+            "test-key",
+            "{}",
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(err.contains("timeout"), "a slow server times out: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the per-attempt timeout cuts a slow server off"
+        );
     }
 
     #[test]
@@ -1157,22 +1328,24 @@ pub mod tests {
         let run = "r1";
         std::fs::create_dir_all(paths.run_dir(run)).unwrap();
 
-        let slow = fake_system_one(200, answer_body("auth", 0.99), Duration::from_secs(3));
+        let (slow_cls, slow) =
+            stub_system_one(200, answer_body("auth", 0.99), Duration::from_secs(3));
         let cfg = ClassifierConfig {
             timeout_secs: 1,
             ..enabled_cfg(&slow.base_url, &tmp.path().join("key"))
         };
-        let rec = consult(
-            &cfg,
-            &paths,
-            run,
-            "s1",
-            "claude",
-            &state("slow"),
-            Site::Verdict,
-            RegexVerdict::Work,
-        )
-        .unwrap();
+        let rec = slow_cls
+            .consult(
+                &cfg,
+                &paths,
+                run,
+                "s1",
+                "claude",
+                &state("slow"),
+                Site::Verdict,
+                RegexVerdict::Work,
+            )
+            .unwrap();
         assert_eq!(rec.action, Action::None);
         assert!(rec.error.is_some());
         let sent = slow.bodies.lock().unwrap().len();
@@ -1183,17 +1356,18 @@ pub mod tests {
             rec.latency_ms
         );
         let started = Instant::now();
-        let rec = consult(
-            &cfg,
-            &paths,
-            run,
-            "s1",
-            "claude",
-            &state("another failure, same dead endpoint"),
-            Site::Verdict,
-            RegexVerdict::Work,
-        )
-        .unwrap();
+        let rec = slow_cls
+            .consult(
+                &cfg,
+                &paths,
+                run,
+                "s1",
+                "claude",
+                &state("another failure, same dead endpoint"),
+                Site::Verdict,
+                RegexVerdict::Work,
+            )
+            .unwrap();
         assert!(
             rec.error.unwrap().contains("skipped"),
             "the breaker is open"
@@ -1201,66 +1375,71 @@ pub mod tests {
         assert!(started.elapsed() < Duration::from_millis(200));
         assert_eq!(slow.bodies.lock().unwrap().len(), sent, "no new request");
 
-        let broken = fake_system_one(400, "{}".into(), Duration::ZERO);
+        let (broken_cls, broken) = stub_system_one(400, "{}".into(), Duration::ZERO);
         let cfg = enabled_cfg(&broken.base_url, &tmp.path().join("key"));
-        let rec = consult(
-            &cfg,
-            &paths,
-            run,
-            "s1",
-            "claude",
-            &state("bad request"),
-            Site::Verdict,
-            RegexVerdict::Work,
-        )
-        .unwrap();
+        let rec = broken_cls
+            .consult(
+                &cfg,
+                &paths,
+                run,
+                "s1",
+                "claude",
+                &state("bad request"),
+                Site::Verdict,
+                RegexVerdict::Work,
+            )
+            .unwrap();
         assert_eq!(rec.action, Action::None);
         assert_eq!(broken.bodies.lock().unwrap().len(), 1, "4xx is not retried");
 
-        let garbage = fake_system_one(200, "{\"answers\":{}}".into(), Duration::ZERO);
+        let (garbage_cls, garbage) =
+            stub_system_one(200, "{\"answers\":{}}".into(), Duration::ZERO);
         let cfg = enabled_cfg(&garbage.base_url, &tmp.path().join("key"));
-        let rec = consult(
-            &cfg,
-            &paths,
-            run,
-            "s1",
-            "claude",
-            &state("garbage"),
-            Site::Verdict,
-            RegexVerdict::Work,
-        )
-        .unwrap();
+        let rec = garbage_cls
+            .consult(
+                &cfg,
+                &paths,
+                run,
+                "s1",
+                "claude",
+                &state("garbage"),
+                Site::Verdict,
+                RegexVerdict::Work,
+            )
+            .unwrap();
         assert_eq!(rec.action, Action::None);
 
-        let fine = fake_system_one(200, answer_body("auth", 0.99), Duration::ZERO);
+        let (fine_cls, fine) = stub_system_one(200, answer_body("auth", 0.99), Duration::ZERO);
         let mut cfg = enabled_cfg(&fine.base_url, &tmp.path().join("key"));
         cfg.key_file = Some(tmp.path().join("missing"));
-        let rec = consult(
-            &cfg,
-            &paths,
-            run,
-            "s1",
-            "claude",
-            &state("no key"),
-            Site::Verdict,
-            RegexVerdict::Work,
-        )
-        .unwrap();
+        let rec = fine_cls
+            .consult(
+                &cfg,
+                &paths,
+                run,
+                "s1",
+                "claude",
+                &state("no key"),
+                Site::Verdict,
+                RegexVerdict::Work,
+            )
+            .unwrap();
         assert_eq!(rec.action, Action::None);
         assert!(fine.bodies.lock().unwrap().is_empty(), "no key, no request");
 
         cfg.enabled = false;
-        assert!(consult(
-            &cfg,
-            &paths,
-            run,
-            "s1",
-            "claude",
-            &state("off"),
-            Site::Verdict,
-            RegexVerdict::Work
-        )
-        .is_none());
+        assert!(fine_cls
+            .consult(
+                &cfg,
+                &paths,
+                run,
+                "s1",
+                "claude",
+                &state("off"),
+                Site::Verdict,
+                RegexVerdict::Work
+            )
+            .is_none());
     }
 
     #[test]
@@ -1268,9 +1447,9 @@ pub mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         std::fs::create_dir_all(paths.run_dir("r1")).unwrap();
-        let fake = fake_system_one(200, answer_body("auth", 0.88), Duration::ZERO);
+        let (cls, fake) = stub_system_one(200, answer_body("auth", 0.88), Duration::ZERO);
         let cfg = enabled_cfg(&fake.base_url, &tmp.path().join("key"));
-        consult(
+        cls.consult(
             &cfg,
             &paths,
             "r1",
@@ -1332,7 +1511,7 @@ pub mod tests {
                 spar_error: Some("exit 1".into()),
                 log_tail: log_tail(tail),
             };
-            let a = classify(&cfg, adapter, &st).unwrap();
+            let a = Classifier::live().classify(&cfg, adapter, &st).unwrap();
             println!(
                 "{adapter}: {:?} p={:.3} latency={}ms cost={:?}",
                 a.choice, a.probability, a.latency_ms, a.cost_usd
@@ -1456,8 +1635,13 @@ pub mod tests {
         assert!(!tail.contains("password=a\n"));
     }
 
-    fn consult_once(cfg: &ClassifierConfig, paths: &SparPaths, tail: &str) -> Record {
-        consult(
+    fn consult_once(
+        cls: &Classifier,
+        cfg: &ClassifierConfig,
+        paths: &SparPaths,
+        tail: &str,
+    ) -> Record {
+        cls.consult(
             cfg,
             paths,
             "r1",
@@ -1476,51 +1660,55 @@ pub mod tests {
         let paths = SparPaths::new(tmp.path());
         std::fs::create_dir_all(paths.run_dir("r1")).unwrap();
 
-        let down = fake_system_one(503, "{}".into(), Duration::ZERO);
+        let (down_cls, down) = stub_system_one(503, "{}".into(), Duration::ZERO);
         let cfg = enabled_cfg(&down.base_url, &tmp.path().join("key"));
-        let first = consult_once(&cfg, &paths, "first").error.unwrap();
+        let first = consult_once(&down_cls, &cfg, &paths, "first")
+            .error
+            .unwrap();
         assert!(
             first.contains(&format!("after {} attempts", 1 + MAX_RETRIES)),
             "{first}"
         );
         let sent = down.bodies.lock().unwrap().len();
-        let rec = consult_once(&cfg, &paths, "second");
+        let rec = consult_once(&down_cls, &cfg, &paths, "second");
         assert!(
             rec.error.unwrap().contains("skipped"),
             "5xx exhausted trips"
         );
-        breaker_report(&cfg.base_url, false);
-        let again = consult_once(&cfg, &paths, "first").error.unwrap();
+        down_cls.breaker_report(&cfg.base_url, false);
+        let again = consult_once(&down_cls, &cfg, &paths, "first")
+            .error
+            .unwrap();
         assert!(
             !again.contains("cached") && down.bodies.lock().unwrap().len() > sent,
             "a 5xx is never served from memory: {again}"
         );
 
-        let refused = fake_system_one(400, "{}".into(), Duration::ZERO);
+        let (refused_cls, refused) = stub_system_one(400, "{}".into(), Duration::ZERO);
         let cfg = enabled_cfg(&refused.base_url, &tmp.path().join("key"));
-        consult_once(&cfg, &paths, "a");
-        consult_once(&cfg, &paths, "b");
+        consult_once(&refused_cls, &cfg, &paths, "a");
+        consult_once(&refused_cls, &cfg, &paths, "b");
         assert_eq!(refused.bodies.lock().unwrap().len(), 2, "4xx does not trip");
-        let rec = consult_once(&cfg, &paths, "a");
+        let rec = consult_once(&refused_cls, &cfg, &paths, "a");
         assert!(
             rec.error.unwrap().contains("cached"),
             "a 4xx is deterministic"
         );
         assert_eq!(refused.bodies.lock().unwrap().len(), 2);
 
-        let ok = fake_system_one(200, answer_body("auth", 0.9), Duration::ZERO);
+        let (ok_cls, ok) = stub_system_one(200, answer_body("auth", 0.9), Duration::ZERO);
         let cfg = enabled_cfg(&ok.base_url, &tmp.path().join("key"));
-        consult_once(&cfg, &paths, "");
-        consult_once(&cfg, &paths, "");
+        consult_once(&ok_cls, &cfg, &paths, "");
+        consult_once(&ok_cls, &cfg, &paths, "");
         assert_eq!(
             ok.bodies.lock().unwrap().len(),
             2,
             "an empty tail is not memoized"
         );
         let mut other = state("same tail");
-        consult_once(&cfg, &paths, "same tail");
+        consult_once(&ok_cls, &cfg, &paths, "same tail");
         other.spar_error = Some("missing expected artifact".into());
-        classify(&cfg, "claude", &other).unwrap();
+        ok_cls.classify(&cfg, "claude", &other).unwrap();
         assert_eq!(
             ok.bodies.lock().unwrap().len(),
             4,
@@ -1530,21 +1718,22 @@ pub mod tests {
 
     #[test]
     fn a_lapsed_breaker_lets_exactly_one_probe_through() {
-        let url = "http://breaker.test/one-probe";
+        let (cls, _stub) = stub_system_one(200, "{}".into(), Duration::ZERO);
+        let url = "stub://classifier-reports-probe";
         let budget = Duration::from_secs(6);
-        breakers().lock().unwrap().insert(
+        cls.breakers.lock().unwrap().insert(
             url.into(),
             Breaker::Open(Instant::now() - Duration::from_secs(1)),
         );
         let admitted: Vec<bool> = std::thread::scope(|sc| {
             let handles: Vec<_> = (0..8)
-                .map(|_| sc.spawn(|| breaker_admits(url, budget)))
+                .map(|_| sc.spawn(|| cls.breaker_admits(url, budget)))
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         assert_eq!(admitted.iter().filter(|a| **a).count(), 1);
-        breaker_report(url, false);
-        assert!(breaker_admits(url, budget));
+        cls.breaker_report(url, false);
+        assert!(cls.breaker_admits(url, budget));
     }
 
     #[test]
