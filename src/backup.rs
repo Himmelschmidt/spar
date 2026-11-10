@@ -151,7 +151,7 @@ pub fn backup_eligible(
         return false;
     }
     if first_probe(&key) {
-        let report = crate::probe::probe(paths, backup, false);
+        let report = crate::probe::probe(paths, backup, false, codex_profile);
         eprintln!(
             "note: backup {key} was on a quota pause; probe says {:?} ({})",
             report.verdict, report.store
@@ -698,6 +698,89 @@ mod tests {
         );
         log.push_str("Not logged in\n");
         assert_eq!(scrape_auth_signal(&log).as_deref(), Some("Not logged in"));
+    }
+
+    /// A fake `codex` answering every call with `body`, holding the shared env
+    /// lock. `profile` sets `SPAR_CODEX_PROFILE` (None removes it for the
+    /// default); the recorded profile passed to `backup_eligible` decides the
+    /// bucket, never the ambient value. Restores both vars afterwards.
+    fn with_fake_codex(
+        profile: Option<&str>,
+        body: &str,
+        f: impl FnOnce(&crate::paths::SparPaths),
+    ) {
+        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
+        let old_profile = std::env::var("SPAR_CODEX_PROFILE").ok();
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        match profile {
+            Some(p) => std::env::set_var("SPAR_CODEX_PROFILE", p),
+            None => std::env::remove_var("SPAR_CODEX_PROFILE"),
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(tmp.path().join("proj")).unwrap();
+        std::fs::write(bin.join("codex"), format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        f(&crate::paths::SparPaths::new(tmp.path().join("proj")));
+        match old_profile {
+            Some(v) => std::env::set_var("SPAR_CODEX_PROFILE", v),
+            None => std::env::remove_var("SPAR_CODEX_PROFILE"),
+        }
+        std::env::set_var("PATH", old_path);
+    }
+
+    #[test]
+    fn a_quota_paused_codex_bucket_recovers_through_backup_eligible() {
+        with_fake_codex(None, "echo OK", |paths| {
+            let mut store = QuotaStore::default();
+            store.pause_quota("cli:codex@openrouter", "possible quota signal: usage limit");
+            store.save(paths).unwrap();
+            let loaded = QuotaStore::load(paths).unwrap();
+            assert!(
+                !is_provider_eligible("cli:codex", &loaded, None, None),
+                "the bucket pause benches the bare seat"
+            );
+            assert!(
+                backup_eligible("cli:codex", &loaded, None, paths, false, None),
+                "a healthy probe retires the bucket pause and seats the backup"
+            );
+            let fresh = QuotaStore::load(paths).unwrap();
+            assert!(
+                is_provider_eligible("cli:codex", &fresh, None, None),
+                "the recovered bucket serves the seat again"
+            );
+        });
+    }
+
+    #[test]
+    fn a_codex_quota_verdict_benches_only_the_recorded_bucket() {
+        with_fake_codex(
+            None,
+            "echo \"You've hit your usage limit. Try again later.\" >&2\nexit 1",
+            |paths| {
+                let mut store = QuotaStore::default();
+                store.pause_quota("cli:codex@native", "possible quota signal: usage limit");
+                store.save(paths).unwrap();
+                let loaded = QuotaStore::load(paths).unwrap();
+                assert!(
+                    !backup_eligible("cli:codex", &loaded, None, paths, false, Some("")),
+                    "the re-paused bucket stays benched"
+                );
+                let fresh = QuotaStore::load(paths).unwrap();
+                assert!(!fresh.is_usable("cli:codex@native"));
+                assert!(
+                    fresh.is_usable("cli:codex@openrouter"),
+                    "the sibling bucket stays live"
+                );
+            },
+        );
     }
 
     #[test]
