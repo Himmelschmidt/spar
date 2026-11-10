@@ -300,6 +300,22 @@ impl Drop for SlotTmp {
     }
 }
 
+/// Stamp the round's start HEAD and tree once, when the slot joins the round.
+/// A same-round backup retry re-dispatches the same worktree, so re-stamping
+/// would measure against its own start and the primary seat's commits would
+/// read as no work. A same-round resume keeps both for the same reason: the
+/// round's own banked commit still compares against the round's start.
+fn stamp_round_start(s: &mut SlotState, round: u32, role: SlotRole, cwd: &Path) {
+    if s.round != round || s.dispatch_head.is_none() {
+        s.dispatch_head = role_is_recoverable(role)
+            .then(|| git_output(cwd, &["rev-parse", "HEAD"]))
+            .flatten();
+        s.dispatch_tree = role_is_recoverable(role)
+            .then(|| worktree_snapshot(cwd))
+            .flatten();
+    }
+}
+
 fn prepare_slot_execution(
     state: &mut RunState,
     paths: &SparPaths,
@@ -392,20 +408,7 @@ fn prepare_slot_execution(
         s.quota_hit = false;
         s.auth_fault = false;
         s.timeout_cause = None;
-        // The round's start HEAD and tree, stamped once when the slot joins
-        // the round. A same-round backup retry re-dispatches the same worktree,
-        // so re-stamping would measure against its own start and the primary
-        // seat's commits would read as no work. A same-round resume keeps both
-        // for the same reason: the round's own banked commit still compares
-        // against the round's start.
-        if s.round != round || s.dispatch_head.is_none() {
-            s.dispatch_head = role_is_recoverable(job.role)
-                .then(|| git_output(&cwd, &["rev-parse", "HEAD"]))
-                .flatten();
-            s.dispatch_tree = role_is_recoverable(job.role)
-                .then(|| worktree_snapshot(&cwd))
-                .flatten();
-        }
+        stamp_round_start(s, round, job.role, &cwd);
         s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
@@ -2901,20 +2904,7 @@ pub fn run_slot(
         s.quota_hit = false;
         s.auth_fault = false;
         s.timeout_cause = None;
-        // The round's start HEAD and tree, stamped once when the slot joins
-        // the round. A same-round backup retry re-dispatches the same worktree,
-        // so re-stamping would measure against its own start and the primary
-        // seat's commits would read as no work. A same-round resume keeps both
-        // for the same reason: the round's own banked commit still compares
-        // against the round's start.
-        if s.round != round || s.dispatch_head.is_none() {
-            s.dispatch_head = role_is_recoverable(job.role)
-                .then(|| git_output(&cwd, &["rev-parse", "HEAD"]))
-                .flatten();
-            s.dispatch_tree = role_is_recoverable(job.role)
-                .then(|| worktree_snapshot(&cwd))
-                .flatten();
-        }
+        stamp_round_start(s, round, job.role, &cwd);
         s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
@@ -9091,7 +9081,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     /// Thousands of untracked files overflow both pipes at once (path list in,
     /// sha list out). Writing everything before reading anything wedges git and
     /// spar against each other with no timeout, so the write must overlap the
-    /// drain on its own thread. Fails by hanging on the old sequence.
+    /// drain on its own thread. Fails by hanging when the write runs first.
     #[test]
     fn snapshot_combo_hashes_thousands_of_untracked_files() {
         let tmp = tempfile::tempdir().unwrap();
