@@ -1007,6 +1007,7 @@ fn prepare_implement_slots(
         &store,
         paths,
         dry,
+        state.recorded_route(),
         &model_for,
     )?;
     for seat in seats {
@@ -2326,23 +2327,6 @@ pub fn execute_loop(
                 {
                     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
                     let health = providers::LiveHealth::for_dry(state.dry_run);
-                    let has_backup = cfg.backups.implementer.is_some();
-                    let available: Option<std::collections::HashSet<String>> =
-                        if state.dry_run || !has_backup {
-                            None
-                        } else {
-                            let detected: std::collections::HashSet<String> =
-                                crate::providers::detect_all()
-                                    .into_iter()
-                                    .filter(|r| r.is_available())
-                                    .map(|r| format!("cli:{}", r.name))
-                                    .collect();
-                            if detected.is_empty() {
-                                None
-                            } else {
-                                Some(detected)
-                            }
-                        };
                     let slot_state = state
                         .slots
                         .iter()
@@ -2352,7 +2336,6 @@ pub fn execute_loop(
                     let cause = crate::backup::dispatch_stop_cause(
                         &slot_state,
                         &store,
-                        available.as_ref(),
                         state.recorded_route(),
                     );
                     if cause.engages_backup()
@@ -2370,7 +2353,6 @@ pub fn execute_loop(
                                 SlotRole::Implementer,
                                 cfg,
                                 &store,
-                                available.as_ref(),
                                 paths,
                                 state.dry_run,
                                 state.recorded_route(),
@@ -2424,23 +2406,6 @@ pub fn execute_loop(
             } else {
                 let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
                 let health = providers::LiveHealth::for_dry(state.dry_run);
-                let has_backup = cfg.backups.implementer.is_some();
-                let available: Option<std::collections::HashSet<String>> =
-                    if state.dry_run || !has_backup {
-                        None
-                    } else {
-                        let detected: std::collections::HashSet<String> =
-                            crate::providers::detect_all()
-                                .into_iter()
-                                .filter(|r| r.is_available())
-                                .map(|r| format!("cli:{}", r.name))
-                                .collect();
-                        if detected.is_empty() {
-                            None
-                        } else {
-                            Some(detected)
-                        }
-                    };
                 let slot_state = state
                     .slots
                     .iter()
@@ -2450,7 +2415,6 @@ pub fn execute_loop(
                 let cause = crate::backup::dispatch_stop_cause(
                     &slot_state,
                     &store,
-                    available.as_ref(),
                     state.recorded_route(),
                 );
                 if cause.engages_backup() && !slot_state.source.is_some_and(SeatSource::is_backup) {
@@ -2462,7 +2426,6 @@ pub fn execute_loop(
                             SlotRole::Implementer,
                             cfg,
                             &store,
-                            available.as_ref(),
                             paths,
                             state.dry_run,
                             state.recorded_route(),
@@ -3503,24 +3466,13 @@ fn gate_implementer_seat(
         None => Ok(None),
         Some(id) => match recheck_seat(state, paths, cfg, &id, true)? {
             SeatCheck::Ready(id) => {
-                // Quota-clean but the CLI may still be missing: the old run-start
-                // gate parked then too, once backups exist to detect against.
+                // Quota-clean but the CLI may still be missing: without a
+                // backup to take over, the seat stays put.
                 let has_backup = cfg.backups.implementer.is_some()
-                    || !cfg.backups.reviewer.is_empty()
                     || cfg.backups.tester.is_some();
                 if !has_backup {
                     return Ok(None);
                 }
-                let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                    .into_iter()
-                    .filter(|r| r.is_available())
-                    .map(|r| format!("cli:{}", r.name))
-                    .collect();
-                let available = if detected.is_empty() {
-                    None
-                } else {
-                    Some(detected)
-                };
                 let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
                 let route = state.recorded_route();
                 let missing = state
@@ -3531,7 +3483,6 @@ fn gate_implementer_seat(
                         !crate::backup::is_provider_eligible(
                             &s.provider_ref().display(),
                             &store,
-                            available.as_ref(),
                             route,
                         )
                     })
@@ -3611,7 +3562,6 @@ fn recheck_seat(
                 slot.role,
                 cfg,
                 &store,
-                None,
                 paths,
                 state.dry_run,
                 route,
@@ -3685,7 +3635,6 @@ fn recheck_seat_health(
         cfg,
         slot.model.as_deref(),
         &store,
-        None,
         paths,
         state.dry_run,
         state.recorded_route(),
@@ -3749,25 +3698,9 @@ fn try_rotate_implementer(
     {
         let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
         let has_backup = cfg.backups.implementer.is_some();
-        let available_opt: Option<std::collections::HashSet<String>> =
-            if state.dry_run || !has_backup {
-                None
-            } else {
-                let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                    .into_iter()
-                    .filter(|r| r.is_available())
-                    .map(|r| format!("cli:{}", r.name))
-                    .collect();
-                if detected.is_empty() {
-                    None
-                } else {
-                    Some(detected)
-                }
-            };
         let cause = crate::backup::dispatch_stop_cause(
             &slot_state,
             &store,
-            available_opt.as_ref(),
             state.recorded_route(),
         );
         if has_backup {
@@ -3792,7 +3725,6 @@ fn try_rotate_implementer(
                             SlotRole::Implementer,
                             cfg,
                             &store,
-                            available_opt.as_ref(),
                             paths,
                             state.dry_run,
                             state.recorded_route(),
@@ -4015,7 +3947,6 @@ fn try_rotate_reviewer_provider(
                     SlotRole::Reviewer,
                     cfg,
                     &store,
-                    None,
                     paths,
                     state.dry_run,
                     state.recorded_route(),
@@ -4033,7 +3964,7 @@ fn try_rotate_reviewer_provider(
         }
     }
     let eligible = |p: &String| -> bool {
-        *p != cur && crate::backup::is_provider_eligible(p, &store, None, state.recorded_route())
+        *p != cur && crate::backup::is_provider_eligible(p, &store, state.recorded_route())
     };
     let healthy = |p: &String| -> bool { eligible(p) && health.check(p).usable };
     let reviewer_role_source = if cfg

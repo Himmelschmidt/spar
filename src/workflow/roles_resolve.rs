@@ -296,6 +296,7 @@ pub fn build_implement_seats(
     store: &crate::quota::QuotaStore,
     paths: &crate::paths::SparPaths,
     dry: bool,
+    route: crate::providers::RecordedRoute<'_>,
     model_for: &dyn Fn(usize) -> Option<String>,
 ) -> anyhow::Result<Vec<FleetSeat>> {
     let mut out = Vec::new();
@@ -310,10 +311,9 @@ pub fn build_implement_seats(
         cfg,
         model.as_deref(),
         store,
-        None,
         paths,
         dry,
-        crate::providers::RecordedRoute::ambient(),
+        route,
         health,
         &used,
     ) {
@@ -350,10 +350,9 @@ pub fn build_implement_seats(
             cfg,
             model.as_deref(),
             store,
-            None,
             paths,
             dry,
-            crate::providers::RecordedRoute::ambient(),
+            route,
             health,
             &used,
         ) else {
@@ -430,6 +429,7 @@ pub fn project_implement_fleet(
     paths: &crate::paths::SparPaths,
     dry: bool,
     pool_dry: bool,
+    route: crate::providers::RecordedRoute<'_>,
     run_id: Option<&str>,
 ) -> anyhow::Result<Vec<FleetSeat>> {
     let width = pool_width(cfg);
@@ -459,6 +459,7 @@ pub fn project_implement_fleet(
         store,
         paths,
         dry,
+        route,
         &model_for,
     )
 }
@@ -512,6 +513,8 @@ pub fn launch_fleet(
         }
     };
     let implement_panel = |pool: &[String], projected: bool| -> anyhow::Result<Vec<FleetSeat>> {
+        // A fresh launch has no run to record a route yet: the ambient
+        // environment is the route the launch would stamp.
         let mut out = project_implement_fleet(
             cfg,
             pool,
@@ -521,6 +524,7 @@ pub fn launch_fleet(
             paths,
             dry,
             opts.dry_run,
+            crate::providers::RecordedRoute::ambient(),
             None,
         )?;
         let used: Vec<String> = out.iter().map(|s| s.provider.clone()).collect();
@@ -571,7 +575,6 @@ pub fn launch_fleet(
                     cfg,
                     None,
                     &store,
-                    None,
                     paths,
                     dry,
                     crate::providers::RecordedRoute::ambient(),
@@ -948,5 +951,53 @@ mod tests {
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:codex".into()];
         assert!(reviewer_panel_has_pins(&cfg));
+    }
+
+    #[test]
+    fn implement_seats_key_quota_against_the_recorded_route() {
+        // Bare `cli:codex` bills OpenRouter under the recorded `muse` profile
+        // but native under an empty ambient one: pausing the recorded bucket
+        // must yield the implementer to its backup, while ambient keeps it.
+        let _pin = crate::providers::codex::pin_codex_env();
+        std::env::set_var("SPAR_CODEX_PROFILE", "");
+        let health = StubHealth::allow_all();
+        let mut cfg = Config::default();
+        cfg.roles.implementer = Some("cli:codex".into());
+        cfg.backups.implementer = Some("cli:claude".into());
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:codex@openrouter", "test");
+        let mut state = crate::state::RunState::new(
+            "route-test",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.codex_profile = Some("muse".into());
+        let seats = |route: crate::providers::RecordedRoute<'_>| {
+            build_implement_seats(
+                &cfg,
+                &[],
+                PoolOrigin::Synth,
+                false,
+                &health,
+                &store,
+                &paths,
+                true,
+                route,
+                &|_| None,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            seats(state.recorded_route())[0].provider,
+            "cli:claude",
+            "the paused recorded bucket yields to the backup"
+        );
+        assert_eq!(
+            seats(crate::providers::RecordedRoute::ambient())[0].provider,
+            "cli:codex",
+            "the unpaused ambient bucket keeps the primary"
+        );
     }
 }

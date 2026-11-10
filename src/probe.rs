@@ -450,7 +450,6 @@ mod tests {
         assert!(!crate::backup::is_provider_eligible(
             "cli:codex",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         let seat = crate::provider_ref::ProviderRef::parse("cli:codex")
@@ -462,7 +461,6 @@ mod tests {
         assert!(crate::backup::is_provider_eligible(
             "cli:codex",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
     }
@@ -637,7 +635,6 @@ mod tests {
                 !crate::backup::is_provider_eligible(
                     "cli:codex",
                     &loaded,
-                    None,
                     crate::providers::RecordedRoute::ambient()
                 ),
                 "the bucket pause benches the bare seat"
@@ -658,7 +655,6 @@ mod tests {
                 crate::backup::is_provider_eligible(
                     "cli:codex",
                     &fresh,
-                    None,
                     crate::providers::RecordedRoute::ambient()
                 ),
                 "the recovered bucket serves the seat again"
@@ -698,7 +694,6 @@ mod tests {
                     !crate::backup::is_provider_eligible(
                         "cli:codex",
                         &fresh,
-                        None,
                         crate::providers::RecordedRoute::ambient()
                     ),
                     "the seat that hit the wall stays benched"
