@@ -296,7 +296,7 @@ pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str
     fs::write(path.with_extension("tmp"), &next)?;
     fs::rename(path.with_extension("tmp"), &path)?;
     let listed: HashSet<String> = msgs.iter().map(|m| m.id.clone()).collect();
-    bus::prune_aged_claims(paths, agent, &seen, &listed, &acked);
+    bus::prune_aged_claims(paths, agent, &seen, &listed, &acked, &superseded);
     Ok(msgs.len())
 }
 
@@ -512,6 +512,30 @@ pub fn drain_poll_files(paths: &SparPaths, targets: &[String]) {
                 eprintln!("warning: poll-file fan-out to {agent} failed: {e:#}");
             }
         }
+    }
+}
+
+/// Claim a PollFile slot's backlog as its dispatch starts. A message sent while
+/// the slot was idle stays `queued` until a turn that can read the poll file
+/// starts; the round-start sweep renders but never claims, and PollFile slots
+/// have no turn-end deliver hook, so without this the copy would sit in the
+/// file with the word stuck at `queued` for the whole turn. Skipped for dry
+/// runs (no live slot reads) and non-PollFile strategies. Best effort with a
+/// stderr line, like the file-time fan-out.
+pub fn drain_slot_backlog(paths: &SparPaths, state: &RunState, slot_id: &str) {
+    if state.dry_run || strategy_for_slot(state, slot_id) != DeliveryStrategy::PollFile {
+        return;
+    }
+    let agent = bus::agent_ref(Some(&state.id), slot_id);
+    if let Err(e) = deliver(
+        paths,
+        Some(&state.id),
+        &agent,
+        DeliveryStrategy::PollFile,
+        None,
+        false,
+    ) {
+        eprintln!("warning: poll-file backlog drain for {slot_id} failed: {e:#}");
     }
 }
 
@@ -993,5 +1017,84 @@ mod tests {
         refresh_run_poll_files(&paths, "r1");
         let body = std::fs::read_to_string(&file).unwrap();
         assert!(body.contains("quota note"), "{body}");
+    }
+
+    #[test]
+    fn dispatch_start_claims_the_idle_backlog() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.slots.push(crate::executor::init_slot(
+            "impl",
+            "cli:agy",
+            crate::state::SlotRole::Implementer,
+        ));
+        state.slots.push(crate::executor::init_slot(
+            "rev",
+            "cli:claude",
+            crate::state::SlotRole::Reviewer,
+        ));
+        state.save(&paths).unwrap();
+
+        let poll_slot = agent_ref(Some("r1"), "impl");
+        let hook_slot = agent_ref(Some("r1"), "rev");
+        chat(
+            &paths,
+            Some("r1"),
+            "human",
+            &poll_slot,
+            "idle ruling",
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        chat(
+            &paths,
+            Some("r1"),
+            "human",
+            &hook_slot,
+            "idle review note",
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        let claimed_count = |agent: &str| {
+            bus::bus_root(&paths)
+                .join("inbox")
+                .join(agent)
+                .join("claimed")
+                .read_dir()
+                .map(|r| r.count())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            claimed_count(&poll_slot),
+            0,
+            "no claim into a file no turn can read"
+        );
+
+        state.slots[0].status = crate::state::SlotStatus::Running;
+        state.slots[1].status = crate::state::SlotStatus::Running;
+        drain_slot_backlog(&paths, &state, "impl");
+        drain_slot_backlog(&paths, &state, "rev");
+        assert_eq!(claimed_count(&poll_slot), 1);
+        assert_eq!(claimed_count(&hook_slot), 0);
+        let body = std::fs::read_to_string(poll_file(&paths, Some("r1"), &poll_slot)).unwrap();
+        assert!(body.contains("idle ruling"), "{body}");
+
+        state.dry_run = true;
+        chat(
+            &paths,
+            Some("r1"),
+            "human",
+            &poll_slot,
+            "dry ruling",
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        drain_slot_backlog(&paths, &state, "impl");
+        assert_eq!(claimed_count(&poll_slot), 1);
     }
 }

@@ -1308,9 +1308,10 @@ replacement addressed to a slot that never held the old one still reaches its fi
 inbox and the bus log but never become action items. Posting into the live poll file
 counts as `delivered`, and the drain claims only what renders, so `delivered` never
 describes a message the slot cannot see. A send to a poll slot with no running turn
-stays `queued` until the slot's turn starts and a filing or turn-end `bus deliver`
-claims it: the round-start sweep may already render the copy into the file, but the
-word flips only on the claim. Dry-run runs skip the fan-out (nothing live polls their
+stays `queued` until the slot's turn starts, when the dispatch-start drain
+claims the backlog (a filing while `Running` claims it too): the round-start
+sweep may already render the copy into the file, but the word flips only on
+the claim. Dry-run runs skip the fan-out (nothing live polls their
 files); the messages stay in the inbox for inspection and no poll file is
 written. A message leaves the file once the slot acks it, the ack filing re-renders
 the acker's own file at once, and the heading names the exact ack command for the

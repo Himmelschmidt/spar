@@ -414,6 +414,9 @@ fn prepare_slot_execution(
         &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
     );
     let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
+    // The turn that can read the poll file starts here: claim what piled up
+    // while the slot was idle so the word flips from `queued` to `delivered`.
+    crate::providers::delivery::drain_slot_backlog(paths, state, &job.slot_id);
     let tmp = SlotTmp::create(paths, &state.id, &job.slot_id, state.isolation);
     let mut env = wire_slot_presence(state, paths, &job, &cwd, &pref);
     env.extend(tmp.env());
@@ -2515,6 +2518,9 @@ pub fn run_slot(
         &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
     );
     let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
+    // The turn that can read the poll file starts here: claim what piled up
+    // while the slot was idle so the word flips from `queued` to `delivered`.
+    crate::providers::delivery::drain_slot_backlog(paths, state, &job.slot_id);
     let mut build_cache = lease_build_cache(state, paths, cfg, job, &cwd);
     state.save(paths)?;
 

@@ -153,6 +153,15 @@ pub struct MsgRefs {
     pub supersedes: Option<String>,
 }
 
+impl MsgRefs {
+    /// The `--supersedes` edge target, if this message withdraws one. The one
+    /// extraction both the full event parse and the poll render's streaming
+    /// probe use, so the two cannot drift into different field readings.
+    pub(crate) fn superseded_id(&self) -> Option<&str> {
+        self.supersedes.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Presence {
     pub agent: String,
@@ -1676,15 +1685,7 @@ struct RenderProbe {
     #[serde(default)]
     run: Option<String>,
     #[serde(default)]
-    refs: RenderRefs,
-}
-
-#[derive(serde::Deserialize, Default)]
-struct RenderRefs {
-    #[serde(default)]
-    reply_to: Option<String>,
-    #[serde(default)]
-    supersedes: Option<String>,
+    refs: MsgRefs,
 }
 
 /// What one poll-file render needs from the logs: the message ids each listed
@@ -1736,8 +1737,8 @@ fn scan_render_log(
         let Ok(probe) = serde_json::from_str::<RenderProbe>(&line) else {
             continue;
         };
-        if let Some(old) = probe.refs.supersedes {
-            superseded.insert(old);
+        if let Some(old) = probe.refs.superseded_id() {
+            superseded.insert(old.to_string());
         }
         if probe.kind != Some(MsgKind::Ack) {
             continue;
@@ -1753,28 +1754,32 @@ fn scan_render_log(
     (acked, superseded)
 }
 
-/// Delete `claimed/` copies the render filtered out of every future render:
-/// the slot acked them, a later message superseded them, their round passed, or
-/// they never list. `claimed/` is append-only otherwise, so without this every
-/// poll render and `disk_positions` rescan all historical copies.
+/// Delete `claimed/` copies whose message is permanently resolved: the slot
+/// acked it or a later message superseded it. `claimed/` is append-only
+/// otherwise, so without this every poll render and `disk_positions` rescan
+/// all historical copies.
+///
+/// Only resolved copies go, never merely aged-out ones: a `delivered` word can
+/// rest on the claimed copy plus its claim receipt alone, and receipt rotation
+/// drops old claim receipts, so deleting an unacked copy would flip the word
+/// to `withdrawn` two rotations later. An acked word reads `acknowledged` from
+/// the event log (never rotated) whatever the disk holds, and a supersede edge
+/// lives in the same log, so neither prune changes a word. Delivered-but-live
+/// copies stay on disk as the word's anchor.
 ///
 /// Only copies the render just classified (`seen`) go: a copy filed by a
-/// concurrent drain mid-render is live traffic, not history. The log word is
-/// unchanged: an acked message reads `acknowledged` from the event log whatever
-/// the disk holds, and every other aged-out copy keeps its claim receipt (deletion
-/// is skipped once receipts have rotated, where the claimed file is the word's
-/// only anchor).
+/// concurrent drain mid-render is live traffic, not history.
 pub(crate) fn prune_aged_claims(
     paths: &SparPaths,
     agent: &str,
     seen: &HashSet<String>,
     listed: &HashSet<String>,
     acked: &HashSet<String>,
+    superseded: &HashSet<String>,
 ) {
     if seen.is_empty() {
         return;
     }
-    let receipts_intact = !rotated_receipts_path(paths).is_file();
     let claimed = bus_root(paths).join("inbox").join(agent).join("claimed");
     let Ok(entries) = std::fs::read_dir(&claimed) else {
         return;
@@ -1787,7 +1792,7 @@ pub(crate) fn prune_aged_claims(
         if listed.contains(id) || !seen.contains(id) {
             continue;
         }
-        if !acked.contains(id) && !receipts_intact {
+        if !acked.contains(id) && !superseded.contains(id) {
             continue;
         }
         if let Err(e) = std::fs::remove_file(entry.path()) {
@@ -1831,7 +1836,11 @@ impl ExpiryGate {
 /// re-files its copy after the withdrawal deleted it.
 pub(crate) fn supersede_edges(all: &[BusMessage]) -> Vec<(String, String)> {
     all.iter()
-        .filter_map(|m| m.refs.supersedes.clone().map(|old| (old, m.id.clone())))
+        .filter_map(|m| {
+            m.refs
+                .superseded_id()
+                .map(|old| (old.to_string(), m.id.clone()))
+        })
         .collect()
 }
 
@@ -2313,6 +2322,67 @@ mod tests {
         };
         assert_eq!(word(&done.id), DeliveryState::Acknowledged);
         assert_eq!(word(&live.id), DeliveryState::Delivered);
+    }
+
+    #[test]
+    fn prune_keeps_the_unacked_anchor_across_receipt_rotation() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        join(&paths, Some("r1"), "p", Some("cli:pi"), Some("native-cli")).unwrap();
+        let mut state = crate::state::RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.slots.push(crate::executor::init_slot(
+            "p",
+            "cli:pi",
+            crate::state::SlotRole::Implementer,
+        ));
+        state.slots[0].status = crate::state::SlotStatus::Running;
+        state.save(&paths).unwrap();
+
+        let agent = agent_ref(Some("r1"), "p");
+        let m = chat(
+            &paths,
+            Some("r1"),
+            "a",
+            "p",
+            "do this",
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        let claimed = inbox_dir(&paths, &agent).join("claimed");
+        let seen: HashSet<String> = HashSet::from([m.id.clone()]);
+        prune_aged_claims(
+            &paths,
+            &agent,
+            &seen,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(claimed.read_dir().unwrap().count(), 1);
+
+        for _ in 0..2 {
+            record_receipt(&paths, "junk", &agent, ReceiptEvent::Queued, "test");
+            rotate_receipts(&paths, 1);
+        }
+        let word = log_entries(&paths, Some("r1"))
+            .unwrap()
+            .into_iter()
+            .find(|e| e.msg.id == m.id)
+            .map(|e| e.delivery);
+        assert_eq!(word, Some(DeliveryState::Delivered));
+
+        ack(&paths, Some("r1"), "p", &m.id).unwrap();
+        assert_eq!(claimed.read_dir().unwrap().count(), 0);
+        let word = log_entries(&paths, Some("r1"))
+            .unwrap()
+            .into_iter()
+            .find(|e| e.msg.id == m.id)
+            .map(|e| e.delivery);
+        assert_eq!(word, Some(DeliveryState::Acknowledged));
     }
 
     #[test]

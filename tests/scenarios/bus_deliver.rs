@@ -1285,7 +1285,7 @@ fn poll_file_round_start_refresh_drops_expired_for_pi() {
 /// the withdrawal clears the pending record, so the tick has nothing to
 /// re-file, and the render skips superseded ids even for a re-filed copy.
 #[test]
-fn supersede_during_redelivery_tick_lists_only_the_replacement() {
+fn supersede_before_a_due_redelivery_tick_lists_only_the_replacement() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
     let (run_id, agent) = live_poll_run(tmp.path(), "cli:agy");
@@ -1462,10 +1462,11 @@ fn supersede_clear_waits_for_the_pending_ack_lock() {
 /// `human` and `@human` are one seat: a message sent `--from @human` is
 /// superseded by a send with the default `--from human`, and both spellings
 /// file into the one `@human` inbox. (Pair grouping across the spellings is
-/// covered at unit level: the guard exempts human-bound traffic by design, so
-/// no CLI refusal can observe it.)
+/// covered at unit level by `loop_guard_groups_human_spellings_as_one_pair`:
+/// the guard exempts human-bound traffic by design, so no CLI refusal can
+/// observe it.)
 #[test]
-fn human_spelling_supersede_and_single_budget_pair() {
+fn human_spelling_supersede_and_shared_inbox() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
     let (run_id, agent) = live_poll_run(tmp.path(), "cli:agy");
