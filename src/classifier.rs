@@ -1017,7 +1017,9 @@ pub mod tests {
             enabled: true,
             base_url: base_url.to_string(),
             key_file: Some(key_file.to_path_buf()),
-            timeout_secs: 1,
+            // Generous: tests that count attempts must not see a loaded machine's
+            // slow round trip as a timeout that retries or ends the budget early.
+            timeout_secs: 30,
             ..Default::default()
         }
     }
@@ -1156,7 +1158,10 @@ pub mod tests {
         std::fs::create_dir_all(paths.run_dir(run)).unwrap();
 
         let slow = fake_system_one(200, answer_body("auth", 0.99), Duration::from_secs(3));
-        let cfg = enabled_cfg(&slow.base_url, &tmp.path().join("key"));
+        let cfg = ClassifierConfig {
+            timeout_secs: 1,
+            ..enabled_cfg(&slow.base_url, &tmp.path().join("key"))
+        };
         let rec = consult(
             &cfg,
             &paths,
