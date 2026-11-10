@@ -230,10 +230,17 @@ pub enum CeilingPartialKind {
 }
 
 /// A recorded ceiling-cut round and how it left its work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CeilingPartialRound {
     pub round: u32,
     pub kind: CeilingPartialKind,
+    /// The commit the round's work was banked as (`Wip`'s WIP commit, or the
+    /// HEAD a `Clean` round died on). `None` for `Refused` (nothing was banked)
+    /// and for records written before this field existed. A same-round resume
+    /// compares the tree against this so the round's own banked commit does not
+    /// read as new work a second time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
 }
 
 /// The words for naming the cut-short rounds in a sentence.
@@ -627,12 +634,21 @@ pub struct SlotState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_cause: Option<crate::executor::TimeoutCause>,
     /// HEAD of this slot's worktree when the current round started. Work is
-    /// measured against it (dirty tree, or commits past it), never against the
-    /// run base: from round 2 on the base predates earlier rounds' commits, so
-    /// the base always reads as work. Stamped when the slot joins the round, and
-    /// kept across same-round backup retries and provider rotation.
+    /// measured against it (commits past it) and [`Self::dispatch_tree`],
+    /// never against the run base: from round 2 on the base predates earlier
+    /// rounds' commits, so the base always reads as work. Stamped when the slot
+    /// joins the round, and kept across same-round backup retries, provider
+    /// rotation, and same-round resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_head: Option<String>,
+    /// Content digest of this slot's worktree when the current round started.
+    /// Uncommitted changes count as this round's work only when they differ
+    /// from this snapshot: the tree can already be dirty at round start (the
+    /// test-author overlay, a refused round's leftovers), and that pre-existing
+    /// dirt is not the round's work. Stamped alongside [`Self::dispatch_head`],
+    /// under the same condition, and never re-stamped on same-round resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_tree: Option<String>,
     /// The build-cache pool directory this implementer leased (O143). Kept after the
     /// dispatch ends so the next one prefers the same warm directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]

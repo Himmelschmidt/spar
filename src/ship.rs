@@ -1250,6 +1250,7 @@ mod tests {
         state.ceiling_partial_rounds = vec![CeilingPartialRound {
             round: 1,
             kind: CeilingPartialKind::Wip,
+            commit: None,
         }];
         std::fs::write(
             paths.artifact("rb1", "summary-impl.md"),
@@ -1280,10 +1281,12 @@ mod tests {
             CeilingPartialRound {
                 round: 1,
                 kind: CeilingPartialKind::Wip,
+                commit: None,
             },
             CeilingPartialRound {
                 round: 2,
                 kind: CeilingPartialKind::Wip,
+                commit: None,
             },
         ];
         std::fs::write(

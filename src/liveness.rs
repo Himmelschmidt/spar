@@ -243,6 +243,7 @@ mod tests {
             auth_fault: false,
             timeout_cause: None,
             dispatch_head: None,
+            dispatch_tree: None,
             build_cache: None,
             former_ids: Vec::new(),
             classifier: None,

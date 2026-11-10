@@ -35,7 +35,37 @@ pub struct ApiSlotRequest<'a> {
     pub model_override: Option<String>,
 }
 
-pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, Usage)> {
+/// What one api-sdk dispatch produced. The hard ceiling is reported with the
+/// same typed cause the native-cli path reports, so the workflow treats both
+/// backends identically.
+pub struct ApiSlotOutcome {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub usage: Usage,
+    pub timeout_cause: Option<crate::executor::TimeoutCause>,
+}
+
+impl ApiSlotOutcome {
+    fn fail(error: String, usage: Usage) -> Self {
+        Self {
+            ok: false,
+            error: Some(error),
+            usage,
+            timeout_cause: None,
+        }
+    }
+
+    fn done(usage: Usage) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            usage,
+            timeout_cause: None,
+        }
+    }
+}
+
+pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<ApiSlotOutcome> {
     let mut usage = Usage {
         provider: Some(format!("api:{}", req.provider_name)),
         ..Default::default()
@@ -61,7 +91,7 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, U
                 )?;
             }
         }
-        return Ok((true, None, usage));
+        return Ok(ApiSlotOutcome::done(usage));
     }
 
     let mut cfg = ApiProviderConfig::resolve(req.provider_name)?;
@@ -101,7 +131,12 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, U
     let max_steps = 12u32;
     for step in 0..max_steps {
         if start.elapsed() > req.timeout {
-            return Ok((false, Some("api slot timeout".into()), usage));
+            return Ok(ApiSlotOutcome {
+                ok: false,
+                error: Some("api slot timeout".into()),
+                usage,
+                timeout_cause: Some(crate::executor::TimeoutCause::HardCeiling),
+            });
         }
         append_log(
             req.log_path,
@@ -121,13 +156,12 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, U
 
         if result.content.contains("FINAL:") {
             if !artifact_ok(req) {
-                return Ok((
-                    false,
-                    Some("missing expected artifact after FINAL".into()),
+                return Ok(ApiSlotOutcome::fail(
+                    "missing expected artifact after FINAL".into(),
                     usage,
                 ));
             }
-            return Ok((true, None, usage));
+            return Ok(ApiSlotOutcome::done(usage));
         }
 
         if let Some(tool_line) = extract_tool_json(&result.content) {
@@ -145,13 +179,12 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, U
 
         if step + 1 == max_steps {
             if !artifact_ok(req) {
-                return Ok((
-                    false,
-                    Some("api slot finished without expected artifact".into()),
+                return Ok(ApiSlotOutcome::fail(
+                    "api slot finished without expected artifact".into(),
                     usage,
                 ));
             }
-            return Ok((true, None, usage));
+            return Ok(ApiSlotOutcome::done(usage));
         }
         messages.push(ChatMessage {
             role: "user".into(),
@@ -159,13 +192,12 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, U
         });
     }
     if !artifact_ok(req) {
-        return Ok((
-            false,
-            Some("api slot finished without expected artifact".into()),
+        return Ok(ApiSlotOutcome::fail(
+            "api slot finished without expected artifact".into(),
             usage,
         ));
     }
-    Ok((true, None, usage))
+    Ok(ApiSlotOutcome::done(usage))
 }
 
 fn artifact_ok(req: &ApiSlotRequest<'_>) -> bool {
@@ -364,6 +396,35 @@ fn _paths_touch(_: &SparPaths) {}
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// The api-sdk backend reports the typed hard-ceiling cause the same way
+    /// the native-cli path does, so the workflow treats both backends
+    /// identically. A zero timeout reaches the ceiling arm before any network
+    /// call. Fails on the old untyped timeout error, which carried
+    /// `timeout_cause: None` and failed the round empty.
+    #[test]
+    fn hard_ceiling_reports_a_typed_cause() {
+        // Resolve reads the key from the environment but the zero timeout
+        // trips before any network call; no other test resolves a provider.
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+        let tmp = tempdir().unwrap();
+        let outcome = run_api_slot(&ApiSlotRequest {
+            provider_name: "openai",
+            prompt: "hello",
+            cwd: tmp.path(),
+            log_path: &tmp.path().join("api.log"),
+            expected_artifact: None,
+            timeout: std::time::Duration::ZERO,
+            dry_run: false,
+            model_override: None,
+        })
+        .unwrap();
+        assert!(!outcome.ok, "a ceiling kill is not a success");
+        assert_eq!(
+            outcome.timeout_cause,
+            Some(crate::executor::TimeoutCause::HardCeiling)
+        );
+    }
 
     #[test]
     fn rejects_parent_dir() {

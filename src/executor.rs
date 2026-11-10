@@ -158,6 +158,9 @@ struct PreparedSlot {
     /// against it (never re-derived later): from round 2 on the run base predates
     /// earlier rounds' commits, so the base always reads as work.
     dispatch_head: Option<String>,
+    /// Content digest of the slot's worktree when this round started, stamped
+    /// alongside `dispatch_head`. Uncommitted changes count only past it.
+    dispatch_tree: Option<String>,
     round: u32,
     /// The native session/thread id an earlier round of this same slot captured
     /// (`markers::read_session_id`), if any. `execute_prepared` passes it to the
@@ -387,13 +390,18 @@ fn prepare_slot_execution(
         s.quota_hit = false;
         s.auth_fault = false;
         s.timeout_cause = None;
-        // The round's start HEAD, stamped once when the slot joins the round. A
-        // same-round backup retry re-dispatches the same worktree, so re-stamping
-        // would measure against its own start and the primary seat's commits
-        // would read as no work.
+        // The round's start HEAD and tree, stamped once when the slot joins
+        // the round. A same-round backup retry re-dispatches the same worktree,
+        // so re-stamping would measure against its own start and the primary
+        // seat's commits would read as no work. A same-round resume keeps both
+        // for the same reason: the round's own banked commit still compares
+        // against the round's start.
         if s.round != round || s.dispatch_head.is_none() {
             s.dispatch_head = role_is_recoverable(job.role)
                 .then(|| git_output(&cwd, &["rev-parse", "HEAD"]))
+                .flatten();
+            s.dispatch_tree = role_is_recoverable(job.role)
+                .then(|| worktree_snapshot(&cwd))
                 .flatten();
         }
         clear_expected_artifact(paths, &run_id, &job);
@@ -437,11 +445,9 @@ fn prepare_slot_execution(
         prior_session_for_role(paths, &state.id, &job.slot_id, &session_provider, job.role);
     let fleet_lease = crate::fleet::SlotLease::start(paths, &state.id, &job.slot_id, &job.provider);
 
-    let dispatch_head = state
-        .slots
-        .iter()
-        .find(|s| s.id == job.slot_id)
-        .and_then(|s| s.dispatch_head.clone());
+    let slot = state.slots.iter().find(|s| s.id == job.slot_id);
+    let dispatch_head = slot.and_then(|s| s.dispatch_head.clone());
+    let dispatch_tree = slot.and_then(|s| s.dispatch_tree.clone());
     Ok(PreparedSlot {
         job,
         cwd,
@@ -453,6 +459,7 @@ fn prepare_slot_execution(
         paths: paths.clone(),
         run_id: state.id.clone(),
         dispatch_head,
+        dispatch_tree,
         owns_cwd,
         round,
         prior_session_id,
@@ -1121,7 +1128,7 @@ fn execute_prepared(
                 .unwrap_or_else(|| PathBuf::from(n))
         });
         let model = prep.job.model.clone();
-        let (ok, err, usage) = crate::api::run_api_slot(&crate::api::runtime::ApiSlotRequest {
+        let outcome = crate::api::run_api_slot(&crate::api::runtime::ApiSlotRequest {
             provider_name: &prep.pref.name,
             prompt: &prep.prompt,
             cwd: &prep.cwd,
@@ -1131,6 +1138,12 @@ fn execute_prepared(
             dry_run: false,
             model_override: model.clone(),
         })?;
+        let (ok, err, usage, timeout_cause) = (
+            outcome.ok,
+            outcome.error,
+            outcome.usage,
+            outcome.timeout_cause,
+        );
         let slot_usage = SlotUsage {
             slot_id: prep.job.slot_id.clone(),
             provider: prep.pref.storage_key(),
@@ -1172,7 +1185,7 @@ fn execute_prepared(
                 quota_rejected: None,
                 quota_resets_at: None,
                 quota_recovered: false,
-                timeout_cause: None,
+                timeout_cause,
             }
         });
     }
@@ -1287,9 +1300,6 @@ fn execute_prepared(
     // retry or transient retry inside `dispatch_with_resume_recovery` is still
     // this dispatch, and its write lands after this capture either way.
     let dispatch_start = SystemTime::now();
-    // Carried from prepare, never re-derived here: from round 2 on the run base
-    // predates earlier rounds' commits, so the base always reads as work.
-    let dispatch_head = prep.dispatch_head.clone();
     let mut res = dispatch_with_resume_recovery(
         adapter.as_ref(),
         &bin,
@@ -1360,9 +1370,9 @@ fn execute_prepared(
                     env: &prep.env,
                     isolation,
                     dispatch_head: prep.dispatch_head.as_deref(),
+                    dispatch_tree: prep.dispatch_tree.as_deref(),
                     artifact: &prep.paths.artifact(&prep.run_id, name),
                 },
-                dispatch_head.as_deref(),
                 dispatch_start,
             )
         });
@@ -1540,6 +1550,7 @@ fn execute_prepared(
                 env: &prep.env,
                 isolation,
                 dispatch_head: prep.dispatch_head.as_deref(),
+                dispatch_tree: prep.dispatch_tree.as_deref(),
                 artifact: &path,
             });
             if !recovered {
@@ -1610,6 +1621,10 @@ struct ArtifactRecovery<'a> {
     /// round 2 on the run base predates earlier rounds' commits and always
     /// reads as work, so a fix round that did nothing still earns a turn.
     dispatch_head: Option<&'a str>,
+    /// Content digest of the worktree when this round started. Uncommitted
+    /// changes count only past this snapshot: the tree can be dirty at round
+    /// start already, and that dirt is not the round's work.
+    dispatch_tree: Option<&'a str>,
     artifact: &'a Path,
 }
 
@@ -1640,20 +1655,14 @@ fn role_is_recoverable(role: SlotRole) -> bool {
 /// is; new commits since the dispatch began earn the same artifact-only recovery turn a
 /// clean exit without its artifact gets. A dirty tree alone does not: that is a round
 /// cut short, and the checkpoint (O112) already keeps it.
-fn ceiling_kill_kept_work(
-    r: &ArtifactRecovery,
-    dispatch_head: Option<&str>,
-    since: SystemTime,
-) -> bool {
+fn ceiling_kill_kept_work(r: &ArtifactRecovery, since: SystemTime) -> bool {
     if !role_is_recoverable(r.role) || !r.owns_cwd {
         return false;
     }
     let kept = if artifact_fresh_since(r.artifact, since) {
         true
     } else {
-        let committed = dispatch_head
-            .is_some_and(|h| git_output(r.cwd, &["rev-parse", "HEAD"]).is_some_and(|now| now != h));
-        committed && recover_artifact(r)
+        slot_has_work(r.cwd, r.dispatch_head, r.dispatch_tree) && recover_artifact(r)
     };
     if kept {
         let _ = crate::events::append(
@@ -1668,25 +1677,90 @@ fn ceiling_kill_kept_work(
     kept
 }
 
-/// Work the slot left behind: uncommitted changes, or commits past `since`.
-///
-/// Pass the round's start HEAD: from round 2 on the run base predates earlier
-/// rounds' commits, so the base always reads as work. `None` leaves only the
-/// dirty check rather than guessing at HEAD.
-pub fn slot_has_work(cwd: &Path, since: Option<&str>) -> bool {
-    let git = |args: &[&str]| {
+/// Content digest of everything `HEAD` does not carry: the tracked diff plus
+/// every untracked file's bytes, hashed through git itself. `None` when `cwd`
+/// is not a readable worktree. Two snapshots compare equal only for identical
+/// trees, so dirt that predates the snapshot (the test-author overlay, a
+/// refused round's leftovers) does not read as new work, while any edit —
+/// even to an already-dirty file — does.
+pub(crate) fn worktree_snapshot(cwd: &Path) -> Option<String> {
+    let bytes = |args: &[&str]| {
         std::process::Command::new("git")
             .args(args)
             .current_dir(cwd)
             .output()
             .ok()
             .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .map(|o| o.stdout)
     };
-    if git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty()) {
+    let mut combo = bytes(&["diff", "HEAD", "--no-color", "--no-ext-diff"])?;
+    combo.push(0);
+    let others = bytes(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+    let mut paths: Vec<&[u8]> = others
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .collect();
+    paths.sort_unstable();
+    for rel in paths {
+        combo.extend_from_slice(rel);
+        combo.push(0);
+        let full = cwd.join(String::from_utf8_lossy(rel).as_ref());
+        let content = match std::fs::symlink_metadata(&full) {
+            Ok(md) if md.file_type().is_symlink() => std::fs::read_link(&full)
+                .map(|t| t.to_string_lossy().into_owned().into_bytes())
+                .unwrap_or_default(),
+            _ => std::fs::read(&full).unwrap_or_default(),
+        };
+        combo.extend_from_slice(&content);
+        combo.push(0);
+    }
+    let mut hash = std::process::Command::new("git");
+    hash.args(["hash-object", "--stdin"]).current_dir(cwd);
+    let mut child = hash
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    use std::io::Write;
+    child.stdin.take()?.write_all(&combo).ok()?;
+    let out = child.wait_with_output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Work the slot left behind since the round started: uncommitted changes past
+/// `since_tree`, or commits past `since_head`.
+///
+/// Pass the stamps taken when the slot joined the round: from round 2 on the
+/// run base predates earlier rounds' commits, so the base always reads as
+/// work, and the tree can already be dirty at round start (the test-author
+/// overlay lands before round 1, a refused round leaves leftovers), so any
+/// dirty tree always reads as work. `None` for either stamp falls back to the
+/// legacy read for that half: any dirty tree, or only HEAD movement.
+pub fn slot_has_work(cwd: &Path, since_head: Option<&str>, since_tree: Option<&str>) -> bool {
+    let tree_work = match (worktree_snapshot(cwd), since_tree) {
+        (Some(now), Some(before)) => now != before,
+        _ => std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(cwd)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .is_some_and(|o| !o.stdout.iter().all(|b| b.is_ascii_whitespace())),
+    };
+    if tree_work {
         return true;
     }
-    match (since, git(&["rev-parse", "HEAD"])) {
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    match (since_head, head) {
         (Some(before), Some(head)) => head != before,
         _ => false,
     }
@@ -1702,8 +1776,10 @@ pub fn slot_has_work(cwd: &Path, since: Option<&str>) -> bool {
 /// Only fires for the implementer, and only when the tree actually holds work — a slot
 /// that did nothing still fails.
 fn recover_artifact(r: &ArtifactRecovery) -> bool {
-    let since = r.dispatch_head;
-    if !role_is_recoverable(r.role) || !r.owns_cwd || !slot_has_work(r.cwd, since) {
+    if !role_is_recoverable(r.role)
+        || !r.owns_cwd
+        || !slot_has_work(r.cwd, r.dispatch_head, r.dispatch_tree)
+    {
         return false;
     }
     let Some(adapter) = providers::adapter_named(r.provider) else {
@@ -2525,13 +2601,18 @@ pub fn run_slot(
         s.quota_hit = false;
         s.auth_fault = false;
         s.timeout_cause = None;
-        // The round's start HEAD, stamped once when the slot joins the round. A
-        // same-round backup retry re-dispatches the same worktree, so re-stamping
-        // would measure against its own start and the primary seat's commits
-        // would read as no work.
+        // The round's start HEAD and tree, stamped once when the slot joins
+        // the round. A same-round backup retry re-dispatches the same worktree,
+        // so re-stamping would measure against its own start and the primary
+        // seat's commits would read as no work. A same-round resume keeps both
+        // for the same reason: the round's own banked commit still compares
+        // against the round's start.
         if s.round != round || s.dispatch_head.is_none() {
             s.dispatch_head = role_is_recoverable(job.role)
                 .then(|| git_output(&cwd, &["rev-parse", "HEAD"]))
+                .flatten();
+            s.dispatch_tree = role_is_recoverable(job.role)
+                .then(|| worktree_snapshot(&cwd))
                 .flatten();
         }
         clear_expected_artifact(paths, &run_id, job);
@@ -3952,7 +4033,7 @@ fn run_api(
         .as_ref()
         .map(|n| paths.artifact(&state.id, n));
     let model = slot_model_for(Some(state), job);
-    let (ok, err, usage) = api::run_api_slot(&api::runtime::ApiSlotRequest {
+    let outcome = api::run_api_slot(&api::runtime::ApiSlotRequest {
         provider_name: &pref.name,
         prompt,
         cwd,
@@ -3962,6 +4043,12 @@ fn run_api(
         dry_run: false,
         model_override: model.clone(),
     })?;
+    let (ok, err, usage, timeout_cause) = (
+        outcome.ok,
+        outcome.error,
+        outcome.usage,
+        outcome.timeout_cause,
+    );
     let slot_usage = SlotUsage {
         slot_id: job.slot_id.clone(),
         provider: pref.storage_key(),
@@ -4003,7 +4090,7 @@ fn run_api(
             quota_rejected: None,
             quota_resets_at: None,
             quota_recovered: false,
-            timeout_cause: None,
+            timeout_cause,
         })
     }
 }
@@ -4128,11 +4215,9 @@ fn run_headless(
     // this dispatch.
     let dispatch_start = SystemTime::now();
     // Carried from `run_slot`'s dispatch record, never re-derived here.
-    let dispatch_head = state
-        .slots
-        .iter()
-        .find(|s| s.id == job.slot_id)
-        .and_then(|s| s.dispatch_head.clone());
+    let slot = state.slots.iter().find(|s| s.id == job.slot_id);
+    let dispatch_head = slot.and_then(|s| s.dispatch_head.clone());
+    let dispatch_tree = slot.and_then(|s| s.dispatch_tree.clone());
     let mut res = dispatch_with_resume_recovery(
         adapter.as_ref(),
         &bin,
@@ -4197,9 +4282,9 @@ fn run_headless(
                     env,
                     isolation: state.isolation,
                     dispatch_head: dispatch_head.as_deref(),
+                    dispatch_tree: dispatch_tree.as_deref(),
                     artifact: &paths.artifact(&state.id, name),
                 },
-                dispatch_head.as_deref(),
                 dispatch_start,
             )
         });
@@ -4357,6 +4442,7 @@ fn run_headless(
                 env,
                 isolation: state.isolation,
                 dispatch_head: dispatch_head.as_deref(),
+                dispatch_tree: dispatch_tree.as_deref(),
                 artifact: &path,
             });
             if !recovered {
@@ -4433,6 +4519,15 @@ fn tmux_outcome(marker: MarkerState, pane_alive: bool, budget_left: bool) -> Tmu
         MarkerState::Done => TmuxDecision::DoneButAlive,
         MarkerState::None => TmuxDecision::Wait,
     }
+}
+
+/// The pid whose group a tmux ceiling kill may terminate: only a pane token that
+/// still identifies its own process. A pane that exited without writing a marker
+/// leaves a dead pid behind, and the OS may since have recycled it onto an
+/// unrelated group, so the start-time identity check decides, like the rest of
+/// this loop.
+fn tmux_kill_target(token: Option<process::PidToken>) -> Option<u32> {
+    token.filter(|t| t.alive()).map(|t| t.pid)
 }
 
 /// tmux's pane runs `build_interactive`, which for pi is the same `--mode json` stream
@@ -4741,8 +4836,8 @@ fn run_tmux(
                     // The agent is still alive in its pane: terminate its process
                     // group before reporting, so the WIP snapshot and the suite
                     // judge a tree that cannot keep changing under them.
-                    if let Some(token) = pane_pid {
-                        process::terminate_tree(token.pid, true);
+                    if let Some(pid) = tmux_kill_target(pane_pid) {
+                        process::terminate_tree(pid, true);
                     }
                     return Ok(SlotOutcome {
                         usage: tmux_recovered_usage(replays_stream, job, log_path),
@@ -4861,6 +4956,7 @@ pub fn init_slot_model(
         auth_fault: false,
         timeout_cause: None,
         dispatch_head: None,
+        dispatch_tree: None,
         build_cache: None,
         former_ids: Vec::new(),
         classifier: None,
@@ -5136,6 +5232,30 @@ pub fn wait_run(
 mod tests {
     use super::*;
     use crate::providers::ProviderAdapter;
+
+    /// The ceiling kill only targets a pane token that still identifies its own
+    /// process: a pane that exited without writing a marker must not send a
+    /// group kill at a possibly recycled pid. Fails if the identity check is
+    /// dropped from the kill decision.
+    #[test]
+    fn tmux_ceiling_kill_skips_a_dead_pane_token() {
+        let live = process::PidToken::capture(std::process::id());
+        assert_eq!(tmux_kill_target(Some(live)), Some(std::process::id()));
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let token = process::PidToken::capture(child.id());
+        assert!(token.alive(), "a running sleep must read alive");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            tmux_kill_target(Some(token)),
+            None,
+            "a reaped pane pid must not be a kill target"
+        );
+        assert_eq!(tmux_kill_target(None), None);
+    }
 
     fn seat_ref(raw: &str) -> ProviderRef {
         ProviderRef::parse(raw).unwrap()
@@ -8074,23 +8194,27 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "base"]);
         let base = git(&["rev-parse", "HEAD"]);
+        let tree = worktree_snapshot(&repo);
 
         assert!(
-            !slot_has_work(&repo, Some(&base)),
+            !slot_has_work(&repo, Some(&base), tree.as_deref()),
             "an untouched worktree is not recoverable work"
         );
 
         std::fs::write(repo.join("b.txt"), "new").unwrap();
-        assert!(slot_has_work(&repo, Some(&base)), "untracked work counts");
+        assert!(
+            slot_has_work(&repo, Some(&base), tree.as_deref()),
+            "untracked work counts"
+        );
 
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "slot work"]);
         assert!(
-            slot_has_work(&repo, Some(&base)),
+            slot_has_work(&repo, Some(&base), tree.as_deref()),
             "committed work past the base counts"
         );
         assert!(
-            !slot_has_work(&repo, None),
+            !slot_has_work(&repo, None, None),
             "with no recorded base, only a dirty tree can be judged"
         );
     }
@@ -9275,7 +9399,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
 
 #[cfg(test)]
 mod round_start_work_tests {
-    use super::slot_has_work;
+    use super::{slot_has_work, worktree_snapshot};
 
     fn git(dir: &std::path::Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
@@ -9287,6 +9411,39 @@ mod round_start_work_tests {
             .unwrap();
         assert!(out.status.success(), "{args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Dirt that predates the round-start snapshot is not the round's work: an
+    /// idle ceiling kill over the test-author overlay still fails the round
+    /// instead of recording a partial one, while any edit past the snapshot
+    /// counts. Fails on the old any-dirty-tree check, which read the overlay
+    /// as work.
+    #[test]
+    fn round_start_dirt_is_not_round_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.email", "t@t"]);
+        git(dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("f"), "a\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "round base"]);
+        std::fs::write(dir.join("overlay.txt"), "test author files\n").unwrap();
+        let start = git(dir, &["rev-parse", "HEAD"]);
+        let tree = worktree_snapshot(dir);
+        assert!(
+            !slot_has_work(dir, Some(&start), tree.as_deref()),
+            "pre-round dirt over an untouched HEAD is not recoverable work"
+        );
+        std::fs::write(
+            dir.join("overlay.txt"),
+            "test author files plus a slot edit\n",
+        )
+        .unwrap();
+        assert!(
+            slot_has_work(dir, Some(&start), tree.as_deref()),
+            "an edit past the round-start snapshot counts, even in a dirty file"
+        );
     }
 
     /// Work is measured against the round's start HEAD: a commit the primary
@@ -9303,14 +9460,16 @@ mod round_start_work_tests {
         git(dir, &["add", "."]);
         git(dir, &["commit", "-qm", "round start"]);
         let start = git(dir, &["rev-parse", "HEAD"]);
+        let tree = worktree_snapshot(dir);
 
-        assert!(!slot_has_work(dir, Some(&start)));
+        assert!(!slot_has_work(dir, Some(&start), tree.as_deref()));
         std::fs::write(dir.join("f"), "b\n").unwrap();
-        assert!(slot_has_work(dir, Some(&start)));
+        assert!(slot_has_work(dir, Some(&start), tree.as_deref()));
         git(dir, &["commit", "-qam", "primary seat work"]);
-        assert!(slot_has_work(dir, Some(&start)));
+        assert!(slot_has_work(dir, Some(&start), tree.as_deref()));
         let now = git(dir, &["rev-parse", "HEAD"]);
-        assert!(!slot_has_work(dir, Some(&now)));
-        assert!(!slot_has_work(dir, None));
+        let clean = worktree_snapshot(dir);
+        assert!(!slot_has_work(dir, Some(&now), clean.as_deref()));
+        assert!(!slot_has_work(dir, None, None));
     }
 }

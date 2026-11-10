@@ -2292,7 +2292,8 @@ pub fn execute_loop(
             // The ceiling check runs before the quota park: a dispatch that hit both
             // still goes to review on its partial work, costing one extra panel, and
             // the next round's seat recheck parks it.
-            if let Some((note, kind)) = try_commit_ceiling_partial(state, paths, &impl_job.slot_id)
+            if let Some((note, kind, commit)) =
+                try_commit_ceiling_partial(state, paths, &impl_job.slot_id)
             {
                 record_ceiling_partial(
                     state,
@@ -2300,6 +2301,7 @@ pub fn execute_loop(
                     &impl_job.slot_id,
                     note,
                     kind,
+                    commit,
                     &mut ceiling_partial_note,
                 )?;
             } else {
@@ -2530,7 +2532,9 @@ pub fn execute_loop(
         if should_stop(paths, &state.id) {
             return stop_now(state, paths);
         }
-        commit_before_review(state, paths, cfg, &impl_slot.id);
+        if let Some(note) = commit_before_review(state, paths, cfg, &impl_slot.id) {
+            ceiling_partial_note = Some(note);
+        }
 
         // Suite channel: cheap model runs full suites; reviewers must not re-run them.
         let mut suite_body = String::new();
@@ -3135,6 +3139,7 @@ pub fn execute_loop(
             blockers.push(note);
         }
         if !any_request_changes {
+            clear_finished_round_partial_mark(state);
             write_impl_summary(state, paths)?;
             if state.big {
                 if let Ok(mut g) = crate::tasks::TaskGraph::load(paths, &state.id) {
@@ -3245,33 +3250,55 @@ fn commit_branch_leftovers(
     Some((wt.branch, outcome))
 }
 
-fn commit_before_review(state: &mut RunState, paths: &SparPaths, cfg: &Config, impl_id: &str) {
+/// The refreshed cut-short notice when the commit below banks a ceiling-cut
+/// round's leftovers: the reviewers and the next round read this instead of
+/// the kill-time note, so a Refused round whose work did land never claims it
+/// is uncommitted. `None` when no notice needs refreshing.
+fn commit_before_review(
+    state: &mut RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+    impl_id: &str,
+) -> Option<String> {
     let subject = crate::ship::pr_title(state.task.as_deref(), cfg.ship.title_max);
     let body = format!(
         "spar: uncommitted implementer work before review round {}",
         state.round
     );
     let round = state.round;
-    let Some((branch, outcome)) = commit_branch_leftovers(state, paths, impl_id, &subject, &body)
-    else {
-        return;
-    };
-    let note = match outcome {
-        LeftoverCommit::Committed(sha) => format!(
-            "committed uncommitted implementer work on {branch} as {} before review round {round}",
-            sha.chars().take(8).collect::<String>(),
-        ),
-        LeftoverCommit::Clean => return,
+    let (branch, outcome) = commit_branch_leftovers(state, paths, impl_id, &subject, &body)?;
+    match outcome {
+        LeftoverCommit::Committed(sha) => {
+            let note = format!(
+                "committed uncommitted implementer work on {branch} as {} before review round {round}",
+                sha.chars().take(8).collect::<String>(),
+            );
+            let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
+            // A ceiling-cut round whose WIP commit the hooks refused banks here
+            // instead: HEAD now carries the work, so the round reads as WIP
+            // rather than Refused. Rounds without a partial mark leave none behind.
+            if let Some(entry) = state
+                .ceiling_partial_rounds
+                .iter_mut()
+                .find(|e| e.round == round)
+            {
+                entry.kind = CeilingPartialKind::Wip;
+                entry.commit = Some(sha);
+                return Some(ceiling_partial_notice(round));
+            }
+            None
+        }
+        LeftoverCommit::Clean => None,
         LeftoverCommit::Refused(e) => {
             let msg = format!(
                 "could not commit uncommitted implementer work before review round {round}: {e}; \
                  the panel judges HEAD without it"
             );
             eprintln!("warning: {msg}");
-            msg
+            let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+            None
         }
-    };
-    let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
+    }
 }
 
 /// What the reviewers and the next round are told when the implementer is cut
@@ -3300,8 +3327,9 @@ fn ceiling_partial_clean_notice(round: u32) -> String {
 
 /// What the next round is told when the previous implementer was cut short at
 /// its hard ceiling and its leftovers could not be committed: no WIP commit
-/// exists, so the notice must not claim one. The live kill names the commit
-/// error; the rebuild has none to name.
+/// exists, so the notice must not claim one, and the panel judges a checkout of
+/// HEAD, so it must never be told to judge an uncommitted tree. The live kill
+/// names the commit error; the rebuild has none to name.
 fn ceiling_partial_refused_notice(round: u32, detail: Option<&str>) -> String {
     let cause = match detail {
         Some(e) => format!(" ({e})"),
@@ -3310,7 +3338,7 @@ fn ceiling_partial_refused_notice(round: u32, detail: Option<&str>) -> String {
     format!(
         "NOTE: the implementer pass for round {round} was cut short at its hard time \
          ceiling and its partial work could not be committed{cause}; judge the HEAD commit \
-         and the uncommitted tree as partial work and continue the task from there."
+         as partial work and continue the task from there."
     )
 }
 
@@ -3325,7 +3353,7 @@ fn try_commit_ceiling_partial(
     state: &mut RunState,
     paths: &SparPaths,
     impl_id: &str,
-) -> Option<(String, CeilingPartialKind)> {
+) -> Option<(String, CeilingPartialKind, Option<String>)> {
     if executor::slot_timeout_cause(state, impl_id) != Some(executor::TimeoutCause::HardCeiling) {
         return None;
     }
@@ -3334,27 +3362,39 @@ fn try_commit_ceiling_partial(
         .iter()
         .find(|w| w.slot_id == impl_id)
         .map(|w| w.path.clone())?;
-    // The round's start HEAD, never the run base: from round 2 on the base predates
-    // earlier rounds' commits, so the base always reads as work. Without a recorded
-    // HEAD only a dirty tree counts.
-    let since = state
+    // The round's start HEAD and tree, never the run base: from round 2 on the base
+    // predates earlier rounds' commits, so the base always reads as work. The tree
+    // snapshot matters too: round 1 starts dirty (the test author's files land
+    // uncommitted) and a Refused round leaves leftovers, so a dirty tree alone
+    // cannot mean this round did anything. Without a recorded start only a dirty
+    // tree can be judged.
+    let (since, since_tree) = state
         .slots
         .iter()
         .find(|s| s.id == impl_id)
-        .and_then(|s| s.dispatch_head.clone());
-    if !executor::slot_has_work(&wt_path, since.as_deref()) {
+        .map(|s| (s.dispatch_head.clone(), s.dispatch_tree.clone()))
+        .unwrap_or_default();
+    if !executor::slot_has_work(&wt_path, since.as_deref(), since_tree.as_deref()) {
         return None;
     }
     let round = state.round;
     let subject =
-        format!("WIP: implementer cut short at hard ceiling (round {round}, partial work)");
+        format!("chore(spar): partial work, implementer cut short at hard ceiling (round {round})");
     let body = format!(
         "spar: the round {round} implementer was killed at its hard time ceiling before it \
          could finish. Its leftovers are committed here so the suite and the review panel \
          judge what is on the branch, and the next round continues from this commit."
     );
     let (branch, outcome) = commit_branch_leftovers(state, paths, impl_id, &subject, &body)?;
-    let (note, notice, kind) = match outcome {
+    // The round's own banked WIP commit: a same-round resume that idles into a
+    // second ceiling kill leaves HEAD exactly here with a clean tree, which must
+    // read as no new work rather than re-record the round.
+    let banked = state
+        .ceiling_partial_rounds
+        .iter()
+        .find(|e| e.round == round)
+        .and_then(|e| e.commit.clone());
+    let (note, notice, kind, commit) = match outcome {
         LeftoverCommit::Committed(sha) => (
             format!(
                 "committed partial round-{round} implementer work on {branch} as {} (ceiling kill WIP)",
@@ -3362,14 +3402,25 @@ fn try_commit_ceiling_partial(
             ),
             ceiling_partial_notice(round),
             CeilingPartialKind::Wip,
+            Some(sha),
         ),
-        LeftoverCommit::Clean => (
-            format!(
-                "ceiling kill left committed work on {branch} with a clean tree; round {round} goes on"
-            ),
-            ceiling_partial_clean_notice(round),
-            CeilingPartialKind::Clean,
-        ),
+        LeftoverCommit::Clean => {
+let head = worktree::git_out(&wt_path, &["rev-parse", "HEAD"]);
+            if banked
+                .as_deref()
+                .is_some_and(|sha| head.as_deref() == Some(sha))
+            {
+                return None;
+            }
+            (
+                format!(
+                    "ceiling kill left committed work on {branch} with a clean tree; round {round} goes on"
+                ),
+                ceiling_partial_clean_notice(round),
+                CeilingPartialKind::Clean,
+                None,
+            )
+        }
         LeftoverCommit::Refused(e) => {
             let msg = format!(
                 "could not commit partial round-{round} implementer work (ceiling kill WIP): {e}; \
@@ -3380,11 +3431,12 @@ fn try_commit_ceiling_partial(
             return Some((
                 ceiling_partial_refused_notice(round, Some(&e)),
                 CeilingPartialKind::Refused,
+                None,
             ));
         }
     };
     let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
-    Some((notice, kind))
+    Some((notice, kind, commit))
 }
 
 /// A backup-retry implementer dispatch failed. A ceiling-cut partial round goes on
@@ -3400,8 +3452,8 @@ fn handle_retry_err(
     err: anyhow::Error,
     note_out: &mut Option<String>,
 ) -> Result<bool> {
-    if let Some((note, kind)) = try_commit_ceiling_partial(state, paths, slot_id) {
-        record_ceiling_partial(state, paths, slot_id, note, kind, note_out)?;
+    if let Some((note, kind, commit)) = try_commit_ceiling_partial(state, paths, slot_id) {
+        record_ceiling_partial(state, paths, slot_id, note, kind, commit, note_out)?;
         Ok(true)
     } else {
         let quota_hit = executor::slot_parks_on_quota(state, slot_id);
@@ -3415,12 +3467,22 @@ fn handle_retry_err(
 /// remembered on the run so a fresh process rebuilds the cut-short notice from
 /// disk for the next round's implementer. The kind records how the work was left
 /// so the rebuilt notice words the WIP commit honestly.
+/// A round the panel approved finished normally: drop its ceiling-cut mark so
+/// ship judges the real summary instead of the cut-short notice. Older rounds
+/// keep their marks for the PR's Partial work section.
+fn clear_finished_round_partial_mark(state: &mut RunState) {
+    state
+        .ceiling_partial_rounds
+        .retain(|e| e.round != state.round);
+}
+
 fn record_ceiling_partial(
     state: &mut RunState,
     paths: &SparPaths,
     slot_id: &str,
     note: String,
     kind: CeilingPartialKind,
+    commit: Option<String>,
     out: &mut Option<String>,
 ) -> Result<()> {
     eprintln!("note: {note}");
@@ -3456,10 +3518,12 @@ fn record_ceiling_partial(
         .find(|e| e.round == state.round)
     {
         entry.kind = kind;
+        entry.commit = commit;
     } else {
         state.ceiling_partial_rounds.push(CeilingPartialRound {
             round: state.round,
             kind,
+            commit,
         });
     }
     state.save(paths)?;
@@ -5100,6 +5164,14 @@ fn render_scoped_review(
 /// gate, a stop, a quota bounce, a crashed orchestrator — starts knowing which `AC-n`
 /// failed. Silent when the reviews approved: a stale approval is not a blocker, and the
 /// live round overwrites this list at its own review step anyway.
+fn ceiling_partial_blocker(kind: CeilingPartialKind, round: u32) -> String {
+    match kind {
+        CeilingPartialKind::Clean => ceiling_partial_clean_notice(round),
+        CeilingPartialKind::Refused => ceiling_partial_refused_notice(round, None),
+        CeilingPartialKind::Wip => ceiling_partial_notice(round),
+    }
+}
+
 fn blockers_from_disk(
     state: &RunState,
     paths: &SparPaths,
@@ -5152,12 +5224,19 @@ fn blockers_from_disk(
             .iter()
             .find(|e| e.round == prev)
         {
-            out.push(match entry.kind {
-                CeilingPartialKind::Clean => ceiling_partial_clean_notice(prev),
-                CeilingPartialKind::Refused => ceiling_partial_refused_notice(prev, None),
-                CeilingPartialKind::Wip => ceiling_partial_notice(prev),
-            });
+            out.push(ceiling_partial_blocker(entry.kind, prev));
         }
+    }
+    // A same-round resume after a ceiling kill (`continue` without a new round):
+    // the resumed implementer would otherwise start with no idea its own round
+    // was cut short. The round-start snapshot is not re-stamped on resume, so
+    // this notice cannot make the round's own banked commit read as new work.
+    if let Some(entry) = state
+        .ceiling_partial_rounds
+        .iter()
+        .find(|e| e.round == state.round)
+    {
+        out.push(ceiling_partial_blocker(entry.kind, state.round));
     }
     out
 }
@@ -6432,11 +6511,15 @@ mod carry_forward_tests {
 mod ceiling_partial_notice_tests {
     use super::{
         blockers_from_disk, ceiling_partial_clean_notice, ceiling_partial_notice,
-        ceiling_partial_refused_notice,
+        ceiling_partial_refused_notice, clear_finished_round_partial_mark, commit_before_review,
+        try_commit_ceiling_partial,
     };
     use crate::config::Config;
+    use crate::executor::{self, TimeoutCause};
     use crate::paths::SparPaths;
-    use crate::state::{CeilingPartialKind, CeilingPartialRound, RunState};
+    use crate::state::{
+        CeilingPartialKind, CeilingPartialRound, RunState, SlotRole, SlotState, WorktreeRecord,
+    };
 
     fn blockers(kind: Option<CeilingPartialKind>) -> Vec<String> {
         let tmp = tempfile::tempdir().unwrap();
@@ -6448,7 +6531,11 @@ mod ceiling_partial_notice_tests {
         );
         state.round = 2;
         if let Some(kind) = kind {
-            state.ceiling_partial_rounds = vec![CeilingPartialRound { round: 1, kind }];
+            state.ceiling_partial_rounds = vec![CeilingPartialRound {
+                round: 1,
+                kind,
+                commit: None,
+            }];
         }
         blockers_from_disk(&state, &paths, &[], &Config::default())
     }
@@ -6486,5 +6573,186 @@ mod ceiling_partial_notice_tests {
     #[test]
     fn no_partial_round_means_no_notice() {
         assert!(blockers(None).is_empty());
+    }
+
+    #[test]
+    fn refused_notice_judges_head_not_an_uncommitted_tree() {
+        for detail in [None, Some("hook said no")] {
+            let note = ceiling_partial_refused_notice(1, detail);
+            assert!(!note.contains("uncommitted"), "{note}");
+            assert!(note.contains("judge the HEAD commit"), "{note}");
+        }
+    }
+
+    #[test]
+    fn same_round_resume_sees_its_own_cut_short_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.round = 1;
+        state.ceiling_partial_rounds = vec![CeilingPartialRound {
+            round: 1,
+            kind: CeilingPartialKind::Wip,
+            commit: None,
+        }];
+        let out = blockers_from_disk(&state, &paths, &[], &Config::default());
+        assert_eq!(out, [ceiling_partial_notice(1)]);
+    }
+
+    #[test]
+    fn approving_a_round_clears_only_its_own_partial_mark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.round = 2;
+        state.ceiling_partial_rounds = vec![
+            CeilingPartialRound {
+                round: 1,
+                kind: CeilingPartialKind::Wip,
+                commit: Some("abc".into()),
+            },
+            CeilingPartialRound {
+                round: 2,
+                kind: CeilingPartialKind::Clean,
+                commit: None,
+            },
+        ];
+        clear_finished_round_partial_mark(&mut state);
+        assert_eq!(state.ceiling_partial_rounds.len(), 1);
+        assert_eq!(state.ceiling_partial_rounds[0].round, 1);
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn ceiling_state(
+        tmp: &tempfile::TempDir,
+        wt: &std::path::Path,
+        branch: &str,
+        head: Option<String>,
+        tree: Option<String>,
+    ) -> (SparPaths, RunState) {
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.task = Some("add work".into());
+        let mut slot: SlotState = executor::init_slot("impl", "cli:muse", SlotRole::Implementer);
+        slot.timeout_cause = Some(TimeoutCause::HardCeiling);
+        slot.dispatch_head = head;
+        slot.dispatch_tree = tree;
+        state.slots = vec![slot];
+        state.worktrees = vec![WorktreeRecord {
+            slot_id: "impl".into(),
+            path: wt.to_path_buf(),
+            branch: branch.into(),
+        }];
+        (paths, state)
+    }
+
+    fn fresh_repo(tmp: &tempfile::TempDir) -> (std::path::PathBuf, String) {
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        git(&wt, &["init", "-q"]);
+        git(&wt, &["config", "user.email", "t@t"]);
+        git(&wt, &["config", "user.name", "t"]);
+        std::fs::write(wt.join("f"), "a\n").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-qm", "base"]);
+        let branch = git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        (wt, branch)
+    }
+
+    #[test]
+    fn first_ceiling_kill_with_new_work_banks_a_conventional_wip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, branch) = fresh_repo(&tmp);
+        let head = git(&wt, &["rev-parse", "HEAD"]);
+        let tree = executor::worktree_snapshot(&wt);
+        std::fs::write(wt.join("work.txt"), "slot work\n").unwrap();
+        let (paths, mut state) = ceiling_state(&tmp, &wt, &branch, Some(head), tree);
+        let (notice, kind, commit) = try_commit_ceiling_partial(&mut state, &paths, "impl")
+            .expect("new work at the ceiling is a partial round");
+        assert_eq!(notice, ceiling_partial_notice(1));
+        assert!(matches!(kind, CeilingPartialKind::Wip));
+        let sha = commit.expect("the wip commit is banked");
+        let subject = git(&wt, &["log", "-1", "--format=%s", &sha]);
+        assert!(
+            subject.starts_with("chore(spar):"),
+            "wip subject must pass conventional-commit hooks: {subject}"
+        );
+    }
+
+    #[test]
+    fn second_idle_ceiling_kill_over_the_banked_wip_is_not_a_partial_round() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, branch) = fresh_repo(&tmp);
+        let head = git(&wt, &["rev-parse", "HEAD"]);
+        let tree = executor::worktree_snapshot(&wt);
+        std::fs::write(wt.join("work.txt"), "slot work\n").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-qm", "banked wip"]);
+        let banked = git(&wt, &["rev-parse", "HEAD"]);
+        let (paths, mut state) = ceiling_state(&tmp, &wt, &branch, Some(head), tree);
+        state.ceiling_partial_rounds = vec![CeilingPartialRound {
+            round: 1,
+            kind: CeilingPartialKind::Wip,
+            commit: Some(banked),
+        }];
+        assert!(
+            try_commit_ceiling_partial(&mut state, &paths, "impl").is_none(),
+            "only the round's own banked wip on a clean tree is no new work"
+        );
+    }
+
+    #[test]
+    fn commit_before_review_banks_a_refused_round_as_wip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, branch) = fresh_repo(&tmp);
+        std::fs::write(wt.join("leftovers.txt"), "not yet committed\n").unwrap();
+        let (paths, mut state) = ceiling_state(&tmp, &wt, &branch, None, None);
+        state.ceiling_partial_rounds = vec![CeilingPartialRound {
+            round: 1,
+            kind: CeilingPartialKind::Refused,
+            commit: None,
+        }];
+        let note = commit_before_review(&mut state, &paths, &Config::default(), "impl");
+        assert_eq!(note, Some(ceiling_partial_notice(1)));
+        let entry = state
+            .ceiling_partial_rounds
+            .iter()
+            .find(|e| e.round == 1)
+            .unwrap();
+        assert!(matches!(entry.kind, CeilingPartialKind::Wip));
+        assert!(entry.commit.is_some(), "head now carries the work");
+    }
+
+    #[test]
+    fn commit_before_review_leaves_no_mark_on_a_normal_round() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, branch) = fresh_repo(&tmp);
+        std::fs::write(wt.join("leftovers.txt"), "not yet committed\n").unwrap();
+        let (paths, mut state) = ceiling_state(&tmp, &wt, &branch, None, None);
+        let note = commit_before_review(&mut state, &paths, &Config::default(), "impl");
+        assert!(note.is_none());
+        assert!(state.ceiling_partial_rounds.is_empty());
     }
 }

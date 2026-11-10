@@ -977,12 +977,13 @@ slot is stuck on.**
   during this dispatch keeps the slot `done`; new commits since the round began earn the
   same artifact-only recovery turn a clean exit without its artifact gets (below). Either
   way the slot note reads `killed at the hard ceiling after finishing its work; kept as
-  done` and the round goes on to review. A dirty tree alone, or commits the recovery turn
-  could not keep, is committed as partial work instead of failing the round: a
-  `WIP: implementer cut short at hard ceiling (round N, partial work)` commit lands on the
-  run branch and the suite and the panel judge it like any round, with the reviewers and
-  the next round told the previous pass was cut short. Only a ceiling kill with no work at
-  all fails the round. Implementer only, like the recovery turn. Cut-short rounds stay
+  done` and the round goes on to review. Work left since the round started — a tree
+  changed past its round-start snapshot, or commits the recovery turn could not keep —
+  is committed as partial work instead of failing the round: a
+  `chore(spar): partial work, implementer cut short at hard ceiling (round N)` commit
+  lands on the run branch and the suite and the panel judge it like any round, with the
+  reviewers and the next round told the previous pass was cut short. Only a ceiling kill
+  with no work at all fails the round. Implementer only, like the recovery turn. Cut-short rounds stay
   visible as partial work: a `partial work: …` line in `spar status` and a `## Partial
   work` section in the ship PR body, and a ceiling-cut final round never ships the
   previous round's `summary-impl.md` as its own.
