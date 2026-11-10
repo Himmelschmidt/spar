@@ -506,6 +506,340 @@ mod preview_amend_tests {
     }
 }
 
+#[cfg(test)]
+mod base_merge_tests {
+    use super::*;
+
+    /// A repo with a bare `origin` plus a clone standing in for the run's
+    /// implementer worktree.
+    struct MergeSetup {
+        _tmp: tempfile::TempDir,
+        paths: SparPaths,
+        repo: std::path::PathBuf,
+        run: std::path::PathBuf,
+        origin_main: String,
+    }
+
+    fn tgit(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn setup() -> MergeSetup {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let repo = tmp.path().join("repo");
+        let run = tmp.path().join("run");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        tgit(&origin, &["init", "-q", "--bare"]);
+        tgit(&repo, &["init", "-q", "-b", "main"]);
+        tgit(&repo, &["config", "user.email", "t@t.com"]);
+        tgit(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("file.txt"), "base\n").unwrap();
+        tgit(&repo, &["add", "."]);
+        tgit(&repo, &["commit", "-q", "-m", "init"]);
+        tgit(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        tgit(&repo, &["push", "-q", "origin", "main"]);
+        tgit(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+                run.to_str().unwrap(),
+            ],
+        );
+        tgit(&run, &["config", "user.email", "t@t.com"]);
+        tgit(&run, &["config", "user.name", "t"]);
+        tgit(&run, &["checkout", "-q", "-b", "spar/r1/impl"]);
+        let origin_main = tgit(&repo, &["rev-parse", "HEAD"]);
+        let paths = SparPaths::new(repo.clone());
+        MergeSetup {
+            _tmp: tmp,
+            paths,
+            repo,
+            run,
+            origin_main,
+        }
+    }
+
+    /// States in these tests load the way production loads them: through the
+    /// same JSON the run file uses, so only the four fields the merge reads
+    /// are named.
+    fn round_state(fx: &MergeSetup, round: u32) -> RunState {
+        let mut st = RunState::new("r1", crate::cli::WorkflowKind::Loop, fx.repo.clone());
+        st.base_ref = Some("main".to_string());
+        st.base_commit = Some(fx.origin_main.clone());
+        st.merged_base = Some(fx.origin_main.clone());
+        st.round = round;
+        st.slots = vec![serde_json::from_value(serde_json::json!({
+            "id": "impl",
+            "provider": "cli:claude",
+            "role": "implementer",
+            "status": "done",
+            "cwd": fx.run,
+        }))
+        .unwrap()];
+        st
+    }
+
+    fn advance_origin(fx: &MergeSetup, contents: &str) -> String {
+        std::fs::write(fx.repo.join("file.txt"), contents).unwrap();
+        tgit(&fx.repo, &["add", "."]);
+        tgit(&fx.repo, &["commit", "-q", "-m", "advance base"]);
+        tgit(&fx.repo, &["push", "-q", "origin", "main"]);
+        tgit(&fx.repo, &["rev-parse", "HEAD"])
+    }
+
+    /// #229: round 1 never merges; the run branch stays behind the moved base.
+    #[test]
+    fn round_one_never_merges_the_base_forward() {
+        let fx = setup();
+        let tip = advance_origin(&fx, "base\nmore\n");
+        let mut st = round_state(&fx, 1);
+        let cfg = Config::default();
+        assert!(merge_base_at_round_start(&mut st, &fx.paths, &cfg)
+            .unwrap()
+            .is_none());
+        let head = tgit(&fx.run, &["rev-parse", "HEAD"]);
+        assert_ne!(head, tip);
+        assert!(st.merged_base == Some(fx.origin_main.clone()));
+    }
+
+    /// #229: round 2 merges a cleanly moved base and records the new tip.
+    #[test]
+    fn round_two_merges_a_moved_base_and_records_it() {
+        let fx = setup();
+        std::fs::write(fx.run.join("run.txt"), "run work\n").unwrap();
+        tgit(&fx.run, &["add", "."]);
+        tgit(&fx.run, &["commit", "-q", "-m", "run work"]);
+        let tip = advance_origin(&fx, "base\nmore\n");
+        let mut st = round_state(&fx, 2);
+        let cfg = Config::default();
+        assert!(merge_base_at_round_start(&mut st, &fx.paths, &cfg)
+            .unwrap()
+            .is_none());
+        assert_eq!(st.merged_base.as_deref(), Some(tip.as_str()));
+        assert!(tgit(&fx.run, &["merge-base", "--is-ancestor", &tip, "HEAD"]).is_empty());
+    }
+
+    /// #229: a conflicted round-start merge is handed to the implementer as a
+    /// prompt section naming the base and the conflicting files, with the
+    /// pending tip the pre-review guard verifies a resolution against.
+    #[test]
+    fn round_two_conflict_hands_a_section_to_the_implementer() {
+        let fx = setup();
+        std::fs::write(fx.run.join("file.txt"), "run side\n").unwrap();
+        tgit(&fx.run, &["add", "."]);
+        tgit(&fx.run, &["commit", "-q", "-m", "run work"]);
+        let tip = advance_origin(&fx, "base side\n");
+        let mut st = round_state(&fx, 2);
+        let cfg = Config::default();
+        let (section, pending) = merge_base_at_round_start(&mut st, &fx.paths, &cfg)
+            .unwrap()
+            .expect("conflict hands a section to the implementer");
+        assert!(section.starts_with("## Base merge conflict"));
+        assert!(section.contains("`main`"));
+        assert!(section.contains("`file.txt`"));
+        assert_eq!(pending, tip);
+        assert!(crate::worktree::merge_in_progress(&fx.run));
+        assert_eq!(st.merged_base.as_deref(), Some(fx.origin_main.as_str()));
+    }
+
+    /// #229: a merge the previous round left open is re-handed, not committed
+    /// over and not cleared: the section returns with the open merge's tip and
+    /// `merged_base` stays on the stale base until a resolution lands.
+    #[test]
+    fn round_three_rehands_a_merge_left_open_with_its_tip() {
+        let fx = setup();
+        std::fs::write(fx.run.join("file.txt"), "run side\n").unwrap();
+        tgit(&fx.run, &["add", "."]);
+        tgit(&fx.run, &["commit", "-q", "-m", "run work"]);
+        advance_origin(&fx, "base side\n");
+        let mut st = round_state(&fx, 2);
+        let cfg = Config::default();
+        let (_, first_tip) = merge_base_at_round_start(&mut st, &fx.paths, &cfg)
+            .unwrap()
+            .expect("round two hands the conflict over");
+        assert!(crate::worktree::merge_in_progress(&fx.run));
+
+        let mut st3 = round_state(&fx, 3);
+        let (section, pending) = merge_base_at_round_start(&mut st3, &fx.paths, &cfg)
+            .unwrap()
+            .expect("round three re-hands the open merge");
+        assert!(section.starts_with("## Base merge conflict"));
+        assert_eq!(pending, first_tip);
+        assert_eq!(
+            pending,
+            tgit(&fx.run, &["rev-parse", "MERGE_HEAD"]),
+            "the pending tip is the open merge's other parent"
+        );
+        assert_eq!(st3.merged_base.as_deref(), Some(fx.origin_main.as_str()));
+    }
+
+    /// #229: resolving the handed merge (all conflicts staged and committed)
+    /// reads as resolved against the pending tip.
+    #[test]
+    fn base_merge_resolution_accepts_a_committed_resolution() {
+        let fx = setup();
+        std::fs::write(fx.run.join("file.txt"), "run side\n").unwrap();
+        tgit(&fx.run, &["add", "."]);
+        tgit(&fx.run, &["commit", "-q", "-m", "run work"]);
+        let tip = advance_origin(&fx, "base side\n");
+        let mut st = round_state(&fx, 2);
+        let (_, pending) = merge_base_at_round_start(&mut st, &fx.paths, &Config::default())
+            .unwrap()
+            .expect("conflict hands a section to the implementer");
+        assert_eq!(
+            base_merge_resolution(&fx.run, &pending),
+            BaseMergeResolution::InProgress
+        );
+        std::fs::write(fx.run.join("file.txt"), "resolved\n").unwrap();
+        tgit(&fx.run, &["add", "."]);
+        tgit(&fx.run, &["commit", "-q", "--no-edit"]);
+        assert_eq!(
+            base_merge_resolution(&fx.run, &tip),
+            BaseMergeResolution::Resolved
+        );
+    }
+
+    /// #229: aborting the handed merge reads as aborted: the tip is no longer
+    /// in the branch's history and the base is unmerged again.
+    #[test]
+    fn base_merge_resolution_rejects_an_abort() {
+        let fx = setup();
+        std::fs::write(fx.run.join("file.txt"), "run side\n").unwrap();
+        tgit(&fx.run, &["add", "."]);
+        tgit(&fx.run, &["commit", "-q", "-m", "run work"]);
+        advance_origin(&fx, "base side\n");
+        let mut st = round_state(&fx, 2);
+        let (_, pending) = merge_base_at_round_start(&mut st, &fx.paths, &Config::default())
+            .unwrap()
+            .expect("conflict hands a section to the implementer");
+        tgit(&fx.run, &["merge", "--abort"]);
+        assert!(!crate::worktree::merge_in_progress(&fx.run));
+        assert_eq!(
+            base_merge_resolution(&fx.run, &pending),
+            BaseMergeResolution::Aborted
+        );
+    }
+
+    /// #229: the pre-review verdict records a resolution the implementer
+    /// committed during the round, and fails the round while the merge is
+    /// still open. This is the in-round path the dry-run suite cannot reach
+    /// through the CLI (the resolution lands mid-round during a real
+    /// dispatch), driven here against a real repo instead.
+    #[test]
+    fn pre_review_verdict_records_a_committed_resolution() {
+        let fx = setup();
+        std::fs::write(fx.run.join("file.txt"), "run side\n").unwrap();
+        tgit(&fx.run, &["add", "."]);
+        tgit(&fx.run, &["commit", "-q", "-m", "run work"]);
+        let tip = advance_origin(&fx, "base side\n");
+        let mut st = round_state(&fx, 2);
+        let (_, pending) = merge_base_at_round_start(&mut st, &fx.paths, &Config::default())
+            .unwrap()
+            .expect("conflict hands a section to the implementer");
+        let err = pre_review_merge_verdict(&fx.run, "main", Some(&pending)).unwrap_err();
+        assert!(
+            err.contains("unresolved") && err.contains("file.txt"),
+            "{err}"
+        );
+        std::fs::write(fx.run.join("file.txt"), "resolved\n").unwrap();
+        tgit(&fx.run, &["add", "."]);
+        tgit(&fx.run, &["commit", "-q", "--no-edit"]);
+        assert_eq!(
+            pre_review_merge_verdict(&fx.run, "main", Some(&pending)),
+            Ok(Some(tip))
+        );
+    }
+
+    /// #229: the pre-review verdict fails a merge the implementer aborted
+    /// instead of resolving.
+    #[test]
+    fn pre_review_verdict_fails_an_aborted_merge() {
+        let fx = setup();
+        std::fs::write(fx.run.join("file.txt"), "run side\n").unwrap();
+        tgit(&fx.run, &["add", "."]);
+        tgit(&fx.run, &["commit", "-q", "-m", "run work"]);
+        advance_origin(&fx, "base side\n");
+        let mut st = round_state(&fx, 2);
+        let (_, pending) = merge_base_at_round_start(&mut st, &fx.paths, &Config::default())
+            .unwrap()
+            .expect("conflict hands a section to the implementer");
+        tgit(&fx.run, &["merge", "--abort"]);
+        let err = pre_review_merge_verdict(&fx.run, "main", Some(&pending)).unwrap_err();
+        assert!(err.contains("aborted"), "{err}");
+    }
+
+    /// #229: the pre-review verdict passes a round with nothing handed, but
+    /// still fails a merge left open from outside the handoff.
+    #[test]
+    fn pre_review_verdict_passes_a_round_with_nothing_handed() {
+        let fx = setup();
+        assert_eq!(pre_review_merge_verdict(&fx.run, "main", None), Ok(None));
+        std::fs::write(fx.run.join("file.txt"), "run side\n").unwrap();
+        tgit(&fx.run, &["add", "."]);
+        tgit(&fx.run, &["commit", "-q", "-m", "run work"]);
+        advance_origin(&fx, "base side\n");
+        let conflicted = crate::worktree::merge_base_forward(&fx.run, Some("main")).unwrap();
+        assert!(matches!(
+            conflicted,
+            crate::worktree::BaseMerge::Conflict { .. }
+        ));
+        let err = pre_review_merge_verdict(&fx.run, "main", None).unwrap_err();
+        assert!(err.contains("unresolved"), "{err}");
+    }
+
+    /// #229: `[rounds] merge_base = false` keeps the run on its creation base.
+    #[test]
+    fn disabled_merge_base_skips_the_forward_merge() {
+        let fx = setup();
+        let tip = advance_origin(&fx, "base\nmore\n");
+        let mut st = round_state(&fx, 2);
+        let mut cfg = Config::default();
+        cfg.rounds.merge_base = false;
+        assert!(merge_base_at_round_start(&mut st, &fx.paths, &cfg)
+            .unwrap()
+            .is_none());
+        let head = tgit(&fx.run, &["rev-parse", "HEAD"]);
+        assert_ne!(head, tip);
+    }
+
+    /// #229: dry runs never touch git.
+    #[test]
+    fn dry_run_skips_the_forward_merge() {
+        let fx = setup();
+        let tip = advance_origin(&fx, "base\nmore\n");
+        let mut st = round_state(&fx, 2);
+        st.dry_run = true;
+        let cfg = Config::default();
+        assert!(merge_base_at_round_start(&mut st, &fx.paths, &cfg)
+            .unwrap()
+            .is_none());
+        let head = tgit(&fx.run, &["rev-parse", "HEAD"]);
+        assert_ne!(head, tip);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_from_cli(
     run_id: Option<String>,
@@ -1324,6 +1658,16 @@ fn run_from_approved(
         }
         state.error = None;
         state.set_phase(Phase::PrepareIsolation);
+    }
+    // Resuming a run parked by a conflicted pre-ship base merge: the remedy
+    // round supersedes the park, so drop its flag and error now. A stale park
+    // error would otherwise outlive the resolution and misdirect the next gate
+    // (the same hazard the round-gate lift below guards against, #229).
+    if state.gates.ship_parked {
+        state.gates.ship_parked = false;
+        if state.phase == Phase::AwaitingShipConfirm {
+            state.error = None;
+        }
     }
     // `-t` on an approved run is a directive for THIS round only. It never rewrites
     // the run's task; absent `-t`, any prior amendment is cleared so it never silently
@@ -3580,6 +3924,21 @@ pub fn execute_loop(
         let panel_direct = take_panel_rerun(state);
         state.save(paths)?;
 
+        // Round 2+ opens by merging the base forward, after the previous
+        // round's leftovers were committed (#229). A conflicted merge stays in
+        // progress and is handed to this round's implementer via its prompt.
+        // A `--re-review` pass sends the current HEAD straight to the panel
+        // unchanged (O180), so it merges nothing: the next implementer round
+        // re-merges whatever moved meanwhile.
+        let merge_conflict_section = if panel_direct {
+            None
+        } else {
+            match merge_base_at_round_start(state, paths, cfg) {
+                Ok(section) => section,
+                Err(e) => return fail(state, paths, e, false),
+            }
+        };
+
         if let Some(id) = state
             .slots
             .iter()
@@ -3649,6 +4008,13 @@ pub fn execute_loop(
             extra.insert(
                 "no_progress_warning".into(),
                 state.no_progress_warning.clone().unwrap_or_default(),
+            );
+            extra.insert(
+                "merge_conflict_section".into(),
+                merge_conflict_section
+                    .clone()
+                    .map(|(section, _)| section)
+                    .unwrap_or_default(),
             );
             extra.insert(
                 "carry_forward_section".into(),
@@ -3965,6 +4331,33 @@ pub fn execute_loop(
         if let Some(note) = commit_before_review(state, paths, cfg, &impl_slot.id) {
             ceiling_partial_note = Some(note);
         }
+        // The panel judges a checkout of HEAD, so a round whose base merge is
+        // still open, or whose merge was aborted instead of resolved, must fail
+        // here rather than go to review. A resolution the implementer committed
+        // advances `merged_base` to the pending tip (#229).
+        let impl_workdir = impl_cwd(state, &impl_slot);
+        let pending_tip = merge_conflict_section.as_ref().map(|(_, tip)| tip.as_str());
+        match pre_review_merge_verdict(
+            &impl_workdir,
+            state.base_ref.as_deref().unwrap_or("branch"),
+            pending_tip,
+        ) {
+            Ok(Some(tip)) => {
+                state.merged_base = Some(tip.clone());
+                state.save(paths)?;
+                let _ = crate::events::append(
+                    paths,
+                    &state.id,
+                    &crate::events::Event::info(format!(
+                        "implementer resolved the base {} merge ({}); merged_base now {tip}",
+                        state.base_ref.as_deref().unwrap_or("branch"),
+                        tip.chars().take(8).collect::<String>(),
+                    )),
+                );
+            }
+            Ok(None) => {}
+            Err(msg) => return fail(state, paths, anyhow::anyhow!(msg), false),
+        }
 
         // Suite channel: cheap model runs full suites; reviewers must not re-run them.
         let mut suite_body = String::new();
@@ -4135,8 +4528,14 @@ pub fn execute_loop(
             }
             state.suite_outcome = Some(suite_outcome);
 
-            let unreferenced =
-                unreferenced_test_files(&review_cwd, state.base_commit.as_deref(), &suite_body);
+            let unreferenced = unreferenced_test_files(
+                &review_cwd,
+                state
+                    .merged_base
+                    .as_deref()
+                    .or(state.base_commit.as_deref()),
+                &suite_body,
+            );
             if !unreferenced.is_empty() {
                 let note = format!(
                     "suite gate does not reference {} added test file(s): {}",
@@ -5014,6 +5413,197 @@ fn commit_branch_leftovers(
         Err(e) => LeftoverCommit::Refused(e),
     };
     Some((wt.branch, outcome))
+}
+
+/// Merge the run's base branch forward at the start of round 2 and later, after
+/// the previous round's leftovers were committed (#229). Returns the prompt
+/// section handing a conflicted merge to the round's implementer plus the
+/// pending upstream tip the pre-review guard verifies a resolution against,
+/// `None` when there is nothing to hand over. A clean merge proceeds silently
+/// (one event); a fetch the base's remote refuses is not a round failure, so
+/// the round works on and ship retries before pushing.
+fn merge_base_at_round_start(
+    state: &mut RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+) -> Result<Option<(String, String)>> {
+    // A `--dry-run` preview never touches branches; the scenario harness opts back
+    // in (`SPAR_MERGE_BASE_DRY_RUN=1`) after swapping a real worktree for the fake one.
+    let merge_in_dry_run = crate::util::env_truthy("SPAR_MERGE_BASE_DRY_RUN");
+    if (state.dry_run && !merge_in_dry_run) || !cfg.rounds.merge_base || state.round < 2 {
+        return Ok(None);
+    }
+    let Some(impl_slot) = state
+        .slots
+        .iter()
+        .find(|s| s.role == SlotRole::Implementer)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let cwd = impl_cwd(state, &impl_slot);
+    if worktree::git_out(&cwd, &["rev-parse", "HEAD"]).is_none() {
+        return Ok(None);
+    }
+    // A merge an earlier round left open is re-handed below, not committed over:
+    // committing now would conclude it with the conflict markers as content.
+    let resumed = worktree::merge_in_progress(&cwd);
+    let dirty_tree =
+        worktree::git_out(&cwd, &["status", "--porcelain"]).is_some_and(|s| !s.trim().is_empty());
+    if !resumed && dirty_tree {
+        let sha = worktree::commit_leftovers(
+            &cwd,
+            "spar: leftover work before base merge",
+            &format!("round {}", state.round),
+        )
+        .map_err(|e| anyhow::anyhow!("could not commit leftover work before merging the base forward: {e}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("could not commit leftover work before merging the base forward: tree refuses to commit")
+        })?;
+        let _ = crate::events::append(
+            paths,
+            &state.id,
+            &crate::events::Event::info(format!(
+                "committed leftover work as {} before merging the base forward",
+                sha.chars().take(8).collect::<String>(),
+            )),
+        );
+    }
+    let base_ref = state.base_ref.clone().unwrap_or_default();
+    match worktree::merge_base_forward(&cwd, state.base_ref.as_deref())? {
+        worktree::BaseMerge::Clean { merged } => {
+            state.merged_base = Some(merged.clone());
+            state.save(paths)?;
+            let _ = crate::events::append(
+                paths,
+                &state.id,
+                &crate::events::Event::info(format!(
+                    "merged base {base_ref} forward ({})",
+                    merged.chars().take(8).collect::<String>(),
+                )),
+            );
+            Ok(None)
+        }
+        worktree::BaseMerge::AlreadyCurrent { tip } => {
+            state.merged_base = Some(tip.clone());
+            state.save(paths)?;
+            let _ = crate::events::append(
+                paths,
+                &state.id,
+                &crate::events::Event::info(format!(
+                    "base {base_ref} already current ({})",
+                    tip.chars().take(8).collect::<String>(),
+                )),
+            );
+            Ok(None)
+        }
+        worktree::BaseMerge::Skipped(skip) => {
+            let _ = crate::events::append(
+                paths,
+                &state.id,
+                &crate::events::Event::info(format!("skipping base forward merge: {skip}")),
+            );
+            Ok(None)
+        }
+        worktree::BaseMerge::Conflict { files, tip } => {
+            let _ = crate::events::append(
+                paths,
+                &state.id,
+                &crate::events::Event::info(format!(
+                    "base {base_ref} merge conflicted ({}); handed to the round {} implementer",
+                    files.join(", "),
+                    state.round,
+                )),
+            );
+            let _ = crate::bus::broadcast(
+                paths,
+                Some(&state.id),
+                crate::bus::ORCHESTRATOR_SEAT,
+                format!(
+                    "base {base_ref} merge conflicted ({}); the round {} implementer resolves it first",
+                    files.join(", "),
+                    state.round,
+                ),
+                state.message_budget,
+            );
+            Ok(Some((base_merge_conflict_section(&base_ref, &files), tip)))
+        }
+    }
+}
+
+/// The prompt section heading a round whose base forward merge conflicted: the
+/// merge is in progress in the implementer's worktree, so resolving it is the
+/// round's first job, before any of the brief below.
+fn base_merge_conflict_section(base_ref: &str, files: &[String]) -> String {
+    let list = if files.is_empty() {
+        "(`git status` names them)".to_string()
+    } else {
+        files
+            .iter()
+            .map(|f| format!("- `{f}`"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "## Base merge conflict — resolve this first\n\n\
+         The run's base branch `{base_ref}` moved forward and merging it into your branch \
+         conflicted. The merge is in progress in your worktree: resolve it before anything else.\n\n\
+         {list}\n\n\
+         Resolve each conflict, `git add` the files, and commit the resolution \
+         (`git commit --no-edit` keeps the merge message). Do not `git merge --abort` unless \
+         the base change genuinely reverts your work: the next round re-merges and the same \
+         conflict returns.\n"
+    )
+}
+
+/// What the implementer did with the base merge handed to its round: committed
+/// a resolution containing the pending tip, aborted back to the unmerged
+/// branch, or left the merge open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseMergeResolution {
+    Resolved,
+    Aborted,
+    InProgress,
+}
+
+fn base_merge_resolution(cwd: &std::path::Path, tip: &str) -> BaseMergeResolution {
+    if worktree::merge_in_progress(cwd) {
+        BaseMergeResolution::InProgress
+    } else if worktree::git_out(cwd, &["merge-base", "--is-ancestor", tip, "HEAD"]).is_some() {
+        BaseMergeResolution::Resolved
+    } else {
+        BaseMergeResolution::Aborted
+    }
+}
+
+/// The pre-review verdict on the base merge handed to this round: the pending
+/// tip to record when the implementer committed a resolution, `None` when
+/// there is nothing to verify, or the message the round fails with when the
+/// merge is still open or was aborted instead (#229).
+fn pre_review_merge_verdict(
+    cwd: &std::path::Path,
+    base: &str,
+    pending: Option<&str>,
+) -> Result<Option<String>, String> {
+    let unresolved = || {
+        let files = worktree::conflicted_files(cwd).join(", ");
+        format!(
+            "base {base} merge unresolved: the implementer did not commit a resolution \
+             (conflicting files: {files}); resolve it in the implementer worktree and resume"
+        )
+    };
+    match pending {
+        Some(tip) => match base_merge_resolution(cwd, tip) {
+            BaseMergeResolution::Resolved => Ok(Some(tip.to_string())),
+            BaseMergeResolution::Aborted => Err(format!(
+                "base {base} merge aborted: the implementer did not commit a resolution \
+                 (the base is unmerged again); resolve it in the implementer worktree and resume"
+            )),
+            BaseMergeResolution::InProgress => Err(unresolved()),
+        },
+        None if worktree::merge_in_progress(cwd) => Err(unresolved()),
+        None => Ok(None),
+    }
 }
 
 /// The refreshed cut-short notice when the commit below banks a ceiling-cut

@@ -1228,6 +1228,12 @@ pub struct RoundsConfig {
     /// grown: `plan.md` is already a median 30k chars and is inlined every round.
     #[serde(default = "default_carry_forward_chars")]
     pub carry_forward_chars: usize,
+    /// Merge the run's base branch forward at each round start and before ship
+    /// pushes. A clean merge proceeds silently; a conflicted one goes to the
+    /// round's implementer, or parks the run at ship. On by default: a run that
+    /// never merges its base lands its PR behind and conflicting (#229).
+    #[serde(default = "default_rounds_merge_base")]
+    pub merge_base: bool,
 }
 
 impl Default for RoundsConfig {
@@ -1235,6 +1241,7 @@ impl Default for RoundsConfig {
         Self {
             max: default_max_rounds(),
             carry_forward_chars: default_carry_forward_chars(),
+            merge_base: default_rounds_merge_base(),
         }
     }
 }
@@ -1259,6 +1266,10 @@ pub fn default_max_rounds() -> u32 {
 
 fn default_carry_forward_chars() -> usize {
     4000
+}
+
+pub fn default_rounds_merge_base() -> bool {
+    true
 }
 
 fn default_max_agents() -> u32 {
@@ -1519,6 +1530,7 @@ struct CriticConfigFile {
 struct RoundsConfigFile {
     max: Option<u32>,
     carry_forward_chars: Option<usize>,
+    merge_base: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2460,6 +2472,9 @@ impl Config {
             if let Some(v) = r.carry_forward_chars {
                 self.rounds.carry_forward_chars = v;
             }
+            if let Some(v) = r.merge_base {
+                self.rounds.merge_base = v;
+            }
         }
         if let Some(v) = file.checkpoint.as_ref().and_then(|c| c.push) {
             self.checkpoint.push = v;
@@ -2804,15 +2819,17 @@ mod tests {
         let tmp = tempdir().unwrap();
         assert_eq!(Config::default().rounds.max, 8);
         assert_eq!(Config::default().rounds.carry_forward_chars, 4000);
+        assert!(Config::default().rounds.merge_base);
 
         std::fs::write(
             tmp.path().join("spar.toml"),
-            "[rounds]\nmax = 4\ncarry_forward_chars = 1500\n",
+            "[rounds]\nmax = 4\ncarry_forward_chars = 1500\nmerge_base = false\n",
         )
         .unwrap();
         let cfg = Config::load(tmp.path()).unwrap();
         assert_eq!(cfg.rounds.max, 4);
         assert_eq!(cfg.rounds.carry_forward_chars, 1500);
+        assert!(!cfg.rounds.merge_base);
 
         // A partial section keeps the other default rather than zeroing it: a
         // `carry_forward_chars = 0` inferred from absence would disable truncation.
@@ -2820,6 +2837,7 @@ mod tests {
         let cfg = Config::load(tmp.path()).unwrap();
         assert_eq!(cfg.rounds.max, 2);
         assert_eq!(cfg.rounds.carry_forward_chars, 4000);
+        assert!(cfg.rounds.merge_base);
     }
 
     /// A run reads its own frozen snapshot (O27), so the ceiling has to survive the
@@ -2831,10 +2849,12 @@ mod tests {
         let mut cfg = Config::default();
         cfg.rounds.max = 5;
         cfg.rounds.carry_forward_chars = 900;
+        cfg.rounds.merge_base = false;
         cfg.save_snapshot(&paths, "r1").unwrap();
         let bound = Config::for_run(&paths, "r1").unwrap();
         assert_eq!(bound.rounds.max, 5);
         assert_eq!(bound.rounds.carry_forward_chars, 900);
+        assert!(!bound.rounds.merge_base);
     }
 
     /// O118/O119: severity gating and scoped re-review are on by default, tunable per

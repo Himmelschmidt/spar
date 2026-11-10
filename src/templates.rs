@@ -96,6 +96,7 @@ pub fn base_vars(ctx: &TemplateCtx<'_>) -> HashMap<String, String> {
     m.insert("nudge_protocol".into(), nudge_protocol(ctx.nudge_file));
     m.insert("plan_body".into(), String::new());
     m.insert("no_progress_warning".into(), String::new());
+    m.insert("merge_conflict_section".into(), String::new());
     m.insert("amendment_section".into(), String::new());
     m.insert("carry_forward_section".into(), String::new());
     m.insert(
@@ -144,6 +145,27 @@ mod tests {
         );
         let s = render("implementer", &v).unwrap();
         assert!(s.starts_with("## No-progress warning\nBody\n"), "{s}");
+    }
+
+    /// #229: a conflicted base merge opens the implementer prompt, ahead of
+    /// the role line and the brief, so resolving it is the round's first job.
+    #[test]
+    fn implementer_template_renders_merge_conflict_section_first() {
+        let mut v = HashMap::new();
+        v.insert("task".into(), "add login".into());
+        v.insert("no_progress_warning".into(), String::new());
+        v.insert(
+            "merge_conflict_section".into(),
+            "## Base merge conflict — resolve this first\nBody\n".into(),
+        );
+        let s = render("implementer", &v).unwrap();
+        assert!(
+            s.starts_with("## Base merge conflict — resolve this first\nBody\n"),
+            "{s}"
+        );
+        let role_at = s.find("# Role: Implementer").unwrap();
+        let section_at = s.find("## Base merge conflict").unwrap();
+        assert!(section_at < role_at, "{s}");
     }
 
     #[test]
