@@ -233,3 +233,7 @@ path = "tests/scenarios/bare_spar.rs"
 [[test]]
 name = "classifier_routing"
 path = "tests/scenarios/classifier_routing.rs"
+
+[[test]]
+name = "codex_route"
+path = "tests/scenarios/codex_route.rs"

@@ -356,8 +356,14 @@ pub struct Reassignment {
 
 /// Parse `--reassign` and refuse a provider the run could not dispatch anyway: unknown,
 /// manually paused, or paused on a trusted quota signal (O106, O136). Read before the run
-/// lock, so a typo costs nothing.
-pub fn parse_reassignments(raw: &[String], paths: &SparPaths) -> Result<Vec<Reassignment>> {
+/// lock, so a typo costs nothing. The pause check keys the route the next dispatch will
+/// stamp (this process's environment): a model-less codex seat reassigned onto a paused
+/// ambient bucket is refused even when the run's stale record would key elsewhere.
+pub fn parse_reassignments(
+    raw: &[String],
+    paths: &SparPaths,
+    route: crate::providers::RecordedRoute<'_>,
+) -> Result<Vec<Reassignment>> {
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     let mut out = Vec::new();
     for r in raw {
@@ -376,7 +382,8 @@ pub fn parse_reassignments(raw: &[String], paths: &SparPaths) -> Result<Vec<Reas
                 bail!("--reassign {r:?}: no adapter named {cli}");
             }
         }
-        let key = crate::quota::quota_key(&pin.display());
+        let seat = crate::provider_ref::ProviderRef::for_seat(&pin.provider, pin.model.as_deref());
+        let key = seat.quota_key(route);
         if store.blocks_live_dispatch(&key) {
             bail!(
                 "--reassign {r:?}: {key} is paused; resume it with `spar provider resume {key}` \
@@ -616,7 +623,14 @@ fn run_from_approved(
     // a run directory for it. Everything below mutates the run, so it all happens under
     // the lock: a live orchestrator refuses us before its state.json can be overwritten.
     let unlocked = RunState::load(paths, run_id)?;
-    let reassignments = parse_reassignments(&opts.reassign, paths)?;
+    // Key the route this process's dispatch will stamp (continuing entries
+    // stamp on resumption), not the previous record: a stale record would
+    // accept a bucket the dispatch now bills, or refuse one it no longer does.
+    let reassignments = parse_reassignments(
+        &opts.reassign,
+        paths,
+        crate::providers::codex::dispatch_route().as_recorded(),
+    )?;
     let mut patient = None;
     if let Some(mr) = opts.max_rounds {
         let target = mr.resolve(unlocked.round);
@@ -2339,7 +2353,7 @@ pub fn execute_loop(
                         &slot_state,
                         &store,
                         available.as_ref(),
-                        state.codex_profile.as_deref(),
+                        state.recorded_route(),
                     );
                     if cause.engages_backup()
                         && !slot_state.source.is_some_and(SeatSource::is_backup)
@@ -2359,7 +2373,7 @@ pub fn execute_loop(
                                 available.as_ref(),
                                 paths,
                                 state.dry_run,
-                                state.codex_profile.as_deref(),
+                                state.recorded_route(),
                                 &health,
                             ) {
                                 crate::backup::engage(
@@ -2437,7 +2451,7 @@ pub fn execute_loop(
                     &slot_state,
                     &store,
                     available.as_ref(),
-                    state.codex_profile.as_deref(),
+                    state.recorded_route(),
                 );
                 if cause.engages_backup() && !slot_state.source.is_some_and(SeatSource::is_backup) {
                     if let Some(backup_raw) =
@@ -2451,7 +2465,7 @@ pub fn execute_loop(
                             available.as_ref(),
                             paths,
                             state.dry_run,
-                            state.codex_profile.as_deref(),
+                            state.recorded_route(),
                             &health,
                         ) {
                             let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
@@ -3508,7 +3522,7 @@ fn gate_implementer_seat(
                     Some(detected)
                 };
                 let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-                let codex_profile = state.codex_profile.clone();
+                let route = state.recorded_route();
                 let missing = state
                     .slots
                     .iter()
@@ -3518,7 +3532,7 @@ fn gate_implementer_seat(
                             &s.provider_ref().display(),
                             &store,
                             available.as_ref(),
-                            codex_profile.as_deref(),
+                            route,
                         )
                     })
                     .map(|s| s.provider.clone());
@@ -3557,7 +3571,7 @@ fn recheck_seat(
     }
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     let seat = slot.provider_ref();
-    let key = seat.quota_key(state.codex_profile.as_deref());
+    let key = seat.quota_key(state.recorded_route());
     let sub = seat.storage_key();
     // A live run trusts only pauses it can trust: manual and strong (O106). A
     // weak heuristic pause ("429" in "429 passed") written by this very dispatch
@@ -3576,7 +3590,7 @@ fn recheck_seat(
     };
     if !blocked {
         // A continued run re-checks an auto-selected seat's health through the
-        // same single resolution point as launch (O169): a provider that went
+        // same single resolution point as launch (O171): a provider that went
         // unhealthy between dispatches is re-seated, never blindly dispatched.
         // Pins only warn; quota already cleared above, so a seat with nothing
         // healthy left fails readiness (exit 1), never parks (exit 4).
@@ -3587,7 +3601,7 @@ fn recheck_seat(
         SlotRole::Reviewer => reviewer_ordinal(slot_id),
         _ => Some(0),
     };
-    let codex_profile = state.codex_profile.clone();
+    let route = state.recorded_route();
     let backup = ordinal
         .and_then(|o| crate::backup::backup_for_role(slot.role, o, cfg))
         .filter(|b| crate::quota::sub_key(b) != sub)
@@ -3600,7 +3614,7 @@ fn recheck_seat(
                 None,
                 paths,
                 state.dry_run,
-                codex_profile.as_deref(),
+                route,
                 &providers::LiveHealth::for_dry(state.dry_run),
             )
             .map(|source| (b, source))
@@ -3674,7 +3688,7 @@ fn recheck_seat_health(
         None,
         paths,
         state.dry_run,
-        state.codex_profile.as_deref(),
+        state.recorded_route(),
         health,
         &used,
     );
@@ -3754,7 +3768,7 @@ fn try_rotate_implementer(
             &slot_state,
             &store,
             available_opt.as_ref(),
-            state.codex_profile.as_deref(),
+            state.recorded_route(),
         );
         if has_backup {
             if cause.engages_backup() {
@@ -3781,7 +3795,7 @@ fn try_rotate_implementer(
                             available_opt.as_ref(),
                             paths,
                             state.dry_run,
-                            state.codex_profile.as_deref(),
+                            state.recorded_route(),
                             health,
                         ) {
                             let impl_id = slot_state.id.clone();
@@ -4004,7 +4018,7 @@ fn try_rotate_reviewer_provider(
                     None,
                     paths,
                     state.dry_run,
-                    state.codex_profile.as_deref(),
+                    state.recorded_route(),
                     health,
                 )
                 .map(|source| (b, source))
@@ -4019,8 +4033,7 @@ fn try_rotate_reviewer_provider(
         }
     }
     let eligible = |p: &String| -> bool {
-        *p != cur
-            && crate::backup::is_provider_eligible(p, &store, None, state.codex_profile.as_deref())
+        *p != cur && crate::backup::is_provider_eligible(p, &store, None, state.recorded_route())
     };
     let healthy = |p: &String| -> bool { eligible(p) && health.check(p).usable };
     let reviewer_role_source = if cfg

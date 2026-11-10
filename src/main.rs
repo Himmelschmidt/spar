@@ -459,7 +459,14 @@ fn run() -> Result<ExitCode> {
                     key,
                     reassign,
                 };
-                workflow::implement::parse_reassignments(&opts.reassign, &paths)?;
+                // The pause check keys the route this process's dispatch will
+                // stamp (new or resumed: continuing entries stamp on entry),
+                // not the previous record.
+                workflow::implement::parse_reassignments(
+                    &opts.reassign,
+                    &paths,
+                    providers::codex::dispatch_route().as_recorded(),
+                )?;
                 let mut fleet = None;
                 match &run_id {
                     Some(id) => {
@@ -3657,9 +3664,19 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
             all,
             json,
             dry_run,
+            run,
         } => {
             let (paths, _) = project_ctx()?;
             let dry = dry_run || util::env_truthy("SPAR_DRY_RUN");
+            let route_state;
+            let route = match run {
+                Some(id) => {
+                    route_state = crate::state::RunState::load(&paths, &id)
+                        .map_err(|e| anyhow::anyhow!("cannot load run {id} for --run: {e}"))?;
+                    route_state.recorded_route()
+                }
+                None => providers::RecordedRoute::ambient(),
+            };
             let targets: Vec<String> = match name {
                 Some(n) => vec![n],
                 None if all => providers::all_adapters()
@@ -3671,7 +3688,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
             };
             let reports: Vec<probe::ProbeReport> = targets
                 .iter()
-                .map(|t| probe::probe(&paths, t, dry, None))
+                .map(|t| probe::probe(&paths, t, dry, route))
                 .collect();
             if json {
                 println!("{}", serde_json::to_string_pretty(&reports)?);

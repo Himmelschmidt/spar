@@ -313,7 +313,7 @@ pub fn build_implement_seats(
         None,
         paths,
         dry,
-        None,
+        crate::providers::RecordedRoute::ambient(),
         health,
         &used,
     ) {
@@ -353,7 +353,7 @@ pub fn build_implement_seats(
             None,
             paths,
             dry,
-            None,
+            crate::providers::RecordedRoute::ambient(),
             health,
             &used,
         ) else {
@@ -563,8 +563,20 @@ pub fn launch_fleet(
             for (idx, (role, prefix)) in specs.into_iter().enumerate() {
                 let used: Vec<String> = out.iter().map(|s| s.provider.clone()).collect();
                 match crate::backup::resolve_with_backup(
-                    role, idx, idx, &pool, origin, cfg, None, &store, None, paths, dry, None,
-                    health, &used,
+                    role,
+                    idx,
+                    idx,
+                    &pool,
+                    origin,
+                    cfg,
+                    None,
+                    &store,
+                    None,
+                    paths,
+                    dry,
+                    crate::providers::RecordedRoute::ambient(),
+                    health,
+                    &used,
                 ) {
                     Some((raw, source)) => {
                         let id = format!("{prefix}-{}", sanitize_slot(&raw));

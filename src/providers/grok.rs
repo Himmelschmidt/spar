@@ -199,7 +199,6 @@ mod tests {
         assert_eq!(GrokAdapter.presence_source(), PresenceSource::Hooks);
         assert_eq!(GrokAdapter.hook_file_rel(), ".grok/hooks/spar.json");
         let env = GrokAdapter.extra_env(&SpawnOpts {
-            codex_profile: None,
             prompt: String::new(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
@@ -220,7 +219,6 @@ mod tests {
 
     fn opts_with_session(prompt: &str, file: Option<&str>, session_id: Option<&str>) -> SpawnOpts {
         SpawnOpts {
-            codex_profile: None,
             prompt: prompt.into(),
             prompt_file: file.map(PathBuf::from),
             cwd: PathBuf::from("/tmp"),
@@ -259,7 +257,6 @@ mod tests {
     #[test]
     fn headless_inline_uses_single_with_prompt() {
         let opts = SpawnOpts {
-            codex_profile: None,
             prompt: "do the thing".into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
@@ -352,7 +349,6 @@ mod tests {
     fn effort_renders_flag_when_set_and_nothing_when_unset() {
         use crate::effort::EffortLevel;
         let mut opts = SpawnOpts {
-            codex_profile: None,
             prompt: "go".into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
@@ -384,7 +380,6 @@ mod tests {
     fn effort_interactive_matches_headless() {
         use crate::effort::EffortLevel;
         let mut opts = SpawnOpts {
-            codex_profile: None,
             prompt: "go".into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),

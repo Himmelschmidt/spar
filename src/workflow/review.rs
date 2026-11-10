@@ -67,6 +67,11 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         return Ok(ExitCode::Failure);
     }
 
+    // This entry dispatches seats, so it stamps the dispatch like every other
+    // entry: the horizon for pause reads, and the codex route the quota keys
+    // derive from.
+    state.stamp_dispatch();
+    state.save(paths)?;
     // The independent-review workflow bypasses `build_implement_seats` (no panel
     // pinning), but each reviewer's source is still resolved per position so a `Synth`
     // pool mixing `[roles]` and `[providers].order` seats reports each honestly.
@@ -123,7 +128,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             &provider,
             &store,
             available.as_ref(),
-            state.codex_profile.as_deref(),
+            state.recorded_route(),
         ) || unhealthy_auto
         {
             if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Reviewer, i, cfg) {
@@ -135,7 +140,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
                     available.as_ref(),
                     paths,
                     dry,
-                    state.codex_profile.as_deref(),
+                    state.recorded_route(),
                     &health,
                 ) {
                     if let Ok(bpin) = crate::provider_ref::Pin::parse(&backup_raw) {
@@ -282,7 +287,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             &slot_state,
             &store,
             available.as_ref(),
-            state.codex_profile.as_deref(),
+            state.recorded_route(),
         );
         if !cause.engages_backup()
             || slot_state
@@ -303,7 +308,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             available.as_ref(),
             paths,
             state.dry_run,
-            state.codex_profile.as_deref(),
+            state.recorded_route(),
             &health,
         ) {
             Some(source) => source,

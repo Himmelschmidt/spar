@@ -31,6 +31,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     cfg.save_snapshot(paths, &state.id)?;
     state.isolation = cfg.isolation;
     state.dry_run = dry;
+    state.stamp_dispatch();
     state.message_budget = cfg.message_budget;
     state.autonomy = cfg.autonomy;
     if dry {

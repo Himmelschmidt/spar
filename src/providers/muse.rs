@@ -329,7 +329,6 @@ mod tests {
 
     fn opts_with_session(prompt: &str, model: Option<&str>, session_id: Option<&str>) -> SpawnOpts {
         SpawnOpts {
-            codex_profile: None,
             prompt: prompt.into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
