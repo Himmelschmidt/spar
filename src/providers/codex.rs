@@ -354,6 +354,17 @@ impl CodexAdapter {
     /// instructions are read from stdin"). A tmux pane's stdin is its terminal, so the
     /// interactive path always passes the text.
     fn exec_command(&self, bin: &Path, opts: &SpawnOpts, stdin_prompt: bool) -> Command {
+        let route = opts_route(opts);
+        self.exec_command_with_route(bin, opts, stdin_prompt, &route)
+    }
+
+    fn exec_command_with_route(
+        &self,
+        bin: &Path,
+        opts: &SpawnOpts,
+        stdin_prompt: bool,
+        route: &CodexRoute,
+    ) -> Command {
         let mut cmd = Command::new(bin);
         cmd.arg("exec");
         cmd.arg("--json");
@@ -363,7 +374,6 @@ impl CodexAdapter {
         }
         // An explicit model is self-describing (it names its own provider), so it
         // supersedes the profile; the profile is only the no-model default.
-        let route = opts_route(opts);
         match route.model.as_deref() {
             Some(m) => {
                 for a in model_args(m) {
@@ -547,6 +557,15 @@ impl ProviderAdapter for CodexAdapter {
 
     fn build_headless(&self, bin: &Path, opts: &SpawnOpts) -> Command {
         self.exec_command(bin, opts, opts.prompt_file.is_some())
+    }
+
+    /// A `--run` probe replays the run's recorded route into the spawn, so the
+    /// call bills the keyed bucket: an explicit seat model still wins, the
+    /// recorded model fills a bare ref, and the recorded profile (not this
+    /// process's ambient one) selects `-p`.
+    fn build_probe(&self, bin: &Path, opts: &SpawnOpts, route: RecordedRoute<'_>) -> Command {
+        let resolved = resolve_route(opts.model.as_deref(), route);
+        self.exec_command_with_route(bin, opts, opts.prompt_file.is_some(), &resolved)
     }
 
     /// Resume is implemented, so the derived `Capabilities.resume` reports true.

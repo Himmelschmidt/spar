@@ -190,18 +190,15 @@ fn call(
         trust: TrustPolicy::Prompt,
         extra_args: vec![],
         session_id: None,
-        // A `--run` probe replays the run's recorded model; the key above was
-        // derived from that same route, and the spawn reads this process's
-        // ambient route, which agrees on the box that stamped the run.
-        model: pref
-            .model
-            .clone()
-            .or_else(|| route.model.filter(|m| !m.is_empty()).map(str::to_string)),
+        // Only an explicit ref model; a `--run` probe's recorded route reaches
+        // the spawn through the adapter (`build_probe`), never as a generic
+        // model every adapter would render.
+        model: pref.model.clone(),
         effort: None,
         timeout_secs: Some(PROBE_TIMEOUT.as_secs()),
         session_dir: None,
     };
-    let mut cmd = adapter.build_headless(&bin, &opts);
+    let mut cmd = adapter.build_probe(&bin, &opts, route);
     if dry {
         let (program, args) = providers::command_to_parts(&cmd);
         return CallOutcome::without_output(

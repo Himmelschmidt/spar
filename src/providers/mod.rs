@@ -421,6 +421,14 @@ pub trait ProviderAdapter: Send + Sync {
         None
     }
     fn build_headless(&self, bin: &Path, opts: &SpawnOpts) -> Command;
+    /// A probe spawn keyed to a recorded dispatch route (`provider probe
+    /// --run`). Default builds the ambient spawn: the route only changes
+    /// keying, and the spawn reads the same ambient environment. The codex
+    /// adapter replays the recorded profile and model so the spawn bills the
+    /// keyed bucket.
+    fn build_probe(&self, bin: &Path, opts: &SpawnOpts, _route: RecordedRoute<'_>) -> Command {
+        self.build_headless(bin, opts)
+    }
     fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> Command;
 
     /// Build a command that resumes a previously captured native session (e.g. codex's
