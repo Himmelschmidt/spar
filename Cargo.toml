@@ -163,6 +163,10 @@ name = "claude_family_quota"
 path = "tests/scenarios/claude_family_quota.rs"
 
 [[test]]
+name = "claude_auth_retry"
+path = "tests/scenarios/claude_auth_retry.rs"
+
+[[test]]
 name = "pi_dispatch"
 path = "tests/scenarios/pi_dispatch.rs"
 
