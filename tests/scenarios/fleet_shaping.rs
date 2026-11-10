@@ -2604,3 +2604,64 @@ fn refused_amend_after_a_reassign_changes_nothing() {
         "a refused amend leaves state, config, events, artifacts and markers alone"
     );
 }
+
+/// #234 follow-up: the frozen pin records providers by panel ordinal, and a
+/// `--reassign` moves seats after the preview pinned them. A successful amend
+/// with both must freeze the moved panel, not the pre-move one.
+#[test]
+fn amend_after_a_reassign_freezes_the_moved_panel() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(
+        tmp.path(),
+        &["--providers", "cli:claude,cli:codex,cli:grok"],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        2,
+    );
+    let state = read_state(tmp.path(), &run_id);
+    let ids = slot_ids_for(&state, "reviewer");
+    assert!(ids.len() > 1, "the dispatch seated a panel: {ids:?}");
+    let seat = ids[0].clone();
+    let current = providers_for(&state, "reviewer")[0].clone();
+    // A moved seat keeps its ordinal, so any other provider's id is free.
+    let other = ["cli:claude", "cli:codex", "cli:grok"]
+        .into_iter()
+        .map(str::to_string)
+        .find(|p| *p != current)
+        .expect("a provider to move the seat to");
+    run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--reassign",
+            &format!("{seat}={other}"),
+            "--without",
+            "reviewer[1]",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let cfg = read_run_config(tmp.path(), &run_id);
+    let panel: Vec<&str> = cfg["roles"]["reviewer"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        panel,
+        vec![other.as_str()],
+        "the frozen pin names the moved provider with the drop applied: {panel:?}"
+    );
+}

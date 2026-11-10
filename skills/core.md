@@ -771,9 +771,9 @@ clamped on a word boundary to `[ship] title_max` characters (default 72, `0` = n
 of spar's own), and never past GitHub's 256-character limit.
 The PR **body** is built from the run: OPEN questions from the shipped slot's summary
 (lines under an `Open questions` heading, or lines marked `OPEN`), each reviewer's final
-verdict and the commit it named, an **Open findings (non-blocking)** list (the last
-panel's reviewer findings from `review_history`: minors under `block_on`, follow-ups,
-notes on an approving review), then the summary itself (`summary-<slot>.md`, else
+verdict and the commit it named, an **Open findings (non-blocking)** list (the latest
+reviewed round's surviving seats' findings from `review_history`: minors under `block_on`,
+follow-ups, notes on an approving review), then the summary itself (`summary-<slot>.md`, else
 `summary-impl.md`). A body over GitHub's limit is cut from the end of the summary with a
 note naming the full file. It is written to `artifacts/pr-body.md` and passed with
 `--body-file`; dry-run puts both into `artifacts/ship.md`.
