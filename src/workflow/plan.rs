@@ -883,6 +883,7 @@ fn seed_spec_bus(
                 requires_ack: false,
                 persist: false,
                 expires_after_round: None,
+                filed_round: None,
                 meta: HashMap::new(),
             },
             budget,

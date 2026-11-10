@@ -868,6 +868,9 @@ fn run_from_approved(
             state.error = Some(msg.clone());
             state.set_phase(crate::state::Phase::Quota);
             state.save(paths)?;
+            // The round already bumped above: refresh so poll files drop what the
+            // new round ages out even though no slot dispatches.
+            crate::providers::delivery::refresh_run_poll_files(paths, run_id);
             if opts.json {
                 crate::executor::emit_run_json(&state)?;
             } else {

@@ -229,6 +229,7 @@ pub fn claim(paths: &SparPaths, run_id: &str, task_id: &str, agent: &str) -> Res
             requires_ack: false,
             persist: false,
             expires_after_round: None,
+            filed_round: None,
             meta,
         },
         bus::MessageBudget::Normal,
