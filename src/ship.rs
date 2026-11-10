@@ -313,23 +313,34 @@ pub struct ShipOverride {
     findings: Vec<OpenFinding>,
 }
 
-/// Every finding of the last round the gate read: `review_history`'s highest round, or
-/// the slots' own records on a run with no history.
+/// Every finding the current round's surviving seats left: the current round's own
+/// history entries, or the slots' own records on a run with no history. Judging
+/// anything older would resurrect findings the current panel already addressed:
+/// dropping a seat prunes its entries, so the highest round left is not the
+/// round that judged.
 fn open_findings(state: &RunState) -> Vec<OpenFinding> {
-    let latest = state.review_history.iter().map(|e| e.round).max();
-    let reviews: Vec<(String, u32, &crate::workflow::review_result::ReviewResult)> = match latest {
-        Some(round) => state
-            .review_history
-            .iter()
-            .filter(|e| e.round == round)
-            .map(|e| (e.slot_id.clone(), e.round, &e.review))
-            .collect(),
-        None => state
-            .slots
-            .iter()
-            .filter_map(|s| s.review.as_ref().map(|r| (s.id.clone(), s.round, r)))
-            .collect(),
-    };
+    let live: std::collections::BTreeSet<&str> = state
+        .slots
+        .iter()
+        .filter(|s| s.role == crate::state::SlotRole::Reviewer)
+        .flat_map(|s| std::iter::once(s.id.as_str()).chain(s.former_ids.iter().map(|f| f.as_str())))
+        .collect();
+    let reviews: Vec<(String, u32, &crate::workflow::review_result::ReviewResult)> =
+        if state.review_history.is_empty() {
+            state
+                .slots
+                .iter()
+                .filter(|s| s.role == crate::state::SlotRole::Reviewer)
+                .filter_map(|s| s.review.as_ref().map(|r| (s.id.clone(), s.round, r)))
+                .collect()
+        } else {
+            state
+                .review_history
+                .iter()
+                .filter(|e| e.round == state.round && live.contains(e.slot_id.as_str()))
+                .map(|e| (e.slot_id.clone(), e.round, &e.review))
+                .collect()
+        };
     reviews
         .into_iter()
         .flat_map(|(slot_id, round, review)| {
@@ -1159,6 +1170,7 @@ mod tests {
     fn pr_body_lists_the_last_panels_open_findings() {
         let tmp = tempdir().unwrap();
         let (paths, mut state) = body_state(tmp.path());
+        state.round = 3;
         let parse = crate::workflow::review_result::parse_review;
         for (round, slot, body) in [
             (2, "review-1", "## Verdict\nrequest_changes\n## Findings\n- severity: major — fixed long ago\n"),
@@ -1633,12 +1645,22 @@ mod tests {
         }
     }
 
-    /// #166: only the last round's findings are open; earlier rounds were addressed or
-    /// re-reported.
+    /// O154: the gate judges the current round's surviving seats, never the highest
+    /// round left in history. A dropped seat's entries are pruned, so the highest
+    /// round left would otherwise fall back to an older round whose findings the
+    /// current panel already addressed.
     #[test]
-    fn open_findings_come_from_the_latest_reviewed_round() {
+    fn open_findings_judge_the_current_rounds_surviving_seats() {
         use crate::workflow::review_result::Severity;
         let mut state = RunState::new("r1", WorkflowKind::Loop, PathBuf::from("/x"));
+        for id in ["review-0", "review-1"] {
+            state.slots.push(crate::executor::init_slot(
+                id,
+                "cli:codex",
+                crate::state::SlotRole::Reviewer,
+            ));
+        }
+        state.round = 2;
         state.review_history = vec![
             crate::state::ReviewHistoryEntry {
                 round: 1,
@@ -1666,6 +1688,14 @@ mod tests {
                     vec![finding(Severity::Minor, None, None, "nit")],
                 ),
             },
+            crate::state::ReviewHistoryEntry {
+                round: 2,
+                slot_id: "review-9-dropped".into(),
+                review: review_with(
+                    "0123456789abcdef",
+                    vec![finding(Severity::Critical, None, None, "gone seat")],
+                ),
+            },
         ];
         let found = open_findings(&state);
         assert_eq!(found.len(), 2);
@@ -1677,6 +1707,13 @@ mod tests {
             finding_line(&found[1]),
             "- **minor**: nit (review-1, round 2, Reviewed-Commit `0123456789ab`)"
         );
+
+        // The dropped seat was the only one with entries in the latest round: its
+        // pruning leaves an older round behind, and the gate reports nothing rather
+        // than resurrecting that round's addressed findings.
+        state.review_history.retain(|e| e.round < 2);
+        state.round = 2;
+        assert!(open_findings(&state).is_empty());
     }
 
     #[test]
