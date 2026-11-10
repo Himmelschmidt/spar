@@ -126,7 +126,7 @@ progress, so a lift loop terminates. Two consecutive rounds that change nothing
 while a `request_changes` review against the same commit is open park at the same
 gate (O168): the first re-dispatches the implementer with a warning before the
 panel runs, the second parks with the reason in `error`. A stall parks before
-the panel, so re-enter without `--max-rounds` after changing the tree. A re-entry that would
+the panel, so re-enter after changing the tree, without `--max-rounds` below the ceiling (at the ceiling the park message names the `--max-rounds` value). A re-entry that would
 adopt a `test-contract.md` that drifted mid-round exits `1` until you pass
 `--accept-contract`. Between rounds the implementer's
 `artifacts/carry-forward-<slot>.md` is seeded into the next round's prompt, capped by

@@ -149,6 +149,36 @@ impl Fixture {
             .join(format!("review-{slot_id}.md"))
     }
 
+    /// HEAD of the implementer worktree: the head a panel would judge next.
+    fn worktree_head(&self) -> String {
+        let state = self.state();
+        let slot_id = state["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["role"] == "implementer")
+            .unwrap()["id"]
+            .as_str()
+            .unwrap();
+        let path = state["worktrees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["slot_id"].as_str() == Some(slot_id))
+            .unwrap()["path"]
+            .as_str()
+            .unwrap();
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "rev-parse HEAD failed");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
     fn implement(&self) -> assert_cmd::assert::Assert {
         self.spar()
             .args([
@@ -382,9 +412,12 @@ fn a_healthy_probe_clears_the_paused_bucket_it_reads() {
 }
 
 /// O153. A `request_changes` recorded on the shipping head still blocks ship after
-/// its seat stands down on quota: the panel head has not moved, so the veto carries
-/// instead of dying with the seat's dispatch. Dry runs cannot cover this — they
-/// skip pause gating — so the panel runs on fake CLIs.
+/// its seat stands down on quota. Round 3 changes nothing, so the stall detector
+/// parks before a panel that would only re-count the same veto; the park preserves
+/// the veto on its head instead of judging an unchanged head again. `spar ship`
+/// refuses the parked run, so the veto still blocks ship through the gate that
+/// matters. Dry runs cannot cover this: they skip pause gating, so rounds 1-2
+/// run their panels on fake CLIs.
 #[test]
 fn a_stood_down_request_changes_on_this_head_still_blocks_ship() {
     let fx = Fixture::new();
@@ -403,8 +436,9 @@ fn a_stood_down_request_changes_on_this_head_still_blocks_ship() {
     // while claude (implementer) and pi (sibling reviewer) stay usable.
     fx.pause("cli:grok");
 
-    // Past a raised ceiling: grok never dispatches, pi approves, and grok's
-    // round-2 veto on this unchanged head still holds the run.
+    // Past a raised ceiling: round 3 changes nothing, so the run stall-parks with
+    // grok's round-2 veto preserved on this unchanged head. No panel runs, so pi's
+    // artifact below is round 2's approve, not a round-3 review.
     fx.implement_round(&run_id, false, &["--max-rounds", "3"])
         .code(2);
     let st = fx.state();
@@ -427,15 +461,38 @@ fn a_stood_down_request_changes_on_this_head_still_blocks_ship() {
         Some("request_changes"),
         "its recorded verdict is untouched: {grok}"
     );
+    let head = fx.worktree_head();
+    assert_eq!(
+        grok["review"]["reviewed_commit"].as_str(),
+        Some(head.as_str()),
+        "the preserved veto names the current head, so the next panel on this head counts it: {grok}"
+    );
 
     let pi = fx.reviewer_slot(ANTHROPIC_MODEL);
     let pi_id = pi["id"].as_str().unwrap();
     let text = fs::read_to_string(fx.review_artifact(pi_id)).unwrap();
-    assert!(text.contains("approve"), "the sibling seat reviews: {text}");
+    assert!(
+        text.contains("approve"),
+        "the sibling seat's last review stands: {text}"
+    );
     let text = fs::read_to_string(fx.review_artifact(grok_id)).unwrap();
     assert!(
         text.contains("request_changes"),
         "the carried artifact is round 2's verdict: {text}"
+    );
+
+    // No round-3 panel ran to count the veto, but the run is still not
+    // shippable while it stands: the ship gate refuses the parked run.
+    let ship = fx.spar().args(["ship", &run_id]).assert().failure();
+    let err = String::from_utf8_lossy(&ship.get_output().stderr);
+    assert!(
+        err.contains("not ready to ship"),
+        "the parked run stays unshippable: {err}"
+    );
+    assert_eq!(
+        fx.state()["phase"],
+        "awaiting_round_extension",
+        "the refused ship leaves the park in place"
     );
 }
 
