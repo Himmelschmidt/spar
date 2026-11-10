@@ -2692,6 +2692,7 @@ fn bound_drop_with_role_pin_freezes_the_role_panel() {
         .map(str::to_string)
         .find(|p| *p != current)
         .expect("a provider to move the seat to");
+    let survivor = ids[1].clone();
     let survivor_provider = providers_for(&state, "reviewer")[1].clone();
     spar_cmd()
         .current_dir(tmp.path())
@@ -2728,8 +2729,14 @@ fn bound_drop_with_role_pin_freezes_the_role_panel() {
     let state = read_state(tmp.path(), &run_id);
     assert_eq!(
         slot_ids_for(&state, "reviewer"),
-        vec![format!("review-0-{}", survivor_provider.replace(':', "-"))],
+        vec![survivor],
         "the drop still removes its seat while the role pin wins the panel: {:?}",
+        state["slots"]
+    );
+    assert_eq!(
+        providers_for(&state, "reviewer"),
+        vec![survivor_provider],
+        "the surviving seat keeps its provider: {:?}",
         state["slots"]
     );
 }
