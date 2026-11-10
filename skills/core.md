@@ -86,8 +86,10 @@ fault. An `unhealthy` provider is skipped by auto-selection and backup rotation
 it, or a `--role` seat) still dispatches, with a launch warning carried on the
 run as `warnings` (stderr and `--json`); a dispatched `--backup` records source
 `cli-backup`. A `[backups]`-file entry stays a fallback and is skipped while
-unhealthy. Launch resolves readiness once per pinned provider, so a hung
-login can delay that launch up to the readiness timeout before dispatch.
+unhealthy. Launch resolves readiness once per seat where its provider is
+settled, so a hung login can delay that launch up to the readiness timeout
+before dispatch. A non-pin seat with no healthy provider fails readiness
+(exit `1`) naming the failed probes; exit `4` is quota pauses only.
 
 **A reviewer that cannot run is not a verdict (O103).** In the implement loop, a
 reviewer dispatch that fails because the provider could not serve it (rate limit, auth
