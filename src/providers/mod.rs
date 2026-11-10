@@ -270,7 +270,7 @@ pub struct SpawnOpts {
     /// value so the halves cannot split across dispatch structs. `None` means
     /// no recorded dispatch, so the adapter reads this process's ambient
     /// route. Only codex reads this field.
-    pub codex_route: Option<codex::CodexRoute>,
+    pub route: Option<codex::CodexRoute>,
 }
 
 pub trait ProviderAdapter: Send + Sync {
@@ -924,7 +924,7 @@ mod tests {
         assert!(!GrokAdapter.step_budget_exhausted("max-model-steps"));
         // Grok dispatches carry run-scoped folder trust (never operator state).
         let env = GrokAdapter.extra_env(&SpawnOpts {
-            codex_route: None,
+            route: None,
             prompt: String::new(),
             prompt_file: None,
             cwd: std::path::PathBuf::from("/tmp"),
@@ -1126,7 +1126,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("CODEX_HOME", home.path());
         let opts = SpawnOpts {
-            codex_route: None,
+            route: None,
             prompt: "go".into(),
             prompt_file: None,
             cwd: std::path::PathBuf::from("/tmp"),

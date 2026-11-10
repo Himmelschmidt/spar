@@ -355,10 +355,9 @@ mod tests {
 
     #[test]
     fn bucket_pause_benches_only_its_own_route() {
-        // Bare codex models follow the profile route from process env, so pin
-        // it: every other test thread shares this process.
-        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
+        // Bare codex models follow the ambient route, so pin both route vars:
+        // every other test thread shares this process.
+        let _pin = crate::providers::codex::pin_codex_env();
         let mut store = QuotaStore::default();
         store.pause_quota("cli:codex@openrouter", "test");
         assert!(
@@ -860,21 +859,20 @@ mod tests {
         assert_eq!(scrape_auth_signal(&log).as_deref(), Some("Not logged in"));
     }
 
-    /// A fake `codex` answering every call with `body`, holding the shared env
-    /// lock. `profile` sets `SPAR_CODEX_PROFILE` (None removes it for the
-    /// default); the recorded profile passed to `backup_eligible` decides the
-    /// bucket, never the ambient value. Restores both vars afterwards.
+    /// A fake `codex` answering every call with `body`. `profile` sets
+    /// `SPAR_CODEX_PROFILE` (None leaves the pinned default); the recorded
+    /// profile passed to `backup_eligible` decides the bucket, never the
+    /// ambient value. The route vars are pinned at unset (restored after), so
+    /// an ambient `SPAR_CODEX_MODEL` cannot move the asserted bucket.
     fn with_fake_codex(
         profile: Option<&str>,
         body: &str,
         f: impl FnOnce(&crate::paths::SparPaths),
     ) {
-        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
-        let old_profile = std::env::var("SPAR_CODEX_PROFILE").ok();
+        let _pin = crate::providers::codex::pin_codex_env();
         let old_path = std::env::var("PATH").unwrap_or_default();
-        match profile {
-            Some(p) => std::env::set_var("SPAR_CODEX_PROFILE", p),
-            None => std::env::remove_var("SPAR_CODEX_PROFILE"),
+        if let Some(p) = profile {
+            std::env::set_var("SPAR_CODEX_PROFILE", p);
         }
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
@@ -889,10 +887,6 @@ mod tests {
         }
         std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin.display()));
         f(&crate::paths::SparPaths::new(tmp.path().join("proj")));
-        match old_profile {
-            Some(v) => std::env::set_var("SPAR_CODEX_PROFILE", v),
-            None => std::env::remove_var("SPAR_CODEX_PROFILE"),
-        }
         std::env::set_var("PATH", old_path);
     }
 

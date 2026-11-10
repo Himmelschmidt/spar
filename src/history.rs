@@ -142,6 +142,12 @@ pub struct HistoryRow {
     /// Times the run entered the `quota` phase.
     #[serde(default)]
     pub quota_parks: u32,
+    /// The codex route the run's last dispatch stamped. Old lines predate it
+    /// and key from the ambient environment instead.
+    #[serde(default)]
+    pub codex_profile: Option<String>,
+    #[serde(default)]
+    pub codex_model: Option<String>,
     /// `[review] block_on` the `blocking` counts were taken at.
     #[serde(default)]
     pub block_on: Option<Severity>,
@@ -156,6 +162,16 @@ impl HistoryRow {
     /// No per-dispatch ledger: a schema 1 line or a compact one.
     pub fn run_level_only(&self) -> bool {
         self.schema_version < 2 || self.compact
+    }
+
+    /// The dispatch route this run recorded at stamp time, for quota keying.
+    /// Both `None` on an old line means no record: key from this process's
+    /// environment, exactly as a reader without the run would.
+    pub fn recorded_route(&self) -> crate::providers::RecordedRoute<'_> {
+        crate::providers::RecordedRoute {
+            profile: self.codex_profile.as_deref(),
+            model: self.codex_model.as_deref(),
+        }
     }
 }
 
@@ -352,6 +368,8 @@ pub fn row(
             .iter()
             .filter(|e| e.kind == EventKind::Phase && e.phase == Some(Phase::Quota))
             .count() as u32,
+        codex_profile: state.codex_profile.clone(),
+        codex_model: state.codex_model.clone(),
         block_on: Some(block_on),
         compact: false,
     }

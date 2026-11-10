@@ -184,7 +184,7 @@ fn call(
         return CallOutcome::without_output(Verdict::Skipped, Some("not on PATH".into()));
     };
     let opts = SpawnOpts {
-        codex_route: route.into_carrier(),
+        route: route.into_carrier(),
         prompt: PROBE_PROMPT.into(),
         prompt_file: None,
         cwd: paths.project_root.clone(),
@@ -441,8 +441,7 @@ mod tests {
 
     #[test]
     fn a_healthy_probe_clears_the_bucket_key_the_seat_reads() {
-        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
+        let _pin = crate::providers::codex::pin_codex_env();
         let mut store = QuotaStore::default();
         store.pause_quota("cli:codex@openrouter", "route limit");
         store.mark_strong("cli:codex@openrouter");
@@ -603,16 +602,12 @@ mod tests {
         );
     }
 
-    /// A fake `codex` answering every call with `body`, with the ambient profile
-    /// at its default so a bare ref keys the `openrouter` bucket. Holds the
-    /// shared env lock and restores `PATH` and `SPAR_CODEX_PROFILE` after.
+    /// A fake `codex` answering every call with `body`, with both route vars
+    /// pinned at unset (restored after) so a bare ref keys the `openrouter`
+    /// bucket whatever the operator's shell holds.
     fn with_fake_codex(body: &str, f: impl FnOnce(&SparPaths)) {
-        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
-        let old_profile = std::env::var("SPAR_CODEX_PROFILE").ok();
-        let old_model = std::env::var("SPAR_CODEX_MODEL").ok();
+        let _pin = crate::providers::codex::pin_codex_env();
         let old_path = std::env::var("PATH").unwrap_or_default();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
-        std::env::remove_var("SPAR_CODEX_MODEL");
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -626,14 +621,6 @@ mod tests {
         }
         std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin.display()));
         f(&SparPaths::new(tmp.path().join("proj")));
-        match old_profile {
-            Some(v) => std::env::set_var("SPAR_CODEX_PROFILE", v),
-            None => std::env::remove_var("SPAR_CODEX_PROFILE"),
-        }
-        match old_model {
-            Some(v) => std::env::set_var("SPAR_CODEX_MODEL", v),
-            None => std::env::remove_var("SPAR_CODEX_MODEL"),
-        }
         std::env::set_var("PATH", old_path);
     }
 

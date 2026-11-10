@@ -169,7 +169,7 @@ struct PreparedSlot {
     /// The dispatch route recorded in run state (`RunState::codex_route`),
     /// carried across the thread boundary so the spawn keys the seat this run
     /// actually dispatched instead of this worker's ambient environment.
-    codex_route: Option<crate::providers::codex::CodexRoute>,
+    route: Option<crate::providers::codex::CodexRoute>,
     /// Held for the dispatch's lifetime; dropped (and the directory removed) once the
     /// outcome has been applied.
     _tmp: SlotTmp,
@@ -448,7 +448,7 @@ fn prepare_slot_execution(
         session_provider,
         cfg: cfg.clone(),
         dry_run: state.dry_run,
-        codex_route: state.codex_route(),
+        route: state.codex_route(),
         _tmp: tmp,
         _fleet_lease: fleet_lease,
         _build_cache: build_cache.and_then(|(lease, _)| lease),
@@ -1188,7 +1188,7 @@ fn execute_prepared(
         effort: prep.job.effort,
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(prep.paths.sessions_dir(&prep.run_id, &prep.job.slot_id)),
-        codex_route: prep.codex_route.clone(),
+        route: prep.route.clone(),
     };
     let (mut cmd, used_resume) = build_dispatch_command(
         adapter.as_ref(),
@@ -1339,7 +1339,7 @@ fn execute_prepared(
                     slot_id: &prep.job.slot_id,
                     round: prep.round,
                     role: prep.job.role,
-                    codex_route: prep.codex_route.clone(),
+                    route: prep.route.clone(),
                     owns_cwd: prep.owns_cwd,
                     provider: &prep.job.provider,
                     model: prep.job.model.clone(),
@@ -1514,7 +1514,7 @@ fn execute_prepared(
                 slot_id: &prep.job.slot_id,
                 round: prep.round,
                 role: prep.job.role,
-                codex_route: prep.codex_route.clone(),
+                route: prep.route.clone(),
                 owns_cwd: prep.owns_cwd,
                 provider: &prep.job.provider,
                 model: prep.job.model.clone(),
@@ -1579,7 +1579,7 @@ struct ArtifactRecovery<'a> {
     slot_id: &'a str,
     round: u32,
     role: SlotRole,
-    codex_route: Option<crate::providers::codex::CodexRoute>,
+    route: Option<crate::providers::codex::CodexRoute>,
     /// `cwd` is this slot's own worktree. See [`owns_cwd`].
     owns_cwd: bool,
     provider: &'a str,
@@ -1760,7 +1760,7 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
         effort: r.effort,
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(r.paths.sessions_dir(r.run_id, r.slot_id)),
-        codex_route: r.codex_route.clone(),
+        route: r.route.clone(),
     };
     let cmd = adapter.build_headless(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
@@ -3998,7 +3998,7 @@ fn run_headless(
         effort: slot_effort_for(cfg, Some(state), job),
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(paths.sessions_dir(&state.id, &job.slot_id)),
-        codex_route: state.codex_route(),
+        route: state.codex_route(),
     };
     let prior_session_id =
         prior_session_for_role(paths, &state.id, &job.slot_id, cli_name, job.role);
@@ -4138,7 +4138,7 @@ fn run_headless(
                     slot_id: &job.slot_id,
                     round: state.round,
                     role: job.role,
-                    codex_route: state.codex_route(),
+                    route: state.codex_route(),
                     owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                     provider: &job.provider,
                     model: slot_model_for(Some(state), job),
@@ -4293,7 +4293,7 @@ fn run_headless(
                 slot_id: &job.slot_id,
                 round: state.round,
                 role: job.role,
-                codex_route: state.codex_route(),
+                route: state.codex_route(),
                 owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                 provider: &job.provider,
                 model: slot_model_for(Some(state), job),
@@ -4514,7 +4514,7 @@ fn run_tmux(
         effort,
         timeout_secs: None,
         session_dir: Some(paths.sessions_dir(&state.id, &job.slot_id)),
-        codex_route: state.codex_route(),
+        route: state.codex_route(),
     };
     // The pane is teed to a log, never run through `StreamCoalescer`, so no id is
     // ever captured here (O65). An adapter that accepts a caller-supplied id gets
@@ -5111,7 +5111,7 @@ mod tests {
 
     fn dispatch_opts(prompt: &str) -> SpawnOpts {
         SpawnOpts {
-            codex_route: None,
+            route: None,
             prompt: prompt.into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
@@ -7911,7 +7911,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     /// seat dispatched natively writes and reads `cli:codex@native`.
     #[test]
     fn recorded_codex_profile_governs_writes_and_reads_under_a_foreign_env() {
-        let _guard = providers::codex::ENV_LOCK.lock().unwrap();
+        let _pin = providers::codex::pin_codex_env();
         std::env::set_var("SPAR_CODEX_PROFILE", "muse");
         let seat = seat_ref("cli:codex");
         let write = quota_write_key(

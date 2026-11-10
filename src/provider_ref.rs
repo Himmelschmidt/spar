@@ -419,8 +419,7 @@ mod tests {
             "cli:agy@flash",
             "agy always writes the seat"
         );
-        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
+        let _pin = crate::providers::codex::pin_codex_env();
         let codex = ProviderRef::parse("cli:codex@gpt-5").unwrap();
         assert_eq!(
             codex.rejection_key(
@@ -439,8 +438,7 @@ mod tests {
     fn quota_key_splits_codex_by_route() {
         // The profile route is process env, so pin it: every other test thread
         // shares this process.
-        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
+        let _pin = crate::providers::codex::pin_codex_env();
         let routed = ProviderRef::parse("cli:codex@gpt-5.2-codex").unwrap();
         assert_eq!(
             routed.quota_key(RecordedRoute::ambient()),
@@ -479,7 +477,6 @@ mod tests {
             "cli:codex@openrouter",
             "an explicit slug forces OpenRouter under any profile"
         );
-        std::env::remove_var("SPAR_CODEX_PROFILE");
     }
 
     #[test]
@@ -487,7 +484,7 @@ mod tests {
         use crate::providers::QuotaSignal;
         // The seat's bucket comes from the profile the run recorded at dispatch,
         // not from whatever SPAR_CODEX_PROFILE the keying process holds.
-        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
+        let _pin = crate::providers::codex::pin_codex_env();
         std::env::set_var("SPAR_CODEX_PROFILE", "");
         let bare = ProviderRef::parse("cli:codex").unwrap();
         assert_eq!(
@@ -548,7 +545,6 @@ mod tests {
             "cli:codex@openrouter",
             "rejections land in the recorded bucket too"
         );
-        std::env::remove_var("SPAR_CODEX_PROFILE");
     }
 
     #[test]
@@ -596,8 +592,7 @@ mod tests {
         // back through `quota_key` must be a fixed point, never a collapse.
         // Codex bucketing reads the profile route from process env, so pin it:
         // every other test thread shares this process.
-        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
+        let _pin = crate::providers::codex::pin_codex_env();
         for seat in [
             "cli:codex",
             "cli:codex@openrouter",
@@ -651,8 +646,7 @@ mod tests {
     #[test]
     fn rejection_key_lands_in_the_seat_bucket() {
         use crate::providers::{QuotaSignal, RateLimitWindow as W};
-        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
-        std::env::remove_var("SPAR_CODEX_PROFILE");
+        let _pin = crate::providers::codex::pin_codex_env();
         let key = |seat: &str, window: Option<W>, text: &str| {
             ProviderRef::parse(seat)
                 .unwrap()
