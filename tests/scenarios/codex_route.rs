@@ -1,6 +1,6 @@
 //! Codex route unification: one resolver feeds the spawn and every quota and
 //! rejection key, so a model-less `cli:codex` seat keys the bucket it bills.
-//! All seven drive the real binary with `--dry-run` (no provider CLI needed);
+//! All fourteen drive the real binary with `--dry-run` (no provider CLI needed);
 //! the recorded route in `state.json` is the seam under test.
 
 mod common;
@@ -125,6 +125,17 @@ impl Sandbox {
             .collect();
         assert_eq!(runs.len(), 1, "{runs:?}");
         assert_eq!(self.count("claude"), 1, "implementer dispatched");
+        runs.pop().unwrap()
+    }
+
+    /// The one run dir in the sandbox project.
+    fn single_run(&self) -> String {
+        let mut runs: Vec<String> = std::fs::read_dir(self.project.join(".spar/runs"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(runs.len(), 1, "{runs:?}");
         runs.pop().unwrap()
     }
 
@@ -337,6 +348,239 @@ fn arena_stamps_the_codex_route() {
     let v = json(&out);
     let id = v["run_id"].as_str().expect("arena mints a run: {v}");
     assert_eq!(sb.state(id)["codex_profile"], "", "{v}");
+}
+
+/// A `--run` probe bills the keyed bucket: a run stamped model-less under an
+/// emptied profile keys `native`, and the spawn omits `-p` even when this
+/// shell's ambient profile would select one.
+#[test]
+fn probe_run_spawns_the_recorded_route() {
+    let sb = Sandbox::new();
+    let id = sb.plan_codex(None, Some(""));
+    sb.cli("codex", "exit 1");
+    let out = sb
+        .spar()
+        .args([
+            "provider",
+            "probe",
+            "cli:codex",
+            "--dry-run",
+            "--json",
+            "--run",
+            &id,
+        ])
+        .output()
+        .unwrap();
+    let r = json(&out);
+    let rows = r.as_array().expect("probe returns rows: {r}");
+    let row = rows
+        .iter()
+        .find(|r| r["provider"] == "cli:codex@native")
+        .expect("native key: {r}");
+    let detail = row["detail"].as_str().unwrap_or("");
+    assert!(
+        !detail.contains(" -p "),
+        "spawn renders the record, not ambient: {detail}"
+    );
+}
+
+/// A recorded codex model stays inside the codex adapter: probing another
+/// provider from the same run never renders it into that provider's spawn.
+#[test]
+fn probe_run_keeps_a_recorded_codex_model_off_other_adapters() {
+    let sb = Sandbox::new();
+    let id = sb.plan_codex(Some("gpt-5"), None);
+    sb.cli("claude", "exit 1");
+    sb.cli("codex", "exit 1");
+    let out = sb
+        .spar()
+        .args([
+            "provider",
+            "probe",
+            "cli:claude",
+            "--dry-run",
+            "--json",
+            "--run",
+            &id,
+        ])
+        .output()
+        .unwrap();
+    let r = json(&out);
+    let rows = r.as_array().expect("probe returns rows: {r}");
+    let row = rows
+        .iter()
+        .find(|r| r["provider"] == "cli:claude")
+        .expect("claude row: {r}");
+    let detail = row["detail"].as_str().unwrap_or("");
+    assert!(!detail.contains("gpt-5"), "codex model leaks: {detail}");
+    let out = sb
+        .spar()
+        .args([
+            "provider",
+            "probe",
+            "cli:codex",
+            "--dry-run",
+            "--json",
+            "--run",
+            &id,
+        ])
+        .output()
+        .unwrap();
+    let r = json(&out);
+    let rows = r.as_array().expect("probe returns rows: {r}");
+    let row = rows
+        .iter()
+        .find(|r| r["provider"] == "cli:codex@native")
+        .expect("native key: {r}");
+    let detail = row["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("-m gpt-5"),
+        "codex replays the recorded model: {detail}"
+    );
+}
+
+/// Roles and peer runs dispatch seats without going through the plan or
+/// implement entries, so they stamp the codex route themselves.
+#[test]
+fn roles_stamps_the_codex_route() {
+    let sb = Sandbox::new();
+    let out = sb
+        .spar()
+        .env("SPAR_CODEX_PROFILE", "")
+        .args([
+            "run",
+            "--workflow",
+            "roles",
+            "-t",
+            "split this",
+            "--providers",
+            "cli:codex",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v = json(&out);
+    let id = v["run_id"].as_str().expect("roles mints a run: {v}");
+    assert_eq!(sb.state(id)["codex_profile"], "", "{v}");
+}
+
+#[test]
+fn peer_stamps_the_codex_route() {
+    let sb = Sandbox::new();
+    let out = sb
+        .spar()
+        .env("SPAR_CODEX_PROFILE", "")
+        .args([
+            "run",
+            "--workflow",
+            "peer",
+            "-t",
+            "pair on this",
+            "--providers",
+            "cli:codex",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v = json(&out);
+    let id = v["run_id"].as_str().expect("peer mints a run: {v}");
+    assert_eq!(sb.state(id)["codex_profile"], "", "{v}");
+}
+
+/// `reconcile` starts a new dispatch on the arena run, so it re-stamps the
+/// codex route from its own environment instead of keeping the arena record.
+#[test]
+fn reconcile_restamps_the_codex_route() {
+    let sb = Sandbox::new();
+    let out = sb
+        .spar()
+        .env("SPAR_CODEX_PROFILE", "")
+        .args([
+            "run",
+            "--workflow",
+            "arena",
+            "-t",
+            "race two",
+            "--providers",
+            "cli:codex",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v = json(&out);
+    let id = v["run_id"].as_str().expect("arena mints a run: {v}");
+    assert_eq!(sb.state(id)["codex_profile"], "", "{v}");
+    let out = sb
+        .spar()
+        .env("SPAR_CODEX_PROFILE", "muse")
+        .args(["reconcile", id, "--json"])
+        .output()
+        .unwrap();
+    let v = json(&out);
+    assert_eq!(sb.state(id)["codex_profile"], "muse", "{v}");
+}
+
+/// `amend` dispatches the test author, so it re-stamps the codex route from
+/// its own environment instead of keeping the plan record.
+#[test]
+fn amend_restamps_the_codex_route() {
+    let sb = Sandbox::new();
+    let id = sb.plan_codex(None, Some(""));
+    assert_eq!(sb.state(&id)["codex_profile"], "");
+    let out = sb
+        .spar()
+        .env("SPAR_CODEX_PROFILE", "muse")
+        .args([
+            "amend",
+            "--run",
+            &id,
+            "--contract",
+            "add a portability criterion",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v = json(&out);
+    assert_eq!(sb.state(&id)["codex_profile"], "muse", "{v}");
+}
+
+/// An `implement --run` resume starts a new dispatch, so it re-stamps the
+/// codex route: a live run that fails fast under an emptied profile resumes
+/// dry under the default profile and records it.
+#[test]
+fn implement_resume_restamps_the_codex_route() {
+    let sb = Sandbox::new();
+    sb.cli("codex", "exit 1");
+    let out = sb
+        .spar()
+        .env("SPAR_CODEX_PROFILE", "")
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--providers",
+            "cli:codex",
+            "--fleet",
+            "small",
+            "--without",
+            "suite",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let id = sb.single_run();
+    assert_eq!(sb.state(&id)["codex_profile"], "");
+    let out = sb
+        .spar()
+        .env("SPAR_CODEX_PROFILE", "muse")
+        .args(["implement", "--run", &id, "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    let v = json(&out);
+    assert_eq!(sb.state(&id)["codex_profile"], "muse", "{v}");
 }
 
 /// A replan is a new dispatch: it re-stamps the codex route instead of
