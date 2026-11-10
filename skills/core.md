@@ -1923,12 +1923,14 @@ it before anyone confirms:
 - `fleet`: the seats, in the run JSON `fleet` shape (`{seat, role, provider, model, source,
   projected}`), resolved by the same functions the launch uses: plan-phase seats plus the
   projected implement panel for `plan`, the implement panel for `implement -t` and
-  `--workflow loop`, the reviewers for `--workflow review`, and the run's own seats for
-  `implement --run <id>` and `plan --run <id>`. Quota pauses are not re-probed, so a
-  paused primary with no backup shows as itself. Readiness is probed for real: an
-  unhealthy seat shows the fallback launch would take, and a panel with nothing
-  healthy fails with the same readiness error launch would print. `null` with
-  `--select` and for arena, peer and roles.
+  `--workflow loop`, the reviewers for `--workflow review`, and for `implement --run
+  <id>` and `plan --run <id>` the run's stored seats projected through the next
+  dispatch's re-resolution: a paused seat shows its backup, a sick seat its
+  fallback. Quota pauses are not re-probed, so a paused primary with no backup
+  shows as itself. Readiness is probed for real: an unhealthy seat shows the
+  fallback launch would take, and a panel with nothing healthy fails with the
+  same readiness error launch would print. `null` with `--select` and for arena,
+  peer and roles.
 - `gates`: `autonomy` plus `auto_plan`, `auto_winner`, `auto_ship`, true when the config
   (`autonomy`, `[gates]`, `[ship].auto_confirm`) would pass that gate without the operator.
 - `implement --run <id> --validate-only` also refuses, as data, a run that is not resumable

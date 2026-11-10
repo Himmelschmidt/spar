@@ -261,6 +261,75 @@ fn validate_only_refuses_a_run_that_cannot_continue() {
     );
 }
 
+/// A continued run's `--validate-only` fleet mirrors the next dispatch: a paused
+/// implementer with a backup shows the backup seat, not the stored one.
+#[test]
+fn validate_only_run_projects_paused_seats_onto_backups() {
+    let sb = Sandbox::new();
+    std::fs::write(
+        sb.project.join("spar.toml"),
+        "[backups]\nimplementer = \"api:xai\"\n",
+    )
+    .unwrap();
+    // A dry run stores the panel without dispatching; flipping `dry_run` then
+    // exercises the live projection over those stored seats.
+    let out = sb
+        .spar()
+        .args([
+            "plan",
+            "-t",
+            "task",
+            "--providers",
+            "api:openai,api:xai",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let id = json(&out)["run_id"].as_str().unwrap().to_string();
+    sb.spar()
+        .args(["approve", &id, "--json"])
+        .assert()
+        .success();
+    sb.spar()
+        .args(["implement", "--run", &id, "--dry-run", "--json"])
+        .assert()
+        .code(2);
+    let state_path = sb.project.join(format!(".spar/runs/{id}/state.json"));
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    state["dry_run"] = serde_json::Value::Bool(false);
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    sb.spar()
+        .args(["provider", "pause", "api:openai"])
+        .assert()
+        .success();
+    let out = sb
+        .spar()
+        .args(["implement", "--run", &id, "--json", "--validate-only"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json(&out);
+    let fleet = v["fleet"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no fleet: {v}"));
+    assert!(
+        fleet.iter().any(|s| s["role"] == "implementer"
+            && s["provider"] == "api:xai"
+            && s["projected"] == true),
+        "{v}"
+    );
+    assert!(
+        fleet
+            .iter()
+            .filter(|s| s["role"] == "implementer")
+            .all(|s| s["provider"] != "api:openai"),
+        "{v}"
+    );
+}
+
 /// #187: every refusal before a run exists is exit 1 with one parseable shape, and
 /// leaves nothing under `.spar/runs`.
 #[test]

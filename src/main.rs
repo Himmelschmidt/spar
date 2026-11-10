@@ -226,11 +226,15 @@ fn run() -> Result<ExitCode> {
                     Err(e) => return launch_refused(e, json, Some(&id)),
                 };
                 if validate_only {
+                    // A replan still dispatches the stored seats through the
+                    // re-check, so show the projection, not the stored seats.
                     return launch_validated(
                         json,
                         Some(&id),
                         &cfg,
-                        Some(executor::run_fleet_seats(&st)),
+                        Some(workflow::implement::project_continued_fleet(
+                            &st, &paths, &cfg,
+                        )),
                     );
                 }
                 cfg.reapply_captured_env();
@@ -500,7 +504,11 @@ fn run() -> Result<ExitCode> {
                                     .into());
                                 }
                             }
-                            fleet = Some(executor::run_fleet_seats(&st));
+                            // A continued run re-resolves stored seats on dispatch, so
+                            // show the projection, not the stored seats.
+                            fleet = Some(workflow::implement::project_continued_fleet(
+                                &st, &paths, &cfg,
+                            ));
                         }
                         if let Some(mr) = max_rounds {
                             workflow::implement::check_round_extension(
