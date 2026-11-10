@@ -33,9 +33,44 @@ pub struct ApiSlotRequest<'a> {
     pub dry_run: bool,
     /// Override model from env default (model-select).
     pub model_override: Option<String>,
+    /// Inject the credential instead of reading the process environment, so
+    /// tests never touch shared env vars.
+    pub api_key: Option<String>,
+    /// Inject the endpoint instead of reading the process environment.
+    pub base_url: Option<String>,
 }
 
-pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, Usage)> {
+/// What one api-sdk dispatch produced. The hard ceiling is reported with the
+/// same typed cause the native-cli path reports, so the workflow treats both
+/// backends identically.
+pub struct ApiSlotOutcome {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub usage: Usage,
+    pub timeout_cause: Option<crate::executor::TimeoutCause>,
+}
+
+impl ApiSlotOutcome {
+    fn fail(error: String, usage: Usage) -> Self {
+        Self {
+            ok: false,
+            error: Some(error),
+            usage,
+            timeout_cause: None,
+        }
+    }
+
+    fn done(usage: Usage) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            usage,
+            timeout_cause: None,
+        }
+    }
+}
+
+pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<ApiSlotOutcome> {
     let mut usage = Usage {
         provider: Some(format!("api:{}", req.provider_name)),
         ..Default::default()
@@ -61,14 +96,17 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, U
                 )?;
             }
         }
-        return Ok((true, None, usage));
+        return Ok(ApiSlotOutcome::done(usage));
     }
 
-    let mut cfg = ApiProviderConfig::resolve(req.provider_name)?;
+    let mut cfg = ApiProviderConfig::resolve(req.provider_name, req.api_key.as_deref())?;
     if let Some(m) = &req.model_override {
         if !m.is_empty() {
             cfg.model = m.clone();
         }
+    }
+    if let Some(u) = &req.base_url {
+        cfg.base_url = u.clone();
     }
     usage.model = Some(cfg.model.clone());
 
@@ -100,14 +138,23 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, U
     let start = std::time::Instant::now();
     let max_steps = 12u32;
     for step in 0..max_steps {
-        if start.elapsed() > req.timeout {
-            return Ok((false, Some("api slot timeout".into()), usage));
+        let remaining = req
+            .timeout
+            .checked_sub(start.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            return Ok(ceiling_outcome(usage));
         }
         append_log(
             req.log_path,
             &format!("\n--- api step {step} model={} ---\n", cfg.model),
         )?;
-        let result = openai_compat::chat_completion(&cfg, &messages)?;
+        let result = match openai_compat::chat_completion(&cfg, &messages, remaining) {
+            Err(e) if is_timeout(&e) || start.elapsed() >= req.timeout => {
+                return Ok(ceiling_outcome(usage));
+            }
+            result => result?,
+        };
         usage.input_tokens += result.input_tokens;
         usage.output_tokens += result.output_tokens;
         usage.peak_input_tokens = usage.peak_input_tokens.max(result.input_tokens);
@@ -121,13 +168,12 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, U
 
         if result.content.contains("FINAL:") {
             if !artifact_ok(req) {
-                return Ok((
-                    false,
-                    Some("missing expected artifact after FINAL".into()),
+                return Ok(ApiSlotOutcome::fail(
+                    "missing expected artifact after FINAL".into(),
                     usage,
                 ));
             }
-            return Ok((true, None, usage));
+            return Ok(ApiSlotOutcome::done(usage));
         }
 
         if let Some(tool_line) = extract_tool_json(&result.content) {
@@ -145,13 +191,12 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, U
 
         if step + 1 == max_steps {
             if !artifact_ok(req) {
-                return Ok((
-                    false,
-                    Some("api slot finished without expected artifact".into()),
+                return Ok(ApiSlotOutcome::fail(
+                    "api slot finished without expected artifact".into(),
                     usage,
                 ));
             }
-            return Ok((true, None, usage));
+            return Ok(ApiSlotOutcome::done(usage));
         }
         messages.push(ChatMessage {
             role: "user".into(),
@@ -159,13 +204,30 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<(bool, Option<String>, U
         });
     }
     if !artifact_ok(req) {
-        return Ok((
-            false,
-            Some("api slot finished without expected artifact".into()),
+        return Ok(ApiSlotOutcome::fail(
+            "api slot finished without expected artifact".into(),
             usage,
         ));
     }
-    Ok((true, None, usage))
+    Ok(ApiSlotOutcome::done(usage))
+}
+
+fn ceiling_outcome(usage: Usage) -> ApiSlotOutcome {
+    ApiSlotOutcome {
+        ok: false,
+        error: Some("api slot timeout".into()),
+        usage,
+        timeout_cause: Some(crate::executor::TimeoutCause::HardCeiling),
+    }
+}
+
+/// Whether the chat call failed on its own deadline rather than the API: the
+/// transport error then reads as the hard ceiling, like the step-loop check.
+fn is_timeout(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<ureq::Error>(),
+        Some(ureq::Error::Timeout(..))
+    )
 }
 
 fn artifact_ok(req: &ApiSlotRequest<'_>) -> bool {
@@ -364,6 +426,35 @@ fn _paths_touch(_: &SparPaths) {}
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// The api-sdk backend reports the typed hard-ceiling cause the same way
+    /// the native-cli path does, so the workflow treats both backends
+    /// identically. A zero timeout reaches the ceiling arm before any network
+    /// call. The credential is injected on the request: no test may mutate
+    /// the shared process environment. Fails on the old untyped timeout
+    /// error, which carried `timeout_cause: None` and failed the round empty.
+    #[test]
+    fn hard_ceiling_reports_a_typed_cause() {
+        let tmp = tempdir().unwrap();
+        let outcome = run_api_slot(&ApiSlotRequest {
+            provider_name: "openai",
+            prompt: "hello",
+            cwd: tmp.path(),
+            log_path: &tmp.path().join("api.log"),
+            expected_artifact: None,
+            timeout: std::time::Duration::ZERO,
+            dry_run: false,
+            model_override: None,
+            api_key: Some("test-key".to_string()),
+            base_url: None,
+        })
+        .unwrap();
+        assert!(!outcome.ok, "a ceiling kill is not a success");
+        assert_eq!(
+            outcome.timeout_cause,
+            Some(crate::executor::TimeoutCause::HardCeiling)
+        );
+    }
 
     #[test]
     fn rejects_parent_dir() {

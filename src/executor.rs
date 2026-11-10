@@ -158,6 +158,13 @@ struct PreparedSlot {
     /// against it (never re-derived later): from round 2 on the run base predates
     /// earlier rounds' commits, so the base always reads as work.
     dispatch_head: Option<String>,
+    /// Content digest of the slot's worktree when this round started, stamped
+    /// alongside `dispatch_head`. Uncommitted changes count only past it.
+    dispatch_tree: Option<String>,
+    /// The round's own banked WIP commit, if the ceiling already banked this
+    /// round's leftovers: the kept-work gate must not read the bank back as
+    /// fresh work on a same-round resume.
+    banked_head: Option<String>,
     round: u32,
     /// The native session/thread id an earlier round of this same slot captured
     /// (`markers::read_session_id`), if any. `execute_prepared` passes it to the
@@ -170,6 +177,10 @@ struct PreparedSlot {
     /// sizes its budgets and nudge cadence off the same document every other phase reads.
     cfg: Config,
     dry_run: bool,
+    /// The dispatch profile recorded in run state (`RunState::codex_profile`),
+    /// carried across the thread boundary so the spawn keys the seat this run
+    /// actually dispatched instead of this worker's ambient environment.
+    codex_profile: Option<String>,
     /// Held for the dispatch's lifetime; dropped (and the directory removed) once the
     /// outcome has been applied.
     _tmp: SlotTmp,
@@ -387,19 +398,25 @@ fn prepare_slot_execution(
         s.quota_hit = false;
         s.auth_fault = false;
         s.timeout_cause = None;
-        // The round's start HEAD, stamped once when the slot joins the round. A
-        // same-round backup retry re-dispatches the same worktree, so re-stamping
-        // would measure against its own start and the primary seat's commits
-        // would read as no work.
+        // The round's start HEAD and tree, stamped once when the slot joins
+        // the round. A same-round backup retry re-dispatches the same worktree,
+        // so re-stamping would measure against its own start and the primary
+        // seat's commits would read as no work. A same-round resume keeps both
+        // for the same reason: the round's own banked commit still compares
+        // against the round's start.
         if s.round != round || s.dispatch_head.is_none() {
             s.dispatch_head = role_is_recoverable(job.role)
                 .then(|| git_output(&cwd, &["rev-parse", "HEAD"]))
+                .flatten();
+            s.dispatch_tree = role_is_recoverable(job.role)
+                .then(|| worktree_snapshot(&cwd))
                 .flatten();
         }
         clear_expected_artifact(paths, &run_id, &job);
         s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
+        s.stood_down = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -425,6 +442,9 @@ fn prepare_slot_execution(
         &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
     );
     let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
+    // The turn that can read the poll file starts here: claim what piled up
+    // while the slot was idle so the word flips from `queued` to `delivered`.
+    crate::providers::delivery::drain_slot_backlog(paths, state, &job.slot_id);
     let tmp = SlotTmp::create(paths, &state.id, &job.slot_id, state.isolation);
     let mut env = wire_slot_presence(state, paths, &job, &cwd, &pref);
     env.extend(tmp.env());
@@ -437,11 +457,9 @@ fn prepare_slot_execution(
         prior_session_for_role(paths, &state.id, &job.slot_id, &session_provider, job.role);
     let fleet_lease = crate::fleet::SlotLease::start(paths, &state.id, &job.slot_id, &job.provider);
 
-    let dispatch_head = state
-        .slots
-        .iter()
-        .find(|s| s.id == job.slot_id)
-        .and_then(|s| s.dispatch_head.clone());
+    let slot = state.slots.iter().find(|s| s.id == job.slot_id);
+    let dispatch_head = slot.and_then(|s| s.dispatch_head.clone());
+    let dispatch_tree = slot.and_then(|s| s.dispatch_tree.clone());
     Ok(PreparedSlot {
         job,
         cwd,
@@ -453,12 +471,15 @@ fn prepare_slot_execution(
         paths: paths.clone(),
         run_id: state.id.clone(),
         dispatch_head,
+        dispatch_tree,
+        banked_head: banked_partial_commit(state, round),
         owns_cwd,
         round,
         prior_session_id,
         session_provider,
         cfg: cfg.clone(),
         dry_run: state.dry_run,
+        codex_profile: state.codex_profile.clone(),
         _tmp: tmp,
         _fleet_lease: fleet_lease,
         _build_cache: build_cache.and_then(|(lease, _)| lease),
@@ -623,6 +644,37 @@ fn build_dispatch_command(
     (adapter.build_headless(bin, opts), false)
 }
 
+/// Build the command for a same-dispatch retry: the transient retry inside
+/// `dispatch_with_resume_recovery` and the credential-refresh retry below it.
+/// A retry that resolves to a resume keeps the captured session, so the work
+/// the failed attempt did stays in context. A retry that stays cold must never
+/// reuse the session id the attempt it follows carried: that attempt already
+/// created the session vendor-side, and the vendor refuses the id as already
+/// in use (#241). `attempt` counts the retries this dispatch already issued,
+/// so every attempt of the round carries a distinct id.
+#[allow(clippy::too_many_arguments)]
+fn build_retry_command(
+    adapter: &dyn providers::ProviderAdapter,
+    bin: &Path,
+    opts: &mut SpawnOpts,
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+    session_provider: &str,
+    round: u32,
+    attempt: u32,
+    prior_session_id: Option<&str>,
+) -> (std::process::Command, bool) {
+    let (cmd, used_resume) = build_dispatch_command(adapter, bin, opts, prior_session_id);
+    if used_resume || !adapter.capabilities().assigns_session_id {
+        return (cmd, used_resume);
+    }
+    let id = session_id::derive_retry(run_id, slot_id, round, attempt);
+    opts.session_id = Some(id.clone());
+    let _ = markers::write_session_id(paths, run_id, slot_id, session_provider, &id);
+    (adapter.build_headless(bin, opts), false)
+}
+
 /// True when a resume dispatch exited without ever establishing a session (no
 /// `thread.started` captured). Necessary but not sufficient evidence that the vendor's
 /// rollout is gone (pruned, a different `CODEX_HOME`, a moved box) — plenty of other
@@ -780,6 +832,7 @@ fn name_cold_retry(
 /// so tests never sleep the real schedule.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_with_resume_recovery(
+    classifier: &crate::classifier::Classifier,
     adapter: &dyn providers::ProviderAdapter,
     bin: &Path,
     opts: &mut SpawnOpts,
@@ -867,7 +920,7 @@ fn dispatch_with_resume_recovery(
     let backoff = transient_backoff_secs();
     let mut retries = 0usize;
     let advise = |res: &process::SpawnResult| {
-        classifier_dispatch_advice(adapter, paths, run_id, slot_id, res, &log_path)
+        classifier_dispatch_advice(classifier, adapter, paths, run_id, slot_id, res, &log_path)
     };
     let mut advice = advise(&res);
     while retries < backoff.len()
@@ -907,11 +960,23 @@ fn dispatch_with_resume_recovery(
         );
         sleep(wait);
         let prior = markers::read_session_id(paths, run_id, slot_id, session_provider);
-        // D2 is enforced inside `build_dispatch_command`: a retry that resolves
-        // to a resume drops the cold dispatch's assigned id there, so muse can
-        // never emit `--session-id` twice.
-        let (cmd, retry_used_resume) =
-            build_dispatch_command(adapter, bin, &mut *opts, prior.as_deref());
+        // D2 is enforced inside `build_dispatch_command` (via
+        // `build_retry_command`): a retry that resolves to a resume drops the
+        // cold dispatch's assigned id there, so muse can never emit
+        // `--session-id` twice; a retry that stays cold takes a fresh
+        // `derive_retry` id instead of reusing the refused one.
+        let (cmd, retry_used_resume) = build_retry_command(
+            adapter,
+            bin,
+            &mut *opts,
+            paths,
+            run_id,
+            slot_id,
+            session_provider,
+            round,
+            retries as u32,
+            prior.as_deref(),
+        );
         let (program, args) = providers::command_to_parts(&cmd);
         let (program, args) = sandbox::maybe_wrap(isolation, &cwd, &program, &args);
         let req = SpawnRequest {
@@ -996,7 +1061,22 @@ fn dispatch_with_resume_recovery(
         );
         sleep(wait);
         let prior = markers::read_session_id(paths, run_id, slot_id, session_provider);
-        let (cmd, _) = build_dispatch_command(adapter, bin, &mut *opts, prior.as_deref());
+        // Same rule as the transient retry above: a resume keeps the captured
+        // session, a cold retry takes a fresh `derive_retry` id (#241). `retries`
+        // counts the transient retries already issued, so the auth retry's id
+        // is distinct from every attempt before it.
+        let (cmd, _) = build_retry_command(
+            adapter,
+            bin,
+            &mut *opts,
+            paths,
+            run_id,
+            slot_id,
+            session_provider,
+            round,
+            retries as u32,
+            prior.as_deref(),
+        );
         let (program, args) = providers::command_to_parts(&cmd);
         let (program, args) = sandbox::maybe_wrap(isolation, &cwd, &program, &args);
         let req = SpawnRequest {
@@ -1112,6 +1192,7 @@ fn execute_prepared(
     let soft = timeout_for_role(&prep.cfg, prep.job.role);
     let timeout = hard_ceiling_for_role(&prep.cfg, prep.job.role);
     if prep.pref.is_api() {
+        let dispatch_start = SystemTime::now();
         let expected = prep.job.expected_artifact.as_ref().map(|n| {
             // artifact path reconstructed from log path parent layout
             prep.log_path
@@ -1121,7 +1202,7 @@ fn execute_prepared(
                 .unwrap_or_else(|| PathBuf::from(n))
         });
         let model = prep.job.model.clone();
-        let (ok, err, usage) = crate::api::run_api_slot(&crate::api::runtime::ApiSlotRequest {
+        let outcome = crate::api::run_api_slot(&crate::api::runtime::ApiSlotRequest {
             provider_name: &prep.pref.name,
             prompt: &prep.prompt,
             cwd: &prep.cwd,
@@ -1130,7 +1211,15 @@ fn execute_prepared(
             timeout,
             dry_run: false,
             model_override: model.clone(),
+            api_key: None,
+            base_url: None,
         })?;
+        let (ok, err, usage, timeout_cause) = (
+            outcome.ok,
+            outcome.error,
+            outcome.usage,
+            outcome.timeout_cause,
+        );
         let slot_usage = SlotUsage {
             slot_id: prep.job.slot_id.clone(),
             provider: prep.pref.storage_key(),
@@ -1161,6 +1250,54 @@ fn execute_prepared(
                 timeout_cause: None,
             }
         } else {
+            // An api implementer that finished and committed its work before the
+            // ceiling earns the same kept-read as a native-cli one: without it
+            // the typed cause above would fail a finished round as a partial.
+            let kept = timeout_cause == Some(TimeoutCause::HardCeiling)
+                && prep.job.expected_artifact.as_ref().is_some_and(|name| {
+                    ceiling_kill_kept_work(
+                        &ArtifactRecovery {
+                            paths: &prep.paths,
+                            run_id: &prep.run_id,
+                            slot_id: &prep.job.slot_id,
+                            round: prep.round,
+                            role: prep.job.role,
+                            codex_profile: prep.codex_profile.clone(),
+                            owns_cwd: prep.owns_cwd,
+                            provider: &prep.job.provider,
+                            model: prep.job.model.clone(),
+                            effort: prep.job.effort,
+                            cwd: &prep.cwd,
+                            log_path: &prep.log_path,
+                            prompt_path: &recovery_prompt_path(
+                                &prep.prompt_path,
+                                &prep.job.slot_id,
+                            ),
+                            env: &prep.env,
+                            isolation,
+                            dispatch_head: prep.dispatch_head.as_deref(),
+                            dispatch_tree: prep.dispatch_tree.as_deref(),
+                            banked_head: prep.banked_head.as_deref(),
+                            artifact: &prep.paths.artifact(&prep.run_id, name),
+                        },
+                        dispatch_start,
+                    )
+                });
+            if kept {
+                return Ok(SlotOutcome {
+                    ok: true,
+                    pid: None,
+                    exit_code: Some(0),
+                    signal: None,
+                    error: None,
+                    usage: Some(slot_usage),
+                    agy_quota_hit: false,
+                    quota_rejected: None,
+                    quota_resets_at: None,
+                    quota_recovered: false,
+                    timeout_cause: None,
+                });
+            }
             SlotOutcome {
                 ok: false,
                 pid: None,
@@ -1172,7 +1309,7 @@ fn execute_prepared(
                 quota_rejected: None,
                 quota_resets_at: None,
                 quota_recovered: false,
-                timeout_cause: None,
+                timeout_cause,
             }
         });
     }
@@ -1200,6 +1337,7 @@ fn execute_prepared(
         effort: prep.job.effort,
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(prep.paths.sessions_dir(&prep.run_id, &prep.job.slot_id)),
+        codex_profile: prep.codex_profile.clone(),
     };
     let (mut cmd, used_resume) = build_dispatch_command(
         adapter.as_ref(),
@@ -1287,10 +1425,8 @@ fn execute_prepared(
     // retry or transient retry inside `dispatch_with_resume_recovery` is still
     // this dispatch, and its write lands after this capture either way.
     let dispatch_start = SystemTime::now();
-    // Carried from prepare, never re-derived here: from round 2 on the run base
-    // predates earlier rounds' commits, so the base always reads as work.
-    let dispatch_head = prep.dispatch_head.clone();
     let mut res = dispatch_with_resume_recovery(
+        crate::classifier::Classifier::live(),
         adapter.as_ref(),
         &bin,
         &mut opts,
@@ -1350,6 +1486,7 @@ fn execute_prepared(
                     slot_id: &prep.job.slot_id,
                     round: prep.round,
                     role: prep.job.role,
+                    codex_profile: prep.codex_profile.clone(),
                     owns_cwd: prep.owns_cwd,
                     provider: &prep.job.provider,
                     model: prep.job.model.clone(),
@@ -1360,9 +1497,10 @@ fn execute_prepared(
                     env: &prep.env,
                     isolation,
                     dispatch_head: prep.dispatch_head.as_deref(),
+                    dispatch_tree: prep.dispatch_tree.as_deref(),
+                    banked_head: prep.banked_head.as_deref(),
                     artifact: &prep.paths.artifact(&prep.run_id, name),
                 },
-                dispatch_head.as_deref(),
                 dispatch_start,
             )
         });
@@ -1530,6 +1668,7 @@ fn execute_prepared(
                 slot_id: &prep.job.slot_id,
                 round: prep.round,
                 role: prep.job.role,
+                codex_profile: prep.codex_profile.clone(),
                 owns_cwd: prep.owns_cwd,
                 provider: &prep.job.provider,
                 model: prep.job.model.clone(),
@@ -1540,6 +1679,8 @@ fn execute_prepared(
                 env: &prep.env,
                 isolation,
                 dispatch_head: prep.dispatch_head.as_deref(),
+                dispatch_tree: prep.dispatch_tree.as_deref(),
+                banked_head: prep.banked_head.as_deref(),
                 artifact: &path,
             });
             if !recovered {
@@ -1596,6 +1737,7 @@ struct ArtifactRecovery<'a> {
     slot_id: &'a str,
     round: u32,
     role: SlotRole,
+    codex_profile: Option<String>,
     /// `cwd` is this slot's own worktree. See [`owns_cwd`].
     owns_cwd: bool,
     provider: &'a str,
@@ -1610,6 +1752,14 @@ struct ArtifactRecovery<'a> {
     /// round 2 on the run base predates earlier rounds' commits and always
     /// reads as work, so a fix round that did nothing still earns a turn.
     dispatch_head: Option<&'a str>,
+    /// Content digest of the worktree when this round started. Uncommitted
+    /// changes count only past this snapshot: the tree can be dirty at round
+    /// start already, and that dirt is not the round's work.
+    dispatch_tree: Option<&'a str>,
+    /// The round's own banked WIP commit, if the ceiling already banked this
+    /// round's leftovers on an earlier attempt: the kept-work gate must not
+    /// read the bank back as fresh work on a same-round resume.
+    banked_head: Option<&'a str>,
     artifact: &'a Path,
 }
 
@@ -1619,7 +1769,7 @@ struct ArtifactRecovery<'a> {
 /// role for which that inference is sound:
 ///
 /// - `tester` and `reviewer` are pointed at the *implementer's* worktree, so
-///   `slot_has_work` is true for them whether or not they did anything. A recovered
+///   `dispatch_left_work` is true for them whether or not they did anything. A recovered
 ///   `suite.md` reading `## Result: pass` sets the authoritative gate green with no suite
 ///   ever having run.
 /// - `test_author` writes the `AC-n` acceptance contract. Prose passes the non-empty
@@ -1640,20 +1790,14 @@ fn role_is_recoverable(role: SlotRole) -> bool {
 /// is; new commits since the dispatch began earn the same artifact-only recovery turn a
 /// clean exit without its artifact gets. A dirty tree alone does not: that is a round
 /// cut short, and the checkpoint (O112) already keeps it.
-fn ceiling_kill_kept_work(
-    r: &ArtifactRecovery,
-    dispatch_head: Option<&str>,
-    since: SystemTime,
-) -> bool {
+fn ceiling_kill_kept_work(r: &ArtifactRecovery, since: SystemTime) -> bool {
     if !role_is_recoverable(r.role) || !r.owns_cwd {
         return false;
     }
     let kept = if artifact_fresh_since(r.artifact, since) {
         true
     } else {
-        let committed = dispatch_head
-            .is_some_and(|h| git_output(r.cwd, &["rev-parse", "HEAD"]).is_some_and(|now| now != h));
-        committed && recover_artifact(r)
+        committed_since_dispatch(r) && recover_artifact(r)
     };
     if kept {
         let _ = crate::events::append(
@@ -1668,26 +1812,196 @@ fn ceiling_kill_kept_work(
     kept
 }
 
-/// Work the slot left behind: uncommitted changes, or commits past `since`.
-///
-/// Pass the round's start HEAD: from round 2 on the run base predates earlier
-/// rounds' commits, so the base always reads as work. `None` leaves only the
-/// dirty check rather than guessing at HEAD.
-pub fn slot_has_work(cwd: &Path, since: Option<&str>) -> bool {
-    let git = |args: &[&str]| {
+/// Whether HEAD moved past the stamped dispatch commit, ignoring the round's own
+/// banked partial commit: the round's WIP is the starting point, not new work.
+/// One predicate for every "did this dispatch do work" gate, so recovery and
+/// the ceiling-commit pre-check cannot drift apart.
+fn head_moved_since_dispatch(
+    cwd: &Path,
+    dispatch_head: Option<&str>,
+    banked_head: Option<&str>,
+) -> bool {
+    let now = git_output(cwd, &["rev-parse", "HEAD"]);
+    match (dispatch_head, now) {
+        (Some(before), Some(head)) => head != before && banked_head != Some(head.as_str()),
+        _ => false,
+    }
+}
+
+/// Commits the slot left behind since the round started, excluding the round's
+/// own banked WIP commit: the bank is spar's doing on an earlier attempt this
+/// round, not the slot's fresh work. A dirty tree alone never counts here: a
+/// ceiling kill with only uncommitted edits is a round cut short, which commits
+/// as a partial WIP round instead of passing.
+fn committed_since_dispatch(r: &ArtifactRecovery) -> bool {
+    head_moved_since_dispatch(r.cwd, r.dispatch_head, r.banked_head)
+}
+
+/// The round's own banked WIP commit, if the ceiling already recorded one.
+fn banked_partial_commit(state: &RunState, round: u32) -> Option<String> {
+    state
+        .ceiling_partial_rounds
+        .iter()
+        .find(|e| e.round == round)
+        .and_then(|e| e.commit.clone())
+}
+
+/// Raw snapshot input: the tracked diff plus a separator plus every untracked
+/// file's hash. A tree with nothing past HEAD always builds `[0]`: the diff is
+/// empty and there is nothing to hash.
+fn snapshot_combo(cwd: &Path) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = |args: &[&str]| {
         std::process::Command::new("git")
             .args(args)
             .current_dir(cwd)
             .output()
             .ok()
             .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .map(|o| o.stdout)
     };
-    if git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty()) {
-        return true;
+    let mut combo = bytes(&["diff", "HEAD", "--no-color", "--no-ext-diff", "--binary"])?;
+    combo.push(0);
+    let others = bytes(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+    let mut paths: Vec<&[u8]> = others
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .collect();
+    paths.sort_unstable();
+    // Regular files are hashed by git in one batch so large artifacts never
+    // pass through this process's memory; anything else keeps the old read.
+    let mut files: Vec<&[u8]> = Vec::new();
+    for rel in paths {
+        let full = cwd.join(std::ffi::OsStr::from_bytes(rel));
+        match std::fs::symlink_metadata(&full) {
+            Ok(md) if md.file_type().is_file() => files.push(rel),
+            Ok(md) if md.file_type().is_symlink() => {
+                combo.extend_from_slice(rel);
+                combo.push(0);
+                let target = std::fs::read_link(&full)
+                    .map(|t| t.into_os_string().into_encoded_bytes())
+                    .unwrap_or_default();
+                combo.extend_from_slice(&target);
+                combo.push(0);
+            }
+            _ => {
+                combo.extend_from_slice(rel);
+                combo.push(0);
+                combo.extend_from_slice(&std::fs::read(&full).unwrap_or_default());
+                combo.push(0);
+            }
+        }
     }
-    match (since, git(&["rev-parse", "HEAD"])) {
-        (Some(before), Some(head)) => head != before,
+    if !files.is_empty() {
+        let out = std::process::Command::new("git")
+            .arg("hash-object")
+            .arg("--")
+            .args(files.iter().map(|r| std::ffi::OsStr::from_bytes(r)))
+            .current_dir(cwd)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        for (rel, sha) in files.iter().zip(out.stdout.split(|b| *b == b'\n')) {
+            if sha.is_empty() {
+                return None;
+            }
+            combo.extend_from_slice(rel);
+            combo.push(0);
+            combo.extend_from_slice(sha);
+            combo.push(0);
+        }
+    }
+    Some(combo)
+}
+
+/// Content digest of everything `HEAD` does not carry: the tracked diff plus
+/// every untracked file's hash, folded through git itself. `None` when `cwd`
+/// is not a readable worktree. Two snapshots compare equal only for identical
+/// trees, so dirt that predates the snapshot (the test-author overlay, a
+/// refused round's leftovers) does not read as new work, while any edit —
+/// even to an already-dirty file — does. `--binary` keeps an edited tracked
+/// binary distinct from its identical `Binary files ... differ` line.
+pub(crate) fn worktree_snapshot(cwd: &Path) -> Option<String> {
+    let combo = snapshot_combo(cwd)?;
+    let mut hash = std::process::Command::new("git");
+    hash.args(["hash-object", "--stdin"]).current_dir(cwd);
+    let mut child = hash
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    use std::io::Write;
+    child.stdin.take()?.write_all(&combo).ok()?;
+    let out = child.wait_with_output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Work the slot left behind since the round started: uncommitted changes past
+/// `since_tree`, or commits past `since_head`.
+///
+/// Whether the tree changed since the round-start snapshot. `None` for the live
+/// digest falls back to the legacy read: any dirty tree.
+fn tree_differs_since(cwd: &Path, since_tree: Option<&str>) -> bool {
+    match (worktree_snapshot(cwd), since_tree) {
+        (Some(now), Some(before)) => now != before,
+        _ => tree_is_dirty(cwd),
+    }
+}
+
+/// The legacy read, shared by both tree halves: any dirty tree counts when a
+/// stamp is missing or git cannot build a snapshot.
+fn tree_is_dirty(cwd: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| !o.stdout.iter().all(|b| b.is_ascii_whitespace()))
+}
+
+/// Whether the tree holds anything past HEAD: a non-empty diff or new
+/// untracked files. The banked-round case reads this instead of the
+/// round-start snapshot.
+fn tree_differs_from_head(cwd: &Path) -> bool {
+    match snapshot_combo(cwd) {
+        Some(combo) => combo != [0],
+        _ => tree_is_dirty(cwd),
+    }
+}
+
+/// Pass the stamps taken when the slot joined the round: from round 2 on the
+/// run base predates earlier rounds' commits, so the base always reads as
+/// work, and the tree can already be dirty at round start (the test-author
+/// overlay lands before round 1, a refused round leaves leftovers), so any
+/// dirty tree always reads as work. `None` for either stamp falls back to the
+/// legacy read for that half: any dirty tree, or only HEAD movement. The
+/// banked partial commit counts as the starting point rather than new work:
+/// with HEAD on the bank the tree measures against HEAD itself, because the
+/// bank swept the round-start dirt into the commit. The one predicate behind
+/// both recovery and the ceiling-commit pre-check.
+pub fn dispatch_left_work(
+    cwd: &Path,
+    since_head: Option<&str>,
+    since_tree: Option<&str>,
+    banked_head: Option<&str>,
+) -> bool {
+    if head_is_banked(cwd, banked_head) {
+        // The bank committed everything (`git add -A`), so the round-start
+        // dirt is in HEAD now: only post-bank changes count, measured against
+        // HEAD itself rather than the round-start snapshot.
+        return tree_differs_from_head(cwd);
+    }
+    tree_differs_since(cwd, since_tree) || head_moved_since_dispatch(cwd, since_head, banked_head)
+}
+
+/// Whether HEAD is the round's own banked WIP commit.
+fn head_is_banked(cwd: &Path, banked_head: Option<&str>) -> bool {
+    match (banked_head, git_output(cwd, &["rev-parse", "HEAD"])) {
+        (Some(banked), Some(head)) => head == banked,
         _ => false,
     }
 }
@@ -1702,8 +2016,10 @@ pub fn slot_has_work(cwd: &Path, since: Option<&str>) -> bool {
 /// Only fires for the implementer, and only when the tree actually holds work — a slot
 /// that did nothing still fails.
 fn recover_artifact(r: &ArtifactRecovery) -> bool {
-    let since = r.dispatch_head;
-    if !role_is_recoverable(r.role) || !r.owns_cwd || !slot_has_work(r.cwd, since) {
+    if !role_is_recoverable(r.role)
+        || !r.owns_cwd
+        || !dispatch_left_work(r.cwd, r.dispatch_head, r.dispatch_tree, r.banked_head)
+    {
         return false;
     }
     let Some(adapter) = providers::adapter_named(r.provider) else {
@@ -1781,6 +2097,7 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
         effort: r.effort,
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(r.paths.sessions_dir(r.run_id, r.slot_id)),
+        codex_profile: r.codex_profile.clone(),
     };
     let cmd = adapter.build_headless(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
@@ -2060,7 +2377,7 @@ fn enrich_agy_stats(
     if let (Some(frac), Some(reset)) = (t.quota_remaining_fraction, t.quota_reset_secs) {
         if frac < 0.02 && reset > 0 {
             let until = chrono::Utc::now() + chrono::Duration::seconds(reset);
-            let key = pref.quota_key();
+            let key = pref.quota_key(None);
             let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
             store.pause_quota_until(
                 &key,
@@ -2157,7 +2474,12 @@ fn apply_parallel_outcome(
             // `quota_hit_for_outcome`.
             let pref = seat_ref_for(Some(state), &prep.job);
             let log_text = outcome_log_text(&prep.log_path, &result);
-            let key = quota_write_key(&pref, result.quota_rejected, &log_text);
+            let key = quota_write_key(
+                &pref,
+                result.quota_rejected,
+                &log_text,
+                state.codex_profile.as_deref(),
+            );
             let witness = PauseWitness::before(paths, &state.id, &key);
             let quota_hit = quota_hit_for_outcome(paths, &pref, &key, &log_text, &result);
             let witness = witness.map(|w| w.after_scrape(paths, &key));
@@ -2170,6 +2492,7 @@ fn apply_parallel_outcome(
                 result.signal,
             );
             let (quota_hit, auth, classified) = classifier_verdict(
+                crate::classifier::Classifier::live(),
                 paths,
                 &state.id,
                 &prep.job,
@@ -2230,8 +2553,13 @@ fn apply_parallel_outcome(
             // produced a rate_limit_event. The text fallback is what catches an
             // api-sdk 429 here.
             let pref = seat_ref_for(Some(state), &prep.job);
-            let quota_hit =
-                detect_and_pause_quota_with_err(paths, &pref, &log_text, &e.to_string());
+            let quota_hit = detect_and_pause_quota_with_err(
+                paths,
+                &pref,
+                &log_text,
+                &e.to_string(),
+                state.codex_profile.as_deref(),
+            );
             let auth = auth_fault_for(&prep.log_path, &e.to_string(), quota_hit, None, None);
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
@@ -2525,19 +2853,25 @@ pub fn run_slot(
         s.quota_hit = false;
         s.auth_fault = false;
         s.timeout_cause = None;
-        // The round's start HEAD, stamped once when the slot joins the round. A
-        // same-round backup retry re-dispatches the same worktree, so re-stamping
-        // would measure against its own start and the primary seat's commits
-        // would read as no work.
+        // The round's start HEAD and tree, stamped once when the slot joins
+        // the round. A same-round backup retry re-dispatches the same worktree,
+        // so re-stamping would measure against its own start and the primary
+        // seat's commits would read as no work. A same-round resume keeps both
+        // for the same reason: the round's own banked commit still compares
+        // against the round's start.
         if s.round != round || s.dispatch_head.is_none() {
             s.dispatch_head = role_is_recoverable(job.role)
                 .then(|| git_output(&cwd, &["rev-parse", "HEAD"]))
+                .flatten();
+            s.dispatch_tree = role_is_recoverable(job.role)
+                .then(|| worktree_snapshot(&cwd))
                 .flatten();
         }
         clear_expected_artifact(paths, &run_id, job);
         s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
+        s.stood_down = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -2562,6 +2896,9 @@ pub fn run_slot(
         &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
     );
     let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
+    // The turn that can read the poll file starts here: claim what piled up
+    // while the slot was idle so the word flips from `queued` to `delivered`.
+    crate::providers::delivery::drain_slot_backlog(paths, state, &job.slot_id);
     let mut build_cache = lease_build_cache(state, paths, cfg, job, &cwd);
     state.save(paths)?;
 
@@ -2598,7 +2935,13 @@ pub fn run_slot(
         // No outcome exists on this path either: the backend never produced a
         // stream to have parsed a `rate_limit_event` out of, so there is no typed
         // reset instant to thread through.
-        let quota_hit = detect_and_pause_quota_with_err(paths, pref, &log_text, err_text);
+        let quota_hit = detect_and_pause_quota_with_err(
+            paths,
+            pref,
+            &log_text,
+            err_text,
+            state.codex_profile.as_deref(),
+        );
         let auth = auth_fault_for(log_path, err_text, quota_hit, None, None);
         if let Some(s) = state.slot_mut(slot_id) {
             s.quota_hit = quota_hit;
@@ -2606,7 +2949,19 @@ pub fn run_slot(
         }
     };
     let result = if pref.is_api() {
-        match run_api(state, paths, job, &pref, &cwd, &log_path, &prompt, timeout) {
+        match run_api(
+            state,
+            paths,
+            job,
+            &pref,
+            &cwd,
+            &log_path,
+            &prompt_path,
+            &prompt,
+            timeout,
+            None,
+            None,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 salvage_expected_artifact(
@@ -2764,13 +3119,19 @@ pub fn run_slot(
         // `quota_hit_for_outcome`.
         let seat = seat_ref_for(Some(state), job);
         let log_text = outcome_log_text(&log_path, &result);
-        let key = quota_write_key(&seat, result.quota_rejected, &log_text);
+        let key = quota_write_key(
+            &seat,
+            result.quota_rejected,
+            &log_text,
+            state.codex_profile.as_deref(),
+        );
         let witness = PauseWitness::before(paths, &state.id, &key);
         let quota_hit = quota_hit_for_outcome(paths, &seat, &key, &log_text, &result);
         let witness = witness.map(|w| w.after_scrape(paths, &key));
         let err = result.error.as_deref().unwrap_or("failed");
         auth_rejection = auth_fault_for(&log_path, err, quota_hit, result.exit_code, result.signal);
         let (quota_hit, auth, classified) = classifier_verdict(
+            crate::classifier::Classifier::live(),
             paths,
             &state.id,
             job,
@@ -3105,11 +3466,15 @@ fn quota_write_key(
     pref: &ProviderRef,
     structured: Option<RateLimitWindow>,
     log_text: &str,
+    codex_profile: Option<&str>,
 ) -> String {
-    pref.rejection_key(QuotaSignal {
-        window: structured,
-        text: log_text,
-    })
+    pref.rejection_key(
+        QuotaSignal {
+            window: structured,
+            text: log_text,
+        },
+        codex_profile,
+    )
 }
 
 /// The glue between a failed dispatch's tail and [`detect_and_pause_quota`], shared by
@@ -3144,17 +3509,17 @@ fn quota_hit_for_outcome(
 ///
 /// Takes no `structured`/`resets_at`/`quota_recovered`: both call sites are `Err` arms that
 /// by construction never produced a `SlotOutcome`, so a typed verdict cannot exist yet
-/// to thread through. That used to be a parameter every caller passed `None` to — dead
-/// weight a future caller could silently fail to fill in; dropping it from the
-/// signature makes the absence structural instead of a convention callers must uphold.
+/// to thread through. Takes the recorded `codex_profile` for the same reason the
+/// `Ok` arms do: a model-less codex seat writes the bucket it dispatched under.
 fn detect_and_pause_quota_with_err(
     paths: &SparPaths,
     pref: &ProviderRef,
     log_text: &str,
     extra: &str,
+    codex_profile: Option<&str>,
 ) -> bool {
     let text = format!("{log_text}\n{extra}");
-    let key = quota_write_key(pref, None, &text);
+    let key = quota_write_key(pref, None, &text, codex_profile);
     detect_and_pause_quota(paths, pref, &key, &text, None, None, false)
 }
 
@@ -3201,6 +3566,7 @@ fn auth_fault_for(
 /// work into a transient retry or the O104 auth retry. Asked only about a non-zero exit
 /// that no rule already explains; `None` whenever it is off, silent or below threshold.
 fn classifier_dispatch_advice(
+    classifier: &crate::classifier::Classifier,
     adapter: &dyn providers::ProviderAdapter,
     paths: &SparPaths,
     run_id: &str,
@@ -3250,7 +3616,7 @@ fn classifier_dispatch_advice(
         )),
         log_path,
     );
-    let rec = crate::classifier::consult(
+    let rec = classifier.consult(
         &cfg,
         paths,
         run_id,
@@ -3274,6 +3640,7 @@ fn classifier_dispatch_advice(
 /// scrape ([`PauseWitness`]): a veto only weakens a pause that scrape made.
 #[allow(clippy::too_many_arguments)]
 fn classifier_verdict(
+    classifier: &crate::classifier::Classifier,
     paths: &SparPaths,
     run_id: &str,
     job: &SlotJob,
@@ -3331,7 +3698,7 @@ fn classifier_verdict(
         Some(err),
         log_path,
     );
-    let Some(rec) = crate::classifier::consult(
+    let Some(rec) = classifier.consult(
         &cfg,
         paths,
         run_id,
@@ -3944,15 +4311,21 @@ fn run_api(
     pref: &ProviderRef,
     cwd: &Path,
     log_path: &Path,
+    prompt_path: &Path,
     prompt: &str,
     timeout: Duration,
+    api_key: Option<&str>,
+    base_url: Option<&str>,
 ) -> Result<SlotOutcome> {
     let expected = job
         .expected_artifact
         .as_ref()
         .map(|n| paths.artifact(&state.id, n));
     let model = slot_model_for(Some(state), job);
-    let (ok, err, usage) = api::run_api_slot(&api::runtime::ApiSlotRequest {
+    // Stamped before the dispatch starts, the way `execute_prepared` stamps
+    // its own: the kept-read below only counts an artifact this dispatch wrote.
+    let dispatch_start = SystemTime::now();
+    let outcome = api::run_api_slot(&api::runtime::ApiSlotRequest {
         provider_name: &pref.name,
         prompt,
         cwd,
@@ -3961,7 +4334,77 @@ fn run_api(
         timeout,
         dry_run: false,
         model_override: model.clone(),
+        api_key: api_key.map(str::to_owned),
+        base_url: base_url.map(str::to_owned),
     })?;
+    let (ok, err, usage, timeout_cause) = (
+        outcome.ok,
+        outcome.error,
+        outcome.usage,
+        outcome.timeout_cause,
+    );
+    // Same kept-read as the native-cli dispatch: an api implementer that
+    // finished its work before the ceiling stays done. Carried from the slot's
+    // dispatch record, never re-derived here. Runs before `slot_usage`, which
+    // moves `usage` and `model` below.
+    let slot = state.slots.iter().find(|s| s.id == job.slot_id);
+    let kept = !ok
+        && timeout_cause == Some(TimeoutCause::HardCeiling)
+        && job.expected_artifact.as_ref().is_some_and(|name| {
+            ceiling_kill_kept_work(
+                &ArtifactRecovery {
+                    paths,
+                    run_id: &state.id,
+                    slot_id: &job.slot_id,
+                    round: state.round,
+                    role: job.role,
+                    codex_profile: state.codex_profile.clone(),
+                    owns_cwd: owns_cwd(state, &job.slot_id, cwd),
+                    provider: &job.provider,
+                    model: model.clone(),
+                    effort: job.effort,
+                    cwd,
+                    log_path,
+                    prompt_path: &recovery_prompt_path(prompt_path, &job.slot_id),
+                    env: &[],
+                    isolation: state.isolation,
+                    dispatch_head: slot.and_then(|s| s.dispatch_head.clone()).as_deref(),
+                    dispatch_tree: slot.and_then(|s| s.dispatch_tree.clone()).as_deref(),
+                    banked_head: banked_partial_commit(state, state.round).as_deref(),
+                    artifact: &paths.artifact(&state.id, name),
+                },
+                dispatch_start,
+            )
+        });
+    if kept {
+        return Ok(SlotOutcome {
+            ok: true,
+            pid: None,
+            exit_code: Some(0),
+            signal: None,
+            error: None,
+            usage: Some(SlotUsage {
+                slot_id: job.slot_id.clone(),
+                provider: pref.storage_key(),
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cache_read_tokens: 0,
+                context_tokens: usage.peak_input_tokens,
+                context_semantics: ContextSemantics::Peak,
+                billed_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+                tools: 0,
+                model: usage.model.or(model),
+                cost_usd: None,
+                subagent_stats: None,
+                model_usage: Default::default(),
+            }),
+            agy_quota_hit: false,
+            quota_rejected: None,
+            quota_resets_at: None,
+            quota_recovered: false,
+            timeout_cause: None,
+        });
+    }
     let slot_usage = SlotUsage {
         slot_id: job.slot_id.clone(),
         provider: pref.storage_key(),
@@ -4003,7 +4446,7 @@ fn run_api(
             quota_rejected: None,
             quota_resets_at: None,
             quota_recovered: false,
-            timeout_cause: None,
+            timeout_cause,
         })
     }
 }
@@ -4045,6 +4488,7 @@ fn run_headless(
         effort: slot_effort_for(cfg, Some(state), job),
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(paths.sessions_dir(&state.id, &job.slot_id)),
+        codex_profile: state.codex_profile.clone(),
     };
     let prior_session_id =
         prior_session_for_role(paths, &state.id, &job.slot_id, cli_name, job.role);
@@ -4128,12 +4572,12 @@ fn run_headless(
     // this dispatch.
     let dispatch_start = SystemTime::now();
     // Carried from `run_slot`'s dispatch record, never re-derived here.
-    let dispatch_head = state
-        .slots
-        .iter()
-        .find(|s| s.id == job.slot_id)
-        .and_then(|s| s.dispatch_head.clone());
+    let slot = state.slots.iter().find(|s| s.id == job.slot_id);
+    let dispatch_head = slot.and_then(|s| s.dispatch_head.clone());
+    let dispatch_tree = slot.and_then(|s| s.dispatch_tree.clone());
+    let banked_head = banked_partial_commit(state, state.round);
     let mut res = dispatch_with_resume_recovery(
+        crate::classifier::Classifier::live(),
         adapter.as_ref(),
         &bin,
         &mut opts,
@@ -4187,6 +4631,7 @@ fn run_headless(
                     slot_id: &job.slot_id,
                     round: state.round,
                     role: job.role,
+                    codex_profile: state.codex_profile.clone(),
                     owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                     provider: &job.provider,
                     model: slot_model_for(Some(state), job),
@@ -4197,9 +4642,10 @@ fn run_headless(
                     env,
                     isolation: state.isolation,
                     dispatch_head: dispatch_head.as_deref(),
+                    dispatch_tree: dispatch_tree.as_deref(),
+                    banked_head: banked_head.as_deref(),
                     artifact: &paths.artifact(&state.id, name),
                 },
-                dispatch_head.as_deref(),
                 dispatch_start,
             )
         });
@@ -4347,6 +4793,7 @@ fn run_headless(
                 slot_id: &job.slot_id,
                 round: state.round,
                 role: job.role,
+                codex_profile: state.codex_profile.clone(),
                 owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                 provider: &job.provider,
                 model: slot_model_for(Some(state), job),
@@ -4357,6 +4804,8 @@ fn run_headless(
                 env,
                 isolation: state.isolation,
                 dispatch_head: dispatch_head.as_deref(),
+                dispatch_tree: dispatch_tree.as_deref(),
+                banked_head: banked_head.as_deref(),
                 artifact: &path,
             });
             if !recovered {
@@ -4433,6 +4882,15 @@ fn tmux_outcome(marker: MarkerState, pane_alive: bool, budget_left: bool) -> Tmu
         MarkerState::Done => TmuxDecision::DoneButAlive,
         MarkerState::None => TmuxDecision::Wait,
     }
+}
+
+/// The pid whose group a tmux ceiling kill may terminate: only a pane token that
+/// still identifies its own process. A pane that exited without writing a marker
+/// leaves a dead pid behind, and the OS may since have recycled it onto an
+/// unrelated group, so the start-time identity check decides, like the rest of
+/// this loop.
+fn tmux_kill_target(token: Option<process::PidToken>) -> Option<u32> {
+    token.filter(|t| t.alive()).map(|t| t.pid)
 }
 
 /// tmux's pane runs `build_interactive`, which for pi is the same `--mode json` stream
@@ -4570,6 +5028,7 @@ fn run_tmux(
         effort,
         timeout_secs: None,
         session_dir: Some(paths.sessions_dir(&state.id, &job.slot_id)),
+        codex_profile: state.codex_profile.clone(),
     };
     // The pane is teed to a log, never run through `StreamCoalescer`, so no id is
     // ever captured here (O65). An adapter that accepts a caller-supplied id gets
@@ -4741,8 +5200,8 @@ fn run_tmux(
                     // The agent is still alive in its pane: terminate its process
                     // group before reporting, so the WIP snapshot and the suite
                     // judge a tree that cannot keep changing under them.
-                    if let Some(token) = pane_pid {
-                        process::terminate_tree(token.pid, true);
+                    if let Some(pid) = tmux_kill_target(pane_pid) {
+                        process::terminate_tree(pid, true);
                     }
                     return Ok(SlotOutcome {
                         usage: tmux_recovered_usage(replays_stream, job, log_path),
@@ -4857,10 +5316,12 @@ pub fn init_slot_model(
         quota_hit: false,
         reviewed_commit: None,
         review: None,
+        stood_down: None,
         source: None,
         auth_fault: false,
         timeout_cause: None,
         dispatch_head: None,
+        dispatch_tree: None,
         build_cache: None,
         former_ids: Vec::new(),
         classifier: None,
@@ -5137,6 +5598,30 @@ mod tests {
     use super::*;
     use crate::providers::ProviderAdapter;
 
+    /// The ceiling kill only targets a pane token that still identifies its own
+    /// process: a pane that exited without writing a marker must not send a
+    /// group kill at a possibly recycled pid. Fails if the identity check is
+    /// dropped from the kill decision.
+    #[test]
+    fn tmux_ceiling_kill_skips_a_dead_pane_token() {
+        let live = process::PidToken::capture(std::process::id());
+        assert_eq!(tmux_kill_target(Some(live)), Some(std::process::id()));
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let token = process::PidToken::capture(child.id());
+        assert!(token.alive(), "a running sleep must read alive");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            tmux_kill_target(Some(token)),
+            None,
+            "a reaped pane pid must not be a kill target"
+        );
+        assert_eq!(tmux_kill_target(None), None);
+    }
+
     fn seat_ref(raw: &str) -> ProviderRef {
         ProviderRef::parse(raw).unwrap()
     }
@@ -5151,7 +5636,7 @@ mod tests {
     ) -> (bool, String) {
         let pref = seat_ref(seat);
         let log_text = outcome_log_text(log_path, outcome);
-        let key = quota_write_key(&pref, outcome.quota_rejected, &log_text);
+        let key = quota_write_key(&pref, outcome.quota_rejected, &log_text, None);
         (
             quota_hit_for_outcome(paths, &pref, &key, &log_text, outcome),
             key,
@@ -5174,6 +5659,7 @@ mod tests {
 
     fn dispatch_opts(prompt: &str) -> SpawnOpts {
         SpawnOpts {
+            codex_profile: None,
             prompt: prompt.into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
@@ -5345,6 +5831,44 @@ mod tests {
         }
     }
 
+    /// An adapter that names its own sessions (claude/grok) but cannot resume
+    /// them: every dispatch incl. retries builds cold.
+    struct AssigningColdAdapter {
+        script: String,
+        transient_marker: Option<String>,
+    }
+
+    impl providers::ProviderAdapter for AssigningColdAdapter {
+        fn name(&self) -> &'static str {
+            "assigning-cold"
+        }
+        fn binary_names(&self) -> &[&'static str] {
+            &["sh"]
+        }
+        fn capabilities(&self) -> providers::Capabilities {
+            providers::Capabilities {
+                assigns_session_id: true,
+                ..providers::Capabilities::default()
+            }
+        }
+        fn permission_args(&self, _policy: TrustPolicy) -> Vec<String> {
+            Vec::new()
+        }
+        fn build_headless(&self, _bin: &Path, _opts: &SpawnOpts) -> std::process::Command {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg(&self.script);
+            cmd
+        }
+        fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> std::process::Command {
+            self.build_headless(bin, opts)
+        }
+        fn dispatch_failure_is_transient(&self, log_text: &str) -> bool {
+            self.transient_marker
+                .as_deref()
+                .is_some_and(|m| log_text.contains(m))
+        }
+    }
+
     fn refused_result() -> process::SpawnResult {
         process::SpawnResult {
             exit_code: Some(1),
@@ -5495,6 +6019,7 @@ mod tests {
         opts.session_id = Some("abc".into());
         let req = shell_req(&adapter.script, &log_path);
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -5544,6 +6069,127 @@ mod tests {
         );
     }
 
+    /// #241: the credential-refresh retry on an adapter that names its own
+    /// sessions but cannot resume them (claude/grok) must not reuse the first
+    /// attempt's id: the vendor already created that session and refuses the
+    /// id as already in use. The retry takes a fresh `derive_retry` id instead.
+    #[test]
+    fn auth_retry_on_an_assigning_adapter_without_resume_uses_a_fresh_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("run1").unwrap();
+        let log_path = tmp.path().join("slot.log");
+        let ctr = tmp.path().join("attempts");
+        let adapter = AssigningColdAdapter {
+            script: format!(
+                r#"n=$(cat "{ctr}" 2>/dev/null || echo 0); echo $((n+1)) > "{ctr}"; if [ "$n" -lt 1 ]; then echo '{CLAUDE_REVOKED}'; exit 1; fi; echo ok; exit 0"#,
+                ctr = ctr.display()
+            ),
+            transient_marker: None,
+        };
+        let cold = session_id::derive("run1", "slotA", 1);
+        markers::write_session_id(&paths, "run1", "slotA", "assigning-cold", &cold).unwrap();
+        let mut opts = dispatch_opts("go");
+        opts.session_id = Some(cold);
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
+            &adapter,
+            Path::new("/bin/sh"),
+            &mut opts,
+            None,
+            crate::config::IsolationMode::None,
+            shell_req(&adapter.script, &log_path),
+            &paths,
+            "run1",
+            "slotA",
+            "assigning-cold",
+            1,
+            &|_pid| {},
+            &|| {},
+            &|d| {
+                waits.borrow_mut().push(d);
+            },
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, Some(0), "the retry has the refreshed token");
+        assert_eq!(
+            *waits.borrow(),
+            vec![Duration::from_secs(AUTH_RETRY_WAIT_SECS)]
+        );
+        let fresh = session_id::derive_retry("run1", "slotA", 1, 0);
+        assert_eq!(
+            opts.session_id.as_deref(),
+            Some(fresh.as_str()),
+            "the retry carries a fresh id, never the refused one"
+        );
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotA", "assigning-cold").as_deref(),
+            Some(fresh.as_str()),
+            "the marker follows the retry's id"
+        );
+    }
+
+    /// #241, second half: the same rule covers the transient retry. An
+    /// assigning adapter without resume support (claude/grok) fails the same
+    /// "already in use" refusal when the retry reuses the cold id, so the
+    /// retry takes a fresh `derive_retry` id; resume-capable adapters still
+    /// resume (see the test below) and are untouched.
+    #[test]
+    fn transient_retry_on_an_assigning_adapter_without_resume_uses_a_fresh_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("run1").unwrap();
+        let log_path = tmp.path().join("slot.log");
+        let ctr = tmp.path().join("attempts");
+        let adapter = AssigningColdAdapter {
+            script: format!(
+                concat!(
+                    r#"n=$(cat "{ctr}" 2>/dev/null || echo 0); echo $((n+1)) > "{ctr}"; "#,
+                    r#"if [ "$n" -lt 1 ]; then "#,
+                    r#"echo '{{"type":"thread.started","thread_id":"sess-9"}}'; "#,
+                    r#"echo '{{"type":"tool_call","name":"edit"}}'; "#,
+                    r#"echo 'TRANSIENT-BOOM' >&2; exit 1; fi; echo ok; exit 0"#,
+                ),
+                ctr = ctr.display()
+            ),
+            transient_marker: Some("TRANSIENT-BOOM".into()),
+        };
+        let cold = session_id::derive("run1", "slotT", 1);
+        markers::write_session_id(&paths, "run1", "slotT", "assigning-cold", &cold).unwrap();
+        let mut opts = dispatch_opts("go");
+        opts.session_id = Some(cold);
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
+            &adapter,
+            Path::new("/bin/sh"),
+            &mut opts,
+            None,
+            crate::config::IsolationMode::None,
+            shell_req(&adapter.script, &log_path),
+            &paths,
+            "run1",
+            "slotT",
+            "assigning-cold",
+            1,
+            &|_pid| {},
+            &|| {},
+            &|d| {
+                waits.borrow_mut().push(d);
+            },
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, Some(0), "the retry runs past the transient");
+        let fresh = session_id::derive_retry("run1", "slotT", 1, 0);
+        assert_eq!(
+            opts.session_id.as_deref(),
+            Some(fresh.as_str()),
+            "the retry carries a fresh id, never the refused one"
+        );
+        assert!(!waits.borrow().is_empty());
+    }
+
     /// The transient-retry double-flag regression: a retry that resolves to a
     /// resume must drop the cold dispatch's assigned id, so `build_resume` sees
     /// `session_id: None` and the vendor gets exactly one `--session-id`. D2 is
@@ -5570,6 +6216,7 @@ mod tests {
         opts.session_id = Some("derived-1".into());
         let req = shell_req(&adapter.cold_script, &log_path);
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -5965,6 +6612,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let adapter = crate::providers::PiAdapter;
         let mut opts = dispatch_opts("go");
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6003,6 +6651,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let script = r#"echo "agent quoted: No project session found with id 'other'; creating a new session" >&2
 echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut dispatch_opts("go"),
@@ -6038,6 +6687,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let mut opts = dispatch_opts("go");
         let req = shell_req(&adapter.script, &log_path);
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6079,6 +6729,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &log_path,
         );
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6123,6 +6774,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &log_path,
         );
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6176,6 +6828,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         // the real 60s/150s/300s schedule.
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6253,6 +6906,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let req = shell_req(&adapter.script, &log_path);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6295,6 +6949,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     ) -> process::SpawnResult {
         let mut opts = dispatch_opts("go");
         dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6475,6 +7130,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let bad_req = shell_req("exit 2", &log_path);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6524,6 +7180,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let req = shell_req(&adapter.script, &log_path);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6576,6 +7233,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &log_path,
         );
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6611,6 +7269,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let log_path = tmp.path().join("slot.log");
         let mut opts = dispatch_opts("go");
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6668,6 +7327,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let req = shell_req(&adapter.script, &log_path);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -7182,7 +7842,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let until = chrono::Utc::now() + chrono::Duration::hours(2);
         let log = "! rate limit  seven_day_sonnet  rejected\n";
         let seat = seat_ref("cli:claude@opus");
-        let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDaySonnet), log);
+        let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDaySonnet), log, None);
         assert_eq!(key, "cli:claude");
         assert!(detect_and_pause_quota(
             &paths,
@@ -7212,7 +7872,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let until = chrono::Utc::now() + chrono::Duration::hours(2);
         let log = "! rate limit  seven_day_opus  rejected\nYou've hit your limit\n";
         let seat = seat_ref("cli:claude@opus");
-        let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDayOpus), log);
+        let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDayOpus), log, None);
         assert_eq!(key, "cli:claude");
         assert!(detect_and_pause_quota(
             &paths,
@@ -7238,7 +7898,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let paths = SparPaths::new(tmp.path());
         let log = "You've reached your Fable limit\n";
         let seat = seat_ref("cli:claude@fable");
-        let key = quota_write_key(&seat, None, log);
+        let key = quota_write_key(&seat, None, log, None);
         assert_eq!(key, "cli:claude@fable");
         {
             let mut store = crate::quota::QuotaStore::load(&paths).unwrap_or_default();
@@ -7319,10 +7979,20 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn an_overage_included_window_pauses_the_seats_own_bucket() {
         let seat = seat_ref("cli:claude@opus");
-        let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDayOverageIncluded), "");
+        let key = quota_write_key(
+            &seat,
+            Some(RateLimitWindow::SevenDayOverageIncluded),
+            "",
+            None,
+        );
         assert_eq!(key, "cli:claude@opus");
         let haiku = seat_ref("cli:claude@haiku");
-        let key = quota_write_key(&haiku, Some(RateLimitWindow::SevenDayOverageIncluded), "");
+        let key = quota_write_key(
+            &haiku,
+            Some(RateLimitWindow::SevenDayOverageIncluded),
+            "",
+            None,
+        );
         assert_eq!(key, "cli:claude");
     }
 
@@ -7581,11 +8251,13 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(crate::backup::is_provider_eligible(
             "cli:agy@flash",
             &store,
+            None,
             None
         ));
         assert!(crate::backup::is_provider_eligible(
             "cli:agy@pro",
             &store,
+            None,
             None
         ));
     }
@@ -7621,7 +8293,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             effort: None,
         };
         let seat = seat_ref_for(Some(&st), &job);
-        assert_eq!(seat.quota_key(), "cli:agy@gemini-flash");
+        assert_eq!(seat.quota_key(None), "cli:agy@gemini-flash");
         let log = "error: Individual quota reached. Resets in 2h.\n";
         assert!(detect_and_pause_quota(
             &paths,
@@ -7634,17 +8306,21 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         let slot = &st.slots[0];
-        assert_eq!(slot.provider_ref().quota_key(), "cli:agy@gemini-flash");
+        assert_eq!(slot.provider_ref().quota_key(None), "cli:agy@gemini-flash");
         assert!(!crate::backup::is_provider_eligible(
             &slot.provider_ref().display(),
             &store,
+            None,
             None
         ));
         let plan_job = SlotJob {
             model: slot.model.clone(),
             ..job
         };
-        assert_eq!(plan_job.provider_ref().quota_key(), "cli:agy@gemini-flash");
+        assert_eq!(
+            plan_job.provider_ref().quota_key(None),
+            "cli:agy@gemini-flash"
+        );
     }
 
     /// The wiring between a `SlotOutcome` and `detect_and_pause_quota`, not just the
@@ -7929,7 +8605,32 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &seat_ref("api:openai"),
             log,
             err_text,
+            None,
         ));
+    }
+
+    /// The write path and the read path key a model-less codex seat from the same
+    /// recorded profile, not from whatever `SPAR_CODEX_PROFILE` the keying
+    /// process happens to hold: under ambient `muse` (the OpenRouter route) a
+    /// seat dispatched natively writes and reads `cli:codex@native`.
+    #[test]
+    fn recorded_codex_profile_governs_writes_and_reads_under_a_foreign_env() {
+        let _guard = providers::codex::ENV_LOCK.lock().unwrap();
+        std::env::set_var("SPAR_CODEX_PROFILE", "muse");
+        let seat = seat_ref("cli:codex");
+        let write = quota_write_key(&seat, None, "error: 429 rate limit\n", Some(""));
+        assert_eq!(write, "cli:codex@native", "write keys the recorded route");
+        assert_eq!(
+            seat.quota_key(Some("")),
+            "cli:codex@native",
+            "read keys the recorded route"
+        );
+        assert_eq!(
+            seat.quota_key(None),
+            "cli:codex@openrouter",
+            "no record keys this process's route"
+        );
+        std::env::remove_var("SPAR_CODEX_PROFILE");
     }
 
     /// A generic rejection phrase (no Claude-specific shape) must still route, so
@@ -8045,7 +8746,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     /// Recovery must fire only for a slot that actually produced something. A slot that
     /// exited clean having written nothing is a genuine failure and still fails.
     #[test]
-    fn slot_has_work_needs_a_dirty_tree_or_a_commit() {
+    fn dispatch_left_work_needs_a_dirty_tree_or_a_commit() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("wt");
         std::fs::create_dir_all(&repo).unwrap();
@@ -8074,24 +8775,143 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "base"]);
         let base = git(&["rev-parse", "HEAD"]);
+        let tree = worktree_snapshot(&repo);
 
         assert!(
-            !slot_has_work(&repo, Some(&base)),
+            !dispatch_left_work(&repo, Some(&base), tree.as_deref(), None),
             "an untouched worktree is not recoverable work"
         );
 
         std::fs::write(repo.join("b.txt"), "new").unwrap();
-        assert!(slot_has_work(&repo, Some(&base)), "untracked work counts");
+        assert!(
+            dispatch_left_work(&repo, Some(&base), tree.as_deref(), None),
+            "untracked work counts"
+        );
 
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "slot work"]);
         assert!(
-            slot_has_work(&repo, Some(&base)),
+            dispatch_left_work(&repo, Some(&base), tree.as_deref(), None),
             "committed work past the base counts"
         );
         assert!(
-            !slot_has_work(&repo, None),
+            !dispatch_left_work(&repo, None, None, None),
             "with no recorded base, only a dirty tree can be judged"
+        );
+    }
+
+    /// The round's own banked WIP commit is the starting point, not new work:
+    /// recovery and the ceiling-commit pre-check share `dispatch_left_work`, so
+    /// a resumed round that idles into another ceiling kill with HEAD on the
+    /// bank and a clean tree records nothing. The unbanked read still sees
+    /// the banked commit as work, which is exactly the hole.
+    #[test]
+    fn banked_wip_head_is_not_new_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        };
+        if std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        let tree = worktree_snapshot(&repo);
+        git(&["commit", "-q", "--allow-empty", "-m", "banked wip"]);
+        let banked = git(&["rev-parse", "HEAD"]);
+
+        assert!(
+            dispatch_left_work(&repo, Some(&base), tree.as_deref(), None),
+            "the legacy read mistakes the banked commit for new work"
+        );
+        assert!(
+            !dispatch_left_work(&repo, Some(&base), tree.as_deref(), Some(&banked)),
+            "HEAD on the bank with a clean tree is no new work"
+        );
+
+        std::fs::write(repo.join("b.txt"), "fresh").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "slot work"]);
+        assert!(
+            dispatch_left_work(&repo, Some(&base), tree.as_deref(), Some(&banked)),
+            "a commit past the bank is new work"
+        );
+    }
+
+    /// A round that starts dirty and banks its WIP reads no work on resume: the
+    /// bank's `git add -A` sweeps the round-start dirt into HEAD, so HEAD on the
+    /// bank with a clean tree must measure against the bank, not the dirty
+    /// round-start snapshot. Fails on the round-start comparison, which reads
+    /// the cleaned tree as changed.
+    #[test]
+    fn banked_wip_with_a_dirty_round_start_is_not_new_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        };
+        if std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("overlay.txt"), "test author files\n").unwrap();
+        let tree = worktree_snapshot(&repo);
+
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "banked wip"]);
+        let banked = git(&["rev-parse", "HEAD"]);
+
+        assert!(
+            !dispatch_left_work(&repo, Some(&base), tree.as_deref(), Some(&banked)),
+            "HEAD on the bank with a clean tree is no new work, even over a dirty start"
+        );
+
+        std::fs::write(
+            repo.join("overlay.txt"),
+            "test author files plus a slot edit\n",
+        )
+        .unwrap();
+        assert!(
+            dispatch_left_work(&repo, Some(&base), tree.as_deref(), Some(&banked)),
+            "a post-bank edit counts, even in a dirty-started file"
         );
     }
 
@@ -8785,6 +9605,81 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         );
     }
 
+    /// The api-sdk kept-read stamps its `since` before `run_api_slot` starts,
+    /// the way `execute_prepared` stamps its own. The artifact is already on
+    /// disk when the dispatch begins and the fake server never answers, so the
+    /// ceiling fires ~2s in: a `since` taken after the dispatch lands past the
+    /// write plus the 1s grace and the kept-read misses it, failing a round
+    /// whose work is done. Fails if the stamp moves back below the dispatch.
+    #[test]
+    fn run_api_ceiling_keep_sees_an_artifact_written_before_the_ceiling() {
+        use crate::state::RunState;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let cwd = tmp.path().join("wt");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let artifact = paths.artifact("r1", "summary.md");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, "done\n").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            for conn in listener.incoming().take(2) {
+                let Ok(mut stream) = conn else { continue };
+                let mut buf = vec![0u8; 65536];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        });
+        let base_url = format!("http://127.0.0.1:{port}/v1");
+        let mut st = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
+        st.worktrees.push(crate::state::WorktreeRecord {
+            slot_id: "impl".into(),
+            path: cwd.clone(),
+            branch: "impl".into(),
+        });
+        st.slots
+            .push(init_slot("impl", "api:openai", SlotRole::Implementer));
+        let job = SlotJob {
+            slot_id: "impl".into(),
+            provider: "api:openai".into(),
+            role: SlotRole::Implementer,
+            template: String::new(),
+            extra_vars: std::collections::HashMap::new(),
+            expected_artifact: Some("summary.md".into()),
+            model: None,
+            effort: None,
+        };
+        let pref = ProviderRef::parse("api:openai").unwrap();
+        let log = tmp.path().join("slot.log");
+        let prompt = tmp.path().join("prompt.md");
+        std::fs::write(&prompt, "do it").unwrap();
+        let outcome = run_api(
+            &st,
+            &paths,
+            &job,
+            &pref,
+            &cwd,
+            &log,
+            &prompt,
+            "do it",
+            std::time::Duration::from_secs(2),
+            Some("test-key"),
+            Some(base_url.as_str()),
+        );
+        // The hang itself is what the test measures: `chat_completion` already
+        // remakes an EINTR-interrupted read at the source (`retry_interrupted`),
+        // so a transport failure here is a real finding, never retried.
+        let outcome = outcome.unwrap();
+        assert!(
+            outcome.ok,
+            "a ceiling kill after finished work stays done: {:?}",
+            outcome.error
+        );
+        assert_eq!(outcome.timeout_cause, None);
+    }
+
     /// The role gate on the session marker: an implementer reads the prior
     /// session id back, while a reviewer (and the other judging roles) never
     /// sees it even though the marker file is still on disk.
@@ -8881,10 +9776,14 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     fn classifier_run(
         tmp: &Path,
         answer: (&str, f64),
-    ) -> (SparPaths, crate::classifier::tests::FakeSystemOne) {
+    ) -> (
+        SparPaths,
+        crate::classifier::Classifier,
+        crate::classifier::tests::StubSystemOne,
+    ) {
         let paths = SparPaths::new(tmp);
         paths.ensure_run_dirs("run1").unwrap();
-        let fake = crate::classifier::tests::fake_system_one(
+        let (cls, fake) = crate::classifier::tests::stub_system_one(
             200,
             crate::classifier::tests::answer_body(answer.0, answer.1),
             Duration::ZERO,
@@ -8902,7 +9801,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             .slots
             .push(init_slot("impl", "cli:muse", SlotRole::Implementer));
         state.save(&paths).unwrap();
-        (paths, fake)
+        (paths, cls, fake)
     }
 
     fn failed_with(exit_code: Option<i32>, signal: Option<i32>, err: &str) -> SlotOutcome {
@@ -8918,7 +9817,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_fills_a_quota_gap_with_a_strong_pause() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.86));
+        let (paths, cls, fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.86));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(
             &log_path,
@@ -8928,7 +9827,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let job = impl_job("impl");
         let outcome = failed_with(Some(1), None, "exit 1");
         let (quota, auth, rec) = classifier_verdict(
-            &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None, None,
+            &cls, &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None,
+            None,
         );
         assert!(quota && auth.is_none());
         assert_eq!(rec.unwrap().action, crate::classifier::Action::PauseQuota);
@@ -8937,7 +9837,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert_eq!(fake.bodies.lock().unwrap().len(), 1);
 
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.6));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.6));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(
             &log_path,
@@ -8945,7 +9845,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         )
         .unwrap();
         let (quota, auth, rec) = classifier_verdict(
-            &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None, None,
+            &cls, &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None,
+            None,
         );
         assert!(!quota && auth.is_none(), "below threshold: today's verdict");
         assert!(!rec.unwrap().acted);
@@ -8959,7 +9860,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_veto_downgrades_a_text_quota_verdict_to_a_weak_pause() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.95));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.95));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, WEEKLY_LIMIT_LOG).unwrap();
         let job = impl_job("impl");
@@ -8971,6 +9872,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             .unwrap()
             .blocks_live_dispatch("cli:muse"));
         let (quota, auth, rec) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -8991,6 +9893,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(!store.blocks_live_dispatch("cli:muse"), "but weak");
 
         let (quota, auth, _) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9013,7 +9916,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_veto_weakens_only_the_family_bucket_it_vetoes() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.95));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.95));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, "You've reached your Fable limit\n").unwrap();
         let job = impl_job("impl");
@@ -9024,6 +9927,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert_eq!(key, "cli:claude@fable");
         let witness = witness.after_scrape(&paths, "cli:claude@fable");
         let (quota, auth, rec) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9052,7 +9956,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_veto_leaves_a_prior_strong_pause_and_never_pauses_on_auth() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
         let mut store = crate::quota::QuotaStore::load(&paths).unwrap();
         store.pause_quota("cli:muse", "typed five_hour rejection");
         store.mark_strong("cli:muse");
@@ -9064,6 +9968,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let job = impl_job("impl");
         let outcome = failed_with(Some(1), None, "exit 1");
         let (quota, _, rec) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9085,7 +9990,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         );
 
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, WEEKLY_LIMIT_LOG).unwrap();
         let witness = PauseWitness::before(&paths, "run1", "cli:muse").unwrap();
@@ -9100,6 +10005,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         store.mark_strong("cli:muse");
         store.save(&paths).unwrap();
         let (quota, _, _) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9120,10 +10026,11 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         );
 
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, "! not logged in: run `muse login` first\n").unwrap();
         let (quota, auth, _) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9149,7 +10056,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_is_never_asked_about_state_decided_failures() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.99));
+        let (paths, cls, fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.99));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, "something odd\n").unwrap();
         let job = impl_job("impl");
@@ -9193,14 +10100,16 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         ];
         for (outcome, err, quota_hit) in cases {
             let (quota, auth, rec) = classifier_verdict(
-                &paths, "run1", &job, "cli:muse", &log_path, &outcome, &err, quota_hit, None, None,
+                &cls, &paths, "run1", &job, "cli:muse", &log_path, &outcome, &err, quota_hit, None,
+                None,
             );
             assert_eq!((quota, auth, rec), (quota_hit, None, None), "{err}");
         }
         std::fs::write(&log_path, "! model `m` does not exist or you lack access\n").unwrap();
         let outcome = failed_with(Some(1), None, "exit 1");
         let (_, _, rec) = classifier_verdict(
-            &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None, None,
+            &cls, &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None,
+            None,
         );
         assert!(
             rec.is_none(),
@@ -9214,7 +10123,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_transient_answer_takes_the_retry_loop_after_tool_calls() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, fake) = classifier_run(tmp.path(), ("transient_infra", 0.9));
+        let (paths, cls, fake) = classifier_run(tmp.path(), ("transient_infra", 0.9));
         let log_path = tmp.path().join("slot.log");
         let ctr = tmp.path().join("attempts");
         let script = format!(
@@ -9224,6 +10133,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let adapter = ShellAdapter::cold(&script);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &cls,
             &adapter,
             Path::new("/bin/sh"),
             &mut dispatch_opts("go"),
@@ -9247,11 +10157,12 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(events.contains("\"type\":\"classifier\"") && events.contains("\"retry\""));
 
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("transient_infra", 0.9));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("transient_infra", 0.9));
         let log_path = tmp.path().join("slot.log");
         let script = "echo 'upstream wobble, please hold' >&2; exit 1";
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &cls,
             &ShellAdapter::cold(script),
             Path::new("/bin/sh"),
             &mut dispatch_opts("go"),
@@ -9275,7 +10186,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
 
 #[cfg(test)]
 mod round_start_work_tests {
-    use super::slot_has_work;
+    use super::{dispatch_left_work, worktree_snapshot};
 
     fn git(dir: &std::path::Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
@@ -9287,6 +10198,39 @@ mod round_start_work_tests {
             .unwrap();
         assert!(out.status.success(), "{args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Dirt that predates the round-start snapshot is not the round's work: an
+    /// idle ceiling kill over the test-author overlay still fails the round
+    /// instead of recording a partial one, while any edit past the snapshot
+    /// counts. Fails on the old any-dirty-tree check, which read the overlay
+    /// as work.
+    #[test]
+    fn round_start_dirt_is_not_round_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.email", "t@t"]);
+        git(dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("f"), "a\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "round base"]);
+        std::fs::write(dir.join("overlay.txt"), "test author files\n").unwrap();
+        let start = git(dir, &["rev-parse", "HEAD"]);
+        let tree = worktree_snapshot(dir);
+        assert!(
+            !dispatch_left_work(dir, Some(&start), tree.as_deref(), None),
+            "pre-round dirt over an untouched HEAD is not recoverable work"
+        );
+        std::fs::write(
+            dir.join("overlay.txt"),
+            "test author files plus a slot edit\n",
+        )
+        .unwrap();
+        assert!(
+            dispatch_left_work(dir, Some(&start), tree.as_deref(), None),
+            "an edit past the round-start snapshot counts, even in a dirty file"
+        );
     }
 
     /// Work is measured against the round's start HEAD: a commit the primary
@@ -9303,14 +10247,21 @@ mod round_start_work_tests {
         git(dir, &["add", "."]);
         git(dir, &["commit", "-qm", "round start"]);
         let start = git(dir, &["rev-parse", "HEAD"]);
+        let tree = worktree_snapshot(dir);
 
-        assert!(!slot_has_work(dir, Some(&start)));
+        assert!(!dispatch_left_work(
+            dir,
+            Some(&start),
+            tree.as_deref(),
+            None
+        ));
         std::fs::write(dir.join("f"), "b\n").unwrap();
-        assert!(slot_has_work(dir, Some(&start)));
+        assert!(dispatch_left_work(dir, Some(&start), tree.as_deref(), None));
         git(dir, &["commit", "-qam", "primary seat work"]);
-        assert!(slot_has_work(dir, Some(&start)));
+        assert!(dispatch_left_work(dir, Some(&start), tree.as_deref(), None));
         let now = git(dir, &["rev-parse", "HEAD"]);
-        assert!(!slot_has_work(dir, Some(&now)));
-        assert!(!slot_has_work(dir, None));
+        let clean = worktree_snapshot(dir);
+        assert!(!dispatch_left_work(dir, Some(&now), clean.as_deref(), None));
+        assert!(!dispatch_left_work(dir, None, None, None));
     }
 }

@@ -809,6 +809,11 @@ fn run_from_approved(
     } else {
         state.begin_round()
     };
+    // A re-entered round number is not a reused dispatch: this entry is about to
+    // read pauses and spawn, so the pre-existing/this-round line starts now.
+    // A fix pass below opens rounds without re-stamping: it continues this
+    // dispatch, and its seats must not trip over this dispatch's own pauses.
+    state.stamp_dispatch();
     if !opts.json {
         println!("run {run_id} · round {round}");
     }
@@ -825,49 +830,17 @@ fn run_from_approved(
             reload_config: opts.reload_config,
         },
     )?;
+    // Only the implementer must run next at run start, so only it can park the
+    // run here: a paused reviewer or tester seat is reseated onto its backup
+    // or stood down at its own dispatch.
     if !dry {
-        let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-        let has_backup = cfg.backups.implementer.is_some()
-            || !cfg.backups.reviewer.is_empty()
-            || cfg.backups.tester.is_some();
-        let available: Option<std::collections::HashSet<String>> = if !has_backup {
-            None
-        } else {
-            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                .into_iter()
-                .filter(|r| r.available)
-                .map(|r| format!("cli:{}", r.name))
-                .collect();
-            if detected.is_empty() {
-                None
-            } else {
-                Some(detected)
-            }
-        };
-        let mut still_paused: Vec<String> = Vec::new();
-        for slot in &state.slots {
-            if matches!(
-                slot.role,
-                SlotRole::Implementer | SlotRole::Reviewer | SlotRole::Tester
-            ) && !crate::backup::is_provider_eligible(
-                &slot.provider_ref().display(),
-                &store,
-                available.as_ref(),
-            ) {
-                let key = slot.provider_ref().quota_key();
-                if !still_paused.contains(&key) {
-                    still_paused.push(key);
-                }
-            }
-        }
-        if !still_paused.is_empty() {
-            let msg = format!(
-                "provider(s) paused or on cooldown: {}. resume with `spar provider resume <name>` or reassign the role",
-                still_paused.join(", ")
-            );
+        if let Some(msg) = gate_implementer_seat(&mut state, paths, cfg)? {
             state.error = Some(msg.clone());
             state.set_phase(crate::state::Phase::Quota);
             state.save(paths)?;
+            // The round already bumped above: refresh so poll files drop what the
+            // new round ages out even though no slot dispatches.
+            crate::providers::delivery::refresh_run_poll_files(paths, run_id);
             if opts.json {
                 crate::executor::emit_run_json(&state)?;
             } else {
@@ -880,6 +853,7 @@ fn run_from_approved(
         bail!("no implementer slot after provider pick");
     }
     state.save(paths)?;
+    crate::providers::delivery::refresh_run_poll_files(paths, run_id);
     if opts.detach {
         // The detached child takes the lock itself, and flock refuses a second holder.
         drop(lock);
@@ -991,7 +965,12 @@ fn prepare_implement_slots(
         let mut seat_id = seat.seat.clone();
         let seat_ref =
             crate::provider_ref::ProviderRef::for_seat(&provider, model.as_deref()).display();
-        if !crate::backup::is_provider_eligible(&seat_ref, &store, available.as_ref()) {
+        if !crate::backup::is_provider_eligible(
+            &seat_ref,
+            &store,
+            available.as_ref(),
+            state.codex_profile.as_deref(),
+        ) {
             let ordinal = if seat.role == SlotRole::Reviewer {
                 reviewer_ordinal(&seat.seat).unwrap_or(0)
             } else {
@@ -1004,6 +983,7 @@ fn prepare_implement_slots(
                     available.as_ref(),
                     paths,
                     dry,
+                    state.codex_profile.as_deref(),
                 ) {
                     if let Ok(pin) = crate::provider_ref::Pin::parse(&backup_raw) {
                         provider = pin.display();
@@ -1569,6 +1549,25 @@ enum ReviewedCommitDecision {
     Mismatch,
 }
 
+/// The recorded verdict a stood-down reviewer carries into the gate: only a seat
+/// that never dispatched this round (`stood_down`) and whose last recorded
+/// verdict rejects this head. A veto about an older head was superseded by the
+/// fix round; a seat that never judged has nothing to carry; a failure stub
+/// names no commit, so only a real judgment about this head carries.
+fn carried_rejection<'a>(
+    slot: &'a SlotState,
+    panel_head: Option<&str>,
+) -> Option<&'a ReviewResult> {
+    slot.stood_down.as_ref()?;
+    let head = panel_head?;
+    let res = slot.review.as_ref()?;
+    if res.verdict != Some(review_result::Verdict::RequestChanges) {
+        return None;
+    }
+    let sha = res.reviewed_commit.as_deref()?;
+    review_result::reviewed_commit_matches(head, sha).then_some(res)
+}
+
 fn decide_reviewed_commit(panel_head: Option<&str>, res: &ReviewResult) -> ReviewedCommitDecision {
     let Some(head) = panel_head else {
         return ReviewedCommitDecision::Skipped;
@@ -1879,6 +1878,7 @@ fn run_with_task(
     // just at the plan phase.
     state.pool_origin = pool_origin;
     state.providers = providers::pick_providers(&requested, n, Some(&requested), dry);
+    state.stamp_dispatch();
     // Quota gate is now backup-aware and runs after seat resolution: a paused primary
     // with an eligible backup must not park the run.
     prepare_implement_slots(
@@ -1893,43 +1893,11 @@ fn run_with_task(
             reload_config: opts.reload_config,
         },
     )?;
+    // Only the implementer must run next at run start, so only it can park the
+    // run here: a paused reviewer or tester seat is reseated onto its backup
+    // or stood down at its own dispatch.
     if !dry {
-        let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-        let has_backup = cfg.backups.implementer.is_some()
-            || !cfg.backups.reviewer.is_empty()
-            || cfg.backups.tester.is_some();
-        let available: Option<std::collections::HashSet<String>> = if !has_backup {
-            None
-        } else {
-            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                .into_iter()
-                .filter(|r| r.available)
-                .map(|r| format!("cli:{}", r.name))
-                .collect();
-            if detected.is_empty() {
-                None
-            } else {
-                Some(detected)
-            }
-        };
-        let mut still_paused: Vec<String> = Vec::new();
-        for slot in &state.slots {
-            if !crate::backup::is_provider_eligible(
-                &slot.provider_ref().display(),
-                &store,
-                available.as_ref(),
-            ) {
-                let key = slot.provider_ref().quota_key();
-                if !still_paused.contains(&key) {
-                    still_paused.push(key);
-                }
-            }
-        }
-        if !still_paused.is_empty() {
-            let msg = format!(
-                "provider(s) paused or on cooldown: {}. resume with `spar provider resume <name>` or reassign the role",
-                still_paused.join(", ")
-            );
+        if let Some(msg) = gate_implementer_seat(&mut state, paths, cfg)? {
             state.error = Some(msg.clone());
             state.set_phase(Phase::Quota);
             paths.ensure_run_dirs(&state.id)?;
@@ -1945,7 +1913,13 @@ fn run_with_task(
 
     paths.ensure_run_dirs(&state.id)?;
     let _ = crate::bus::ensure_bus(paths);
-    let _ = crate::bus::join(paths, Some(&state.id), "orchestrator", None, None);
+    let _ = crate::bus::join(
+        paths,
+        Some(&state.id),
+        crate::bus::ORCHESTRATOR_SEAT,
+        None,
+        None,
+    );
     if let Some(body) = &plan_body {
         std::fs::write(paths.artifact(&state.id, "plan.md"), body)?;
         if state.big {
@@ -2169,7 +2143,7 @@ pub fn execute_loop(
                 let _ = crate::bus::broadcast(
                     paths,
                     Some(&state.id),
-                    "orchestrator",
+                    crate::bus::ORCHESTRATOR_SEAT,
                     note,
                     state.message_budget,
                 );
@@ -2225,7 +2199,7 @@ pub fn execute_loop(
             .find(|s| s.role == SlotRole::Implementer)
             .map(|s| s.id.clone())
         {
-            if let SeatCheck::Park(msg) = recheck_seat(state, paths, cfg, &id)? {
+            if let SeatCheck::Park(msg) = recheck_seat(state, paths, cfg, &id, false)? {
                 return fail(state, paths, anyhow::anyhow!(msg), true);
             }
         }
@@ -2284,6 +2258,9 @@ pub fn execute_loop(
             model: impl_model,
             effort: None,
         };
+        // Set when the pass below records a ceiling partial for this round, so
+        // the normal-finish clear after the dispatch does not erase it.
+        let mut partial_recorded = false;
         if let Err(e) = executor::run_slot(state, paths, cfg, &impl_job) {
             // A hard-ceiling kill is reported as a typed cause on the slot, never
             // matched from the error prose. With work left behind the round goes on:
@@ -2292,7 +2269,8 @@ pub fn execute_loop(
             // The ceiling check runs before the quota park: a dispatch that hit both
             // still goes to review on its partial work, costing one extra panel, and
             // the next round's seat recheck parks it.
-            if let Some((note, kind)) = try_commit_ceiling_partial(state, paths, &impl_job.slot_id)
+            if let Some((note, kind, commit)) =
+                try_commit_ceiling_partial(state, paths, &impl_job.slot_id)
             {
                 record_ceiling_partial(
                     state,
@@ -2300,8 +2278,10 @@ pub fn execute_loop(
                     &impl_job.slot_id,
                     note,
                     kind,
+                    commit,
                     &mut ceiling_partial_note,
                 )?;
+                partial_recorded = true;
             } else {
                 let quota_hit = executor::slot_parks_on_quota(state, &impl_job.slot_id);
                 if quota_hit {
@@ -2336,6 +2316,7 @@ pub fn execute_loop(
                             &slot_state,
                             &store,
                             available.as_ref(),
+                            state.codex_profile.as_deref(),
                         );
                         if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
                             let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
@@ -2352,6 +2333,7 @@ pub fn execute_loop(
                                     available.as_ref(),
                                     paths,
                                     state.dry_run,
+                                    state.codex_profile.as_deref(),
                                 )
                             {
                                 if let Some(s) = state.slot_mut(&impl_job.slot_id) {
@@ -2392,6 +2374,7 @@ pub fn execute_loop(
                                     )? {
                                         return Ok(());
                                     }
+                                    partial_recorded = true;
                                 }
                                 // Retry succeeded, continue to review phase
                             } else {
@@ -2428,8 +2411,12 @@ pub fn execute_loop(
                         .find(|s| s.id == impl_job.slot_id)
                         .cloned()
                         .unwrap();
-                    let cause =
-                        crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
+                    let cause = crate::backup::dispatch_stop_cause(
+                        &slot_state,
+                        &store,
+                        available.as_ref(),
+                        state.codex_profile.as_deref(),
+                    );
                     if cause.engages_backup() {
                         if let Some(backup_raw) =
                             crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
@@ -2440,6 +2427,7 @@ pub fn execute_loop(
                                 available.as_ref(),
                                 paths,
                                 state.dry_run,
+                                state.codex_profile.as_deref(),
                             ) && slot_state.source != Some(SeatSource::Backup)
                             {
                                 let backup_key =
@@ -2490,6 +2478,7 @@ pub fn execute_loop(
                                         )? {
                                             return Ok(());
                                         }
+                                        partial_recorded = true;
                                     }
                                 } else {
                                     return fail(state, paths, e, quota_hit);
@@ -2505,6 +2494,13 @@ pub fn execute_loop(
                     }
                 }
             }
+        }
+
+        // The implementer finished without a ceiling kill, so this round is not
+        // cut short even if an earlier same-round attempt was: drop its mark
+        // before review. A just-recorded partial sets the flag below instead.
+        if !partial_recorded {
+            clear_finished_round_partial_mark(state, paths)?;
         }
 
         // Refresh implementer cwd after run (worktree may have been set at prepare).
@@ -2530,7 +2526,9 @@ pub fn execute_loop(
         if should_stop(paths, &state.id) {
             return stop_now(state, paths);
         }
-        commit_before_review(state, paths, cfg, &impl_slot.id);
+        if let Some(note) = commit_before_review(state, paths, cfg, &impl_slot.id) {
+            ceiling_partial_note = Some(note);
+        }
 
         // Suite channel: cheap model runs full suites; reviewers must not re-run them.
         let mut suite_body = String::new();
@@ -2542,6 +2540,16 @@ pub fn execute_loop(
                 .iter()
                 .find(|s| s.role == SlotRole::Tester)
                 .cloned();
+            // A tester seat with no usable provider parks the run: the suite
+            // is a singular gate. `recheck_seat` moves it onto an eligible
+            // backup when it has one (O153).
+            let tester = match tester {
+                Some(t) => match recheck_seat(state, paths, cfg, &t.id, false)? {
+                    SeatCheck::Ready(id) => state.slots.iter().find(|s| s.id == id).cloned(),
+                    SeatCheck::Park(msg) => return fail(state, paths, anyhow::anyhow!(msg), true),
+                },
+                None => None,
+            };
             if cfg.suite.is_builtin() {
                 state.set_phase(Phase::Suite);
                 state.save(paths)?;
@@ -2600,7 +2608,7 @@ pub fn execute_loop(
                 let _ = crate::bus::broadcast(
                     paths,
                     Some(&state.id),
-                    "orchestrator",
+                    crate::bus::ORCHESTRATOR_SEAT,
                     msg,
                     state.message_budget,
                 );
@@ -2672,7 +2680,7 @@ pub fn execute_loop(
                 let _ = crate::bus::broadcast(
                     paths,
                     Some(&state.id),
-                    "orchestrator",
+                    crate::bus::ORCHESTRATOR_SEAT,
                     msg,
                     state.message_budget,
                 );
@@ -2682,7 +2690,7 @@ pub fn execute_loop(
                 let _ = crate::bus::broadcast(
                     paths,
                     Some(&state.id),
-                    "orchestrator",
+                    crate::bus::ORCHESTRATOR_SEAT,
                     "suite channel inconclusive: no tester slot prepared".to_string(),
                     state.message_budget,
                 );
@@ -2705,7 +2713,7 @@ pub fn execute_loop(
                 let _ = crate::bus::broadcast(
                     paths,
                     Some(&state.id),
-                    "orchestrator",
+                    crate::bus::ORCHESTRATOR_SEAT,
                     note.clone(),
                     state.message_budget,
                 );
@@ -2778,7 +2786,7 @@ pub fn execute_loop(
             let _ = crate::bus::broadcast(
                 paths,
                 Some(&state.id),
-                "orchestrator",
+                crate::bus::ORCHESTRATOR_SEAT,
                 msg.clone(),
                 state.message_budget,
             );
@@ -2843,14 +2851,29 @@ pub fn execute_loop(
             eprintln!("note: {msg}");
             let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
         }
+        // A reviewer seat with no usable provider is stood down, not parked: the
+        // panel keeps running its other seats. Only a panel with no usable
+        // seat left parks the run (O153).
+        let mut stood_down: Vec<String> = Vec::new();
         for rev in &reviewers {
             // Stop boundary: before each reviewer job.
             if should_stop(paths, &state.id) {
                 return stop_now(state, paths);
             }
-            let rev_id = match recheck_seat(state, paths, cfg, &rev.id)? {
+            let rev_id = match recheck_seat(state, paths, cfg, &rev.id, false)? {
                 SeatCheck::Ready(id) => id,
-                SeatCheck::Park(msg) => return fail(state, paths, anyhow::anyhow!(msg), true),
+                SeatCheck::Park(msg) => {
+                    let note = format!("reviewer seat `{}` stood down: {msg}", rev.id);
+                    eprintln!("warning: {note}");
+                    let _ =
+                        crate::events::append(paths, &state.id, &crate::events::Event::info(note));
+                    if let Some(s) = state.slot_mut(&rev.id) {
+                        s.stood_down = Some(msg.clone());
+                    }
+                    state.save(paths)?;
+                    stood_down.push(msg);
+                    continue;
+                }
             };
             let mut rev = state
                 .slots
@@ -3117,7 +3140,7 @@ pub fn execute_loop(
                     let _ = crate::bus::broadcast(
                         paths,
                         Some(&state.id),
-                        "orchestrator",
+                        crate::bus::ORCHESTRATOR_SEAT,
                         format!(
                             "acceptance gate blocked ship (review {}): {}",
                             rev.id,
@@ -3126,6 +3149,29 @@ pub fn execute_loop(
                         state.message_budget,
                     );
                 }
+            }
+        }
+        // Every reviewer stood down: the panel has no usable seat, so the run
+        // parks exactly as a lone reviewer with no backup always has.
+        if !reviewers.is_empty() && stood_down.len() == reviewers.len() {
+            return fail(state, paths, anyhow::anyhow!(stood_down.join("; ")), true);
+        }
+        // A stood-down seat's recorded veto still blocks when it rejects the
+        // head about to ship: judged, unanswered, and unable to re-judge. The
+        // same verdict and acceptance predicates judge it as a fresh artifact.
+        let mut carried: Vec<(String, review_result::ReviewResult)> = Vec::new();
+        for s in state.slots.iter().filter(|s| s.role == SlotRole::Reviewer) {
+            if let Some(res) = carried_rejection(s, panel_head.as_deref()) {
+                carried.push((s.id.clone(), res.clone()));
+            }
+        }
+        for (id, res) in &carried {
+            if res.blocks(cfg.review.block_on) || acceptance_blocks_ship(&criteria, res, cfg) {
+                any_request_changes = true;
+                blockers.push(format!(
+                    "review `{id}` stood down on quota; its recorded request_changes on {} still blocks this head",
+                    res.reviewed_commit.as_deref().unwrap_or("unknown")
+                ));
             }
         }
         // The next round continues from the partial WIP commit, so its
@@ -3198,6 +3244,8 @@ pub fn execute_loop(
         state.begin_round();
         state.set_phase(Phase::Fix);
         state.save(paths)?;
+        let run_id = state.id.clone();
+        crate::providers::delivery::refresh_run_poll_files(paths, &run_id);
     }
 }
 
@@ -3245,33 +3293,55 @@ fn commit_branch_leftovers(
     Some((wt.branch, outcome))
 }
 
-fn commit_before_review(state: &mut RunState, paths: &SparPaths, cfg: &Config, impl_id: &str) {
+/// The refreshed cut-short notice when the commit below banks a ceiling-cut
+/// round's leftovers: the reviewers and the next round read this instead of
+/// the kill-time note, so a Refused round whose work did land never claims it
+/// is uncommitted. `None` when no notice needs refreshing.
+fn commit_before_review(
+    state: &mut RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+    impl_id: &str,
+) -> Option<String> {
     let subject = crate::ship::pr_title(state.task.as_deref(), cfg.ship.title_max);
     let body = format!(
         "spar: uncommitted implementer work before review round {}",
         state.round
     );
     let round = state.round;
-    let Some((branch, outcome)) = commit_branch_leftovers(state, paths, impl_id, &subject, &body)
-    else {
-        return;
-    };
-    let note = match outcome {
-        LeftoverCommit::Committed(sha) => format!(
-            "committed uncommitted implementer work on {branch} as {} before review round {round}",
-            sha.chars().take(8).collect::<String>(),
-        ),
-        LeftoverCommit::Clean => return,
+    let (branch, outcome) = commit_branch_leftovers(state, paths, impl_id, &subject, &body)?;
+    match outcome {
+        LeftoverCommit::Committed(sha) => {
+            let note = format!(
+                "committed uncommitted implementer work on {branch} as {} before review round {round}",
+                sha.chars().take(8).collect::<String>(),
+            );
+            let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
+            // A ceiling-cut round whose WIP commit the hooks refused banks here
+            // instead: HEAD now carries the work, so the round reads as WIP
+            // rather than Refused. Rounds without a partial mark leave none behind.
+            if let Some(entry) = state
+                .ceiling_partial_rounds
+                .iter_mut()
+                .find(|e| e.round == round)
+            {
+                entry.kind = CeilingPartialKind::Wip;
+                entry.commit = Some(sha);
+                return Some(ceiling_partial_notice(round));
+            }
+            None
+        }
+        LeftoverCommit::Clean => None,
         LeftoverCommit::Refused(e) => {
             let msg = format!(
                 "could not commit uncommitted implementer work before review round {round}: {e}; \
                  the panel judges HEAD without it"
             );
             eprintln!("warning: {msg}");
-            msg
+            let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
+            None
         }
-    };
-    let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
+    }
 }
 
 /// What the reviewers and the next round are told when the implementer is cut
@@ -3300,8 +3370,9 @@ fn ceiling_partial_clean_notice(round: u32) -> String {
 
 /// What the next round is told when the previous implementer was cut short at
 /// its hard ceiling and its leftovers could not be committed: no WIP commit
-/// exists, so the notice must not claim one. The live kill names the commit
-/// error; the rebuild has none to name.
+/// exists, so the notice must not claim one, and the panel judges a checkout of
+/// HEAD, so it must never be told to judge an uncommitted tree. The live kill
+/// names the commit error; the rebuild has none to name.
 fn ceiling_partial_refused_notice(round: u32, detail: Option<&str>) -> String {
     let cause = match detail {
         Some(e) => format!(" ({e})"),
@@ -3310,7 +3381,7 @@ fn ceiling_partial_refused_notice(round: u32, detail: Option<&str>) -> String {
     format!(
         "NOTE: the implementer pass for round {round} was cut short at its hard time \
          ceiling and its partial work could not be committed{cause}; judge the HEAD commit \
-         and the uncommitted tree as partial work and continue the task from there."
+         as partial work and continue the task from there."
     )
 }
 
@@ -3325,7 +3396,7 @@ fn try_commit_ceiling_partial(
     state: &mut RunState,
     paths: &SparPaths,
     impl_id: &str,
-) -> Option<(String, CeilingPartialKind)> {
+) -> Option<(String, CeilingPartialKind, Option<String>)> {
     if executor::slot_timeout_cause(state, impl_id) != Some(executor::TimeoutCause::HardCeiling) {
         return None;
     }
@@ -3334,27 +3405,44 @@ fn try_commit_ceiling_partial(
         .iter()
         .find(|w| w.slot_id == impl_id)
         .map(|w| w.path.clone())?;
-    // The round's start HEAD, never the run base: from round 2 on the base predates
-    // earlier rounds' commits, so the base always reads as work. Without a recorded
-    // HEAD only a dirty tree counts.
-    let since = state
+    // The round's start HEAD and tree, never the run base: from round 2 on the base
+    // predates earlier rounds' commits, so the base always reads as work. The tree
+    // snapshot matters too: round 1 starts dirty (the test author's files land
+    // uncommitted) and a Refused round leaves leftovers, so a dirty tree alone
+    // cannot mean this round did anything. Without a recorded start only a dirty
+    // tree can be judged.
+    let (since, since_tree) = state
         .slots
         .iter()
         .find(|s| s.id == impl_id)
-        .and_then(|s| s.dispatch_head.clone());
-    if !executor::slot_has_work(&wt_path, since.as_deref()) {
+        .map(|s| (s.dispatch_head.clone(), s.dispatch_tree.clone()))
+        .unwrap_or_default();
+    let round = state.round;
+    // The round's own banked WIP commit: a same-round resume that idles into a
+    // second ceiling kill leaves HEAD exactly here with a clean tree, which must
+    // read as no new work rather than re-record the round.
+    let banked = state
+        .ceiling_partial_rounds
+        .iter()
+        .find(|e| e.round == round)
+        .and_then(|e| e.commit.clone());
+    if !executor::dispatch_left_work(
+        &wt_path,
+        since.as_deref(),
+        since_tree.as_deref(),
+        banked.as_deref(),
+    ) {
         return None;
     }
-    let round = state.round;
     let subject =
-        format!("WIP: implementer cut short at hard ceiling (round {round}, partial work)");
+        format!("chore(spar): partial work, implementer cut short at hard ceiling (round {round})");
     let body = format!(
         "spar: the round {round} implementer was killed at its hard time ceiling before it \
          could finish. Its leftovers are committed here so the suite and the review panel \
          judge what is on the branch, and the next round continues from this commit."
     );
     let (branch, outcome) = commit_branch_leftovers(state, paths, impl_id, &subject, &body)?;
-    let (note, notice, kind) = match outcome {
+    let (note, notice, kind, commit) = match outcome {
         LeftoverCommit::Committed(sha) => (
             format!(
                 "committed partial round-{round} implementer work on {branch} as {} (ceiling kill WIP)",
@@ -3362,14 +3450,25 @@ fn try_commit_ceiling_partial(
             ),
             ceiling_partial_notice(round),
             CeilingPartialKind::Wip,
+            Some(sha),
         ),
-        LeftoverCommit::Clean => (
-            format!(
-                "ceiling kill left committed work on {branch} with a clean tree; round {round} goes on"
-            ),
-            ceiling_partial_clean_notice(round),
-            CeilingPartialKind::Clean,
-        ),
+        LeftoverCommit::Clean => {
+            let head = worktree::git_out(&wt_path, &["rev-parse", "HEAD"]);
+            if banked
+                .as_deref()
+                .is_some_and(|sha| head.as_deref() == Some(sha))
+            {
+                return None;
+            }
+            (
+                format!(
+                    "ceiling kill left committed work on {branch} with a clean tree; round {round} goes on"
+                ),
+                ceiling_partial_clean_notice(round),
+                CeilingPartialKind::Clean,
+                head,
+            )
+        }
         LeftoverCommit::Refused(e) => {
             let msg = format!(
                 "could not commit partial round-{round} implementer work (ceiling kill WIP): {e}; \
@@ -3380,11 +3479,12 @@ fn try_commit_ceiling_partial(
             return Some((
                 ceiling_partial_refused_notice(round, Some(&e)),
                 CeilingPartialKind::Refused,
+                None,
             ));
         }
     };
     let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(note));
-    Some((notice, kind))
+    Some((notice, kind, commit))
 }
 
 /// A backup-retry implementer dispatch failed. A ceiling-cut partial round goes on
@@ -3400,8 +3500,8 @@ fn handle_retry_err(
     err: anyhow::Error,
     note_out: &mut Option<String>,
 ) -> Result<bool> {
-    if let Some((note, kind)) = try_commit_ceiling_partial(state, paths, slot_id) {
-        record_ceiling_partial(state, paths, slot_id, note, kind, note_out)?;
+    if let Some((note, kind, commit)) = try_commit_ceiling_partial(state, paths, slot_id) {
+        record_ceiling_partial(state, paths, slot_id, note, kind, commit, note_out)?;
         Ok(true)
     } else {
         let quota_hit = executor::slot_parks_on_quota(state, slot_id);
@@ -3415,12 +3515,29 @@ fn handle_retry_err(
 /// remembered on the run so a fresh process rebuilds the cut-short notice from
 /// disk for the next round's implementer. The kind records how the work was left
 /// so the rebuilt notice words the WIP commit honestly.
+/// Drop this round's ceiling-cut mark when its implementer finishes without a
+/// ceiling kill: the round is no longer cut short, so ship judges the real
+/// summary and the next round gets no stale notice. Keyed on the dispatch, not
+/// the verdict — a finished round the panel rejects still finished. Older
+/// rounds keep their marks for the PR's Partial work section.
+fn clear_finished_round_partial_mark(state: &mut RunState, paths: &SparPaths) -> Result<()> {
+    let before = state.ceiling_partial_rounds.len();
+    state
+        .ceiling_partial_rounds
+        .retain(|e| e.round != state.round);
+    if state.ceiling_partial_rounds.len() != before {
+        state.save(paths)?;
+    }
+    Ok(())
+}
+
 fn record_ceiling_partial(
     state: &mut RunState,
     paths: &SparPaths,
     slot_id: &str,
     note: String,
     kind: CeilingPartialKind,
+    commit: Option<String>,
     out: &mut Option<String>,
 ) -> Result<()> {
     eprintln!("note: {note}");
@@ -3456,10 +3573,12 @@ fn record_ceiling_partial(
         .find(|e| e.round == state.round)
     {
         entry.kind = kind;
+        entry.commit = commit;
     } else {
         state.ceiling_partial_rounds.push(CeilingPartialRound {
             round: state.round,
             kind,
+            commit,
         });
     }
     state.save(paths)?;
@@ -3620,6 +3739,70 @@ enum SeatCheck {
     Park(String),
 }
 
+/// Run-start quota gate: only the implementer must run next at run start, so
+/// only it can park the run here. `recheck_seat` moves it onto an eligible
+/// backup when it has one; a seat with no usable provider parks the run, and
+/// the returned message names it (O153).
+fn gate_implementer_seat(
+    state: &mut RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+) -> Result<Option<String>> {
+    let impl_id: Option<String> = state
+        .slots
+        .iter()
+        .find(|s| s.role == SlotRole::Implementer)
+        .map(|s| s.id.clone());
+    match impl_id {
+        None => Ok(None),
+        Some(id) => match recheck_seat(state, paths, cfg, &id, true)? {
+            SeatCheck::Ready(id) => {
+                // Quota-clean but the CLI may still be missing: the old run-start
+                // gate parked then too, once backups exist to detect against.
+                let has_backup = cfg.backups.implementer.is_some()
+                    || !cfg.backups.reviewer.is_empty()
+                    || cfg.backups.tester.is_some();
+                if !has_backup {
+                    return Ok(None);
+                }
+                let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                    .into_iter()
+                    .filter(|r| r.available)
+                    .map(|r| format!("cli:{}", r.name))
+                    .collect();
+                let available = if detected.is_empty() {
+                    None
+                } else {
+                    Some(detected)
+                };
+                let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+                let codex_profile = state.codex_profile.clone();
+                let missing = state
+                    .slots
+                    .iter()
+                    .find(|s| s.id == id)
+                    .filter(|s| {
+                        !crate::backup::is_provider_eligible(
+                            &s.provider_ref().display(),
+                            &store,
+                            available.as_ref(),
+                            codex_profile.as_deref(),
+                        )
+                    })
+                    .map(|s| s.provider.clone());
+                match missing {
+                    Some(provider) => Ok(Some(format!(
+                        "provider for `{id}` not available ({provider}). \
+                         install the CLI or set `--select`/`--providers` to a usable one"
+                    ))),
+                    None => Ok(None),
+                }
+            }
+            SeatCheck::Park(msg) => Ok(Some(msg)),
+        },
+    }
+}
+
 /// Re-read pause state right before a dispatch (#175, O106). Pauses used to be read
 /// only when a run started or resumed, so `provider pause grok --until 2027-01-01` did
 /// not stop a live run from dispatching its next grok reviewer. A seat whose provider
@@ -3629,6 +3812,9 @@ fn recheck_seat(
     paths: &SparPaths,
     cfg: &Config,
     slot_id: &str,
+    // A start-of-run gate parks on any pause (O106: a weak pause still steers the
+    // next run's seat choice); a live re-check trusts only manual and strong pauses.
+    strict: bool,
 ) -> Result<SeatCheck> {
     let Some(slot) = state.slots.iter().find(|s| s.id == slot_id).cloned() else {
         return Ok(SeatCheck::Ready(slot_id.to_string()));
@@ -3639,21 +3825,44 @@ fn recheck_seat(
     }
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     let seat = slot.provider_ref();
-    let key = seat.quota_key();
+    let key = seat.quota_key(state.codex_profile.as_deref());
     let sub = seat.storage_key();
-    // Only a pause a live run can trust stops it here: a weak heuristic pause ("429"
-    // in "429 passed") written by this very run must not park it or reseat it (O106).
-    if !store.blocks_live_dispatch(&key) {
+    // A live run trusts only pauses it can trust: manual and strong (O106). A
+    // weak heuristic pause ("429" in "429 passed") written by this very dispatch
+    // must not park it or reseat it — but a weak pause written before this
+    // dispatch started steers the seat onto its backup, so the first dispatch
+    // reads it strict while later dispatches stay trust-only. The line is the
+    // dispatch start, not the run creation: one id threads plan, implement, and
+    // every round (O45), so `created_at` long predates any later round.
+    let horizon = state.round_started_at.unwrap_or(state.created_at);
+    let blocked = if strict {
+        !store.is_usable(&key)
+    } else if store.blocks_live_dispatch(&key) {
+        true
+    } else {
+        !store.is_usable(&key) && store.get(&key).updated_at.is_none_or(|at| at < horizon)
+    };
+    if !blocked {
         return Ok(SeatCheck::Ready(slot_id.to_string()));
     }
     let ordinal = match slot.role {
         SlotRole::Reviewer => reviewer_ordinal(slot_id),
         _ => Some(0),
     };
+    let codex_profile = state.codex_profile.clone();
     let backup = ordinal
         .and_then(|o| crate::backup::backup_for_role(slot.role, o, cfg))
         .filter(|b| crate::quota::sub_key(b) != sub)
-        .filter(|b| crate::backup::backup_eligible(b, &store, None, paths, state.dry_run));
+        .filter(|b| {
+            crate::backup::backup_eligible(
+                b,
+                &store,
+                None,
+                paths,
+                state.dry_run,
+                codex_profile.as_deref(),
+            )
+        });
     let Some(backup_raw) = backup else {
         return Ok(SeatCheck::Park(format!(
             "provider {key} is paused or on cooldown and `{slot_id}` has no eligible backup. \
@@ -3706,7 +3915,12 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                     Some(detected)
                 }
             };
-        let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, available_opt.as_ref());
+        let cause = crate::backup::dispatch_stop_cause(
+            &slot_state,
+            &store,
+            available_opt.as_ref(),
+            state.codex_profile.as_deref(),
+        );
         if has_backup {
             if cause.engages_backup() {
                 if let Some(backup_raw) =
@@ -3728,6 +3942,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                             available_opt.as_ref(),
                             paths,
                             state.dry_run,
+                            state.codex_profile.as_deref(),
                         )
                         && slot_state.source != Some(SeatSource::Backup)
                     {
@@ -3935,10 +4150,20 @@ fn try_rotate_reviewer_provider(
     let cur = slot.provider.clone();
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     if infra && slot.source != Some(SeatSource::Backup) {
+        let codex_profile = state.codex_profile.clone();
         let backup = reviewer_ordinal(rev_id)
             .and_then(|o| crate::backup::backup_for_role(SlotRole::Reviewer, o, cfg))
             .filter(|b| crate::quota::sub_key(b) != crate::quota::sub_key(&cur))
-            .filter(|b| crate::backup::backup_eligible(b, &store, None, paths, state.dry_run));
+            .filter(|b| {
+                crate::backup::backup_eligible(
+                    b,
+                    &store,
+                    None,
+                    paths,
+                    state.dry_run,
+                    codex_profile.as_deref(),
+                )
+            });
         if let Some(raw) = backup {
             let id = move_seat_to_backup(state, paths, rev_id, &raw)?;
             if let Some(s) = state.slot_mut(&id) {
@@ -3948,8 +4173,10 @@ fn try_rotate_reviewer_provider(
             return Ok(Some(id));
         }
     }
-    let eligible =
-        |p: &String| -> bool { *p != cur && crate::backup::is_provider_eligible(p, &store, None) };
+    let codex_profile = state.codex_profile.clone();
+    let eligible = |p: &String| -> bool {
+        *p != cur && crate::backup::is_provider_eligible(p, &store, None, codex_profile.as_deref())
+    };
     let reviewer_role_source = if cfg
         .cli_role_keys
         .contains(SlotRole::Reviewer.as_config_key())
@@ -4091,7 +4318,14 @@ mod recheck_seat_tests {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let mut st = state_with("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
-        let got = recheck_seat(&mut st, &paths, &Config::default(), "review-0-cli-grok").unwrap();
+        let got = recheck_seat(
+            &mut st,
+            &paths,
+            &Config::default(),
+            "review-0-cli-grok",
+            false,
+        )
+        .unwrap();
         assert!(matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-grok"));
     }
 
@@ -4105,7 +4339,7 @@ mod recheck_seat_tests {
         let mut st = state_with("review-1-cli-grok", "cli:grok", SlotRole::Reviewer);
         let mut cfg = Config::default();
         cfg.backups.reviewer = vec![String::new(), "cli:codex@gpt-5.6-terra".into()];
-        let got = recheck_seat(&mut st, &paths, &cfg, "review-1-cli-grok").unwrap();
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-1-cli-grok", false).unwrap();
         let SeatCheck::Ready(id) = got else {
             panic!("expected a move to the backup");
         };
@@ -4122,18 +4356,127 @@ mod recheck_seat_tests {
         let paths = SparPaths::new(tmp.path());
         pause(&paths, "cli:claude");
         let mut st = state_with("impl", "cli:claude", SlotRole::Implementer);
-        let got = recheck_seat(&mut st, &paths, &Config::default(), "impl").unwrap();
+        let got = recheck_seat(&mut st, &paths, &Config::default(), "impl", true).unwrap();
         assert!(matches!(got, SeatCheck::Park(ref m) if m.contains("cli:claude")));
 
         pause(&paths, "cli:codex");
         let mut cfg = Config::default();
         cfg.backups.implementer = Some("cli:codex".into());
-        let got = recheck_seat(&mut st, &paths, &cfg, "impl").unwrap();
+        let got = recheck_seat(&mut st, &paths, &cfg, "impl", true).unwrap();
         assert!(
             matches!(got, SeatCheck::Park(_)),
             "a paused backup is no way out"
         );
         assert_eq!(st.slots[0].provider, "cli:claude");
+    }
+
+    /// One id threads plan, implement, and every round (O45), so `created_at`
+    /// long predates any later round: the pre-existing/this-dispatch line is the
+    /// dispatch start. A weak pause written after the run was created but before
+    /// this dispatch steers onto the backup; one written after the dispatch
+    /// started stays trust-only.
+    #[test]
+    fn a_weak_pause_between_creation_and_dispatch_steers_onto_the_backup() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        st.created_at -= chrono::Duration::minutes(10);
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:grok", "possible quota signal: 429");
+        store.providers.get_mut("cli:grok").unwrap().updated_at =
+            Some(st.created_at + chrono::Duration::seconds(60));
+        store.save(&paths).unwrap();
+        st.stamp_dispatch();
+        let mut cfg = Config::default();
+        cfg.backups.reviewer = vec!["cli:codex".into()];
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-grok", false).unwrap();
+        assert!(
+            matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-codex"),
+            "a weak pause predating the dispatch steers onto the backup"
+        );
+    }
+
+    #[test]
+    fn a_weak_pause_written_after_dispatch_start_stays_trust_only() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        st.stamp_dispatch();
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:grok", "possible quota signal: 429");
+        store.save(&paths).unwrap();
+        let mut cfg = Config::default();
+        cfg.backups.reviewer = vec!["cli:codex".into()];
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-grok", false).unwrap();
+        assert!(
+            matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-grok"),
+            "a weak pause from this dispatch must not move the seat"
+        );
+    }
+
+    /// A weak pause written before the run started steers the next run onto its
+    /// backup (O106): only pauses this run wrote stay trust-only.
+    #[test]
+    fn a_weak_pause_older_than_the_run_moves_a_reviewer_to_its_backup() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:grok", "possible quota signal: 429");
+        store.providers.get_mut("cli:grok").unwrap().updated_at =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(10));
+        store.save(&paths).unwrap();
+        let mut st = state_with("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        let mut cfg = Config::default();
+        cfg.backups.reviewer = vec!["cli:codex".into()];
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-grok", false).unwrap();
+        assert!(
+            matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-codex"),
+            "a pre-existing weak pause steers onto the backup"
+        );
+    }
+
+    #[test]
+    fn a_weak_pause_older_than_the_run_parks_a_tester_with_no_backup() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:codex", "possible quota signal: 429");
+        store.providers.get_mut("cli:codex").unwrap().updated_at =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(10));
+        store.save(&paths).unwrap();
+        let mut st = state_with("test", "cli:codex", SlotRole::Tester);
+        let got = recheck_seat(&mut st, &paths, &Config::default(), "test", false).unwrap();
+        assert!(
+            matches!(got, SeatCheck::Park(_)),
+            "a pre-existing weak pause parks a tester with no backup"
+        );
+    }
+
+    /// A pre-existing weak pause benches a reviewer with no backup too: the
+    /// re-check parks, and the review panel loop stands the seat down instead
+    /// of parking the run.
+    #[test]
+    fn a_weak_pause_older_than_the_run_parks_a_reviewer_with_no_backup() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:grok", "possible quota signal: 429");
+        store.providers.get_mut("cli:grok").unwrap().updated_at =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(10));
+        store.save(&paths).unwrap();
+        let mut st = state_with("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        let got = recheck_seat(
+            &mut st,
+            &paths,
+            &Config::default(),
+            "review-0-cli-grok",
+            false,
+        )
+        .unwrap();
+        assert!(
+            matches!(got, SeatCheck::Park(_)),
+            "a pre-existing weak pause parks a reviewer with no backup"
+        );
     }
 
     /// The broad scrape paused codex because a test log said "429 passed". That pause is
@@ -4142,24 +4485,39 @@ mod recheck_seat_tests {
     fn a_weak_heuristic_pause_never_moves_or_parks_a_live_seat() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
+        let mut st = state_with("review-0-cli-codex", "cli:codex", SlotRole::Reviewer);
         let mut store = crate::quota::QuotaStore::default();
         store.pause_quota("cli:codex", "possible quota signal: 429");
         store.save(&paths).unwrap();
-        let mut st = state_with("review-0-cli-codex", "cli:codex", SlotRole::Reviewer);
         let mut cfg = Config::default();
         cfg.backups.reviewer = vec!["cli:grok".into()];
-        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-codex").unwrap();
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-codex", false).unwrap();
         assert!(matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-codex"));
         assert_eq!(st.slots[0].provider, "cli:codex");
 
         let mut store = crate::quota::QuotaStore::load(&paths).unwrap();
         store.mark_strong("cli:codex");
         store.save(&paths).unwrap();
-        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-codex").unwrap();
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-codex", false).unwrap();
         assert!(
             matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-grok"),
             "a strong pause still moves the seat"
         );
+    }
+
+    /// The start-of-run gate is strict where a live re-check is lenient (O106): a
+    /// weak pause still steers the next run's seat choice, so with no backup the
+    /// implementer parks instead of dispatching into it.
+    #[test]
+    fn a_weak_pause_parks_the_start_gate_with_no_backup() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:claude", "possible quota signal: quota");
+        store.save(&paths).unwrap();
+        let mut st = state_with("impl", "cli:claude", SlotRole::Implementer);
+        let got = recheck_seat(&mut st, &paths, &Config::default(), "impl", true).unwrap();
+        assert!(matches!(got, SeatCheck::Park(ref m) if m.contains("cli:claude")));
     }
 
     #[test]
@@ -4168,6 +4526,63 @@ mod recheck_seat_tests {
         assert_eq!(reviewer_ordinal("review-12-cli-codex"), Some(12));
         assert_eq!(reviewer_ordinal("review-cli-grok-wide"), None);
         assert_eq!(reviewer_ordinal("impl"), None);
+    }
+}
+
+#[cfg(test)]
+mod carried_rejection_tests {
+    use super::*;
+
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+    const OTHER: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    fn stood_down(body: &str) -> SlotState {
+        let mut s = executor::init_slot("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        s.stood_down = Some("provider cli:grok is paused".into());
+        s.review = Some(crate::workflow::review_result::parse_review(body));
+        s
+    }
+
+    fn verdict_on(verdict: &str, sha: &str) -> String {
+        format!("## Verdict\n{verdict}\n\nReviewed-Commit: {sha}\n\n## Findings\n- severity: major — x\n")
+    }
+
+    #[test]
+    fn request_changes_on_this_head_carries() {
+        let s = stood_down(&verdict_on("request_changes", HEAD));
+        assert!(carried_rejection(&s, Some(HEAD)).is_some());
+    }
+
+    #[test]
+    fn request_changes_on_an_older_head_does_not_carry() {
+        let s = stood_down(&verdict_on("request_changes", OTHER));
+        assert!(carried_rejection(&s, Some(HEAD)).is_none());
+    }
+
+    #[test]
+    fn approve_on_this_head_does_not_carry() {
+        let s = stood_down(&verdict_on("approve", HEAD));
+        assert!(carried_rejection(&s, Some(HEAD)).is_none());
+    }
+
+    #[test]
+    fn a_dispatched_seat_carries_nothing() {
+        let mut s = stood_down(&verdict_on("request_changes", HEAD));
+        s.stood_down = None;
+        assert!(carried_rejection(&s, Some(HEAD)).is_none());
+    }
+
+    #[test]
+    fn a_seat_that_never_judged_carries_nothing() {
+        let mut s = executor::init_slot("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        s.stood_down = Some("provider cli:grok is paused".into());
+        assert!(carried_rejection(&s, Some(HEAD)).is_none());
+    }
+
+    #[test]
+    fn a_failure_stub_names_no_commit_so_it_carries_nothing() {
+        let s = stood_down("## Verdict\nrequest_changes\n\n## Findings\n- severity: major — x\n");
+        assert!(carried_rejection(&s, Some(HEAD)).is_none());
     }
 }
 
@@ -5005,7 +5420,7 @@ fn escalate_round_ceiling(state: &mut RunState, paths: &SparPaths) -> Result<boo
     let _ = crate::bus::broadcast(
         paths,
         Some(&state.id),
-        "orchestrator",
+        crate::bus::ORCHESTRATOR_SEAT,
         msg,
         state.message_budget,
     );
@@ -5100,6 +5515,14 @@ fn render_scoped_review(
 /// gate, a stop, a quota bounce, a crashed orchestrator — starts knowing which `AC-n`
 /// failed. Silent when the reviews approved: a stale approval is not a blocker, and the
 /// live round overwrites this list at its own review step anyway.
+fn ceiling_partial_blocker(kind: CeilingPartialKind, round: u32) -> String {
+    match kind {
+        CeilingPartialKind::Clean => ceiling_partial_clean_notice(round),
+        CeilingPartialKind::Refused => ceiling_partial_refused_notice(round, None),
+        CeilingPartialKind::Wip => ceiling_partial_notice(round),
+    }
+}
+
 fn blockers_from_disk(
     state: &RunState,
     paths: &SparPaths,
@@ -5152,12 +5575,19 @@ fn blockers_from_disk(
             .iter()
             .find(|e| e.round == prev)
         {
-            out.push(match entry.kind {
-                CeilingPartialKind::Clean => ceiling_partial_clean_notice(prev),
-                CeilingPartialKind::Refused => ceiling_partial_refused_notice(prev, None),
-                CeilingPartialKind::Wip => ceiling_partial_notice(prev),
-            });
+            out.push(ceiling_partial_blocker(entry.kind, prev));
         }
+    }
+    // A same-round resume after a ceiling kill (`continue` without a new round):
+    // the resumed implementer would otherwise start with no idea its own round
+    // was cut short. The round-start snapshot is not re-stamped on resume, so
+    // this notice cannot make the round's own banked commit read as new work.
+    if let Some(entry) = state
+        .ceiling_partial_rounds
+        .iter()
+        .find(|e| e.round == state.round)
+    {
+        out.push(ceiling_partial_blocker(entry.kind, state.round));
     }
     out
 }
@@ -5420,6 +5850,15 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
         return crate::workflow::plan::continue_run(paths, cfg, run_id);
     }
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+    // Re-read under the lock: the routing load above can be stale, and the
+    // stamp below writes, so stamping the stale copy would clobber a
+    // concurrent writer's fields.
+    state = RunState::load(paths, run_id)?;
+    // A resume is a new dispatch in this process: re-stamp the horizon and the
+    // profile so a pause written before this resume steers the seat, and reads
+    // key the seats this process actually dispatches. Fix passes inside the
+    // loop below never re-stamp; see `stamp_dispatch`.
+    state.stamp_dispatch();
     match state.workflow {
         crate::cli::WorkflowKind::Loop => {
             // A daemon/`continue` resume is nobody's deliberate amendment, so it never
@@ -6432,11 +6871,15 @@ mod carry_forward_tests {
 mod ceiling_partial_notice_tests {
     use super::{
         blockers_from_disk, ceiling_partial_clean_notice, ceiling_partial_notice,
-        ceiling_partial_refused_notice,
+        ceiling_partial_refused_notice, clear_finished_round_partial_mark, commit_before_review,
+        try_commit_ceiling_partial,
     };
     use crate::config::Config;
+    use crate::executor::{self, TimeoutCause};
     use crate::paths::SparPaths;
-    use crate::state::{CeilingPartialKind, CeilingPartialRound, RunState};
+    use crate::state::{
+        CeilingPartialKind, CeilingPartialRound, RunState, SlotRole, SlotState, WorktreeRecord,
+    };
 
     fn blockers(kind: Option<CeilingPartialKind>) -> Vec<String> {
         let tmp = tempfile::tempdir().unwrap();
@@ -6448,7 +6891,11 @@ mod ceiling_partial_notice_tests {
         );
         state.round = 2;
         if let Some(kind) = kind {
-            state.ceiling_partial_rounds = vec![CeilingPartialRound { round: 1, kind }];
+            state.ceiling_partial_rounds = vec![CeilingPartialRound {
+                round: 1,
+                kind,
+                commit: None,
+            }];
         }
         blockers_from_disk(&state, &paths, &[], &Config::default())
     }
@@ -6486,5 +6933,187 @@ mod ceiling_partial_notice_tests {
     #[test]
     fn no_partial_round_means_no_notice() {
         assert!(blockers(None).is_empty());
+    }
+
+    #[test]
+    fn refused_notice_judges_head_not_an_uncommitted_tree() {
+        for detail in [None, Some("hook said no")] {
+            let note = ceiling_partial_refused_notice(1, detail);
+            assert!(!note.contains("uncommitted"), "{note}");
+            assert!(note.contains("judge the HEAD commit"), "{note}");
+        }
+    }
+
+    #[test]
+    fn same_round_resume_sees_its_own_cut_short_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.round = 1;
+        state.ceiling_partial_rounds = vec![CeilingPartialRound {
+            round: 1,
+            kind: CeilingPartialKind::Wip,
+            commit: None,
+        }];
+        let out = blockers_from_disk(&state, &paths, &[], &Config::default());
+        assert_eq!(out, [ceiling_partial_notice(1)]);
+    }
+
+    #[test]
+    fn finishing_a_round_clears_only_its_own_partial_mark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.round = 2;
+        state.ceiling_partial_rounds = vec![
+            CeilingPartialRound {
+                round: 1,
+                kind: CeilingPartialKind::Wip,
+                commit: Some("abc".into()),
+            },
+            CeilingPartialRound {
+                round: 2,
+                kind: CeilingPartialKind::Clean,
+                commit: None,
+            },
+        ];
+        clear_finished_round_partial_mark(&mut state, &paths).unwrap();
+        assert_eq!(state.ceiling_partial_rounds.len(), 1);
+        assert_eq!(state.ceiling_partial_rounds[0].round, 1);
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn ceiling_state(
+        tmp: &tempfile::TempDir,
+        wt: &std::path::Path,
+        branch: &str,
+        head: Option<String>,
+        tree: Option<String>,
+    ) -> (SparPaths, RunState) {
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.task = Some("add work".into());
+        let mut slot: SlotState = executor::init_slot("impl", "cli:muse", SlotRole::Implementer);
+        slot.timeout_cause = Some(TimeoutCause::HardCeiling);
+        slot.dispatch_head = head;
+        slot.dispatch_tree = tree;
+        state.slots = vec![slot];
+        state.worktrees = vec![WorktreeRecord {
+            slot_id: "impl".into(),
+            path: wt.to_path_buf(),
+            branch: branch.into(),
+        }];
+        (paths, state)
+    }
+
+    fn fresh_repo(tmp: &tempfile::TempDir) -> (std::path::PathBuf, String) {
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        git(&wt, &["init", "-q"]);
+        git(&wt, &["config", "user.email", "t@t"]);
+        git(&wt, &["config", "user.name", "t"]);
+        std::fs::write(wt.join("f"), "a\n").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-qm", "base"]);
+        let branch = git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        (wt, branch)
+    }
+
+    #[test]
+    fn first_ceiling_kill_with_new_work_banks_a_conventional_wip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, branch) = fresh_repo(&tmp);
+        let head = git(&wt, &["rev-parse", "HEAD"]);
+        let tree = executor::worktree_snapshot(&wt);
+        std::fs::write(wt.join("work.txt"), "slot work\n").unwrap();
+        let (paths, mut state) = ceiling_state(&tmp, &wt, &branch, Some(head), tree);
+        let (notice, kind, commit) = try_commit_ceiling_partial(&mut state, &paths, "impl")
+            .expect("new work at the ceiling is a partial round");
+        assert_eq!(notice, ceiling_partial_notice(1));
+        assert!(matches!(kind, CeilingPartialKind::Wip));
+        let sha = commit.expect("the wip commit is banked");
+        let subject = git(&wt, &["log", "-1", "--format=%s", &sha]);
+        assert!(
+            subject.starts_with("chore(spar):"),
+            "wip subject must pass conventional-commit hooks: {subject}"
+        );
+    }
+
+    #[test]
+    fn second_idle_ceiling_kill_over_the_banked_wip_is_not_a_partial_round() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, branch) = fresh_repo(&tmp);
+        let head = git(&wt, &["rev-parse", "HEAD"]);
+        let tree = executor::worktree_snapshot(&wt);
+        std::fs::write(wt.join("work.txt"), "slot work\n").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-qm", "banked wip"]);
+        let banked = git(&wt, &["rev-parse", "HEAD"]);
+        let (paths, mut state) = ceiling_state(&tmp, &wt, &branch, Some(head), tree);
+        state.ceiling_partial_rounds = vec![CeilingPartialRound {
+            round: 1,
+            kind: CeilingPartialKind::Wip,
+            commit: Some(banked),
+        }];
+        assert!(
+            try_commit_ceiling_partial(&mut state, &paths, "impl").is_none(),
+            "only the round's own banked wip on a clean tree is no new work"
+        );
+    }
+
+    #[test]
+    fn commit_before_review_banks_a_refused_round_as_wip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, branch) = fresh_repo(&tmp);
+        std::fs::write(wt.join("leftovers.txt"), "not yet committed\n").unwrap();
+        let (paths, mut state) = ceiling_state(&tmp, &wt, &branch, None, None);
+        state.ceiling_partial_rounds = vec![CeilingPartialRound {
+            round: 1,
+            kind: CeilingPartialKind::Refused,
+            commit: None,
+        }];
+        let note = commit_before_review(&mut state, &paths, &Config::default(), "impl");
+        assert_eq!(note, Some(ceiling_partial_notice(1)));
+        let entry = state
+            .ceiling_partial_rounds
+            .iter()
+            .find(|e| e.round == 1)
+            .unwrap();
+        assert!(matches!(entry.kind, CeilingPartialKind::Wip));
+        assert!(entry.commit.is_some(), "head now carries the work");
+    }
+
+    #[test]
+    fn commit_before_review_leaves_no_mark_on_a_normal_round() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, branch) = fresh_repo(&tmp);
+        std::fs::write(wt.join("leftovers.txt"), "not yet committed\n").unwrap();
+        let (paths, mut state) = ceiling_state(&tmp, &wt, &branch, None, None);
+        let note = commit_before_review(&mut state, &paths, &Config::default(), "impl");
+        assert!(note.is_none());
+        assert!(state.ceiling_partial_rounds.is_empty());
     }
 }

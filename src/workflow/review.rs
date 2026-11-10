@@ -98,25 +98,26 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         let mut model = crate::provider_ref::Pin::parse(&provider)
             .ok()
             .and_then(|p| p.model);
-        let backup_pin =
-            if !crate::backup::is_provider_eligible(&provider, &store, available.as_ref()) {
-                if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Reviewer, i, cfg)
-                {
-                    if crate::backup::backup_eligible(
-                        &backup_raw,
-                        &store,
-                        available.as_ref(),
-                        paths,
-                        dry,
-                    ) {
-                        if let Ok(bpin) = crate::provider_ref::Pin::parse(&backup_raw) {
-                            provider = bpin.display();
-                            source = Some(crate::state::SeatSource::Backup);
-                            model = bpin.model.clone();
-                            Some(bpin)
-                        } else {
-                            None
-                        }
+        let backup_pin = if !crate::backup::is_provider_eligible(
+            &provider,
+            &store,
+            available.as_ref(),
+            state.codex_profile.as_deref(),
+        ) {
+            if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Reviewer, i, cfg) {
+                if crate::backup::backup_eligible(
+                    &backup_raw,
+                    &store,
+                    available.as_ref(),
+                    paths,
+                    dry,
+                    state.codex_profile.as_deref(),
+                ) {
+                    if let Ok(bpin) = crate::provider_ref::Pin::parse(&backup_raw) {
+                        provider = bpin.display();
+                        source = Some(crate::state::SeatSource::Backup);
+                        model = bpin.model.clone();
+                        Some(bpin)
                     } else {
                         None
                     }
@@ -125,7 +126,10 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
                 }
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
         let id = if source == Some(crate::state::SeatSource::Backup) {
             if let Some(bpin) = backup_pin {
                 format!("review-{}-{}", i, sanitize_slot(&bpin.provider))
@@ -142,14 +146,14 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
 
     paths.ensure_run_dirs(&state.id)?;
     bus::ensure_bus(paths)?;
-    bus::join(paths, Some(&state.id), "orchestrator", None, None)?;
+    bus::join(paths, Some(&state.id), bus::ORCHESTRATOR_SEAT, None, None)?;
     for s in &state.slots {
         let _ = bus::join(paths, Some(&state.id), &s.id, Some(&s.provider), None);
     }
     let _ = bus::broadcast(
         paths,
         Some(&state.id),
-        "orchestrator",
+        bus::ORCHESTRATOR_SEAT,
         format!(
             "independent review: {} concurrent reviewers — no coordination, each votes alone",
             state.slots.len()
@@ -247,7 +251,12 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         if slot_state.status != SlotStatus::Failed {
             continue;
         }
-        let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
+        let cause = crate::backup::dispatch_stop_cause(
+            &slot_state,
+            &store,
+            available.as_ref(),
+            state.codex_profile.as_deref(),
+        );
         if !cause.engages_backup() || slot_state.source == Some(crate::state::SeatSource::Backup) {
             continue;
         }
@@ -261,6 +270,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             available.as_ref(),
             paths,
             state.dry_run,
+            state.codex_profile.as_deref(),
         ) {
             continue;
         }

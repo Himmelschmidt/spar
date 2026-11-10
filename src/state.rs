@@ -166,6 +166,20 @@ pub struct RunState {
     /// earlier rounds' verdicts and findings for `.spar/history.jsonl`.
     #[serde(default)]
     pub review_history: Vec<ReviewHistoryEntry>,
+    /// When the current dispatch began: the instant the implement entry point
+    /// stamped this round's seats. A weak pause written before it is pre-existing
+    /// (steer the seat); at or after it belongs to this dispatch (park). `None`
+    /// only for runs stamped before this field existed, which compare against
+    /// `created_at` as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_started_at: Option<DateTime<Utc>>,
+    /// The codex profile (`SPAR_CODEX_PROFILE`) this run's seats dispatch under,
+    /// recorded when the implement entry point stamped the round: `""` records a
+    /// set-but-empty value (codex's own default, the native login). Quota keying
+    /// for model-less codex seats derives from this, not from whatever the ambient
+    /// environment holds when a later process re-reads the seat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_profile: Option<String>,
     /// URL of the PR `ship` opened or adopted, or `sync-prs` found for the branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
@@ -230,10 +244,17 @@ pub enum CeilingPartialKind {
 }
 
 /// A recorded ceiling-cut round and how it left its work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CeilingPartialRound {
     pub round: u32,
     pub kind: CeilingPartialKind,
+    /// The commit the round's work was banked as (`Wip`'s WIP commit, or the
+    /// HEAD a `Clean` round died on). `None` for `Refused` (nothing was banked)
+    /// and for records written before this field existed. A same-round resume
+    /// compares the tree against this so the round's own banked commit does not
+    /// read as new work a second time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
 }
 
 /// The words for naming the cut-short rounds in a sentence.
@@ -603,6 +624,12 @@ pub struct SlotState {
     /// Reset at dispatch alongside the other per-dispatch fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_commit: Option<String>,
+    /// Why a reviewer slot never dispatched this round: the quota pause that stood
+    /// it down. Recorded at stand-down so the ship gate can mark the seat as
+    /// unjudged instead of presenting its stale artifact as current, and cleared
+    /// at dispatch alongside the other per-dispatch fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stood_down: Option<String>,
     /// What the gate parsed from this reviewer's artifact: verdict, the commit it
     /// names (whether or not it matched), per-AC status and findings. `null` until the
     /// gate reads a review; reset at dispatch.
@@ -627,12 +654,21 @@ pub struct SlotState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_cause: Option<crate::executor::TimeoutCause>,
     /// HEAD of this slot's worktree when the current round started. Work is
-    /// measured against it (dirty tree, or commits past it), never against the
-    /// run base: from round 2 on the base predates earlier rounds' commits, so
-    /// the base always reads as work. Stamped when the slot joins the round, and
-    /// kept across same-round backup retries and provider rotation.
+    /// measured against it (commits past it) and [`Self::dispatch_tree`],
+    /// never against the run base: from round 2 on the base predates earlier
+    /// rounds' commits, so the base always reads as work. Stamped when the slot
+    /// joins the round, and kept across same-round backup retries, provider
+    /// rotation, and same-round resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_head: Option<String>,
+    /// Content digest of this slot's worktree when the current round started.
+    /// Uncommitted changes count as this round's work only when they differ
+    /// from this snapshot: the tree can already be dirty at round start (the
+    /// test-author overlay, a refused round's leftovers), and that pre-existing
+    /// dirt is not the round's work. Stamped alongside [`Self::dispatch_head`],
+    /// under the same condition, and never re-stamped on same-round resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_tree: Option<String>,
     /// The build-cache pool directory this implementer leased (O143). Kept after the
     /// dispatch ends so the next one prefers the same warm directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -946,6 +982,8 @@ impl RunState {
             pool_origin: PoolOrigin::default(),
             pool_intent: Vec::new(),
             review_history: Vec::new(),
+            round_started_at: None,
+            codex_profile: None,
             pr_url: None,
             merged_at: None,
             merge_commit: None,
@@ -985,6 +1023,17 @@ impl RunState {
         self.ship_override = None;
         self.touch();
         self.round
+    }
+
+    /// Mark the start of the current dispatch: the instant quota pauses are read
+    /// against, and the codex profile this dispatch's seats run under. Called by
+    /// the implement entry points and by `continue_run` resumption, never by an
+    /// in-process fix pass: a fix pass is a continuation of the same dispatch,
+    /// and re-stamping it would turn this run's own pauses into pre-existing
+    /// ones and park the run on its own fumes.
+    pub fn stamp_dispatch(&mut self) {
+        self.round_started_at = Some(chrono::Utc::now());
+        self.codex_profile = Some(crate::providers::codex::codex_profile().unwrap_or_default());
     }
 
     /// Whether opening another round would take this run past its ceiling (O52).

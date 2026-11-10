@@ -478,7 +478,7 @@ fn a_ceiling_kill_with_uncommitted_edits_becomes_a_wip_round() {
     let log = git(&proj, &["log", &branch, "--format=%s"]);
     assert!(
         log.lines()
-            .any(|l| l.contains("WIP: implementer cut short at hard ceiling")),
+            .any(|l| l.contains("chore(spar): partial work, implementer cut short at hard ceiling")),
         "WIP commit missing on {branch}: {log}"
     );
     let shown = git(&proj, &["show", &format!("{branch}:work.txt")]);
@@ -504,6 +504,18 @@ fn a_ceiling_kill_with_uncommitted_edits_becomes_a_wip_round() {
     assert!(
         calls.lines().next() == Some("ceiling") && !calls.contains("recovery"),
         "implementer died at the ceiling, no recovery turn: {calls}"
+    );
+    let partials = st["ceiling_partial_rounds"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no partial rounds recorded: {st}"));
+    assert_eq!(partials.len(), 1, "the approved round keeps its mark: {st}");
+    assert_eq!(partials[0]["round"], 1, "{st}");
+    assert_eq!(partials[0]["kind"], "wip", "{st}");
+    assert!(
+        partials[0]["commit"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "the WIP notice names the commit reviewers judged: {st}"
     );
 }
 
@@ -540,6 +552,68 @@ fn a_ceiling_kill_with_no_work_still_fails() {
     );
 }
 
+/// #228 follow-up (1): round-start dirt is not round work. A commit-msg hook
+/// refuses every commit, so round 1 dies at the ceiling with an edit that stays
+/// uncommitted (a Refused round whose leftovers remain in the tree); the first
+/// review requests changes and the round-2 implementer hangs with no edits at
+/// all. A dirty tree alone would record a second partial round, but nothing
+/// changed since the round-2 dispatch, so the run must fail there instead.
+#[test]
+fn a_second_round_ceiling_kill_over_refused_leftovers_fails_the_run() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    std::fs::write(
+        proj.join("spar.toml"),
+        "[suite]\nenabled = false\n[rounds]\nmax = 2\n[timeouts]\nslot_secs = 2\nhard_ceiling_multiple = 1.5\n",
+    )
+    .unwrap();
+    let hooks = tmp.path().join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(hooks.join("commit-msg"), "#!/bin/sh\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        hooks.join("commit-msg"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    git(
+        &proj,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+    let bin = tmp.path().join("bin");
+    install_ceiling_idle_fix_round_muse(&bin);
+    let calls_dir = tmp.path().join("muse-state");
+    std::fs::create_dir_all(&calls_dir).unwrap();
+
+    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
+    let st = read_state(&proj, &run_id);
+    assert_eq!(st["phase"], "failed", "{st}");
+    assert_eq!(st["round"], 2, "{st}");
+    let partials = st["ceiling_partial_rounds"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no partial rounds recorded: {st}"));
+    assert_eq!(partials.len(), 1, "only round 1 is partial: {st}");
+    assert_eq!(partials[0]["round"], 1, "{st}");
+    assert_eq!(partials[0]["kind"], "refused", "{st}");
+    let calls = std::fs::read_to_string(calls_dir.join("calls")).unwrap();
+    assert_eq!(
+        calls.lines().filter(|l| *l == "ceiling").count(),
+        2,
+        "both rounds died at the ceiling: {calls}"
+    );
+    assert!(
+        !calls.lines().any(|l| l == "artifact-impl-artifact"),
+        "a refused commit is no commit: without HEAD movement neither kill earns \
+         the artifact-recovery turn: {calls}"
+    );
+    assert_eq!(
+        calls.lines().filter(|l| l.starts_with("review-")).count(),
+        1,
+        "the empty round-2 kill never reached review: {calls}"
+    );
+}
+
 /// #228 (tmux backend): a ceiling kill terminates the agent's process group
 /// before the WIP snapshot, so the round still goes to review on the committed
 /// partial work and nothing is left alive to keep mutating the tree under the
@@ -566,7 +640,7 @@ fn a_ceiling_kill_on_tmux_kills_the_agent_before_the_wip_snapshot() {
     let log = git(&proj, &["log", &branch, "--format=%s"]);
     assert!(
         log.lines()
-            .any(|l| l.contains("WIP: implementer cut short at hard ceiling")),
+            .any(|l| l.contains("chore(spar): partial work, implementer cut short at hard ceiling")),
         "WIP commit missing on {branch}: {log}"
     );
     let pid: u32 = std::fs::read_to_string(
@@ -617,6 +691,9 @@ case "$NAME" in
     echo "$((n + 1))" > "$SPAR_TEST_MUSE_STATE/impl-rounds"
     echo "work round $n" > work.txt
     sleep 60
+    ;;
+  impl-artifact)
+    echo "artifact-$NAME" >> "$SPAR_TEST_MUSE_STATE/calls"
     ;;
   *)
     echo "review-$NAME" >> "$SPAR_TEST_MUSE_STATE/calls"
@@ -764,6 +841,9 @@ case "$NAME" in
     if [ "$n" = "0" ]; then echo work > work.txt; fi
     sleep 60
     ;;
+  impl-artifact)
+    echo "artifact-$NAME" >> "$SPAR_TEST_MUSE_STATE/calls"
+    ;;
   *)
     echo "review-$NAME" >> "$SPAR_TEST_MUSE_STATE/calls"
     n=$(cat "$SPAR_TEST_MUSE_STATE/reviews" 2>/dev/null || echo 0)
@@ -822,7 +902,11 @@ fn a_second_round_ceiling_kill_with_no_new_edits_fails_the_run() {
         1,
         "the empty round-2 kill never reached review: {calls}"
     );
-    assert!(!calls.contains("recovery"), "no recovery turn: {calls}");
+    assert!(
+        !calls.lines().any(|l| l == "artifact-impl-artifact"),
+        "the keep gate is commits-only: HEAD had not moved at either kill, so \
+         neither round earns the artifact-recovery turn: {calls}"
+    );
     let branch = format!("spar/{run_id}/impl");
     let log = git(&proj, &["log", &branch, "--format=%s"]);
     assert_eq!(
@@ -831,6 +915,179 @@ fn a_second_round_ceiling_kill_with_no_new_edits_fails_the_run() {
             .count(),
         1,
         "only round 1 left a WIP commit: {log}"
+    );
+}
+
+/// A fake `muse` for the resume test. The first implementer dispatch leaves an
+/// edit uncommitted and hangs past the hard ceiling (a WIP round); the resumed
+/// dispatch greps its own prompt for the cut-short notice, then finishes
+/// normally. Reviews approve once the run has resumed; before that they hang
+/// so the first process parks in review and can be killed.
+fn install_ceiling_resume_muse(bin: &Path) {
+    std::fs::create_dir_all(bin).unwrap();
+    let p = bin.join("muse");
+    std::fs::write(
+        &p,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "fake-muse 0"; exit 0; fi
+PROMPT_FILE=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--prompt-file" ]; then PROMPT_FILE="$a"; fi
+  prev="$a"
+done
+NAME=$(basename "$PROMPT_FILE" .md)
+NAME=${NAME#prompt-}
+ART="$(dirname "$PROMPT_FILE")/artifacts"
+mkdir -p "$ART"
+echo '{"schema_version":1,"stream":{"kind":"session","id":"sess-c"},"record_type":"event","payload_type":"run.model.configured","payload":{"kind":"run_model_configured","model_id":"m"}}'
+case "$NAME" in
+  impl)
+    if [ -f "$SPAR_TEST_MUSE_STATE/impl-hung" ]; then
+      echo impl-resumed >> "$SPAR_TEST_MUSE_STATE/calls"
+      if grep -q "cut short at its hard time ceiling" "$PROMPT_FILE"; then
+        echo notice-seen >> "$SPAR_TEST_MUSE_STATE/calls"
+      else
+        echo notice-missing >> "$SPAR_TEST_MUSE_STATE/calls"
+      fi
+      echo resumed-work > work2.txt
+      git add work2.txt
+      git commit -qm resumed
+      printf '# Summary\nResumed and finished.\n' > "$ART/summary-impl.md"
+    else
+      echo ceiling-hung >> "$SPAR_TEST_MUSE_STATE/calls"
+      touch "$SPAR_TEST_MUSE_STATE/impl-hung"
+      echo work > work.txt
+      sleep 60
+    fi
+    ;;
+  *)
+    echo "review-$NAME" >> "$SPAR_TEST_MUSE_STATE/calls"
+    if [ -f "$SPAR_TEST_MUSE_STATE/resumed" ]; then
+      CWD=$(sed -n 's/.*Code under review (worktree): \([^ ]*\).*/\1/p' "$PROMPT_FILE" | head -n 1)
+      SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null)
+      printf '## Verdict\napprove\n\nReviewed-Commit: %s\n' "$SHA" > "$ART/review-$NAME.md"
+      RUN_DIR="$(dirname "$PROMPT_FILE")"
+      printf 'ok\n' > "$RUN_DIR/markers/$NAME.done"
+    else
+      sleep 60
+    fi
+    ;;
+esac
+exit 0
+"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// #228 follow-up: a run stopped after a ceiling-cut partial round resumes in
+/// the same round. The resumed implementer sees the cut-short notice for its
+/// own round, and finishing normally clears the round's mark, so the run
+/// ships the real summary instead of the stale notice.
+#[test]
+fn a_resumed_implementer_after_a_partial_round_sees_the_notice_and_clears_it() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    init_repo(&proj);
+    // max = 2: the resume re-enters through the round gate, which refuses to
+    // start past the maximum even for a same-round continuation.
+    std::fs::write(
+        proj.join("spar.toml"),
+        "[suite]\nenabled = false\n[rounds]\nmax = 2\n[timeouts]\nslot_secs = 2\nhard_ceiling_multiple = 1.5\n",
+    )
+    .unwrap();
+    let bin = tmp.path().join("bin");
+    install_ceiling_resume_muse(&bin);
+    let calls_dir = tmp.path().join("muse-state");
+    std::fs::create_dir_all(&calls_dir).unwrap();
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let mut cmd = common::spar_std();
+    cmd.current_dir(&proj)
+        .env("SPAR_HOME", spar_home_dir())
+        .env("PATH", &path_env)
+        .env("SPAR_TEST_MUSE_STATE", &calls_dir)
+        .args([
+            "implement",
+            "-t",
+            "add work",
+            "--providers",
+            "cli:muse",
+            "--fleet",
+            "small",
+            "--json",
+        ]);
+    let mut child = cmd.spawn().unwrap();
+    // Wait for the first process to record the WIP partial and park in review.
+    let run_id = {
+        let mut found = None;
+        for _ in 0..240 {
+            if let Ok(runs) = std::fs::read_dir(proj.join(".spar/runs")) {
+                for e in runs.filter_map(|e| e.ok()) {
+                    let sp = e.path().join("state.json");
+                    if !sp.is_file() {
+                        continue;
+                    }
+                    let Ok(text) = std::fs::read_to_string(&sp) else {
+                        continue;
+                    };
+                    let Ok(st) = serde_json::from_str::<serde_json::Value>(&text) else {
+                        continue;
+                    };
+                    let partial = st["ceiling_partial_rounds"]
+                        .as_array()
+                        .is_some_and(|a| !a.is_empty());
+                    let reviewing = st["phase"] == "review";
+                    if partial && reviewing {
+                        found = Some(e.file_name().to_string_lossy().into_owned());
+                        break;
+                    }
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        found.expect("first process recorded the partial and reached review")
+    };
+    // No `stop`: the orchestrator died mid-review, so the phase is still Review
+    // and `resume` continues the same round via continue_run -> execute_loop.
+    child.kill().unwrap();
+    let _ = child.wait();
+    std::fs::write(calls_dir.join("resumed"), "1").unwrap();
+
+    spar_cmd()
+        .current_dir(&proj)
+        .env("PATH", &path_env)
+        .env("SPAR_TEST_MUSE_STATE", &calls_dir)
+        .args(["resume", &run_id])
+        .assert()
+        .code(2);
+
+    let calls = std::fs::read_to_string(calls_dir.join("calls")).unwrap();
+    assert!(
+        calls.lines().any(|l| l == "notice-seen"),
+        "the resumed prompt carried the cut-short notice: {calls}"
+    );
+    assert!(
+        !calls.lines().any(|l| l == "notice-missing"),
+        "every resumed dispatch saw its own round's notice: {calls}"
+    );
+    let st = read_state(&proj, &run_id);
+    assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
+    assert_eq!(st["round"], 1, "the resume continued the same round: {st}");
+    assert!(
+        st["ceiling_partial_rounds"]
+            .as_array()
+            .is_some_and(|a| a.is_empty()),
+        "a normal finish clears the round's mark, so ship judges the summary: {st}"
     );
 }
 
