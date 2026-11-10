@@ -20,7 +20,7 @@ use std::process::Command;
 
 pub use agy::AgyAdapter;
 pub use claude::{ClaudeAdapter, ClaudeFamily};
-pub use codex::CodexAdapter;
+pub use codex::{default_bucket_for_profile, CodexAdapter};
 pub use grok::GrokAdapter;
 pub use muse::MuseAdapter;
 pub use pi::PiAdapter;
@@ -138,18 +138,133 @@ pub fn test_report(name: &str, available: bool, readiness: Readiness) -> Provide
 }
 
 /// Usable native-CLI providers as `cli:name` keys, or `None` when no provider is
-/// usable. The one constructor for the availability sets the selection paths
-/// thread through, so workflow code never filters on the raw report fields.
-pub fn usable_set() -> Option<std::collections::HashSet<String>> {
-    let detected: std::collections::HashSet<String> = detect_all()
-        .into_iter()
-        .filter(|r| r.usable())
-        .map(|r| format!("cli:{}", r.name))
-        .collect();
-    if detected.is_empty() {
-        None
-    } else {
-        Some(detected)
+/// One readiness verdict for a provider: whether it may be auto-selected, plus
+/// the failed probe's detail when a probe ran and failed it.
+#[derive(Debug, Clone)]
+pub struct HealthVerdict {
+    pub usable: bool,
+    pub probe_message: Option<String>,
+}
+
+/// Where a seat's provider is resolved and its source is known, health is read
+/// through this rather than through the quota availability set: auto-selection
+/// skips a provider whose probe failed, while pins warn and dispatch anyway.
+/// One method, so a check costs one detection and unit tests inject canned
+/// readiness without spawning host CLIs.
+pub trait HealthSource {
+    fn check(&self, provider: &str) -> HealthVerdict;
+}
+
+/// Production health: real detection when probing, blind parse checks wherever
+/// a probe must not spawn (dry runs and the projection-only paths).
+pub struct LiveHealth {
+    probe: bool,
+}
+
+impl LiveHealth {
+    pub fn probing() -> Self {
+        Self { probe: true }
+    }
+    pub fn for_dry(dry: bool) -> Self {
+        Self { probe: !dry }
+    }
+}
+
+impl HealthSource for LiveHealth {
+    fn check(&self, provider: &str) -> HealthVerdict {
+        if !self.probe || crate::util::env_truthy("SPAR_DRY_RUN") {
+            return HealthVerdict {
+                usable: ProviderRef::parse(provider).is_ok(),
+                probe_message: None,
+            };
+        }
+        let Ok(pref) = ProviderRef::parse(provider) else {
+            return HealthVerdict {
+                usable: false,
+                probe_message: None,
+            };
+        };
+        match pref.backend {
+            ExecBackend::NativeCli => match native_adapter(provider) {
+                Some(adapter) => {
+                    let report = adapter.detect();
+                    HealthVerdict {
+                        usable: report.usable(),
+                        probe_message: probe_detail(&report, adapter.as_ref()),
+                    }
+                }
+                None => HealthVerdict {
+                    usable: false,
+                    probe_message: None,
+                },
+            },
+            ExecBackend::ApiSdk => HealthVerdict {
+                usable: api_provider_supported(&pref.name),
+                probe_message: None,
+            },
+        }
+    }
+}
+
+/// The failed probe's detail for an error or a warning: the probe argv that
+/// ran plus its own message. `None` when no probe failed this provider, that is
+/// when it is healthy, unprobed, or missing rather than probe-failed. Takes
+/// the already-run detection so one check costs one detection.
+fn probe_detail(report: &ProviderReport, adapter: &dyn ProviderAdapter) -> Option<String> {
+    if report.readiness != Readiness::Unhealthy {
+        return None;
+    }
+    let message = report.readiness_message.clone()?;
+    match adapter.readiness_probe() {
+        Some(argv) => Some(format!(
+            "probe `{} {}` failed: {message}",
+            adapter.name(),
+            argv.join(" ")
+        )),
+        None => Some(message),
+    }
+}
+
+/// Canned readiness for unit tests: named providers are probe-failed, everything
+/// else stays usable. Hermetic: no host CLI is ever spawned.
+#[cfg(test)]
+pub struct StubHealth {
+    refusals: std::collections::HashMap<String, String>,
+}
+
+#[cfg(test)]
+impl StubHealth {
+    pub fn allow_all() -> Self {
+        Self {
+            refusals: std::collections::HashMap::new(),
+        }
+    }
+    pub fn refuse(provider: &str, message: &str) -> Self {
+        Self::refuse_all(&[(provider, message)])
+    }
+    pub fn refuse_all(entries: &[(&str, &str)]) -> Self {
+        Self {
+            refusals: entries
+                .iter()
+                .map(|(p, m)| (p.to_string(), m.to_string()))
+                .collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl HealthSource for StubHealth {
+    fn check(&self, provider: &str) -> HealthVerdict {
+        match self.refusals.get(provider) {
+            Some(message) => HealthVerdict {
+                usable: false,
+                probe_message: Some(message.clone()),
+            },
+            None => HealthVerdict {
+                usable: true,
+                probe_message: None,
+            },
+        }
     }
 }
 
@@ -286,6 +401,10 @@ pub struct SpawnOpts {
     /// in the user's home. Stable across rounds, so a resume finds what the cold
     /// dispatch wrote. `None` outside a run.
     pub session_dir: Option<PathBuf>,
+    /// Recorded `SPAR_CODEX_PROFILE` from run state (`RunState::codex_profile`).
+    /// `None` means no recorded dispatch, so the adapter reads this process's
+    /// ambient value. Only codex reads this field.
+    pub codex_profile: Option<String>,
 }
 
 pub trait ProviderAdapter: Send + Sync {
@@ -295,6 +414,12 @@ pub trait ProviderAdapter: Send + Sync {
     /// meters families (claude), `None` when every seat bills login-wide. The quota
     /// key derives from this, never from a name list.
     fn quota_bucket<'m>(&self, _model: &'m str) -> Option<Cow<'m, str>> {
+        None
+    }
+    /// The bucket a model-less seat bills to (`None` for the whole login).
+    /// Only adapters whose no-model dispatch routes somewhere other than the
+    /// login override this: codex's default profile layers OpenRouter.
+    fn default_bucket(&self) -> Option<&'static str> {
         None
     }
     /// The quota bucket a rejection covers, `None` for the whole login: the
@@ -881,7 +1006,8 @@ pub fn ensure_known(raw: &str) -> anyhow::Result<()> {
 
 /// Providers eligible for auto-selection, as `cli:name` keys, optionally filtered
 /// by `order`. Skips probe-failed (`Unhealthy`) providers; `Unknown` stays in.
-pub fn available_providers(order: &[String]) -> Vec<String> {
+/// The empty-order branch live-detects: unit tests never pass an empty order.
+pub fn available_providers(order: &[String], health: &dyn HealthSource) -> Vec<String> {
     if order.is_empty() {
         detect_all()
             .into_iter()
@@ -891,7 +1017,7 @@ pub fn available_providers(order: &[String]) -> Vec<String> {
     } else {
         order
             .iter()
-            .filter(|n| is_provider_usable(n, false))
+            .filter(|n| health.check(n).usable)
             .cloned()
             .collect()
     }
@@ -909,6 +1035,7 @@ pub fn pick_providers(
     requested: Option<&[String]>,
     allow_missing: bool,
     pool_origin: PoolOrigin,
+    health: &dyn HealthSource,
 ) -> Vec<String> {
     let allow_missing = allow_missing || crate::util::env_truthy("SPAR_DRY_RUN");
     let base = if let Some(req) = requested {
@@ -922,7 +1049,7 @@ pub fn pick_providers(
                 .filter_map(|n| ProviderRef::parse(n).ok().map(|p| p.display()))
                 .collect::<Vec<_>>()
         } else {
-            available_providers(req)
+            available_providers(req, health)
         }
     } else if allow_missing {
         if order.is_empty() {
@@ -934,7 +1061,7 @@ pub fn pick_providers(
                 .collect()
         }
     } else {
-        available_providers(order)
+        available_providers(order, health)
     };
 
     if base.is_empty() {
@@ -975,6 +1102,7 @@ mod tests {
         assert!(!GrokAdapter.step_budget_exhausted("max-model-steps"));
         // Grok dispatches carry run-scoped folder trust (never operator state).
         let env = GrokAdapter.extra_env(&SpawnOpts {
+            codex_profile: None,
             prompt: String::new(),
             prompt_file: None,
             cwd: std::path::PathBuf::from("/tmp"),
@@ -1000,6 +1128,7 @@ mod tests {
             Some(&["api:openai".into(), "cli:grok".into()]),
             true,
             PoolOrigin::CliProviders,
+            &StubHealth::allow_all(),
         );
         assert_eq!(picked.len(), 2);
         assert_eq!(picked[0], "api:openai");
@@ -1017,6 +1146,7 @@ mod tests {
             ]),
             true,
             PoolOrigin::CliProviders,
+            &StubHealth::allow_all(),
         );
         assert_eq!(picked.len(), 2);
         assert_eq!(picked[0], "cli:codex@openai/gpt-4o-mini");
@@ -1219,6 +1349,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("CODEX_HOME", home.path());
         let opts = SpawnOpts {
+            codex_profile: None,
             prompt: "go".into(),
             prompt_file: None,
             cwd: std::path::PathBuf::from("/tmp"),

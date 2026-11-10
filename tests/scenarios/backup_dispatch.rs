@@ -84,7 +84,7 @@ fn planner_paused_activates_backup_and_records_backup_source() {
     // Create a fake claude and grok that handle --version quickly
     let bin = tmp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
-    for name in ["claude", "grok"] {
+    for name in ["claude", "grok", "agy"] {
         let p = bin.join(name);
         fs::write(&p, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\necho \"hi\"\n").unwrap();
         #[cfg(unix)]
@@ -170,7 +170,7 @@ fn reviewer_unavailable_activates_only_its_ordinal_backup() {
     let spar_home = spar_home_dir();
     let bin = tmp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
-    for name in ["claude", "grok"] {
+    for name in ["claude", "grok", "agy"] {
         let p = bin.join(name);
         fs::write(
             &p,
@@ -310,6 +310,18 @@ fn timeout_does_not_activate_backup() {
             fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
+    // agy must not inherit the 10s sleep below: it answers presence probes only.
+    let p = bin.join("agy");
+    std::fs::write(
+        &p,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let path_env = format!(
         "{}:{}",
         bin.display(),
@@ -369,7 +381,7 @@ fn missing_artifact_does_not_activate_backup() {
     let spar_home = spar_home_dir();
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    for name in ["claude", "grok"] {
+    for name in ["claude", "grok", "agy"] {
         let p = bin.join(name);
         std::fs::write(
             &p,
@@ -435,7 +447,7 @@ fn adverse_review_does_not_activate_backup() {
     let spar_home = spar_home_dir();
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    for name in ["claude", "grok", "codex"] {
+    for name in ["claude", "grok", "codex", "agy"] {
         let p = bin.join(name);
         std::fs::write(
             &p,
@@ -511,7 +523,7 @@ fn work_failure_does_not_activate_backup() {
     let spar_home = spar_home_dir();
     let bin = tmp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
-    for name in ["claude", "grok"] {
+    for name in ["claude", "grok", "agy"] {
         let p = bin.join(name);
         fs::write(
             &p,
@@ -587,7 +599,7 @@ fn implementer_paused_activates_backup_and_records_backup_source() {
         .success();
     let bin = tmp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
-    for name in ["claude", "grok", "codex"] {
+    for name in ["claude", "grok", "codex", "agy"] {
         let p = bin.join(name);
         fs::write(
             &p,
@@ -694,7 +706,7 @@ fn implementer_work_failure_does_not_activate_backup() {
     let spar_home = spar_home_dir();
     let bin = tmp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
-    for name in ["claude", "grok"] {
+    for name in ["claude", "grok", "agy"] {
         let p = bin.join(name);
         fs::write(
             &p,
@@ -771,6 +783,10 @@ fn implementer_quota_mid_dispatch_activates_backup() {
         ),
         (
             "grok",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
+        ),
+        (
+            "agy",
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
         ),
     ] {
@@ -850,6 +866,10 @@ fn planner_quota_mid_dispatch_activates_backup() {
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\necho \"plan content\" > plan.md 2>/dev/null; exit 0\n",
         ),
         (
+            "agy",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
+        ),
+        (
             "codex",
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
         ),
@@ -924,6 +944,10 @@ fn reviewer_quota_mid_dispatch_activates_backup() {
         ),
         (
             "grok",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
+        ),
+        (
+            "agy",
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake\"; exit 0; fi\nexit 0\n",
         ),
         (

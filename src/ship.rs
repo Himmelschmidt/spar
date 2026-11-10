@@ -229,8 +229,10 @@ fn open_questions(summary: &str) -> Vec<String> {
     out
 }
 
-/// One line per reviewer slot: the verdict its artifact carries now (the last round it
-/// judged) and the commit it named.
+/// One line per reviewer slot: `stood down` with the reason when the seat never
+/// dispatched this round (its stale artifact is not a judgment of this head),
+/// else the verdict its artifact carries now (the last round it judged) and the
+/// commit it named.
 fn review_verdicts(paths: &SparPaths, state: &RunState) -> Vec<String> {
     use crate::workflow::review_result::{parse_review, Verdict};
     state
@@ -238,6 +240,17 @@ fn review_verdicts(paths: &SparPaths, state: &RunState) -> Vec<String> {
         .iter()
         .filter(|s| s.role == crate::state::SlotRole::Reviewer)
         .map(|s| {
+            if let Some(reason) = &s.stood_down {
+                let judged = s
+                    .reviewed_commit
+                    .clone()
+                    .map(|c| format!(" (last judged `{}`)", &c[..c.len().min(8)]))
+                    .unwrap_or_default();
+                return format!(
+                    "- `{}` ({}): stood down: {reason}{judged}",
+                    s.id, s.provider
+                );
+            }
             let name = s
                 .artifact
                 .clone()

@@ -159,8 +159,20 @@ name = "provider_health"
 path = "tests/scenarios/provider_health.rs"
 
 [[test]]
+name = "health_gating"
+path = "tests/scenarios/health_gating.rs"
+
+[[test]]
+name = "quota_buckets"
+path = "tests/scenarios/quota_buckets.rs"
+
+[[test]]
 name = "claude_family_quota"
 path = "tests/scenarios/claude_family_quota.rs"
+
+[[test]]
+name = "claude_auth_retry"
+path = "tests/scenarios/claude_auth_retry.rs"
 
 [[test]]
 name = "pi_dispatch"
@@ -197,6 +209,10 @@ path = "tests/scenarios/provider_usage.rs"
 [[test]]
 name = "bus_receipts"
 path = "tests/scenarios/bus_receipts.rs"
+
+[[test]]
+name = "bus_delivery_state"
+path = "tests/scenarios/bus_delivery_state.rs"
 
 [[test]]
 name = "operator_surgery"

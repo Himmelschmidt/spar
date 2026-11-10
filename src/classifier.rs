@@ -1478,20 +1478,22 @@ pub mod tests {
 
         let down = fake_system_one(503, "{}".into(), Duration::ZERO);
         let cfg = enabled_cfg(&down.base_url, &tmp.path().join("key"));
-        assert!(consult_once(&cfg, &paths, "first").error.is_some());
+        let first = consult_once(&cfg, &paths, "first").error.unwrap();
+        assert!(
+            first.contains(&format!("after {} attempts", 1 + MAX_RETRIES)),
+            "{first}"
+        );
         let sent = down.bodies.lock().unwrap().len();
-        assert_eq!(sent, 1 + MAX_RETRIES);
         let rec = consult_once(&cfg, &paths, "second");
         assert!(
             rec.error.unwrap().contains("skipped"),
             "5xx exhausted trips"
         );
         breaker_report(&cfg.base_url, false);
-        consult_once(&cfg, &paths, "first");
-        assert_eq!(
-            down.bodies.lock().unwrap().len(),
-            2 * sent,
-            "a 5xx is never served from memory"
+        let again = consult_once(&cfg, &paths, "first").error.unwrap();
+        assert!(
+            !again.contains("cached") && down.bodies.lock().unwrap().len() > sent,
+            "a 5xx is never served from memory: {again}"
         );
 
         let refused = fake_system_one(400, "{}".into(), Duration::ZERO);

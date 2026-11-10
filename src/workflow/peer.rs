@@ -38,8 +38,15 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     }
     let requested = opts.resolve_pool(2, &["implementer", "implementer"], paths, cfg, &state.id)?;
     state.pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
-    state.providers =
-        providers::pick_providers(&requested, 2, Some(&requested), dry, state.pool_origin);
+    let health = providers::LiveHealth::for_dry(dry);
+    state.providers = providers::pick_providers(
+        &requested,
+        2,
+        Some(&requested),
+        dry,
+        state.pool_origin,
+        &health,
+    );
     if state.providers.is_empty() {
         state.error = Some("no usable providers".into());
         state.set_phase(Phase::Failed);
@@ -65,7 +72,8 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             &state.providers,
             state.pool_origin,
             cfg,
-            dry,
+            &health,
+            &[],
         ) {
             if pin_source.is_explicit_pin() {
                 *seat = pin_provider;
@@ -84,7 +92,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         &state.providers,
         state.pool_origin,
         cfg,
-        dry,
+        &health,
     );
     let mut slot_a = executor::init_slot(&id_a, &a, SlotRole::Peer);
     slot_a.source = sources.first().copied();
@@ -96,7 +104,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
 
     paths.ensure_run_dirs(&state.id)?;
     bus::ensure_bus(paths)?;
-    bus::join(paths, Some(&state.id), "orchestrator", None, None)?;
+    bus::join(paths, Some(&state.id), bus::ORCHESTRATOR_SEAT, None, None)?;
     bus::join(paths, Some(&state.id), &id_a, Some(&a), Some("native-cli"))?;
     bus::join(paths, Some(&state.id), &id_b, Some(&b), Some("native-cli"))?;
     bus::send(
@@ -104,7 +112,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         bus::BusMessage {
             id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
             ts: chrono::Utc::now(),
-            from: "orchestrator".into(),
+            from: bus::ORCHESTRATOR_SEAT.into(),
             to: id_a.clone(),
             kind: MsgKind::Hello,
             body: "You are peer A. Coordinate with peer B via the swarm bus.".into(),
@@ -114,6 +122,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             requires_ack: false,
             persist: false,
             expires_after_round: None,
+            filed_round: None,
             meta: HashMap::new(),
         },
         MessageBudget::Normal,
@@ -123,7 +132,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         bus::BusMessage {
             id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
             ts: chrono::Utc::now(),
-            from: "orchestrator".into(),
+            from: bus::ORCHESTRATOR_SEAT.into(),
             to: id_b.clone(),
             kind: MsgKind::Hello,
             body: "You are peer B. Coordinate with peer A via the swarm bus.".into(),
@@ -133,6 +142,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             requires_ack: false,
             persist: false,
             expires_after_round: None,
+            filed_round: None,
             meta: HashMap::new(),
         },
         MessageBudget::Normal,

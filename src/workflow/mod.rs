@@ -101,6 +101,7 @@ impl CommonOpts {
             roles,
             cfg,
             dry,
+            &crate::providers::LiveHealth::for_dry(dry),
         )?;
         if let Some(art) = &resolved.artifact {
             crate::model_select::write_select_artifact(paths, run_id, art)?;

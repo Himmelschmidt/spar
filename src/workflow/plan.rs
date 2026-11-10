@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
-use crate::providers;
+use crate::providers::{self, HealthSource};
 use crate::state::{Phase, PoolOrigin, RunState, SeatSource, SlotRole};
 use crate::util::{self, sanitize_slot};
 use crate::worktree;
@@ -73,8 +73,15 @@ pub fn run(
     ) {
         state.pool_intent = requested.clone();
     }
-    state.providers =
-        providers::pick_providers(&requested, n_slots, Some(&requested), dry, pool_origin);
+    let health = providers::LiveHealth::for_dry(dry);
+    state.providers = providers::pick_providers(
+        &requested,
+        n_slots,
+        Some(&requested),
+        dry,
+        pool_origin,
+        &health,
+    );
     // `state.providers` is positional, but CLI `--role` pins outrank it (O79). A
     // preflight quota gate that checks the pool before seat resolution sees the
     // *pool* entry as paused and parks, even though the seat's own provider (from
@@ -108,7 +115,7 @@ pub fn run(
         Some(crate::runlock::RunLock::acquire(paths, &state.id)?)
     };
     let _ = bus::ensure_bus(paths);
-    let _ = bus::join(paths, Some(&state.id), "orchestrator", None, None);
+    let _ = bus::join(paths, Some(&state.id), bus::ORCHESTRATOR_SEAT, None, None);
     state.save(paths)?;
 
     let mut jobs = Vec::new();
@@ -119,7 +126,7 @@ pub fn run(
         provider: prov,
         model,
         source,
-    } in plan_slot_specs(&state, cfg)
+    } in plan_slot_specs(&state, cfg)?
     {
         let mut slot = executor::init_slot_model(&id, &prov, role, model.clone());
         slot.source = Some(source);
@@ -151,18 +158,27 @@ pub fn run(
         let available: Option<std::collections::HashSet<String>> = if !has_backup {
             None
         } else {
-            crate::providers::usable_set()
+            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                .into_iter()
+                .filter(|r| r.is_available())
+                .map(|r| format!("cli:{}", r.name))
+                .collect();
+            if detected.is_empty() {
+                None
+            } else {
+                Some(detected)
+            }
         };
         let mut still_paused: Vec<String> = Vec::new();
         for job in &jobs {
             let seat = job.provider_ref().display();
-            let source = state
-                .slots
-                .iter()
-                .find(|s| s.id == job.slot_id)
-                .and_then(|s| s.source);
-            if !crate::backup::seat_eligible(&seat, source, &store, available.as_ref()) {
-                let key = job.provider_ref().quota_key();
+            if !crate::backup::is_provider_eligible(
+                &seat,
+                &store,
+                available.as_ref(),
+                state.codex_profile.as_deref(),
+            ) {
+                let key = job.provider_ref().quota_key(state.codex_profile.as_deref());
                 if !still_paused.contains(&key) {
                     still_paused.push(key);
                 }
@@ -228,12 +244,12 @@ struct PlanSeat {
     source: SeatSource,
 }
 
-/// The planner + critic seats, drawn
-/// from the resolved pool via `resolve_seat` so both the first-pass and re-plan paths key
-/// the slots identically. The model is the `--select` choice for the primary, so the
+/// The planner + critic seats, settled through `backup::resolve_with_backup`, the
+/// same single point the implement panel resolves through, so both the first-pass
+/// and re-plan paths key the slots identically. The model is the `--select` choice for the primary, so the
 /// backup check reads the same quota key the dispatch gate does; a backup carries its own. `plan_critic` is omitted entirely when `[critic].enabled` is false
 /// (`--without critic`) — not resolved-then-discarded, so it never touches the bus.
-fn plan_slot_specs(state: &RunState, cfg: &Config) -> Vec<PlanSeat> {
+fn plan_slot_specs(state: &RunState, cfg: &Config) -> anyhow::Result<Vec<PlanSeat>> {
     let mut specs = vec![(SlotRole::Planner, "planner", "planner")];
     if cfg.critic.enabled {
         specs.push((SlotRole::PlanCritic, "critic", "plan_critic"));
@@ -243,15 +259,27 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> Vec<PlanSeat> {
     let art = crate::model_select::load_select_artifact(&paths, &state.id)
         .ok()
         .flatten();
+    let health = providers::LiveHealth::for_dry(state.dry_run);
     let has_backup = cfg.backups.planner.is_some()
         || cfg.backups.plan_critic.is_some()
         || cfg.backups.test_author.is_some();
     let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
         None
     } else {
-        crate::providers::usable_set()
+        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+            .into_iter()
+            .filter(|r| r.is_available())
+            .map(|r| format!("cli:{}", r.name))
+            .collect();
+        if detected.is_empty() {
+            None
+        } else {
+            Some(detected)
+        }
     };
-    let mut out = Vec::with_capacity(specs.len());
+    let mut out: Vec<PlanSeat> = Vec::with_capacity(specs.len());
+    let mut planner_skips: Vec<(String, String)> = Vec::new();
+    let mut planner_failed = false;
     for (idx, (role, prefix, template)) in specs.into_iter().enumerate() {
         let selected = art.as_ref().and_then(|a| {
             a.choices
@@ -259,6 +287,7 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> Vec<PlanSeat> {
                 .find(|c| c.role.as_deref() == Some(role.as_config_key()) || c.slot == idx)
                 .and_then(|c| c.model.clone())
         });
+        let used: Vec<String> = out.iter().map(|s| s.provider.clone()).collect();
         let Some((prov, source)) = crate::backup::resolve_with_backup(
             role,
             idx,
@@ -271,6 +300,9 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> Vec<PlanSeat> {
             available.as_ref(),
             &paths,
             state.dry_run,
+            state.codex_profile.as_deref(),
+            &health,
+            &used,
         )
         .or_else(|| {
             crate::workflow::roles_resolve::resolve_seat(
@@ -280,9 +312,21 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> Vec<PlanSeat> {
                 &state.providers,
                 state.pool_origin,
                 cfg,
-                state.dry_run,
+                &health,
+                &used,
             )
         }) else {
+            if idx == 0 {
+                planner_failed = true;
+                planner_skips.extend(crate::workflow::roles_resolve::health_skips_for_seat(
+                    role,
+                    idx,
+                    &state.providers,
+                    state.pool_origin,
+                    cfg,
+                    &health,
+                ));
+            }
             continue;
         };
         let model = (!source.is_backup()).then_some(selected).flatten();
@@ -296,7 +340,17 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> Vec<PlanSeat> {
             source,
         });
     }
-    out
+    // The planner is the run's first seat: a missing planner fails even when a
+    // critic resolved, so a gate rejection never reads as a planner-less plan.
+    // The bail is unconditional: a planner that resolved `None` for a
+    // non-health reason leaves no skips, and must still not emit a plan.
+    if planner_failed {
+        if let Some(err) = crate::backup::readiness_error(&planner_skips) {
+            return Err(err);
+        }
+        anyhow::bail!("no provider resolved for planner");
+    }
+    Ok(out)
 }
 
 pub fn execute_plan(
@@ -328,19 +382,34 @@ pub fn execute_plan(
         if let Err(e) = executor::run_slot(state, paths, cfg, job) {
             let slot_state = state.slots.iter().find(|s| s.id == job.slot_id).cloned();
             let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+            let health = providers::LiveHealth::for_dry(state.dry_run);
             let has_backup_global = cfg.backups.planner.is_some()
                 || cfg.backups.plan_critic.is_some()
                 || cfg.backups.test_author.is_some();
-            let available: Option<std::collections::HashSet<String>> =
-                if state.dry_run || !has_backup_global {
+            let available: Option<std::collections::HashSet<String>> = if state.dry_run
+                || !has_backup_global
+            {
+                None
+            } else {
+                let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                    .into_iter()
+                    .filter(|r| r.is_available())
+                    .map(|r| format!("cli:{}", r.name))
+                    .collect();
+                if detected.is_empty() {
                     None
                 } else {
-                    crate::providers::usable_set()
-                };
+                    Some(detected)
+                }
+            };
             let mut handled_via_backup = false;
             if let Some(slot_state) = slot_state {
-                let cause =
-                    crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
+                let cause = crate::backup::dispatch_stop_cause(
+                    &slot_state,
+                    &store,
+                    available.as_ref(),
+                    state.codex_profile.as_deref(),
+                );
                 if cause.engages_backup() && !slot_state.source.is_some_and(SeatSource::is_backup) {
                     if let Some(raw) = crate::backup::backup_for_role(job.role, 0, cfg) {
                         if let Some(source) = crate::backup::takeover(
@@ -351,6 +420,8 @@ pub fn execute_plan(
                             available.as_ref(),
                             paths,
                             state.dry_run,
+                            state.codex_profile.as_deref(),
+                            &health,
                         ) {
                             let cur_key = crate::provider_ref::ProviderRef::parse(&job.provider)
                                 .map(|r| r.storage_key())
@@ -507,21 +578,36 @@ pub fn execute_plan(
     } else {
         &state.pool_intent
     };
+    let health = providers::LiveHealth::for_dry(state.dry_run);
+    // Read-only: a projection never re-probes a quota pause and never records
+    // anything (`probe::probe` writes the store), so it always resolves dry.
+    let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     state.projected_fleet = crate::workflow::roles_resolve::project_implement_fleet(
         cfg,
         projection_pool,
         state.pool_origin,
+        &health,
+        &store,
+        paths,
+        true,
         state.dry_run,
-        Some(paths),
         Some(&state.id),
-    );
+    )
+    .unwrap_or_default();
+    let used: Vec<String> = state
+        .projected_fleet
+        .iter()
+        .map(|s| s.provider.clone())
+        .collect();
     if let Some(seat) = crate::workflow::implement::project_tester_seat(
         cfg,
         state.dry_run,
+        &health,
         projection_pool,
         state.pool_origin,
         Some(paths),
-        Some(&state.id),
+        Some(state.id.as_str()),
+        &used,
     ) {
         state.projected_fleet.push(seat);
     }
@@ -532,7 +618,7 @@ pub fn execute_plan(
         let _ = bus::broadcast(
             paths,
             Some(&state.id),
-            "orchestrator",
+            bus::ORCHESTRATOR_SEAT,
             "plan auto-approved (autonomy)",
             state.message_budget,
         );
@@ -557,13 +643,9 @@ fn resolve_test_author(
         .map(|s| s.provider.clone())
         .collect();
     let test_author_idx = 1 + usize::from(cfg.critic.enabled);
-    let (mut provider, mut source) = resolve_spec_provider(
-        cfg,
-        state.dry_run,
-        &state.providers,
-        state.pool_origin,
-        &used,
-    )?;
+    let health = providers::LiveHealth::for_dry(state.dry_run);
+    let (mut provider, mut source) =
+        resolve_spec_provider(cfg, &health, &state.providers, state.pool_origin, &used)?;
     let mut model = crate::model_select::load_select_artifact(paths, &state.id)
         .ok()
         .flatten()
@@ -581,11 +663,25 @@ fn resolve_test_author(
     let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
         None
     } else {
-        crate::providers::usable_set()
+        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+            .into_iter()
+            .filter(|r| r.is_available())
+            .map(|r| format!("cli:{}", r.name))
+            .collect();
+        if detected.is_empty() {
+            None
+        } else {
+            Some(detected)
+        }
     };
     let seat_ref =
         crate::provider_ref::ProviderRef::for_seat(&provider, model.as_deref()).display();
-    if !crate::backup::seat_eligible(&seat_ref, Some(source), &store, available.as_ref()) {
+    if !crate::backup::is_provider_eligible(
+        &seat_ref,
+        &store,
+        available.as_ref(),
+        state.codex_profile.as_deref(),
+    ) {
         if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg) {
             if let Some(takeover) = crate::backup::takeover(
                 &backup_raw,
@@ -595,6 +691,8 @@ fn resolve_test_author(
                 available.as_ref(),
                 paths,
                 state.dry_run,
+                state.codex_profile.as_deref(),
+                &health,
             ) {
                 if let Ok(pin) = crate::provider_ref::Pin::parse(&backup_raw) {
                     provider = pin.display();
@@ -684,15 +782,30 @@ fn run_test_author(
     if let Err(e) = executor::run_slot(state, paths, cfg, &job) {
         let slot_state = state.slots.iter().find(|s| s.id == id).cloned();
         let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+        let health = providers::LiveHealth::for_dry(state.dry_run);
         let has_backup = cfg.backups.test_author.is_some();
         let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
             None
         } else {
-            crate::providers::usable_set()
+            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                .into_iter()
+                .filter(|r| r.is_available())
+                .map(|r| format!("cli:{}", r.name))
+                .collect();
+            if detected.is_empty() {
+                None
+            } else {
+                Some(detected)
+            }
         };
         let mut handled = false;
         if let Some(slot_state) = slot_state {
-            let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
+            let cause = crate::backup::dispatch_stop_cause(
+                &slot_state,
+                &store,
+                available.as_ref(),
+                state.codex_profile.as_deref(),
+            );
             if cause.engages_backup()
                 && !slot_state
                     .source
@@ -707,6 +820,8 @@ fn run_test_author(
                         available.as_ref(),
                         paths,
                         state.dry_run,
+                        state.codex_profile.as_deref(),
+                        &health,
                     ) {
                         let cur_key = crate::provider_ref::ProviderRef::parse(&job.provider)
                             .map(|r| r.storage_key())
@@ -781,7 +896,7 @@ fn run_test_author(
     let _ = bus::broadcast(
         paths,
         Some(&state.id),
-        "orchestrator",
+        bus::ORCHESTRATOR_SEAT,
         "test-author finished; acceptance contract ready for plan approval",
         state.message_budget,
     );
@@ -804,7 +919,13 @@ fn seed_spec_bus(
          Planner `{planner_slot}`{critic_clause}: reply on bus if still available; \
          otherwise the author uses plan + critique artifacts."
     );
-    let _ = bus::broadcast(paths, Some(&state.id), "orchestrator", &body, budget);
+    let _ = bus::broadcast(
+        paths,
+        Some(&state.id),
+        bus::ORCHESTRATOR_SEAT,
+        &body,
+        budget,
+    );
 
     let coordinate_with = critic_slot
         .map(|c| format!(" and `{c}`"))
@@ -833,7 +954,7 @@ fn seed_spec_bus(
             bus::BusMessage {
                 id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
                 ts: chrono::Utc::now(),
-                from: "orchestrator".into(),
+                from: bus::ORCHESTRATOR_SEAT.into(),
                 to: to.into(),
                 kind: MsgKind::Hello,
                 body: note,
@@ -846,6 +967,7 @@ fn seed_spec_bus(
                 requires_ack: false,
                 persist: false,
                 expires_after_round: None,
+                filed_round: None,
                 meta: HashMap::new(),
             },
             budget,
@@ -862,7 +984,7 @@ fn seed_spec_bus(
 /// pool it should have lost to (Bug B for this one staged seat).
 pub(crate) fn resolve_spec_provider(
     cfg: &Config,
-    dry: bool,
+    health: &dyn HealthSource,
     fleet: &[String],
     pool_origin: PoolOrigin,
     used: &[String],
@@ -874,7 +996,9 @@ pub(crate) fn resolve_spec_provider(
         if let Some(p) = &cfg.roles.test_author {
             crate::provider_ref::ProviderRef::parse(p)
                 .map_err(|e| anyhow::anyhow!("invalid [roles].test_author {p:?}: {e}"))?;
-            if dry || providers::is_provider_present(p, false) {
+            // Pins are kept on presence and warn at launch when unhealthy;
+            // blind health already implies parse-ok, matching the old dry path.
+            if health.check(p).usable || providers::is_provider_present(p, false) {
                 return Ok((p.clone(), SeatSource::CliRole));
             }
         }
@@ -890,12 +1014,11 @@ pub(crate) fn resolve_spec_provider(
             .iter()
             .find(|p| {
                 !used.contains(p)
-                    && (dry
-                        || (if pool_pinned {
-                            providers::is_provider_present(p, false)
-                        } else {
-                            providers::is_provider_usable(p, false)
-                        }))
+                    && (if pool_pinned {
+                        health.check(p).usable || providers::is_provider_present(p, false)
+                    } else {
+                        health.check(p).usable
+                    })
             })
             .cloned()
         {
@@ -906,37 +1029,38 @@ pub(crate) fn resolve_spec_provider(
         if let Some(p) = &cfg.roles.test_author {
             crate::provider_ref::ProviderRef::parse(p)
                 .map_err(|e| anyhow::anyhow!("invalid [roles].test_author {p:?}: {e}"))?;
-            if dry || providers::is_provider_usable(p, false) {
+            if health.check(p).usable {
                 return Ok((p.clone(), SeatSource::RolesFile));
             }
-            // Fall through to fleet if override is unusable (missing CLI / paused).
+            // Fall through to fleet if override is unusable (missing CLI / unhealthy).
         }
-    }
-    if dry {
-        if let Some(p) = fleet.iter().find(|p| !used.contains(p)) {
-            return Ok((p.clone(), pool_source));
-        }
-        if let Some(p) = fleet.get(2) {
-            return Ok((p.clone(), pool_source));
-        }
-        if let Some(p) = fleet.last() {
-            return Ok((p.clone(), pool_source));
-        }
-        return Ok(("cli:claude".into(), SeatSource::ProvidersOrder));
     }
     if let Some(p) = fleet
         .iter()
-        .find(|p| !used.contains(p) && providers::is_provider_usable(p, false))
+        .find(|p| !used.contains(p) && health.check(p).usable)
         .cloned()
     {
         return Ok((p, pool_source));
     }
-    if let Some(p) = fleet
-        .iter()
-        .find(|p| providers::is_provider_usable(p, false))
-        .cloned()
-    {
+    if let Some(p) = fleet.iter().find(|p| health.check(p).usable).cloned() {
         return Ok((p, pool_source));
+    }
+    let skips: Vec<(String, String)> = fleet
+        .iter()
+        .filter_map(|p| {
+            let verdict = health.check(p);
+            (!verdict.usable).then(|| {
+                (
+                    p.clone(),
+                    verdict
+                        .probe_message
+                        .unwrap_or_else(|| "unusable".to_string()),
+                )
+            })
+        })
+        .collect();
+    if let Some(err) = crate::backup::readiness_error(&skips) {
+        return Err(err);
     }
     anyhow::bail!(
         "spec.enabled but no usable test-author provider (set [roles].test_author or pass more --providers)"
@@ -1163,6 +1287,7 @@ pub fn replan(
     state.contract_fingerprint = None;
     state.set_phase(Phase::Init);
     state.save(paths)?;
+    crate::providers::delivery::refresh_run_poll_files(paths, run_id);
     if !json {
         eprintln!("replanning run {run_id} (round {round})");
     }
@@ -1247,16 +1372,34 @@ fn amend_author_seat(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> R
         return Ok(seat.id);
     }
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-    if crate::backup::is_provider_eligible(&seat.provider_ref().display(), &store, None) {
+    if crate::backup::is_provider_eligible(
+        &seat.provider_ref().display(),
+        &store,
+        None,
+        state.codex_profile.as_deref(),
+    ) {
         return Ok(seat.id);
     }
-    let key = seat.provider_ref().quota_key();
+    let key = seat
+        .provider_ref()
+        .quota_key(state.codex_profile.as_deref());
     let sub = crate::quota::sub_key(&seat.provider);
+    let health = providers::LiveHealth::probing();
     let backup = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg)
         .filter(|b| crate::quota::sub_key(b) != sub)
         .and_then(|b| {
-            crate::backup::takeover(&b, SlotRole::TestAuthor, cfg, &store, None, paths, false)
-                .map(|source| (b, source))
+            crate::backup::takeover(
+                &b,
+                SlotRole::TestAuthor,
+                cfg,
+                &store,
+                None,
+                paths,
+                false,
+                state.codex_profile.as_deref(),
+                &health,
+            )
+            .map(|source| (b, source))
         });
     let Some((raw, source)) = backup else {
         anyhow::bail!(
@@ -1352,6 +1495,9 @@ pub fn amend_contract(
         .contract_fingerprint
         .clone()
         .unwrap_or_else(|| on_disk_fp.clone());
+    // The author dispatches now: re-stamp the horizon and the profile so its
+    // quota reads and its spawn key this amend, not an earlier dispatch.
+    state.stamp_dispatch();
     let author = amend_author_seat(&mut state, paths, cfg)?;
     let mut n = state.contract_amendments.len() + 1;
     while paths
@@ -1521,6 +1667,11 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
 /// `continue_run`'s body, for callers that already hold the run lock.
 fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<ExitCode> {
     let mut state = RunState::load(paths, run_id)?;
+    // Re-entering an existing run is a new dispatch: re-stamp the horizon and
+    // the profile before any seat reads quota, so a weak pause written before
+    // this entry steers instead of being trusted. Both callers (replan and
+    // `plan::continue_run`) hold the run lock here.
+    state.stamp_dispatch();
     let amendment_section = plan_amendment_section(&state);
     let mut jobs = Vec::new();
     for slot in &state.slots {
@@ -1554,7 +1705,7 @@ fn continue_locked(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exit
             provider: prov,
             model,
             source,
-        } in plan_slot_specs(&state, cfg)
+        } in plan_slot_specs(&state, cfg)?
         {
             if state.slots.iter().all(|s| s.id != id) {
                 let mut slot = executor::init_slot_model(&id, &prov, role, model);

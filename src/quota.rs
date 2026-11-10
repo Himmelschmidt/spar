@@ -1026,7 +1026,28 @@ pub fn quota_key(raw: &str) -> String {
         format!("cli:{raw}")
     };
     crate::provider_ref::ProviderRef::parse(&candidate)
-        .map(|p| p.quota_key())
+        .map(|p| p.quota_key(None))
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+/// Where an operator's pause, resume, or probe lands. A named model keys its bucket,
+/// exactly like a seat; a bare name denotes the account, not the default route's
+/// bucket (`provider pause cli:codex` holds native and OpenRouter seats alike).
+/// Idempotent on its own output.
+pub fn operator_key(raw: &str) -> String {
+    let candidate = if raw.contains(':') {
+        raw.to_string()
+    } else {
+        format!("cli:{raw}")
+    };
+    crate::provider_ref::ProviderRef::parse(&candidate)
+        .map(|p| {
+            if p.model.is_none() {
+                p.storage_key()
+            } else {
+                p.quota_key(None)
+            }
+        })
         .unwrap_or_else(|_| raw.to_string())
 }
 
@@ -1608,15 +1629,44 @@ mod tests {
 
     #[test]
     fn quota_key_splits_model_scoped_providers_only() {
+        // Codex buckets read the profile route from process env, so pin it:
+        // every other test thread shares this process.
+        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
+        std::env::remove_var("SPAR_CODEX_PROFILE");
         assert_eq!(quota_key("claude"), "cli:claude");
         assert_eq!(quota_key("cli:claude@opus"), "cli:claude@opus");
         assert_eq!(quota_key("cli:claude@claude-opus-5-5"), "cli:claude@opus");
         assert_eq!(quota_key("cli:claude@haiku"), "cli:claude");
-        assert_eq!(quota_key("cli:codex@opus"), "cli:codex");
+        assert_eq!(
+            quota_key("cli:codex@opus"),
+            "cli:codex@native",
+            "an explicit bare codex model dispatches with -m only, under codex's own default"
+        );
         assert_eq!(quota_key("cli:agy@flash"), "cli:agy@flash");
         assert_eq!(quota_key("cli:agy"), "cli:agy");
-        assert_eq!(quota_key("api:openai@gpt-5"), "api:openai");
+        assert_eq!(quota_key("api:openai@gpt-5"), "api:openai@gpt-5");
         assert_eq!(quota_key("cli:agy@flash"), quota_key("cli:agy@flash"));
+    }
+
+    #[test]
+    fn operator_key_names_a_model_bucket_or_the_bare_login() {
+        assert_eq!(operator_key("codex"), "cli:codex");
+        assert_eq!(operator_key("cli:codex"), "cli:codex");
+        assert_eq!(operator_key("cli:pi"), "cli:pi");
+        assert_eq!(
+            operator_key("cli:codex@openai/gpt-5"),
+            "cli:codex@openrouter"
+        );
+        assert_eq!(
+            operator_key("cli:pi@direct:anthropic/x"),
+            "cli:pi@direct:anthropic"
+        );
+        assert_eq!(operator_key("cli:claude@opus"), "cli:claude@opus");
+        assert_eq!(operator_key("cli:codex@openrouter"), "cli:codex@openrouter");
+        assert_eq!(
+            operator_key("cli:pi@direct:anthropic"),
+            "cli:pi@direct:anthropic"
+        );
     }
 
     /// The real captured log text from the dogfooding incident (roadmap/BACKLOG.md).
