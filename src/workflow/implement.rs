@@ -593,7 +593,14 @@ fn run_from_approved(
     // a run directory for it. Everything below mutates the run, so it all happens under
     // the lock: a live orchestrator refuses us before its state.json can be overwritten.
     let unlocked = RunState::load(paths, run_id)?;
-    let reassignments = parse_reassignments(&opts.reassign, paths, unlocked.recorded_route())?;
+    // Key the route this process's dispatch will stamp (continuing entries
+    // stamp on resumption), not the previous record: a stale record would
+    // accept a bucket the dispatch now bills, or refuse one it no longer does.
+    let reassignments = parse_reassignments(
+        &opts.reassign,
+        paths,
+        crate::providers::codex::dispatch_route().as_recorded(),
+    )?;
     let mut patient = None;
     if let Some(mr) = opts.max_rounds {
         let target = mr.resolve(unlocked.round);

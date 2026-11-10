@@ -222,6 +222,15 @@ impl<'a> RecordedRoute<'a> {
     pub fn is_recorded(self) -> bool {
         self.profile.is_some() || self.model.is_some()
     }
+
+    /// The owned carrier a dispatch struct holds for the spawn: `None` when
+    /// the run stamped nothing, so the spawn reads the ambient route instead.
+    pub fn into_carrier(self) -> Option<codex::CodexRoute> {
+        codex::CodexRoute::recorded(
+            self.profile.map(str::to_string),
+            self.model.map(str::to_string),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -257,13 +266,11 @@ pub struct SpawnOpts {
     /// in the user's home. Stable across rounds, so a resume finds what the cold
     /// dispatch wrote. `None` outside a run.
     pub session_dir: Option<PathBuf>,
-    /// Recorded `SPAR_CODEX_PROFILE` from run state (`RunState::codex_profile`).
-    /// `None` means no recorded dispatch, so the adapter reads this process's
-    /// ambient value. Only codex reads this field.
-    pub codex_profile: Option<String>,
-    /// Recorded `SPAR_CODEX_MODEL` from run state (`RunState::codex_model`),
-    /// with the same encoding. Only codex reads this field.
-    pub codex_model: Option<String>,
+    /// The run's recorded codex route (`RunState::codex_route`), carried as one
+    /// value so the halves cannot split across dispatch structs. `None` means
+    /// no recorded dispatch, so the adapter reads this process's ambient
+    /// route. Only codex reads this field.
+    pub codex_route: Option<codex::CodexRoute>,
 }
 
 pub trait ProviderAdapter: Send + Sync {
@@ -917,8 +924,7 @@ mod tests {
         assert!(!GrokAdapter.step_budget_exhausted("max-model-steps"));
         // Grok dispatches carry run-scoped folder trust (never operator state).
         let env = GrokAdapter.extra_env(&SpawnOpts {
-            codex_profile: None,
-            codex_model: None,
+            codex_route: None,
             prompt: String::new(),
             prompt_file: None,
             cwd: std::path::PathBuf::from("/tmp"),
@@ -1120,8 +1126,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("CODEX_HOME", home.path());
         let opts = SpawnOpts {
-            codex_profile: None,
-            codex_model: None,
+            codex_route: None,
             prompt: "go".into(),
             prompt_file: None,
             cwd: std::path::PathBuf::from("/tmp"),

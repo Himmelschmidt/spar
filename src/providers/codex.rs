@@ -52,18 +52,57 @@ pub struct CodexRoute {
     pub profile: Option<String>,
 }
 
+impl CodexRoute {
+    /// An owned carrier built from a run's recorded halves: `None` when the
+    /// run stamped nothing, so the dispatch reads the ambient route instead.
+    pub fn recorded(profile: Option<String>, model: Option<String>) -> Option<Self> {
+        if profile.is_none() && model.is_none() {
+            return None;
+        }
+        Some(Self { model, profile })
+    }
+
+    /// Borrow as a `RecordedRoute` for key derivation: a `None` half resolves
+    /// from the ambient environment, matching the spawn's own fallback.
+    pub fn as_recorded(&self) -> RecordedRoute<'_> {
+        RecordedRoute {
+            profile: self.profile.as_deref(),
+            model: self.model.as_deref(),
+        }
+    }
+}
+
+/// The route a dispatch starting in this process records: this process's
+/// environment, preserving set-but-empty as `Some("")` (empty means default;
+/// resolving it through `resolve_route` would drop the stamping shells can
+/// observe). Shared by `RunState::stamp_dispatch` and the `--reassign`
+/// pre-entry check, so the check keys the route the dispatch will stamp, not
+/// the previous record.
+pub fn dispatch_route() -> CodexRoute {
+    CodexRoute {
+        model: Some(codex_model_env().unwrap_or_default()),
+        profile: Some(codex_profile().unwrap_or_default()),
+    }
+}
+
 pub fn resolve_route(slot_model: Option<&str>, route: RecordedRoute<'_>) -> CodexRoute {
     let model = slot_model
         .and_then(clean_model)
         .or_else(|| match route.model {
-            Some(recorded) => clean_model(recorded),
+            Some(recorded) => recorded_value(recorded),
             None => codex_model_env(),
         });
     let profile = match route.profile {
-        Some(recorded) => clean_model(recorded),
+        Some(recorded) => recorded_value(recorded),
         None => codex_profile(),
     };
     CodexRoute { model, profile }
+}
+
+/// A recorded half arrives trimmed (stamped through the env readers below),
+/// so only an emptied value maps back to `None`.
+fn recorded_value(raw: &str) -> Option<String> {
+    (!raw.is_empty()).then(|| raw.to_string())
 }
 
 /// The bucket a slug bills to: a `/` slug always names an OpenRouter route, a
@@ -93,16 +132,16 @@ pub fn codex_model_env() -> Option<String> {
         .and_then(|m| clean_model(&m))
 }
 
-/// The route a spawn with these options dispatches under: the recorded route
-/// when the dispatch belongs to a run, else this process's ambient route.
+/// The route a spawn with these options dispatches under: the carried
+/// recorded route when the dispatch belongs to a run, else this process's
+/// ambient route.
 fn opts_route(opts: &SpawnOpts) -> CodexRoute {
-    resolve_route(
-        opts.model.as_deref(),
-        RecordedRoute {
-            profile: opts.codex_profile.as_deref(),
-            model: opts.codex_model.as_deref(),
-        },
-    )
+    let route = opts
+        .codex_route
+        .as_ref()
+        .map(CodexRoute::as_recorded)
+        .unwrap_or_else(RecordedRoute::ambient);
+    resolve_route(opts.model.as_deref(), route)
 }
 
 /// Flags that select a model. A `/` marks an OpenRouter slug (`openai/gpt-4o-mini`,
@@ -345,8 +384,11 @@ impl ProviderAdapter for CodexAdapter {
     /// default, the native login; only the `muse` profile is verified to
     /// layer OpenRouter, and any other set profile keys at the login rather
     /// than in a bucket it might not share.
+    /// The ambient route resolved the same way the spawn resolves it: an
+    /// ambient model names its own bucket, only a model-less seat falls back
+    /// to the profile default.
     fn default_bucket(&self) -> Option<&'static str> {
-        default_bucket_for_profile(codex_profile().as_deref())
+        route_bucket(&resolve_route(None, RecordedRoute::ambient()))
     }
 
     /// Rejections carry no route of their own, so every rejection lands in the
@@ -557,8 +599,7 @@ mod tests {
 
     fn opts(prompt: &str, model: Option<&str>) -> SpawnOpts {
         SpawnOpts {
-            codex_profile: None,
-            codex_model: None,
+            codex_route: None,
             prompt: prompt.into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
@@ -732,13 +773,13 @@ mod tests {
         // Recorded OpenRouter profile wins over a natively-set process.
         std::env::set_var("SPAR_CODEX_PROFILE", "");
         let mut o = opts("x", None);
-        o.codex_profile = Some("muse".into());
+        o.codex_route = CodexRoute::recorded(Some("muse".into()), None);
         let (_, a) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &o));
         assert!(a.windows(2).any(|w| w[0] == "-p" && w[1] == "muse"));
         // Recorded native route drops `-p` even when the process names a profile.
         std::env::set_var("SPAR_CODEX_PROFILE", "muse");
         let mut o = opts("x", None);
-        o.codex_profile = Some("".into());
+        o.codex_route = CodexRoute::recorded(Some("".into()), None);
         let (_, a) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &o));
         assert!(!a.iter().any(|x| x == "-p"));
         std::env::remove_var("SPAR_CODEX_PROFILE");
@@ -1129,8 +1170,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let run = dir.path().join("run1");
         let o = SpawnOpts {
-            codex_profile: None,
-            codex_model: None,
+            codex_route: None,
             prompt: "x".into(),
             prompt_file: Some(run.join("prompt-rev.md")),
             cwd: PathBuf::from("/tmp"),
@@ -1176,7 +1216,7 @@ mod tests {
         std::env::set_var("SPAR_CODEX_MODEL", "gpt-5");
         std::env::remove_var("SPAR_CODEX_PROFILE");
         let mut o = opts("x", None);
-        o.codex_model = Some("x-ai/grok-4".into());
+        o.codex_route = CodexRoute::recorded(None, Some("x-ai/grok-4".into()));
         let (_, a) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &o));
         let mi = a.iter().position(|x| x == "-m").expect("-m present");
         assert_eq!(a.get(mi + 1).map(String::as_str), Some("x-ai/grok-4"));
@@ -1185,7 +1225,7 @@ mod tests {
             "explicit model omits the profile"
         );
         let mut o = opts("x", None);
-        o.codex_model = Some("".into());
+        o.codex_route = CodexRoute::recorded(None, Some("".into()));
         let (_, a) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &o));
         assert!(
             !a.iter().any(|x| x == "-m"),

@@ -457,17 +457,14 @@ fn run() -> Result<ExitCode> {
                     key,
                     reassign,
                 };
-                // The pause check keys the resumed run's recorded route when there
-                // is one (a new run has no record yet: ambient).
-                let held_state;
-                let route = match &run_id {
-                    Some(id) => {
-                        held_state = state::RunState::load(&paths, id)?;
-                        held_state.recorded_route()
-                    }
-                    None => providers::RecordedRoute::ambient(),
-                };
-                workflow::implement::parse_reassignments(&opts.reassign, &paths, route)?;
+                // The pause check keys the route this process's dispatch will
+                // stamp (new or resumed: continuing entries stamp on entry),
+                // not the previous record.
+                workflow::implement::parse_reassignments(
+                    &opts.reassign,
+                    &paths,
+                    providers::codex::dispatch_route().as_recorded(),
+                )?;
                 let mut fleet = None;
                 match &run_id {
                     Some(id) => {
