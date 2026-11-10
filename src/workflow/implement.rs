@@ -838,6 +838,9 @@ fn run_from_approved(
             state.error = Some(msg.clone());
             state.set_phase(crate::state::Phase::Quota);
             state.save(paths)?;
+            // The round already bumped above: refresh so poll files drop what the
+            // new round ages out even though no slot dispatches.
+            crate::providers::delivery::refresh_run_poll_files(paths, run_id);
             if opts.json {
                 crate::executor::emit_run_json(&state)?;
             } else {
@@ -850,6 +853,7 @@ fn run_from_approved(
         bail!("no implementer slot after provider pick");
     }
     state.save(paths)?;
+    crate::providers::delivery::refresh_run_poll_files(paths, run_id);
     if opts.detach {
         // The detached child takes the lock itself, and flock refuses a second holder.
         drop(lock);
@@ -1909,7 +1913,13 @@ fn run_with_task(
 
     paths.ensure_run_dirs(&state.id)?;
     let _ = crate::bus::ensure_bus(paths);
-    let _ = crate::bus::join(paths, Some(&state.id), "orchestrator", None, None);
+    let _ = crate::bus::join(
+        paths,
+        Some(&state.id),
+        crate::bus::ORCHESTRATOR_SEAT,
+        None,
+        None,
+    );
     if let Some(body) = &plan_body {
         std::fs::write(paths.artifact(&state.id, "plan.md"), body)?;
         if state.big {
@@ -2133,7 +2143,7 @@ pub fn execute_loop(
                 let _ = crate::bus::broadcast(
                     paths,
                     Some(&state.id),
-                    "orchestrator",
+                    crate::bus::ORCHESTRATOR_SEAT,
                     note,
                     state.message_budget,
                 );
@@ -2541,7 +2551,7 @@ pub fn execute_loop(
                 let _ = crate::bus::broadcast(
                     paths,
                     Some(&state.id),
-                    "orchestrator",
+                    crate::bus::ORCHESTRATOR_SEAT,
                     msg,
                     state.message_budget,
                 );
@@ -2613,7 +2623,7 @@ pub fn execute_loop(
                 let _ = crate::bus::broadcast(
                     paths,
                     Some(&state.id),
-                    "orchestrator",
+                    crate::bus::ORCHESTRATOR_SEAT,
                     msg,
                     state.message_budget,
                 );
@@ -2623,7 +2633,7 @@ pub fn execute_loop(
                 let _ = crate::bus::broadcast(
                     paths,
                     Some(&state.id),
-                    "orchestrator",
+                    crate::bus::ORCHESTRATOR_SEAT,
                     "suite channel inconclusive: no tester slot prepared".to_string(),
                     state.message_budget,
                 );
@@ -2646,7 +2656,7 @@ pub fn execute_loop(
                 let _ = crate::bus::broadcast(
                     paths,
                     Some(&state.id),
-                    "orchestrator",
+                    crate::bus::ORCHESTRATOR_SEAT,
                     note.clone(),
                     state.message_budget,
                 );
@@ -2719,7 +2729,7 @@ pub fn execute_loop(
             let _ = crate::bus::broadcast(
                 paths,
                 Some(&state.id),
-                "orchestrator",
+                crate::bus::ORCHESTRATOR_SEAT,
                 msg.clone(),
                 state.message_budget,
             );
@@ -3065,7 +3075,7 @@ pub fn execute_loop(
                     let _ = crate::bus::broadcast(
                         paths,
                         Some(&state.id),
-                        "orchestrator",
+                        crate::bus::ORCHESTRATOR_SEAT,
                         format!(
                             "acceptance gate blocked ship (review {}): {}",
                             rev.id,
@@ -3163,6 +3173,8 @@ pub fn execute_loop(
         state.begin_round();
         state.set_phase(Phase::Fix);
         state.save(paths)?;
+        let run_id = state.id.clone();
+        crate::providers::delivery::refresh_run_poll_files(paths, &run_id);
     }
 }
 
@@ -5042,7 +5054,7 @@ fn escalate_round_ceiling(state: &mut RunState, paths: &SparPaths) -> Result<boo
     let _ = crate::bus::broadcast(
         paths,
         Some(&state.id),
-        "orchestrator",
+        crate::bus::ORCHESTRATOR_SEAT,
         msg,
         state.message_budget,
     );
