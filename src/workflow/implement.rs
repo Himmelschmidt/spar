@@ -592,24 +592,14 @@ struct Reentry {
     /// Lifted off the round ceiling (O52): the same escalation continuing, so the
     /// stuck ladder's rotate/widen budget is not reset.
     from_round_gate: bool,
-    /// The amend moved the implementer pin, so the existing implementer seat is
-    /// re-resolved from the amended config rather than keeping the provider it
-    /// was minted with. Any other amend leaves it alone.
+    /// An amend was applied, so seats that already exist are re-resolved from
+    /// the amended config rather than keeping what they were minted with.
     repoint: bool,
+    /// The amend moved the implementer pin, so the existing implementer seat
+    /// moves too. Any other amend leaves it alone.
+    repoint_implementer: bool,
 }
 
-/// Re-resolve the provider and model of seats that already exist, from the amended
-/// config (an amend was applied, or `--reload-config` reloaded the file).
-///
-/// Matched by seat id, so a seat the new config no longer produces is left alone
-/// rather than guessed at: dropping it is `--without`'s job, and this must not become
-/// a second path that reaps slots.
-///
-/// The implementer moves only when the amend changed its pin
-/// (`repoint_implementer`): any other amend leaves the seat alone, so a
-/// stuck-ladder rotation off the pin survives it. A reviewer seat's id encodes
-/// its provider, so the implementer is the only seat this can move.
-///
 /// A reviewer seat whose id names one provider while the amended config resolves
 /// that id to another.
 fn reviewer_repoint_refusal(seat: &str, resolved: &str, carried: &str) -> anyhow::Error {
@@ -712,6 +702,18 @@ fn implementer_pin_changed(
         != resolved_implementer(amended, pool, pool_origin)
 }
 
+/// Re-resolve the provider and model of seats that already exist, from the amended
+/// config (an amend was applied, or `--reload-config` reloaded the file).
+///
+/// Matched by seat id, so a seat the new config no longer produces is left alone
+/// rather than guessed at: dropping it is `--without`'s job, and this must not become
+/// a second path that reaps slots.
+///
+/// The implementer moves only when the amend changed its pin
+/// (`repoint_implementer`): any other amend leaves the seat alone, so a
+/// stuck-ladder rotation off the pin survives it. A reviewer seat's id encodes
+/// its provider, so the implementer is the only seat this can move.
+///
 /// **A `Running` seat is never re-pointed.** Its provider is the one that is mid-flight;
 /// rewriting it would make the run's own record disagree with the process it is
 /// waiting on, and the slot's pid marker is filed against what actually spawned.
@@ -1422,7 +1424,8 @@ fn run_from_approved(
         paths,
         Reentry {
             from_round_gate,
-            repoint: repoint_implementer,
+            repoint: amend_applied,
+            repoint_implementer,
         },
     )?;
     // Only the implementer must run next at run start, so only it can park the
@@ -1472,6 +1475,7 @@ fn prepare_implement_slots(
     let Reentry {
         from_round_gate: resuming_from_round_gate,
         repoint,
+        repoint_implementer,
     } = reentry;
     state.workflow = crate::cli::WorkflowKind::Loop;
     state.max_fix_rounds = 3;
@@ -1489,11 +1493,12 @@ fn prepare_implement_slots(
     // Keep planner slots as historical; add impl/review if missing.
     let has_impl = state.slots.iter().any(|s| s.role == SlotRole::Implementer);
     if has_impl {
-        // Seats minted by an earlier round keep the provider they were created
-        // with; only an amend that moved the implementer pin re-points the seat,
-        // so a stuck-ladder rotation off the pin survives any other amend.
+        // Seats minted by an earlier round are re-resolved from the amended
+        // config whenever an amend was applied; only an amend that moved the
+        // implementer pin moves the implementer seat, so a stuck-ladder
+        // rotation off the pin survives any other amend.
         if repoint {
-            repoint_existing_seats(state, paths, cfg, repoint)?;
+            repoint_existing_seats(state, paths, cfg, repoint_implementer)?;
         }
         ensure_suite_slot(state, dry, cfg, paths)?;
         return Ok(());
@@ -1876,6 +1881,56 @@ mod suite_reap_tests {
         assert_eq!(impl_slot.model.as_deref(), Some("muse-spark-1.2"));
     }
 
+    /// A reviewer-model-only amend must still re-point reviewer seats: the flag
+    /// that decides whether the implementer moves must not also decide whether
+    /// `repoint_existing_seats` runs at all. This passes exactly what the dispatch
+    /// passes when the amend did not move the pin, and failed while the call was
+    /// gated on the pin flag: the reviewer kept its stale model.
+    #[test]
+    fn an_amend_without_an_implementer_pin_move_still_repoints_reviewer_models() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = run_with_impl("cli:muse", "muse-spark-1.3", SlotStatus::Failed);
+        let mut review_slot = executor::init_slot_model(
+            "review-0-cli-claude",
+            "cli:claude",
+            SlotRole::Reviewer,
+            Some("opus".into()),
+        );
+        review_slot.status = SlotStatus::Failed;
+        st.slots.push(review_slot);
+        st.providers = vec!["cli:muse".into(), "cli:claude".into()];
+
+        let mut cfg = cfg_with_implementer("cli:muse@muse-spark-1.3");
+        cfg.roles.reviewer = vec!["cli:claude@sonnet".into()];
+
+        prepare_implement_slots(
+            &mut st,
+            None,
+            PoolOrigin::Synth,
+            true,
+            &cfg,
+            &paths,
+            Reentry {
+                from_round_gate: false,
+                repoint: true,
+                repoint_implementer: false,
+            },
+        )
+        .unwrap();
+
+        let review = st
+            .slots
+            .iter()
+            .find(|s| s.id == "review-0-cli-claude")
+            .unwrap();
+        assert_eq!(
+            review.model.as_deref(),
+            Some("sonnet"),
+            "reviewer model follows the amend even when the implementer pin did not move"
+        );
+    }
+
     /// The invariant a re-point must preserve: every reviewer seat's provider still
     /// matches the provider its id names (`review-{r}-{provider}`).
     ///
@@ -1993,10 +2048,9 @@ mod suite_reap_tests {
         );
     }
 
-    /// The re-point trigger is the resolved pin, not the amend: restating the
-    /// same implementer pin resolves identically and moves nothing, while a new
-    /// pin resolves differently. Against the old `repoint: amend_applied` wiring
-    /// the first assertion fails, because every amend re-pointed.
+    /// The implementer-branch gate is the resolved pin, not the amend: restating
+    /// the same pin resolves identically and moves nothing, while a new pin
+    /// resolves differently. No amend means no re-point either way.
     #[test]
     fn only_a_moved_implementer_pin_repoints() {
         let pool = vec!["cli:claude".to_string(), "cli:codex".to_string()];
@@ -2646,6 +2700,7 @@ fn run_with_task(
         Reentry {
             from_round_gate: false,
             repoint: false,
+            repoint_implementer: false,
         },
     )?;
     // Only the implementer must run next at run start, so only it can park the
@@ -5047,14 +5102,17 @@ mod recheck_seat_tests {
 
     /// The 2026-10-22 shape: grok paused after the run started. The next grok reviewer
     /// must move to its declared backup, renamed to name its new vendor (O85).
+    /// The backup comes from the seat's live panel position, not the ordinal in
+    /// its id: this seat is still named `review-1` but it is the only seat left,
+    /// so position 0 governs.
     #[test]
-    fn a_seat_paused_mid_run_moves_to_its_backup_before_dispatch() {
+    fn a_paused_seat_moves_to_the_backup_at_its_live_panel_position() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         pause(&paths, "cli:grok");
         let mut st = state_with("review-1-cli-grok", "cli:grok", SlotRole::Reviewer);
         let mut cfg = Config::default();
-        cfg.backups.reviewer = vec![String::new(), "cli:codex@gpt-5.6-terra".into()];
+        cfg.backups.reviewer = vec!["cli:codex@gpt-5.6-terra".into()];
         let got = recheck_seat(&mut st, &paths, &cfg, "review-1-cli-grok", false).unwrap();
         let SeatCheck::Ready(id) = got else {
             panic!("expected a move to the backup");
