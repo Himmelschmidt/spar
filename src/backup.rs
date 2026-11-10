@@ -331,10 +331,8 @@ pub fn dispatch_stop_cause(
     // set, so error text plus quota state decide for them.
     let seat_missing = || {
         let seat = slot.provider_ref();
-        matches!(
-            seat.backend,
-            crate::provider_ref::ExecBackend::ApiSdk
-        ) || !crate::providers::is_provider_present(&slot.provider, false)
+        matches!(seat.backend, crate::provider_ref::ExecBackend::ApiSdk)
+            || !crate::providers::is_provider_present(&slot.provider, false)
     };
     let seat_key = || slot.provider_ref().quota_key(route);
     if slot.status != crate::state::SlotStatus::Failed {
@@ -581,11 +579,7 @@ mod tests {
         let mut slot = slot_with_quota(true);
         slot.status = SlotStatus::Failed;
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Environmental
         );
     }
@@ -597,11 +591,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("provider unavailable: cli:claude not found".into());
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Work
         );
     }
@@ -614,11 +604,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("provider unavailable: cli:claude not found".into());
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Environmental
         );
     }
@@ -631,11 +617,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("rate limit exceeded".into());
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Environmental
         );
     }
@@ -737,11 +719,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("provider unavailable: cli:no-such-provider not found".into());
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Environmental
         );
     }
@@ -753,11 +731,7 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Done;
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Work
         );
     }
@@ -768,11 +742,7 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Pending;
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Work
         );
     }
@@ -783,11 +753,7 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Work
         );
     }
@@ -798,11 +764,7 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Work
         );
     }
@@ -874,11 +836,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("rate limit exceeded".into());
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Environmental
         );
     }
@@ -890,11 +848,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("hard ceiling: slot timed out after 10s".into());
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Work
         );
     }
@@ -906,11 +860,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("missing expected artifact: summary-impl.md".into());
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Work
         );
     }
@@ -922,11 +872,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("review verdict: request_changes".into());
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Work
         );
     }
@@ -938,11 +884,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         // If Work branch were neutralized to Environmental, this would be Environmental
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Work
         );
         // Verify environmental still distinct
@@ -966,11 +908,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("hard ceiling: slot timed out after 10s".into());
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Work
         );
     }
@@ -983,11 +921,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("missing expected artifact: summary-impl.md".into());
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Work
         );
     }
@@ -1000,11 +934,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("review verdict: request_changes".into());
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Work
         );
     }
@@ -1017,11 +947,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("some other failure".into());
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Work
         );
     }
@@ -1034,11 +960,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("exit code 1".into());
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Work
         );
         // Neutralisation: if paused check were leak, this would be Environmental
@@ -1214,11 +1136,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.auth_fault = true;
         slot.error = Some("exit 1".into());
-        let cause = dispatch_stop_cause(
-            &slot,
-            &store,
-            crate::providers::RecordedRoute::ambient(),
-        );
+        let cause = dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient());
         assert_eq!(cause, StopCause::Auth);
         assert!(cause.engages_backup());
         assert!(StopCause::Environmental.engages_backup());
@@ -1345,11 +1263,7 @@ mod tests {
         slot.status = SlotStatus::Failed;
         slot.error = Some("rate limit seven_day rejected".into());
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Environmental
         );
     }
@@ -1475,20 +1389,12 @@ mod tests {
         let mut store = QuotaStore::default();
         store.pause_quota("cli:agy@pro", "limit");
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Work
         );
         store.pause_quota("cli:agy@flash", "limit");
         assert_eq!(
-            dispatch_stop_cause(
-                &slot,
-                &store,
-                crate::providers::RecordedRoute::ambient()
-            ),
+            dispatch_stop_cause(&slot, &store, crate::providers::RecordedRoute::ambient()),
             StopCause::Environmental
         );
     }
@@ -1548,11 +1454,7 @@ mod tests {
             let mut store = QuotaStore::default();
             store.pause_quota(&crate::quota::quota_key(seat), "limit");
             assert!(
-                !is_provider_eligible(
-                    other,
-                    &store,
-                    crate::providers::RecordedRoute::ambient()
-                ),
+                !is_provider_eligible(other, &store, crate::providers::RecordedRoute::ambient()),
                 "{seat} must hold {other}"
             );
             assert_eq!(

@@ -137,7 +137,6 @@ pub fn test_report(name: &str, available: bool, readiness: Readiness) -> Provide
     }
 }
 
-/// Usable native-CLI providers as `cli:name` keys, or `None` when no provider is
 /// One readiness verdict for a provider: whether it may be auto-selected, plus
 /// the failed probe's detail when a probe ran and failed it.
 #[derive(Debug, Clone)]

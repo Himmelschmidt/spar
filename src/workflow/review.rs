@@ -109,28 +109,30 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             .and_then(|p| p.model);
         let unhealthy_auto = !source.is_some_and(crate::state::SeatSource::is_explicit_pin)
             && !health.check(&provider).usable;
-        let backup_pin = if !crate::backup::is_provider_eligible(
-            &provider,
-            &store,
-            state.recorded_route(),
-        ) || unhealthy_auto
-        {
-            if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Reviewer, i, cfg) {
-                if let Some(takeover) = crate::backup::takeover(
-                    &backup_raw,
-                    SlotRole::Reviewer,
-                    cfg,
-                    &store,
-                    paths,
-                    dry,
-                    state.recorded_route(),
-                    &health,
-                ) {
-                    if let Ok(bpin) = crate::provider_ref::Pin::parse(&backup_raw) {
-                        provider = bpin.display();
-                        source = Some(takeover);
-                        model = bpin.model.clone();
-                        Some(bpin)
+        let backup_pin =
+            if !crate::backup::is_provider_eligible(&provider, &store, state.recorded_route())
+                || unhealthy_auto
+            {
+                if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Reviewer, i, cfg)
+                {
+                    if let Some(takeover) = crate::backup::takeover(
+                        &backup_raw,
+                        SlotRole::Reviewer,
+                        cfg,
+                        &store,
+                        paths,
+                        dry,
+                        state.recorded_route(),
+                        &health,
+                    ) {
+                        if let Ok(bpin) = crate::provider_ref::Pin::parse(&backup_raw) {
+                            provider = bpin.display();
+                            source = Some(takeover);
+                            model = bpin.model.clone();
+                            Some(bpin)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -139,10 +141,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
                 }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
         let id = if source.is_some_and(crate::state::SeatSource::is_backup) {
             if let Some(bpin) = backup_pin {
                 format!("review-{}-{}", i, sanitize_slot(&bpin.provider))
@@ -251,11 +250,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         if slot_state.status != SlotStatus::Failed {
             continue;
         }
-        let cause = crate::backup::dispatch_stop_cause(
-            &slot_state,
-            &store,
-            state.recorded_route(),
-        );
+        let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, state.recorded_route());
         if !cause.engages_backup()
             || slot_state
                 .source

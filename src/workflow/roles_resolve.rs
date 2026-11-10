@@ -971,13 +971,7 @@ mod tests {
             "nothing held: ordinal indexing is unchanged"
         );
         assert_eq!(
-            resolve_order_rung(
-                SlotRole::Reviewer,
-                0,
-                &cfg,
-                &health,
-                &["cli:a".to_string()]
-            ),
+            resolve_order_rung(SlotRole::Reviewer, 0, &cfg, &health, &["cli:a".to_string()]),
             Some(("cli:b".to_string(), SeatSource::ProvidersOrder)),
             "a held ordinal entry falls forward instead of double-seating"
         );

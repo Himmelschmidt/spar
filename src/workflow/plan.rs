@@ -158,11 +158,7 @@ pub fn run(
         let mut still_paused: Vec<String> = Vec::new();
         for job in &jobs {
             let seat = job.provider_ref().display();
-            if !crate::backup::is_provider_eligible(
-                &seat,
-                &store,
-                state.recorded_route(),
-            ) {
+            if !crate::backup::is_provider_eligible(&seat, &store, state.recorded_route()) {
                 let key = job.provider_ref().quota_key(state.recorded_route());
                 if !still_paused.contains(&key) {
                     still_paused.push(key);
@@ -352,11 +348,8 @@ pub fn execute_plan(
             let health = providers::LiveHealth::for_dry(state.dry_run);
             let mut handled_via_backup = false;
             if let Some(slot_state) = slot_state {
-                let cause = crate::backup::dispatch_stop_cause(
-                    &slot_state,
-                    &store,
-                    state.recorded_route(),
-                );
+                let cause =
+                    crate::backup::dispatch_stop_cause(&slot_state, &store, state.recorded_route());
                 if cause.engages_backup() && !slot_state.source.is_some_and(SeatSource::is_backup) {
                     if let Some(raw) = crate::backup::backup_for_role(job.role, 0, cfg) {
                         if let Some(source) = crate::backup::takeover(
@@ -608,11 +601,7 @@ fn resolve_test_author(
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     let seat_ref =
         crate::provider_ref::ProviderRef::for_seat(&provider, model.as_deref()).display();
-    if !crate::backup::is_provider_eligible(
-        &seat_ref,
-        &store,
-        state.recorded_route(),
-    ) {
+    if !crate::backup::is_provider_eligible(&seat_ref, &store, state.recorded_route()) {
         if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::TestAuthor, 0, cfg) {
             if let Some(takeover) = crate::backup::takeover(
                 &backup_raw,
@@ -715,11 +704,8 @@ fn run_test_author(
         let health = providers::LiveHealth::for_dry(state.dry_run);
         let mut handled = false;
         if let Some(slot_state) = slot_state {
-            let cause = crate::backup::dispatch_stop_cause(
-                &slot_state,
-                &store,
-                state.recorded_route(),
-            );
+            let cause =
+                crate::backup::dispatch_stop_cause(&slot_state, &store, state.recorded_route());
             if cause.engages_backup()
                 && !slot_state
                     .source
@@ -909,9 +895,9 @@ pub(crate) fn resolve_spec_provider(
         if let Some(p) = &cfg.roles.test_author {
             crate::provider_ref::ProviderRef::parse(p)
                 .map_err(|e| anyhow::anyhow!("invalid [roles].test_author {p:?}: {e}"))?;
-            // Pins are kept on presence and warn at launch when unhealthy;
-            // blind health already implies parse-ok, matching the old dry path.
-            if health.check(p).usable || providers::is_provider_present(p, false) {
+            // Pins are kept on presence and warn at launch when unhealthy: a
+            // failed probe never drops a pin, only a missing binary does.
+            if providers::is_provider_present(p, false) {
                 return Ok((p.clone(), SeatSource::CliRole));
             }
         }
@@ -928,7 +914,7 @@ pub(crate) fn resolve_spec_provider(
             .find(|p| {
                 !used.contains(p)
                     && (if pool_pinned {
-                        health.check(p).usable || providers::is_provider_present(p, false)
+                        providers::is_provider_present(p, false)
                     } else {
                         health.check(p).usable
                     })
