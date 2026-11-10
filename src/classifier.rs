@@ -266,12 +266,12 @@ fn live_post(
     body: &str,
     timeout: Duration,
 ) -> Result<(u16, String), String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .http_status_as_error(false)
-        .build()
-        .into();
-    crate::util::retry_interrupted(|| {
+    crate::util::retry_interrupted(timeout, |remaining| {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(remaining))
+            .http_status_as_error(false)
+            .build()
+            .into();
         let resp = agent
             .post(url)
             .header("Authorization", &format!("Bearer {api_key}"))
@@ -279,7 +279,7 @@ fn live_post(
             .header("X-OpenRouter-Title", "spar")
             .send(body)?;
         let status = resp.status().as_u16();
-        let text = resp.into_body().read_to_string().unwrap_or_default();
+        let text = resp.into_body().read_to_string()?;
         Ok((status, text))
     })
     .map_err(|e| e.to_string())

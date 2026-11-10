@@ -120,12 +120,13 @@ pub fn chat_completion(
     });
     // Bound the whole request by the slot's remaining ceiling: the step loop
     // only checks between calls, so one hung call would otherwise overrun it.
-    let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .build(),
-    );
-    let (status, text) = crate::util::retry_interrupted(|| {
+    // Every attempt shares that single deadline via `remaining`.
+    let (status, text) = crate::util::retry_interrupted(timeout, |remaining| {
+        let agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(remaining))
+                .build(),
+        );
         let resp = agent
             .post(&url)
             .header("Authorization", &format!("Bearer {}", cfg.api_key))

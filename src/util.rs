@@ -64,18 +64,28 @@ pub fn expand_home(raw: &str) -> std::path::PathBuf {
 /// runs, the syscall still fails) instead of the caller's timeout. ureq reports
 /// that as a typed `Error::Io`, never as `Error::Timeout`, so without a retry a
 /// slow server reads as a transport failure. An interruption carries no server
-/// answer, so the re-send is not an attempt against the endpoint; each attempt
-/// keeps the caller's own timeout, and two retries bound a signal storm.
+/// answer, so the re-send is not an attempt against the endpoint. Every attempt
+/// shares one deadline: `op` receives the time it may still spend, so retries
+/// can never push the total past `budget`. At most three attempts bound a
+/// signal storm; a spent budget reports `Timeout`, never another re-send.
 pub fn retry_interrupted<T>(
-    mut op: impl FnMut() -> Result<T, ureq::Error>,
+    budget: Duration,
+    mut op: impl FnMut(Duration) -> Result<T, ureq::Error>,
 ) -> Result<T, ureq::Error> {
-    for _ in 0..2 {
-        match op() {
-            Err(ureq::Error::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+    let deadline = std::time::Instant::now() + budget;
+    let mut tries = 0;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ureq::Error::Timeout(ureq::Timeout::Global));
+        }
+        match op(remaining) {
+            Err(ureq::Error::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted && tries < 2 => {
+                tries += 1;
+            }
             done => return done,
         }
     }
-    op()
 }
 
 pub fn hostname() -> Option<String> {
@@ -123,7 +133,7 @@ mod tests {
     #[test]
     fn retry_interrupted_reruns_only_an_interrupted_read() {
         let mut calls = 0;
-        let ok = retry_interrupted(|| {
+        let ok = retry_interrupted(Duration::from_secs(30), |_| {
             calls += 1;
             if calls < 3 {
                 Err(interrupted())
@@ -133,20 +143,36 @@ mod tests {
         });
         assert_eq!(ok.unwrap(), "done");
         assert_eq!(calls, 3, "two interruptions then a success");
-        let mut timeouts = 0;
-        let err = retry_interrupted::<()>(|| {
-            timeouts += 1;
+        let mut other = 0;
+        let err = retry_interrupted::<()>(Duration::from_secs(30), |_| {
+            other += 1;
             Err(ureq::Error::HostNotFound)
         });
         assert!(err.is_err());
-        assert_eq!(timeouts, 1, "a non-interruption returns at once");
+        assert_eq!(other, 1, "a non-interruption returns at once");
         let mut storms = 0;
-        let err = retry_interrupted::<()>(|| {
+        let err = retry_interrupted::<()>(Duration::from_secs(30), |_| {
             storms += 1;
             Err(interrupted())
         });
         assert!(err.is_err());
         assert_eq!(storms, 3, "a signal storm still terminates");
+    }
+
+    #[test]
+    fn retry_interrupted_never_spends_past_its_budget() {
+        let budget = Duration::from_millis(100);
+        let mut calls = 0;
+        let err = retry_interrupted::<()>(budget, |_| {
+            calls += 1;
+            std::thread::sleep(budget + Duration::from_millis(50));
+            Err(interrupted())
+        });
+        assert_eq!(calls, 1, "a spent budget is not re-sent");
+        assert!(
+            matches!(err, Err(ureq::Error::Timeout(_))),
+            "exhaustion reports a timeout, not another send"
+        );
     }
 
     #[test]
