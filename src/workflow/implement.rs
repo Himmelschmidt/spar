@@ -1913,17 +1913,19 @@ fn run_from_approved(
         }
         state.max_rounds = kept;
     }
-    // `--one-pass` on a bound run is one more round, then the ship-or-park
-    // verdict: the loop ends at the next ceiling either way. An explicit
-    // `--max-rounds` still wins over the implied one-round ceiling.
-    if amend.one_pass && opts.max_rounds.is_none() {
-        state.max_rounds = state.round + 1;
-    }
     // A round that never dispatched is still the current round, not a spent one: an
     // orchestrator killed between opening it and spawning anything (a launching shell
     // that exited, a quota park before dispatch) cost nothing, so re-entry reuses it,
     // and reusing it is not a step past the ceiling.
     let reuse_round = state.round > 0 && !round_dispatched;
+    // `--one-pass` on a bound run is one more round, then the ship-or-park
+    // verdict: the loop ends at the next ceiling either way. An explicit
+    // `--max-rounds` still wins over the implied one-round ceiling, and a
+    // reused round is the current round unspent, so the ceiling stays where
+    // the earlier entry left it instead of granting two dispatched rounds.
+    if amend.one_pass && opts.max_rounds.is_none() && !reuse_round {
+        state.max_rounds = state.round + 1;
+    }
     if !reuse_round && state.round_ceiling_reached() && escalate_round_ceiling(&mut state, paths)? {
         finish_out(&state, opts.json)?;
         return Ok(state.exit_code());
@@ -2025,14 +2027,18 @@ fn run_from_approved(
     }
     execute_loop(&mut state, paths, cfg, opts.accept_contract)?;
     maybe_auto_ship_or_cleanup(&mut state, paths, cfg)?;
-    if let Some(reason) = one_pass_ship_reason(&state, cfg) {
+    if let Some(reason) = one_pass_ship_reason(&state, paths, cfg) {
         // The real ship takes its own lock and refuses a live orchestrator,
         // so this dispatch releases the run before running it, then re-reads
         // the state the ship wrote.
         drop(lock);
         let id = state.id.clone();
-        run_one_pass_ship(&mut state, paths, cfg, opts.json, reason, &id)?;
+        let ship_code = run_one_pass_ship(&mut state, paths, cfg, reason, &id)?;
         state = RunState::load(paths, &id)?;
+        finish_out(&state, opts.json)?;
+        if ship_code != ExitCode::Success {
+            return Ok(ship_code);
+        }
     }
     finish_out(&state, opts.json)?;
     Ok(state.exit_code())
@@ -3660,21 +3666,28 @@ fn run_with_task(
     let _lock = crate::runlock::RunLock::acquire(paths, &state.id)?;
     execute_loop(&mut state, paths, cfg, opts.accept_contract)?;
     maybe_auto_ship_or_cleanup(&mut state, paths, cfg)?;
-    if let Some(reason) = one_pass_ship_reason(&state, cfg) {
+    if let Some(reason) = one_pass_ship_reason(&state, paths, cfg) {
         // The real ship takes its own lock and refuses a live orchestrator,
         // so this dispatch releases the run before running it, then re-reads
         // the state the ship wrote.
         drop(_lock);
         let id = state.id.clone();
-        run_one_pass_ship(&mut state, paths, cfg, opts.json, reason, &id)?;
+        let ship_code = run_one_pass_ship(&mut state, paths, cfg, reason, &id)?;
         state = RunState::load(paths, &id)?;
+        finish_out(&state, opts.json)?;
+        if ship_code != ExitCode::Success {
+            return Ok(ship_code);
+        }
     }
     finish_out(&state, opts.json)?;
     Ok(state.exit_code())
 }
 
 fn maybe_auto_ship_or_cleanup(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<()> {
-    if state.phase == Phase::AwaitingShipConfirm && cfg.auto_ship() {
+    // A one-pass entry ships through its own verdict below, which must see the
+    // gate outcome to run the real ship; an early auto-ship would mark the run
+    // done before that verdict ever fires.
+    if state.phase == Phase::AwaitingShipConfirm && cfg.auto_ship() && !cfg.one_pass {
         state.gates.ship_confirmed = true;
         // leave at AwaitingShipConfirm with gate set — ship command still does push
         // unless we call ship; for dry-run mark Done
@@ -3758,27 +3771,44 @@ fn panel_stop(
 /// the real ship path, `reason = None` for a passed gate and the recorded
 /// override reason for a failed one; `None` leaves the outcome standing (a
 /// blocking finding parks at the existing gate, exit 2, as without `--one-pass`).
-/// Pure decision, no IO, so call sites drop the dispatch lock before the ship
-/// itself runs — `ship()` takes its own lock and refuses a live orchestrator.
-pub fn one_pass_ship_reason(state: &RunState, cfg: &Config) -> Option<Option<String>> {
+pub fn one_pass_ship_reason(
+    state: &RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+) -> Option<Option<String>> {
     if !cfg.one_pass {
         return None;
     }
     match state.phase {
         Phase::AwaitingShipConfirm => Some(None),
         Phase::AwaitingRoundExtension => {
-            let panel =
-                crate::workflow::review_result::panel_before(&state.review_history, u32::MAX);
-            let open = crate::workflow::review_result::panel_findings(&panel);
-            if open
+            let panel = crate::workflow::review_result::latest_panel(state);
+            if panel.is_empty() {
+                return None;
+            }
+            if panel.iter().any(|e| e.review.blocks(cfg.review.block_on)) {
+                return None;
+            }
+            let criteria = one_pass_criteria(state, paths);
+            if panel
                 .iter()
-                .any(|(entry, f)| f.blocks(cfg.review.block_on, entry.review.scoped))
+                .any(|e| acceptance_blocks_ship(&criteria, &e.review, cfg))
             {
                 return None;
             }
-            let n = open.len();
+            if cfg.suite.enabled && state.suite_outcome.is_some_and(suite_blocks_ship) {
+                return None;
+            }
+            if state
+                .slots
+                .iter()
+                .any(|s| s.role == SlotRole::Reviewer && matches!(s.status, SlotStatus::Failed))
+            {
+                return None;
+            }
+            let n = crate::workflow::review_result::panel_findings(&panel).len();
             Some(Some(format!(
-                "one-pass: the single round's gate did not pass, but no open finding reaches [review] block_on ({}); shipping with {} non-blocking finding{} as follow-ups",
+                "one-pass: the round gate stopped on reviewer findings alone (no finding reaches [review] block_on ({}), acceptance and suite clear); shipping the single round with {} non-blocking finding{} as follow-ups",
                 cfg.review.block_on.as_str(),
                 n,
                 if n == 1 { "" } else { "s" },
@@ -3788,26 +3818,43 @@ pub fn one_pass_ship_reason(state: &RunState, cfg: &Config) -> Option<Option<Str
     }
 }
 
+/// The acceptance contract the round gate judged, rebuilt the way the gate
+/// built it: the frozen criteria off disk minus the run's waivers. The gate ran
+/// earlier in this same entry and nothing dispatches between it and the verdict,
+/// so the bytes still match what the gate froze.
+fn one_pass_criteria(state: &RunState, paths: &SparPaths) -> Vec<String> {
+    let body =
+        std::fs::read_to_string(paths.artifact(&state.id, "test-contract.md")).unwrap_or_default();
+    let frozen = FrozenContract::freeze(&body);
+    crate::rules::unwaived(&frozen.criteria, &crate::rules::for_run(paths, &state.id))
+}
+
 /// Run the real ship path for a one-pass verdict: push and open a draft PR via
-/// the same code `spar ship` uses. The caller holds no lock here; `ship()`
-/// acquires its own.
+/// the same code `spar ship` uses. One-pass ships are always drafts. The caller
+/// holds no lock here; `ship()` acquires its own. Never emits JSON itself; the
+/// caller prints the one document for the entry.
 pub fn run_one_pass_ship(
     state: &mut RunState,
     paths: &SparPaths,
     cfg: &Config,
-    json: bool,
     override_reason: Option<String>,
     run_id: &str,
 ) -> Result<ExitCode> {
-    // The loop earned this ship: a passed gate confirmed itself, and an
-    // override carries its own confirmation.
-    state.gates.ship_confirmed = true;
-    state.save(paths)?;
+    // The passed gate confirmed itself, so the loop may record that; an
+    // override is this invocation's confirmation only and is never persisted
+    // as `ship_confirmed` (ship.rs), or a refused push would leave a run
+    // shippable without one.
+    if override_reason.is_none() {
+        state.gates.ship_confirmed = true;
+        state.save(paths)?;
+    }
+    let mut owned = cfg.clone();
+    owned.ship.draft = true;
     crate::ship::ship(
         paths,
-        cfg,
+        &owned,
         run_id,
-        json,
+        false,
         &crate::ship::ShipOpts {
             base: None,
             override_reason: override_reason.as_deref(),
@@ -10480,13 +10527,16 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
             // A daemon/`continue` resume is nobody's deliberate amendment, so it never
             // adopts a contract that moved under the previous round.
             execute_loop(&mut state, paths, cfg, false)?;
-            if let Some(reason) = one_pass_ship_reason(&state, cfg) {
+            if let Some(reason) = one_pass_ship_reason(&state, paths, cfg) {
                 // The real ship takes its own lock, so this dispatch releases
                 // the run before running it, then re-reads the shipped state.
                 drop(_lock);
                 let id = state.id.clone();
-                run_one_pass_ship(&mut state, paths, cfg, false, reason, &id)?;
+                let ship_code = run_one_pass_ship(&mut state, paths, cfg, reason, &id)?;
                 state = RunState::load(paths, &id)?;
+                if ship_code != ExitCode::Success {
+                    return Ok(ship_code);
+                }
             }
         }
         crate::cli::WorkflowKind::Arena => {
@@ -13043,9 +13093,15 @@ mod one_pass_tests {
         );
         state.phase = phase;
         for (i, body) in bodies.iter().enumerate() {
+            let slot_id = format!("rev-{i}");
+            state.slots.push(executor::init_slot(
+                &slot_id,
+                "cli:claude",
+                SlotRole::Reviewer,
+            ));
             state.review_history.push(crate::state::ReviewHistoryEntry {
                 round: 1,
-                slot_id: format!("rev-{i}"),
+                slot_id,
                 review: crate::workflow::review_result::parse_review(body),
             });
         }
@@ -13059,9 +13115,20 @@ mod one_pass_tests {
         }
     }
 
+    fn test_paths(contract: &str) -> (tempfile::TempDir, SparPaths) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("r1").unwrap();
+        std::fs::write(paths.artifact("r1", "test-contract.md"), contract).unwrap();
+        (tmp, paths)
+    }
+
+    const MINOR_ONLY: &str = "## Verdict\nrequest_changes\n\n## Findings\n- severity: minor - a nit at src/lib.rs:1\n\n## Acceptance\nAC-1: pass — ok\n";
+
     #[test]
     fn flag_off_leaves_every_outcome_standing() {
         let cfg = Config::default();
+        let (_tmp, paths) = test_paths("");
         for phase in [
             Phase::AwaitingShipConfirm,
             Phase::AwaitingRoundExtension,
@@ -13070,7 +13137,7 @@ mod one_pass_tests {
         ] {
             let state = state_with(phase, &[]);
             assert!(
-                one_pass_ship_reason(&state, &cfg).is_none(),
+                one_pass_ship_reason(&state, &paths, &cfg).is_none(),
                 "{phase:?} ships without --one-pass"
             );
         }
@@ -13079,39 +13146,120 @@ mod one_pass_tests {
     #[test]
     fn passed_gate_ships_without_override() {
         let cfg = one_pass_cfg();
+        let (_tmp, paths) = test_paths("");
         let state = state_with(Phase::AwaitingShipConfirm, &[]);
-        assert_eq!(one_pass_ship_reason(&state, &cfg), Some(None));
+        assert_eq!(one_pass_ship_reason(&state, &paths, &cfg), Some(None));
     }
 
     #[test]
-    fn minor_only_failure_ships_with_recorded_reason() {
+    fn findings_alone_ship_with_recorded_reason() {
         let cfg = one_pass_cfg();
-        let body =
-            "## Verdict\nrequest_changes\n\n## Findings\n- severity: minor - a nit at src/lib.rs:1\n";
-        let state = state_with(Phase::AwaitingRoundExtension, &[body]);
-        let reason = one_pass_ship_reason(&state, &cfg)
-            .expect("ships")
+        let (_tmp, paths) = test_paths("- AC-1: hello works\n");
+        let state = state_with(Phase::AwaitingRoundExtension, &[MINOR_ONLY]);
+        let reason = one_pass_ship_reason(&state, &paths, &cfg)
+            .expect("findings alone ship")
             .expect("override reason");
-        assert!(reason.contains("one-pass"), "{reason}");
-        assert!(reason.contains("major"), "{reason}");
+        assert!(reason.contains("findings alone"), "{reason}");
+        assert!(
+            reason.contains("1 non-blocking finding as follow-ups"),
+            "{reason}"
+        );
     }
 
     #[test]
     fn blocking_failure_parks() {
         let cfg = one_pass_cfg();
+        let (_tmp, paths) = test_paths("");
         let body =
             "## Verdict\nrequest_changes\n\n## Findings\n- severity: major - broken at src/lib.rs:1\n";
         let state = state_with(Phase::AwaitingRoundExtension, &[body]);
-        assert!(one_pass_ship_reason(&state, &cfg).is_none());
+        assert!(one_pass_ship_reason(&state, &paths, &cfg).is_none());
+    }
+
+    #[test]
+    fn acceptance_failure_parks() {
+        let cfg = one_pass_cfg();
+        let (_tmp, paths) = test_paths("- AC-1: hello works\n");
+        let body = MINOR_ONLY.replace("AC-1: pass — ok", "AC-1: fail — broken");
+        let state = state_with(Phase::AwaitingRoundExtension, &[&body]);
+        assert!(one_pass_ship_reason(&state, &paths, &cfg).is_none());
+    }
+
+    #[test]
+    fn suite_failure_parks() {
+        let cfg = one_pass_cfg();
+        let (_tmp, paths) = test_paths("");
+        let mut state = state_with(Phase::AwaitingRoundExtension, &[MINOR_ONLY]);
+        state.suite_outcome = Some(SuiteOutcome::Fail);
+        assert!(one_pass_ship_reason(&state, &paths, &cfg).is_none());
+    }
+
+    #[test]
+    fn missing_review_parks() {
+        let cfg = one_pass_cfg();
+        let (_tmp, paths) = test_paths("");
+        let state = state_with(Phase::AwaitingRoundExtension, &[]);
+        assert!(one_pass_ship_reason(&state, &paths, &cfg).is_none());
+    }
+
+    #[test]
+    fn synthetic_review_parks() {
+        let cfg = one_pass_cfg();
+        let (_tmp, paths) = test_paths("");
+        let body = format!(
+            "{}\n{}",
+            crate::workflow::review_result::SYNTHETIC_REVIEW_MARKER,
+            MINOR_ONLY
+        );
+        let state = state_with(Phase::AwaitingRoundExtension, &[&body]);
+        assert!(one_pass_ship_reason(&state, &paths, &cfg).is_none());
+    }
+
+    #[test]
+    fn untagged_item_parks() {
+        let cfg = one_pass_cfg();
+        let (_tmp, paths) = test_paths("");
+        let body = "## Verdict\nrequest_changes\n\n## Findings\n- just a note with no severity\n";
+        let state = state_with(Phase::AwaitingRoundExtension, &[body]);
+        assert!(one_pass_ship_reason(&state, &paths, &cfg).is_none());
+    }
+
+    #[test]
+    fn missing_verdict_parks() {
+        let cfg = one_pass_cfg();
+        let (_tmp, paths) = test_paths("");
+        let body = "## Findings\n- severity: minor - a nit at src/lib.rs:1\n";
+        let state = state_with(Phase::AwaitingRoundExtension, &[body]);
+        assert!(one_pass_ship_reason(&state, &paths, &cfg).is_none());
+    }
+
+    #[test]
+    fn failed_commit_slot_parks() {
+        let cfg = one_pass_cfg();
+        let (_tmp, paths) = test_paths("- AC-1: hello works\n");
+        let mut state = state_with(Phase::AwaitingRoundExtension, &[MINOR_ONLY]);
+        state.slots[0].status = SlotStatus::Failed;
+        assert!(one_pass_ship_reason(&state, &paths, &cfg).is_none());
+    }
+
+    #[test]
+    fn carried_veto_parks() {
+        let cfg = one_pass_cfg();
+        let (_tmp, paths) = test_paths("- AC-1: hello works\n");
+        let body = "## Verdict\nrequest_changes\n\n## Findings\n- severity: major - broken at src/lib.rs:1\n\n## Acceptance\nAC-1: pass — ok\n";
+        let mut state = state_with(Phase::AwaitingRoundExtension, &[body]);
+        state.slots[0].stood_down = Some("quota".to_string());
+        assert!(one_pass_ship_reason(&state, &paths, &cfg).is_none());
     }
 
     #[test]
     fn non_gate_phases_stand() {
         let cfg = one_pass_cfg();
+        let (_tmp, paths) = test_paths("");
         for phase in [Phase::Stuck, Phase::Failed, Phase::Done] {
             let state = state_with(phase, &[]);
             assert!(
-                one_pass_ship_reason(&state, &cfg).is_none(),
+                one_pass_ship_reason(&state, &paths, &cfg).is_none(),
                 "{phase:?} is not a one-pass verdict"
             );
         }

@@ -752,7 +752,7 @@ pub fn panel_findings<'a>(
 /// a seat's older rounds are superseded, and a dropped seat (gone from the slots)
 /// contributes nothing. Never `state.round`: a round begun but not yet reviewed
 /// has no reviews to judge.
-fn latest_panel(state: &RunState) -> Vec<&crate::state::ReviewHistoryEntry> {
+pub(crate) fn latest_panel(state: &RunState) -> Vec<&crate::state::ReviewHistoryEntry> {
     let mut out = Vec::new();
     for slot in state
         .slots
