@@ -2263,7 +2263,7 @@ pub fn execute_loop(
     // paid for — is a fresh process, and an in-memory list would leave it running blind
     // on the most expensive round of the run. Nothing in the implementer's prompt tells
     // it to go read `review-*.md` on its own.
-    let mut blockers: Vec<String> = blockers_from_disk(
+    let mut blockers: Vec<Blocker> = blockers_from_disk(
         state,
         paths,
         &crate::rules::unwaived(&frozen.criteria, &crate::rules::for_run(paths, &state.id)),
@@ -2856,14 +2856,14 @@ pub fn execute_loop(
         let mut any_request_changes = suite_channel_active && suite_blocks_ship(suite_outcome);
         blockers.clear();
         if any_request_changes {
-            blockers.push(format!(
+            blockers.push(Blocker::Note(format!(
                 "suite channel {}: see {}",
                 match suite_outcome {
                     SuiteOutcome::Fail => "red",
                     _ => "inconclusive",
                 },
                 paths.artifact(&state.id, "suite.md").display()
-            ));
+            )));
         }
         // One head per panel, resolved once after the suite ran: the commit the
         // panel was dispatched against is the contract every verdict is judged
@@ -3043,10 +3043,10 @@ pub fn execute_loop(
             // Timeout salvage may have already written a partial review-*.md.
             if !review_ok || missing_or_empty {
                 any_request_changes = true;
-                blockers.push(format!(
+                blockers.push(Blocker::Note(format!(
                     "review slot `{}` failed or produced no review",
                     rev.id
-                ));
+                )));
                 if missing_or_empty {
                     let acceptance = if frozen.criteria.is_empty() {
                         String::new()
@@ -3122,10 +3122,10 @@ pub fn execute_loop(
                     ReviewedCommitDecision::Absent => {
                         any_request_changes = true;
                         let head = panel_head.as_deref().unwrap_or("unknown");
-                        blockers.push(format!(
+                        blockers.push(Blocker::Note(format!(
                             "review `{}` names no commit (panel head {head})",
                             rev.id
-                        ));
+                        )));
                         fail_review_slot_on_commit(
                             state,
                             paths,
@@ -3150,7 +3150,7 @@ pub fn execute_loop(
                                 blocker.push_str(&format!(" [current HEAD {cur}]"));
                             }
                         }
-                        blockers.push(blocker);
+                        blockers.push(Blocker::Note(blocker));
                         fail_review_slot_on_commit(
                             state,
                             paths,
@@ -3161,12 +3161,12 @@ pub fn execute_loop(
                 }
                 if res.blocks(cfg.review.block_on) {
                     any_request_changes = true;
-                    blockers.push(verdict_blocker(
+                    blockers.push(Blocker::Verdict(verdict_blocker(
                         state,
                         &rev,
                         &res,
                         &acceptance_block_reasons(&criteria, &res, cfg),
-                    ));
+                    )));
                 } else if !res.approves() {
                     let _ = crate::events::append(
                         paths,
@@ -3191,7 +3191,10 @@ pub fn execute_loop(
                     // inside the carry-forward budget.
                     if !res.blocks(cfg.review.block_on) {
                         for r in &reasons {
-                            blockers.push(format!("acceptance (review `{}`): {r}", rev.id));
+                            blockers.push(Blocker::Note(format!(
+                                "acceptance (review `{}`): {r}",
+                                rev.id
+                            )));
                         }
                     }
                     let _ = crate::bus::broadcast(
@@ -3221,7 +3224,7 @@ pub fn execute_loop(
             carried_veto_blocker_lines(&state.slots, panel_head.as_deref(), &criteria, cfg);
         if !carried.is_empty() {
             any_request_changes = true;
-            blockers.extend(carried);
+            blockers.extend(carried.into_iter().map(Blocker::Note));
         }
         if !any_request_changes {
             write_impl_summary(state, paths)?;
@@ -3797,7 +3800,7 @@ fn seat_quota_blocked(
         return None;
     }
     let seat = slot.provider_ref();
-    let key = seat.quota_key(state.codex_profile.as_deref());
+    let key = seat.quota_key(state.recorded_route());
     let horizon = state.round_started_at.unwrap_or(state.created_at);
     let blocked = if store.blocks_live_dispatch(&key) {
         true
@@ -5522,13 +5525,13 @@ fn blockers_from_disk(
     paths: &SparPaths,
     criteria: &[String],
     cfg: &Config,
-) -> Vec<String> {
+) -> Vec<Blocker> {
     let mut out = Vec::new();
     if matches!(state.suite_outcome, Some(SuiteOutcome::Fail)) {
-        out.push(format!(
+        out.push(Blocker::Note(format!(
             "suite channel red last round: see {}",
             paths.artifact(&state.id, "suite.md").display()
-        ));
+        )));
     }
     for rev in state.slots.iter().filter(|s| s.role == SlotRole::Reviewer) {
         let path = paths.artifact(&state.id, &format!("review-{}.md", rev.id));
@@ -5548,10 +5551,15 @@ fn blockers_from_disk(
         };
         let reasons = acceptance_block_reasons(criteria, &res, cfg);
         if res.blocks(cfg.review.block_on) {
-            out.push(verdict_blocker(state, rev, &res, &reasons));
+            out.push(Blocker::Verdict(verdict_blocker(
+                state, rev, &res, &reasons,
+            )));
         } else {
             for r in &reasons {
-                out.push(format!("acceptance (review `{}`): {r}", rev.id));
+                out.push(Blocker::Note(format!(
+                    "acceptance (review `{}`): {r}",
+                    rev.id
+                )));
             }
         }
     }
@@ -5583,33 +5591,54 @@ fn take_carry_forward(paths: &SparPaths, run_id: &str, slot_id: &str) -> Option<
     (!body.is_empty()).then_some(body)
 }
 
-/// One blocking review: that it requested changes, the round that wrote it and the
-/// commit it judged, then that review's failing criteria followed by the open
-/// findings as severity plus one line each. The failing ids ride up front as a
-/// manifest because the bullet is clamped and the tail is the part truncation
-/// eats; each criterion line clamps like a finding, so the clamp only ever eats
-/// evidence and finding tails, never an id. One bullet per review: a panel that
-/// repeats the same criterion failure in every review would otherwise pay the
-/// line once per seat and squeeze the slot's own brief out of the budget. The
-/// plain statement that these reviews are the current verdict lives once in
-/// `carry_forward_section`, not in every bullet, for the same reason.
+/// A blocking review's carry-forward entry: the anchor head plus the failing
+/// acceptance lines and the open findings as separate lists, so the section
+/// can budget the acceptance lines first and never truncate them behind
+/// findings. One entry per review: a panel that repeats the same criterion
+/// failure in every review would otherwise pay the line once per seat and
+/// squeeze the slot's own brief out of the budget. The plain statement that
+/// these reviews are the current verdict lives once in
+/// `carry_forward_section`, not in every entry, for the same reason.
+#[derive(Debug)]
+struct VerdictBlocker {
+    review_id: String,
+    head: String,
+    acceptance: Vec<String>,
+    findings: Vec<String>,
+    dropped_findings: usize,
+}
+
+/// One carry-forward blocker: a blocking review with its acceptance lines
+/// intact, or a context note the cap may eat.
+#[derive(Debug)]
+enum Blocker {
+    Note(String),
+    Verdict(VerdictBlocker),
+}
+
+/// One blocking review, split into head, acceptance lines, and findings: the
+/// head anchors which round wrote it and which commit it judged, with the
+/// failing ids up front as a manifest. Each acceptance line clamps like a
+/// finding, so a clamp only ever eats evidence and finding tails, never an id.
+/// The section re-clamps the acceptance lines to a share of the cap, so they
+/// stay whole here.
 fn verdict_blocker(
     state: &RunState,
     rev: &SlotState,
     res: &ReviewResult,
     acceptance: &[AcceptanceReason],
-) -> String {
+) -> VerdictBlocker {
     let (round, commit) = blocking_review_anchor(state, rev, res);
-    let mut s = format!("review `{}` requested changes", rev.id);
+    let mut head = format!("review `{}` requested changes", rev.id);
     match (round, commit) {
         (Some(r), Some(c)) => {
-            s.push_str(&format!(
+            head.push_str(&format!(
                 " (round {r}, Reviewed-Commit {})",
                 short_commit(&c)
             ));
         }
-        (None, Some(c)) => s.push_str(&format!(" (Reviewed-Commit {})", short_commit(&c))),
-        (Some(r), None) => s.push_str(&format!(" (round {r}, no Reviewed-Commit recorded)")),
+        (None, Some(c)) => head.push_str(&format!(" (Reviewed-Commit {})", short_commit(&c))),
+        (Some(r), None) => head.push_str(&format!(" (round {r}, no Reviewed-Commit recorded)")),
         (None, None) => {}
     }
     let ids = acceptance
@@ -5617,7 +5646,10 @@ fn verdict_blocker(
         .map(|a| a.id.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let mut items: Vec<String> = acceptance
+    if !ids.is_empty() {
+        head.push_str(&format!(": failing {ids}"));
+    }
+    let lines: Vec<String> = acceptance
         .iter()
         .map(|a| {
             clamp_line(
@@ -5629,29 +5661,26 @@ fn verdict_blocker(
             )
         })
         .collect();
-    let room = MAX_LISTED_FINDINGS.saturating_sub(items.len().min(MAX_LISTED_FINDINGS));
+    let room = MAX_LISTED_FINDINGS.saturating_sub(lines.len().min(MAX_LISTED_FINDINGS));
     let findings: Vec<String> = res
         .findings
         .iter()
         .filter(|f| !f.synthetic)
         .map(open_finding_line)
         .collect();
-    let dropped = findings.len().saturating_sub(room);
-    items.extend(findings.into_iter().take(room));
-    if items.is_empty() {
-        s.push_str(": no open findings recorded; see the review artifact.");
-    } else {
-        let mut list = items.join("; ");
-        if dropped > 0 {
-            list.push_str(&format!(" (+{dropped} more)"));
-        }
-        if ids.is_empty() {
-            s.push_str(&format!(": {list}."));
-        } else {
-            s.push_str(&format!(": failing {ids}; {list}."));
-        }
+    let dropped_findings = findings.len().saturating_sub(room);
+    let mut findings = findings;
+    findings.truncate(room);
+    if lines.is_empty() && findings.is_empty() {
+        head.push_str(": no open findings recorded; see the review artifact.");
     }
-    s
+    VerdictBlocker {
+        review_id: rev.id.clone(),
+        head,
+        acceptance: lines,
+        findings,
+        dropped_findings,
+    }
 }
 
 /// Display form of a reviewed commit: twelve hex digits name it the way short
@@ -5669,6 +5698,9 @@ const MAX_LISTED_FINDINGS: usize = 5;
 /// One acceptance line never runs longer than a finding: the id leads, so a
 /// clamp eats the evidence tail, never the id.
 const MAX_AC_LINE: usize = 160;
+
+/// The narrowest an acceptance line may render: an id plus a stub of evidence.
+const MIN_AC_SHARE: usize = 32;
 
 /// Severity plus one clamped line, so a finding can never smuggle a paragraph
 /// into the brief.
@@ -5718,7 +5750,7 @@ fn blocking_review_anchor(
 fn carry_forward_section(
     round: u32,
     persisted: &[String],
-    blockers: &[String],
+    blockers: &[Blocker],
     brief: Option<&str>,
     max_chars: usize,
 ) -> String {
@@ -5749,12 +5781,50 @@ fn carry_forward_section(
             "These reviews are the current verdict on the implementer's HEAD and must \
              be fixed, not stale notes: they supersede the previous round's own notes.\n",
         );
+        // Acceptance lines render before everything expendable, sized to a share
+        // of the cap, so findings can never push a failing criterion id out of
+        // the brief. Heads and the manifest ride the same reservation; notes and
+        // findings follow, and the tail truncation below eats them first.
+        let verdicts: Vec<&VerdictBlocker> = blockers
+            .iter()
+            .filter_map(|b| match b {
+                Blocker::Verdict(v) => Some(v),
+                Blocker::Note(_) => None,
+            })
+            .collect();
+        let total_ac: usize = verdicts.iter().map(|v| v.acceptance.len()).sum();
+        let heads_len: usize = verdicts.iter().map(|v| v.head.chars().count()).sum();
+        let share = (max_chars / 2)
+            .saturating_sub(heads_len)
+            .checked_div(total_ac.max(1))
+            .unwrap_or(0)
+            .clamp(MIN_AC_SHARE, MAX_AC_LINE);
+        for v in &verdicts {
+            let mut items = vec![v.head.clone()];
+            items.extend(v.acceptance.iter().map(|a| clamp_line(a, share)));
+            if v.findings.is_empty() && v.dropped_findings > 0 {
+                items.push(format!("(+{} more)", v.dropped_findings));
+            }
+            out.push_str(&format!("- {}\n", items.join("; ")));
+        }
         for b in blockers {
-            // Clamped per bullet, not just in aggregate. A reviewer that pastes a stack
+            // Clamped per note, not just in aggregate. A reviewer that pastes a stack
             // trace as its evidence produces one line longer than the whole budget, and
-            // the line-boundary truncation below would drop it whole — rendering an
+            // the line-boundary truncation below would drop it whole, rendering an
             // empty heading, which reads as "nothing blocked".
-            out.push_str(&format!("- {}\n", clamp_line(b, max_chars / 5)));
+            if let Blocker::Note(line) = b {
+                out.push_str(&format!("- {}\n", clamp_line(line, MAX_AC_LINE)));
+            }
+        }
+        for v in &verdicts {
+            for (i, f) in v.findings.iter().enumerate() {
+                let mut line = format!("- {f} (review `{}`)", v.review_id);
+                if i + 1 == v.findings.len() && v.dropped_findings > 0 {
+                    line.push_str(&format!(" (+{} more)", v.dropped_findings));
+                }
+                out.push_str(&line);
+                out.push('\n');
+            }
         }
         out.push('\n');
     }
@@ -6617,8 +6687,12 @@ mod contract_freeze_tests {
 mod carry_forward_tests {
     use super::*;
 
-    fn brief_of(round: u32, blockers: &[String], brief: Option<&str>, max: usize) -> String {
+    fn brief_of(round: u32, blockers: &[Blocker], brief: Option<&str>, max: usize) -> String {
         carry_forward_section(round, &[], blockers, brief, max)
+    }
+
+    fn note(s: &str) -> Blocker {
+        Blocker::Note(s.to_string())
     }
 
     /// An operator's persisted message leads the section and survives the cap that
@@ -6651,9 +6725,11 @@ mod carry_forward_tests {
     /// implementer, which before this only ever went to the bus.
     #[test]
     fn blockers_name_the_failed_criterion() {
-        let blockers = vec!["acceptance (review `rev-1`): AC-2: fail — no test exists".into()];
+        let blockers = vec![note(
+            "acceptance (review `rev-1`): AC-2: fail - no test exists",
+        )];
         let out = brief_of(4, &blockers, None, 4000);
-        assert!(out.contains("AC-2: fail — no test exists"), "{out}");
+        assert!(out.contains("AC-2: fail - no test exists"), "{out}");
         assert!(out.contains("round 4"), "{out}");
     }
 
@@ -6661,7 +6737,9 @@ mod carry_forward_tests {
     /// cannot push the machine-known half out of the prompt.
     #[test]
     fn truncation_eats_the_slot_prose_not_the_blockers() {
-        let blockers = vec!["acceptance (review `rev-1`): AC-2: fail — missing guard".into()];
+        let blockers = vec![note(
+            "acceptance (review `rev-1`): AC-2: fail - missing guard",
+        )];
         let essay = "padding line that goes on and on\n".repeat(400);
         assert!(
             essay.len() > 4000,
@@ -6669,7 +6747,7 @@ mod carry_forward_tests {
         );
         let out = brief_of(3, &blockers, Some(&essay), 1200);
         assert!(out.chars().count() <= 1400, "capped, got {}", out.len());
-        assert!(out.contains("AC-2: fail — missing guard"), "{out}");
+        assert!(out.contains("AC-2: fail - missing guard"), "{out}");
         assert!(
             out.contains("truncated by spar"),
             "a silent cut is a lie:\n{out}"
@@ -6680,7 +6758,7 @@ mod carry_forward_tests {
     /// would recreate the quadratic context growth it exists to avoid.
     #[test]
     fn the_section_does_not_grow_with_the_round_number() {
-        let blockers = vec!["acceptance (review `rev-1`): AC-1: fail — x".into()];
+        let blockers = vec![note("acceptance (review `rev-1`): AC-1: fail - x")];
         let brief = "- touched src/a.rs: added the guard\n- rejected: a feature flag\n";
         let round_3 = brief_of(3, &blockers, Some(brief), 4000);
         let round_9 = brief_of(9, &blockers, Some(brief), 4000);
@@ -6694,10 +6772,10 @@ mod carry_forward_tests {
     #[test]
     fn one_giant_blocker_never_leaves_an_empty_heading() {
         let huge = format!(
-            "acceptance (review `rev-1`): AC-2: fail — {}",
+            "acceptance (review `rev-1`): AC-2: fail - {}",
             "x".repeat(9000)
         );
-        let out = brief_of(4, &[huge], None, 1000);
+        let out = brief_of(4, &[note(&huge)], None, 1000);
         assert!(
             out.contains("### What blocked the ship last round"),
             "{out}"
@@ -6723,8 +6801,12 @@ mod carry_forward_tests {
     /// reviews share one bullet per review with an id manifest up front.
     #[test]
     fn each_nonblocking_criterion_is_its_own_bullet() {
-        let blockers: Vec<String> = (1..=6)
-            .map(|n| format!("acceptance (review `rev-1`): AC-{n}: fail — evidence {n}"))
+        let blockers: Vec<Blocker> = (1..=6)
+            .map(|n| {
+                note(&format!(
+                    "acceptance (review `rev-1`): AC-{n}: fail - evidence {n}"
+                ))
+            })
             .collect();
         let out = brief_of(3, &blockers, None, 4000);
         for n in 1..=6 {
@@ -6787,19 +6869,28 @@ mod carry_forward_tests {
         .unwrap();
 
         let out = blockers_from_disk(&state, &paths, &["AC-1".to_string()], &Config::default());
+        let verdict = out.iter().find_map(|b| match b {
+            Blocker::Verdict(v) => Some(v),
+            Blocker::Note(_) => None,
+        });
+        let verdict = verdict.expect("a verdict blocker: {out:?}");
         assert!(
-            out.iter()
-                .any(|b| b.contains("AC-1:") && b.contains("no guard exists")),
-            "{out:?}"
+            verdict
+                .acceptance
+                .iter()
+                .any(|a| a.contains("AC-1:") && a.contains("no guard exists")),
+            "{verdict:?}"
+        );
+        assert!(verdict.head.contains("requested changes"), "{verdict:?}");
+        assert!(verdict.head.contains("(round "), "{verdict:?}");
+        assert!(
+            verdict.head.contains("no Reviewed-Commit recorded"),
+            "{verdict:?}"
         );
         assert!(
-            out.iter().any(|b| b.contains("requested changes")
-                && b.contains("(round ")
-                && b.contains("no Reviewed-Commit recorded")
-                && b.contains("AC-1:")
-                && b.contains("no guard exists")),
+            verdict.head.contains("failing AC-1"),
             "a verdict with no findings still anchors round and commit state, \
-             carrying its failing criterion: {out:?}"
+             carrying its failing criterion: {verdict:?}"
         );
     }
 
@@ -6901,22 +6992,33 @@ mod carry_forward_tests {
 
         let out = blockers_from_disk(&state, &paths, &["AC-1".to_string()], &Config::default());
         assert_eq!(out.len(), 1, "one bullet per review: {out:?}");
-        let verdict = out
-            .iter()
-            .find(|b| b.contains("(round 3, Reviewed-Commit"))
-            .expect("a verdict blocker: {out:?}");
-        assert!(verdict.contains("requested changes"), "{verdict}");
+        let Blocker::Verdict(verdict) = &out[0] else {
+            panic!("a verdict blocker: {out:?}");
+        };
         assert!(
-            verdict.contains("(round 3, Reviewed-Commit abcdef123456)"),
-            "{verdict}"
+            verdict.head.contains("(round 3, Reviewed-Commit"),
+            "{verdict:?}"
+        );
+        assert!(verdict.head.contains("requested changes"), "{verdict:?}");
+        assert!(
+            verdict
+                .head
+                .contains("(round 3, Reviewed-Commit abcdef123456)"),
+            "{verdict:?}"
         );
         assert!(
-            verdict.contains("major - the retry at src/net.rs:40 never stops"),
-            "{verdict}"
+            verdict
+                .findings
+                .iter()
+                .any(|f| f.contains("major - the retry at src/net.rs:40 never stops")),
+            "{verdict:?}"
         );
         assert!(
-            verdict.contains("AC-1:") && verdict.contains("no guard exists"),
-            "the review's failing criterion rides in its own bullet: {verdict}"
+            verdict
+                .acceptance
+                .iter()
+                .any(|a| a.contains("AC-1:") && a.contains("no guard exists")),
+            "the review's failing criterion rides in its own bullet: {verdict:?}"
         );
 
         let section = carry_forward_section(4, &[], &out, None, 4000);
@@ -6959,21 +7061,25 @@ mod carry_forward_tests {
                 reason: "fail - seized".to_string(),
             }],
         );
-        assert!(out.contains("requested changes"), "{out}");
+        assert!(out.head.contains("requested changes"), "{out:?}");
         assert!(
-            out.contains(&format!(
+            out.head.contains(&format!(
                 "(round {}, Reviewed-Commit 1234567890ab)",
                 rev.round
             )),
-            "{out}"
+            "{out:?}"
         );
         assert!(
-            out.contains("major - nothing was changed at src/main.rs:9"),
-            "{out}"
+            out.findings
+                .iter()
+                .any(|f| f.contains("major - nothing was changed at src/main.rs:9")),
+            "{out:?}"
         );
         assert!(
-            out.contains("AC-9: fail - seized"),
-            "the review's failing criterion rides in its own bullet: {out}"
+            out.acceptance
+                .iter()
+                .any(|a| a.contains("AC-9: fail - seized")),
+            "the review's failing criterion rides in its own bullet: {out:?}"
         );
     }
 
@@ -6997,9 +7103,14 @@ mod carry_forward_tests {
         let res = review_result::parse_review(&body);
         let rev = state.slots[0].clone();
         let out = verdict_blocker(&state, &rev, &res, &[]);
-        assert_eq!(out.matches("finding number").count(), 5, "{out}");
-        assert!(out.contains("(+2 more)"), "{out}");
-        assert!(!out.contains('\n'), "one line per finding: {out:?}");
+        assert_eq!(out.findings.len(), 5, "{out:?}");
+        assert!(
+            out.findings.iter().all(|f| !f.contains('\n')),
+            "one line per finding: {out:?}"
+        );
+        assert_eq!(out.dropped_findings, 2, "{out:?}");
+        let section = carry_forward_section(2, &[], &[Blocker::Verdict(out)], None, 4000);
+        assert!(section.contains("(+2 more)"), "{section}");
     }
 
     /// Failing criteria lead the bullet, so five long findings cannot push them
@@ -7033,10 +7144,10 @@ mod carry_forward_tests {
             .collect();
         let out = verdict_blocker(&state, &rev, &res, &acceptance);
         assert!(
-            out.contains("failing AC-1, AC-2, AC-3"),
-            "the manifest names every failing id up front: {out}"
+            out.head.contains("failing AC-1, AC-2, AC-3"),
+            "the manifest names every failing id up front: {out:?}"
         );
-        let section = carry_forward_section(2, &[], &[out], None, 4000);
+        let section = carry_forward_section(2, &[], &[Blocker::Verdict(out)], None, 4000);
         for n in 1..=3 {
             assert!(
                 section.contains(&format!("AC-{n}")),
@@ -7046,6 +7157,45 @@ mod carry_forward_tests {
         assert!(
             section.contains("failing AC-1, AC-2, AC-3"),
             "the manifest survives the default cap:\n{section}"
+        );
+    }
+
+    /// Five blocking reviews with five long findings each: at the default cap
+    /// the section keeps every failing criterion id and its evidence, cutting
+    /// findings instead. Findings used to share one bullet with the criteria,
+    /// so a multi-review panel pushed the criteria past the cap.
+    #[test]
+    fn five_reviews_keep_every_failing_criterion_at_the_default_cap() {
+        let blockers: Vec<Blocker> = (1..=5)
+            .map(|r| {
+                Blocker::Verdict(VerdictBlocker {
+                    review_id: format!("rev-{r}"),
+                    head: format!(
+                        "review `rev-{r}` requested changes (round 2, Reviewed-Commit abcdef123456): failing AC-1, AC-2, AC-3, AC-4, AC-5"
+                    ),
+                    acceptance: (1..=5)
+                        .map(|n| format!("AC-{n}: fail: evid-r{r}c{n} {}", "e".repeat(300)))
+                        .collect(),
+                    findings: (1..=5)
+                        .map(|n| format!("major - finding {n} {}", "x".repeat(100)))
+                        .collect(),
+                    dropped_findings: 0,
+                })
+            })
+            .collect();
+        let out = carry_forward_section(3, &[], &blockers, None, 4000);
+        for r in 1..=5 {
+            for n in 1..=5 {
+                assert!(
+                    out.contains(&format!("evid-r{r}c{n}")),
+                    "review {r} AC-{n} evidence survives the default cap:\n{out}"
+                );
+            }
+        }
+        assert_eq!(
+            out.matches("failing AC-1, AC-2, AC-3, AC-4, AC-5").count(),
+            5,
+            "every review keeps its manifest:\n{out}"
         );
     }
 
