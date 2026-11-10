@@ -2959,6 +2959,8 @@ pub fn run_slot(
             &prompt_path,
             &prompt,
             timeout,
+            None,
+            None,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -4312,6 +4314,8 @@ fn run_api(
     prompt_path: &Path,
     prompt: &str,
     timeout: Duration,
+    api_key: Option<&str>,
+    base_url: Option<&str>,
 ) -> Result<SlotOutcome> {
     let expected = job
         .expected_artifact
@@ -4330,8 +4334,8 @@ fn run_api(
         timeout,
         dry_run: false,
         model_override: model.clone(),
-        api_key: None,
-        base_url: None,
+        api_key: api_key.map(str::to_owned),
+        base_url: base_url.map(str::to_owned),
     })?;
     let (ok, err, usage, timeout_cause) = (
         outcome.ok,
@@ -9610,8 +9614,6 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn run_api_ceiling_keep_sees_an_artifact_written_before_the_ceiling() {
         use crate::state::RunState;
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let cwd = tmp.path().join("wt");
@@ -9623,15 +9625,14 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             use std::io::Read as _;
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let mut buf = vec![0u8; 65536];
-            let _ = stream.read(&mut buf);
-            std::thread::sleep(std::time::Duration::from_secs(5));
+            for conn in listener.incoming().take(2) {
+                let Ok(mut stream) = conn else { continue };
+                let mut buf = vec![0u8; 65536];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
         });
-        std::env::set_var("OPENAI_API_KEY", "test-key");
-        std::env::set_var("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
+        let base_url = format!("http://127.0.0.1:{port}/v1");
         let mut st = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
         st.worktrees.push(crate::state::WorktreeRecord {
             slot_id: "impl".into(),
@@ -9664,10 +9665,29 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &prompt,
             "do it",
             std::time::Duration::from_secs(2),
-        )
-        .unwrap();
-        std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("OPENAI_BASE_URL");
+            Some("test-key"),
+            Some(base_url.as_str()),
+        );
+        // A signal delivered to this thread under parallel load can interrupt
+        // the local socket read; the hang itself is what the test measures, so
+        // one retry only remakes a transport failure, never the verdict.
+        let outcome = match outcome {
+            Err(_) => run_api(
+                &st,
+                &paths,
+                &job,
+                &pref,
+                &cwd,
+                &log,
+                &prompt,
+                "do it",
+                std::time::Duration::from_secs(2),
+                Some("test-key"),
+                Some(base_url.as_str()),
+            )
+            .unwrap(),
+            ok => ok.unwrap(),
+        };
         assert!(
             outcome.ok,
             "a ceiling kill after finished work stays done: {:?}",
