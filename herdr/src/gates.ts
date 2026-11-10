@@ -89,7 +89,14 @@ export interface ActionInput {
 	provider?: string;
 }
 
-export function buildArgv(verb: Verb, id: string, input: ActionInput = {}): string[] {
+// At the extension gate a run below its ceiling (or with none) is a no-progress
+// stall, not an exhausted budget: re-entry needs no flag, and the flag would
+// resolve under the ceiling it never reached.
+export function isStallPark(run: { round: number; max_rounds?: number }): boolean {
+	return (run.max_rounds ?? 0) === 0 || run.round < (run.max_rounds ?? 0);
+}
+
+export function buildArgv(verb: Verb, id: string, input: ActionInput = {}, run?: { round: number; max_rounds?: number }): string[] {
 	switch (verb) {
 		case "approve":
 			return ["approve", id, "--json"];
@@ -104,6 +111,9 @@ export function buildArgv(verb: Verb, id: string, input: ActionInput = {}): stri
 		case "reconcile":
 			return ["reconcile", id, "--json"];
 		case "extend":
+			// One argv owner for both parks: a stall needs a bare re-entry, and
+			// the flag would resolve under a ceiling the run never reached.
+			if (run !== undefined && isStallPark(run)) return ["implement", "--run", id, "--detach", "--json"];
 			return ["implement", "--run", id, "--max-rounds", `+${input.rounds ?? 1}`, "--detach", "--json"];
 		case "resume":
 			return ["resume", id, "--detach", "--json"];
@@ -203,6 +213,7 @@ export function effect(verb: Verb, run: RunStatus, input: ActionInput): string {
 		case "reconcile":
 			return "Dispatches a reconciler to merge the good parts of every attempt, then a review panel, then parks at the ship gate.";
 		case "extend":
+			if (isStallPark(run)) return `Re-enters the run without raising the ceiling: round ${run.round} stalled below it, so the next dispatch carries the no-progress warning.`;
 			return `Raises the ceiling to round ${run.round + (input.rounds ?? 1)} and continues the run detached.`;
 		case "resume":
 			return `Picks the run back up from ${run.phase}, detached.`;

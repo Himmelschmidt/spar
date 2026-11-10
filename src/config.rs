@@ -1969,6 +1969,7 @@ impl Config {
                 &roles,
                 self,
                 dry,
+                &crate::providers::LiveHealth::for_dry(dry),
             )?;
             return Ok((resolved, PoolOrigin::Selected));
         }
@@ -2069,19 +2070,32 @@ impl Config {
         if self.cli_role_keys.contains(&SlotRole::Reviewer) {
             return Ok(());
         }
+        let health = crate::providers::LiveHealth::for_dry(dry);
         let expanded = crate::providers::pick_providers(
             pool,
             roles_resolve::pool_width(self),
             Some(pool),
             dry,
+            pool_origin,
+            &health,
         );
         let pool = if expanded.is_empty() { pool } else { &expanded };
-        self.roles.reviewer =
-            roles_resolve::build_implement_seats(self, pool, pool_origin, true, &|_| None)
-                .into_iter()
-                .filter(|seat| seat.role == SlotRole::Reviewer)
-                .map(|seat| seat.provider)
-                .collect();
+        let panel: Vec<String> = (0..roles_resolve::panel_size(self))
+            .filter_map(|r| {
+                roles_resolve::resolve_seat(
+                    SlotRole::Reviewer,
+                    r + 1,
+                    r,
+                    pool,
+                    pool_origin,
+                    self,
+                    &health,
+                    &[],
+                )
+            })
+            .map(|(raw, _)| roles_resolve::split_model(&raw, None).0)
+            .collect();
+        self.roles.reviewer = panel;
         if self.roles.reviewer.is_empty() {
             anyhow::bail!(
                 "--without reviewer[N]: the run has no reviewer panel to index (pin one with --role reviewer=... first)"

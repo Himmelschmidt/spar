@@ -89,6 +89,24 @@ pub fn scrape_auth_signal(text: &str) -> Option<String> {
         .map(|l| l.trim().chars().take(300).collect())
 }
 
+/// The readiness failure for a seat no candidate can fill: every skipped
+/// provider with its failed probe's detail. `None` when nothing was skipped
+/// for health, so callers keep their own error for the genuinely empty pool.
+/// Callers surface this as exit 1; the quota gate's exit 4 stays quota-only.
+pub fn readiness_error(skips: &[(String, String)]) -> Option<anyhow::Error> {
+    if skips.is_empty() {
+        return None;
+    }
+    let detail = skips
+        .iter()
+        .map(|(provider, message)| format!("{provider}: {message}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(anyhow::anyhow!(
+        "no healthy provider available; readiness probes failed: {detail}"
+    ))
+}
+
 /// Where a seat's pause lives under the run's recorded dispatch route: a
 /// model-less seat on a recorded route keys under that route's bucket, not
 /// under whatever the keying process's environment holds. Every other seat
@@ -107,7 +125,6 @@ pub fn seat_quota_key(provider: &str, route: crate::providers::RecordedRoute<'_>
 pub fn is_provider_eligible(
     provider: &str,
     store: &QuotaStore,
-    available: Option<&std::collections::HashSet<String>>,
     route: crate::providers::RecordedRoute<'_>,
 ) -> bool {
     let key = seat_quota_key(provider, route);
@@ -117,16 +134,6 @@ pub fn is_provider_eligible(
     if store.effective_status(&key) != crate::quota::ProviderStatus::Available {
         return false;
     }
-    if let Ok(pref) = crate::provider_ref::ProviderRef::parse(provider) {
-        if pref.backend == crate::provider_ref::ExecBackend::ApiSdk {
-            return true;
-        }
-    }
-    if let Some(set) = available {
-        if !set.contains(&crate::quota::sub_key(provider)) {
-            return false;
-        }
-    }
     true
 }
 
@@ -134,16 +141,32 @@ pub fn is_provider_eligible(
 /// is probed before it is skipped (#153, O106): that pause is a failure recorded at some
 /// point in the past, and a week-old one benched a working backup while its primary
 /// died. A manual pause is the operator's decision and is never probed past, and
-/// `dry` never spawns.
-pub fn backup_eligible(
+/// `dry` never spawns. A `[backups]` file backup whose readiness probe failed is
+/// never eligible: rotation skips it while the run stays on (or falls back to)
+/// the primary. A CLI `--backup` entry is an explicit pin and dispatches despite
+/// `Unhealthy` readiness (warning instead), but only when its binary resolves:
+/// see `takeover`.
+#[allow(clippy::too_many_arguments)]
+fn backup_eligible(
     backup: &str,
     store: &QuotaStore,
-    available: Option<&std::collections::HashSet<String>>,
     paths: &crate::paths::SparPaths,
     dry: bool,
+    presence_dry: bool,
     route: crate::providers::RecordedRoute<'_>,
+    health: &dyn crate::providers::HealthSource,
+    cli: bool,
 ) -> bool {
-    if is_provider_eligible(backup, store, available, route) {
+    // A missing binary is never eligible, pin or not. `dry` is the
+    // never-re-probe-quota flag (always set in projections); presence answers
+    // a different question — whether this launch would run the binary — so it
+    // reads `presence_dry`, the run's own dry flag, never `dry`.
+    let seat_ok = if cli {
+        crate::providers::is_provider_present(backup, presence_dry)
+    } else {
+        health.check(backup).usable
+    };
+    if is_provider_eligible(backup, store, route) && seat_ok {
         return true;
     }
     let key = seat_quota_key(backup, route);
@@ -158,7 +181,54 @@ pub fn backup_eligible(
         );
     }
     let fresh = QuotaStore::load(paths).unwrap_or_default();
-    is_provider_eligible(backup, &fresh, available, route)
+    is_provider_eligible(backup, &fresh, route) && seat_ok
+}
+
+/// Whether `backup` may take `role`'s seat, and the source the winning seat records.
+/// A CLI `--backup` entry (`cfg.cli_backup_keys`) dispatches even while `Unhealthy`
+/// and warns like any other pin, but never when its binary is missing; a
+/// `[backups]` file entry still skips `Unhealthy` providers. `None` when the
+/// backup cannot take the seat.
+#[allow(clippy::too_many_arguments)]
+pub fn takeover(
+    backup: &str,
+    role: crate::state::SlotRole,
+    cfg: &crate::config::Config,
+    store: &QuotaStore,
+    paths: &crate::paths::SparPaths,
+    dry: bool,
+    presence_dry: bool,
+    route: crate::providers::RecordedRoute<'_>,
+    health: &dyn crate::providers::HealthSource,
+) -> Option<crate::state::SeatSource> {
+    let cli = cfg.cli_backup_keys.contains(&role);
+    backup_eligible(backup, store, paths, dry, presence_dry, route, health, cli).then_some(if cli {
+        crate::state::SeatSource::CliBackup
+    } else {
+        crate::state::SeatSource::Backup
+    })
+}
+
+/// Point `slot_id` at an engaged backup: re-point, record the takeover source, warn
+/// when the backup is an `Unhealthy` pin, and save. One call site per engagement
+/// so the warning cannot be forgotten on one path.
+pub fn engage(
+    state: &mut crate::state::RunState,
+    paths: &crate::paths::SparPaths,
+    slot_id: &str,
+    backup_raw: &str,
+    source: crate::state::SeatSource,
+) -> anyhow::Result<()> {
+    let pin = crate::provider_ref::Pin::parse(backup_raw)
+        .map(|p| p.display())
+        .unwrap_or_else(|_| backup_raw.to_string());
+    if let Some(s) = state.slot_mut(slot_id) {
+        s.point_at(&pin);
+        s.source = Some(source);
+    }
+    state.warn_unhealthy_pin(&pin, Some(source));
+    state.save(paths)?;
+    Ok(())
 }
 
 static PROBED_BACKUPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
@@ -196,7 +266,6 @@ pub fn backup_for_role(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub fn resolve_with_backup(
     role: crate::state::SlotRole,
     pool_index: usize,
@@ -206,42 +275,83 @@ pub fn resolve_with_backup(
     cfg: &crate::config::Config,
     primary_model: Option<&str>,
     store: &QuotaStore,
-    available: Option<&std::collections::HashSet<String>>,
     paths: &crate::paths::SparPaths,
     dry: bool,
+    presence_dry: bool,
     route: crate::providers::RecordedRoute<'_>,
+    health: &dyn crate::providers::HealthSource,
+    used: &[String],
 ) -> Option<(String, crate::state::SeatSource)> {
-    let primary = crate::workflow::roles_resolve::resolve_seat(
+    use crate::workflow::roles_resolve as rr;
+    let (prov, src) = rr::resolve_seat(
         role,
         pool_index,
         role_index,
         pool,
         pool_origin,
         cfg,
-    );
-    let (prov, src) = primary?;
+        health,
+        used,
+    )?;
     let seat = crate::provider_ref::ProviderRef::for_seat(&prov, primary_model).display();
-    if is_provider_eligible(&seat, store, available, route) {
+    // An auto-selected seat on a probe-failed provider yields to the declared
+    // backup, then to the order rung: resolution carries the source, so the
+    // quota gate never sees health. An explicit pin stays (quota and manual
+    // pauses still bench it) and the launch warns.
+    let unhealthy_auto = !src.is_explicit_pin() && !health.check(&prov).usable;
+    if is_provider_eligible(&seat, store, route) && !unhealthy_auto {
         return Some((prov, src));
     }
-    let backup_raw = backup_for_role(role, role_index, cfg)?;
-    if !backup_eligible(&backup_raw, store, available, paths, dry, route) {
-        return Some((prov, src));
+    if let Some(backup_raw) = backup_for_role(role, role_index, cfg) {
+        if let Some(source) = takeover(
+            &backup_raw,
+            role,
+            cfg,
+            store,
+            paths,
+            dry,
+            presence_dry,
+            route,
+            health,
+        ) {
+            if let Ok(parsed) = crate::provider_ref::Pin::parse(&backup_raw) {
+                return Some((parsed.display(), source));
+            }
+        }
     }
-    let parsed = crate::provider_ref::Pin::parse(&backup_raw).ok()?;
-    Some((parsed.display(), crate::state::SeatSource::Backup))
+    if unhealthy_auto {
+        // Reviewers key the rung by their own ordinal, exactly as the launch
+        // step-4 rung does: a sick file seat yields to the next healthy order
+        // entry the rung returns, and `None` past its end still narrows the panel.
+        let rung_idx = if role == crate::state::SlotRole::Reviewer {
+            role_index
+        } else {
+            pool_index
+        };
+        let (order_prov, order_src) = rr::resolve_order_rung(role, rung_idx, cfg, health, used)?;
+        return Some((order_prov, order_src));
+    }
+    Some((prov, src))
 }
 
 pub fn dispatch_stop_cause(
     slot: &SlotState,
     store: &QuotaStore,
-    available: Option<&std::collections::HashSet<String>>,
     route: crate::providers::RecordedRoute<'_>,
+    // Injected by the caller: classification reads only recorded facts, never
+    // the host PATH, so a unit test names the presence it means.
+    present: bool,
 ) -> StopCause {
-    let seat_key = || {
+    // A failed dispatch blames the environment when the seat was quota-benched
+    // or its binary is missing; a present binary failing its own work stays
+    // Work. Dry runs set SPAR_DRY_RUN, under which presence is parse-only.
+    // Api seats have no local binary and never appeared in the old detection
+    // set, so error text plus quota state decide for them.
+    let seat_missing = || {
         let seat = slot.provider_ref();
-        (seat.quota_key(route), seat.storage_key())
+        matches!(seat.backend, crate::provider_ref::ExecBackend::ApiSdk) || !present
     };
+    let seat_key = || slot.provider_ref().quota_key(route);
     if slot.status != crate::state::SlotStatus::Failed {
         return StopCause::Work;
     }
@@ -276,10 +386,10 @@ pub fn dispatch_stop_cause(
             || lower.contains("capacity")
             || lower.contains("billing"))
             && {
-                let (key, sub) = seat_key();
+                let key = seat_key();
                 store.effective_status(&key) != crate::quota::ProviderStatus::Available
                     || !store.is_usable(&key)
-                    || available.is_some_and(|s| !s.contains(&sub))
+                    || seat_missing()
             }
         {
             return StopCause::Environmental;
@@ -290,10 +400,10 @@ pub fn dispatch_stop_cause(
             || lower.contains("os error")
             || lower.contains("executable not found"))
             && {
-                let (key, sub) = seat_key();
+                let key = seat_key();
                 store.effective_status(&key) != crate::quota::ProviderStatus::Available
                     || !store.is_usable(&key)
-                    || available.is_some_and(|s| !s.contains(&sub))
+                    || seat_missing()
             }
         {
             return StopCause::Environmental;
@@ -319,6 +429,168 @@ mod tests {
         s
     }
 
+    fn launch_inputs() -> (tempfile::TempDir, crate::config::Config, QuotaStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::default();
+        (tmp, cfg, QuotaStore::default())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve(
+        role: SlotRole,
+        pool: &[String],
+        origin: crate::state::PoolOrigin,
+        cfg: &crate::config::Config,
+        model: Option<&str>,
+        store: &QuotaStore,
+        paths: &crate::paths::SparPaths,
+        dry: bool,
+        health: &dyn crate::providers::HealthSource,
+    ) -> Option<(String, crate::state::SeatSource)> {
+        resolve_with_backup(
+            role,
+            0,
+            0,
+            pool,
+            origin,
+            cfg,
+            model,
+            store,
+            paths,
+            dry,
+            dry,
+            crate::providers::RecordedRoute::ambient(),
+            health,
+            &[],
+        )
+    }
+
+    #[test]
+    fn an_explicit_pin_stays_despite_probe_failure() {
+        use crate::providers::StubHealth;
+        let (tmp, cfg, store) = launch_inputs();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let pool = vec!["cli:claude".to_string()];
+        let health = StubHealth::refuse("cli:claude", "probe failed: not logged in");
+        assert_eq!(
+            resolve(
+                SlotRole::Planner,
+                &pool,
+                crate::state::PoolOrigin::CliProviders,
+                &cfg,
+                None,
+                &store,
+                &paths,
+                true,
+                &health,
+            ),
+            Some((
+                "cli:claude".to_string(),
+                crate::state::SeatSource::CliProviders
+            ))
+        );
+    }
+
+    #[test]
+    fn an_unhealthy_file_seat_with_no_healthy_backup_or_order_resolves_nothing() {
+        use crate::providers::StubHealth;
+        let (tmp, mut cfg, store) = launch_inputs();
+        cfg.roles.planner = Some("cli:codex".to_string());
+        cfg.providers.order = vec!["cli:codex".to_string()];
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let health = StubHealth::refuse("cli:codex", "probe failed: not logged in");
+        assert_eq!(
+            resolve(
+                SlotRole::Planner,
+                &[],
+                crate::state::PoolOrigin::Synth,
+                &cfg,
+                None,
+                &store,
+                &paths,
+                true,
+                &health,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unhealthy_file_seat_yields_to_the_declared_backup() {
+        use crate::providers::StubHealth;
+        let (tmp, mut cfg, store) = launch_inputs();
+        cfg.roles.planner = Some("cli:claude".to_string());
+        cfg.backups.planner = Some("cli:codex".to_string());
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let health = StubHealth::refuse("cli:claude", "probe failed: not logged in");
+        assert_eq!(
+            resolve(
+                SlotRole::Planner,
+                &[],
+                crate::state::PoolOrigin::Synth,
+                &cfg,
+                None,
+                &store,
+                &paths,
+                true,
+                &health,
+            ),
+            Some(("cli:codex".to_string(), crate::state::SeatSource::Backup))
+        );
+    }
+
+    #[test]
+    fn an_unhealthy_file_seat_with_no_backup_falls_back_to_the_order_rung() {
+        use crate::providers::StubHealth;
+        let (tmp, mut cfg, store) = launch_inputs();
+        cfg.roles.planner = Some("cli:codex".to_string());
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let health = StubHealth::refuse("cli:codex", "probe failed: not logged in");
+        assert_eq!(
+            resolve(
+                SlotRole::Planner,
+                &[],
+                crate::state::PoolOrigin::Synth,
+                &cfg,
+                None,
+                &store,
+                &paths,
+                true,
+                &health,
+            ),
+            Some((
+                "cli:claude".to_string(),
+                crate::state::SeatSource::ProvidersOrder
+            ))
+        );
+    }
+
+    #[test]
+    fn a_quota_paused_primary_still_yields_to_a_healthy_backup() {
+        use crate::providers::StubHealth;
+        let (tmp, mut cfg, _) = launch_inputs();
+        cfg.roles.planner = Some("cli:claude".to_string());
+        cfg.backups.planner = Some("cli:codex".to_string());
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:claude", "limit");
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let health = StubHealth::allow_all();
+        assert_eq!(
+            resolve(
+                SlotRole::Planner,
+                &[],
+                crate::state::PoolOrigin::Synth,
+                &cfg,
+                None,
+                &store,
+                &paths,
+                true,
+                &health,
+            ),
+            Some(("cli:codex".to_string(), crate::state::SeatSource::Backup))
+        );
+    }
+
     #[test]
     fn quota_hit_is_environmental() {
         let store = QuotaStore::default();
@@ -328,8 +600,43 @@ mod tests {
             dispatch_stop_cause(
                 &slot,
                 &store,
-                None,
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
+            ),
+            StopCause::Environmental
+        );
+    }
+
+    #[test]
+    fn readiness_failure_without_quota_pause_is_work() {
+        let store = QuotaStore::default();
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
+        slot.error = Some("provider unavailable: cli:claude not found".into());
+        assert_eq!(
+            dispatch_stop_cause(
+                &slot,
+                &store,
+                crate::providers::RecordedRoute::ambient(),
+                true
+            ),
+            StopCause::Work
+        );
+    }
+
+    #[test]
+    fn readiness_failure_with_quota_pause_is_environmental() {
+        let mut store = QuotaStore::default();
+        store.pause_quota("cli:claude", "test");
+        let mut slot = slot_with_quota(false);
+        slot.status = SlotStatus::Failed;
+        slot.error = Some("provider unavailable: cli:claude not found".into());
+        assert_eq!(
+            dispatch_stop_cause(
+                &slot,
+                &store,
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Environmental
         );
@@ -346,8 +653,8 @@ mod tests {
             dispatch_stop_cause(
                 &slot,
                 &store,
-                None,
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Environmental
         );
@@ -364,7 +671,6 @@ mod tests {
             !is_provider_eligible(
                 "cli:codex@openai/gpt-5",
                 &store,
-                None,
                 crate::providers::RecordedRoute::ambient()
             ),
             "the OpenRouter route is benched"
@@ -373,7 +679,6 @@ mod tests {
             is_provider_eligible(
                 "cli:codex@gpt-5.2-codex",
                 &store,
-                None,
                 crate::providers::RecordedRoute::ambient()
             ),
             "an explicit bare model omits -p, so it bills native and keeps running"
@@ -382,7 +687,6 @@ mod tests {
             is_provider_eligible(
                 "cli:codex@native",
                 &store,
-                None,
                 crate::providers::RecordedRoute::ambient()
             ),
             "a native seat keeps running while the OpenRouter bucket is paused"
@@ -393,7 +697,6 @@ mod tests {
             !is_provider_eligible(
                 "cli:codex@native",
                 &store,
-                None,
                 crate::providers::RecordedRoute::ambient()
             ),
             "the paused native bucket benches its own seats"
@@ -402,7 +705,6 @@ mod tests {
             is_provider_eligible(
                 "cli:codex@openai/gpt-5",
                 &store,
-                None,
                 crate::providers::RecordedRoute::ambient()
             ),
             "a native pause leaves an OpenRouter seat eligible"
@@ -411,7 +713,6 @@ mod tests {
             is_provider_eligible(
                 "cli:grok@grok-4-1-fast",
                 &store,
-                None,
                 crate::providers::RecordedRoute::ambient()
             ),
             "another login is unaffected"
@@ -425,14 +726,12 @@ mod tests {
         assert!(!is_provider_eligible(
             "api:openai@gpt-5",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         assert!(
             is_provider_eligible(
                 "api:openai@gpt-4o",
                 &store,
-                None,
                 crate::providers::RecordedRoute::ambient()
             ),
             "another model on the same api login keeps running"
@@ -441,7 +740,6 @@ mod tests {
             is_provider_eligible(
                 "api:openai",
                 &store,
-                None,
                 crate::providers::RecordedRoute::ambient()
             ),
             "a model-less api seat keys the login, not the paused model"
@@ -450,18 +748,20 @@ mod tests {
 
     #[test]
     fn unavailable_provider_is_environmental() {
+        // `cli:no-such-provider` names no adapter, so its binary can never
+        // resolve: the missing-binary verdict does not depend on the test
+        // machine's PATH.
         let store = QuotaStore::default();
         let mut slot = slot_with_quota(false);
+        slot.point_at("cli:no-such-provider");
         slot.status = SlotStatus::Failed;
-        slot.error = Some("provider unavailable: cli:claude not found".into());
-        let mut set = std::collections::HashSet::new();
-        set.insert("cli:grok".to_string());
+        slot.error = Some("provider unavailable: cli:no-such-provider not found".into());
         assert_eq!(
             dispatch_stop_cause(
                 &slot,
                 &store,
-                Some(&set),
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                false
             ),
             StopCause::Environmental
         );
@@ -477,8 +777,8 @@ mod tests {
             dispatch_stop_cause(
                 &slot,
                 &store,
-                None,
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Work
         );
@@ -489,14 +789,12 @@ mod tests {
         let store = QuotaStore::default();
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Pending;
-        let mut set = std::collections::HashSet::new();
-        set.insert("cli:grok".to_string());
         assert_eq!(
             dispatch_stop_cause(
                 &slot,
                 &store,
-                Some(&set),
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Work
         );
@@ -507,14 +805,12 @@ mod tests {
         let store = QuotaStore::default();
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
-        let mut set = std::collections::HashSet::new();
-        set.insert("cli:claude".to_string());
         assert_eq!(
             dispatch_stop_cause(
                 &slot,
                 &store,
-                Some(&set),
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Work
         );
@@ -529,8 +825,8 @@ mod tests {
             dispatch_stop_cause(
                 &slot,
                 &store,
-                None,
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Work
         );
@@ -543,53 +839,49 @@ mod tests {
         assert!(!is_provider_eligible(
             "cli:claude",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         assert!(is_provider_eligible(
             "cli:grok",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
     }
 
     #[test]
-    fn is_provider_eligible_respects_availability_set() {
+    fn is_provider_eligible_checks_quota_only() {
         let store = QuotaStore::default();
-        let mut set = std::collections::HashSet::new();
-        set.insert("cli:claude".to_string());
         assert!(is_provider_eligible(
             "cli:claude",
             &store,
-            Some(&set),
             crate::providers::RecordedRoute::ambient()
         ));
-        assert!(!is_provider_eligible(
+        assert!(is_provider_eligible(
             "cli:grok",
             &store,
-            Some(&set),
+            crate::providers::RecordedRoute::ambient()
+        ));
+        assert!(is_provider_eligible(
+            "cli:totally-bogus-provider",
+            &store,
             crate::providers::RecordedRoute::ambient()
         ));
     }
 
     #[test]
-    fn api_provider_ignores_availability_set() {
+    fn api_provider_needs_only_quota() {
         let store = QuotaStore::default();
-        let mut set = std::collections::HashSet::new();
-        set.insert("cli:claude".to_string());
         assert!(is_provider_eligible(
             "api:openai@gpt-5",
             &store,
-            Some(&set),
             crate::providers::RecordedRoute::ambient()
         ));
         assert_eq!(
             dispatch_stop_cause(
                 &api_slot(),
                 &store,
-                Some(&set),
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Work
         );
@@ -599,12 +891,9 @@ mod tests {
     fn api_provider_still_respects_quota_pause() {
         let mut store = QuotaStore::default();
         store.pause_quota("api:openai", "q");
-        let mut set = std::collections::HashSet::new();
-        set.insert("cli:claude".to_string());
         assert!(!is_provider_eligible(
             "api:openai@gpt-5",
             &store,
-            Some(&set),
             crate::providers::RecordedRoute::ambient()
         ));
         let mut slot = api_slot();
@@ -614,8 +903,8 @@ mod tests {
             dispatch_stop_cause(
                 &slot,
                 &store,
-                Some(&set),
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Environmental
         );
@@ -627,14 +916,12 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         slot.error = Some("hard ceiling: slot timed out after 10s".into());
-        let mut set = std::collections::HashSet::new();
-        set.insert("cli:claude".to_string());
         assert_eq!(
             dispatch_stop_cause(
                 &slot,
                 &store,
-                Some(&set),
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Work
         );
@@ -646,14 +933,12 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         slot.error = Some("missing expected artifact: summary-impl.md".into());
-        let mut set = std::collections::HashSet::new();
-        set.insert("cli:claude".to_string());
         assert_eq!(
             dispatch_stop_cause(
                 &slot,
                 &store,
-                Some(&set),
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Work
         );
@@ -665,14 +950,12 @@ mod tests {
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
         slot.error = Some("review verdict: request_changes".into());
-        let mut set = std::collections::HashSet::new();
-        set.insert("cli:claude".to_string());
         assert_eq!(
             dispatch_stop_cause(
                 &slot,
                 &store,
-                Some(&set),
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Work
         );
@@ -683,15 +966,13 @@ mod tests {
         let store = QuotaStore::default();
         let mut slot = slot_with_quota(false);
         slot.status = SlotStatus::Failed;
-        let mut set = std::collections::HashSet::new();
-        set.insert("cli:claude".to_string());
         // If Work branch were neutralized to Environmental, this would be Environmental
         assert_eq!(
             dispatch_stop_cause(
                 &slot,
                 &store,
-                Some(&set),
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Work
         );
@@ -702,8 +983,8 @@ mod tests {
             dispatch_stop_cause(
                 &env_slot,
                 &store,
-                Some(&set),
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Environmental
         );
@@ -720,8 +1001,8 @@ mod tests {
             dispatch_stop_cause(
                 &slot,
                 &store,
-                None,
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Work
         );
@@ -738,8 +1019,8 @@ mod tests {
             dispatch_stop_cause(
                 &slot,
                 &store,
-                None,
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Work
         );
@@ -756,8 +1037,8 @@ mod tests {
             dispatch_stop_cause(
                 &slot,
                 &store,
-                None,
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Work
         );
@@ -774,8 +1055,8 @@ mod tests {
             dispatch_stop_cause(
                 &slot,
                 &store,
-                None,
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Work
         );
@@ -792,8 +1073,8 @@ mod tests {
             dispatch_stop_cause(
                 &slot,
                 &store,
-                None,
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Work
         );
@@ -804,8 +1085,8 @@ mod tests {
             dispatch_stop_cause(
                 &env_slot,
                 &store,
-                None,
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Environmental
         );
@@ -863,7 +1144,9 @@ mod tests {
     /// `SPAR_CODEX_PROFILE` (None leaves the pinned default); the recorded
     /// profile passed to `backup_eligible` decides the bucket, never the
     /// ambient value. The route vars are pinned at unset (restored after), so
-    /// an ambient `SPAR_CODEX_MODEL` cannot move the asserted bucket.
+    /// an ambient `SPAR_CODEX_MODEL` cannot move the asserted bucket. The fake
+    /// dir is prepended to the live PATH, so parallel tests still resolve
+    /// their own binaries.
     fn with_fake_codex(
         profile: Option<&str>,
         body: &str,
@@ -885,7 +1168,7 @@ mod tests {
             std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o755))
                 .unwrap();
         }
-        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+        std::env::set_var("PATH", format!("{}:{old_path}", bin.display()));
         f(&crate::paths::SparPaths::new(tmp.path().join("proj")));
         std::env::set_var("PATH", old_path);
     }
@@ -901,7 +1184,6 @@ mod tests {
                 !is_provider_eligible(
                     "cli:codex",
                     &loaded,
-                    None,
                     crate::providers::RecordedRoute::ambient()
                 ),
                 "the bucket pause benches the bare seat"
@@ -910,10 +1192,12 @@ mod tests {
                 backup_eligible(
                     "cli:codex",
                     &loaded,
-                    None,
                     paths,
                     false,
-                    crate::providers::RecordedRoute::ambient()
+                    false,
+                    crate::providers::RecordedRoute::ambient(),
+                    &crate::providers::StubHealth::allow_all(),
+                    false
                 ),
                 "a healthy probe retires the bucket pause and seats the backup"
             );
@@ -922,7 +1206,6 @@ mod tests {
                 is_provider_eligible(
                     "cli:codex",
                     &fresh,
-                    None,
                     crate::providers::RecordedRoute::ambient()
                 ),
                 "the recovered bucket serves the seat again"
@@ -944,13 +1227,15 @@ mod tests {
                     !backup_eligible(
                         "cli:codex",
                         &loaded,
-                        None,
                         paths,
+                        false,
                         false,
                         crate::providers::RecordedRoute {
                             profile: Some(""),
                             model: None
-                        }
+                        },
+                        &crate::providers::StubHealth::allow_all(),
+                        false
                     ),
                     "the re-paused bucket stays benched"
                 );
@@ -974,8 +1259,8 @@ mod tests {
         let cause = dispatch_stop_cause(
             &slot,
             &store,
-            None,
             crate::providers::RecordedRoute::ambient(),
+            true,
         );
         assert_eq!(cause, StopCause::Auth);
         assert!(cause.engages_backup());
@@ -993,47 +1278,161 @@ mod tests {
     }
 
     #[test]
-    fn backup_eligible_never_probes_under_dry_run_or_past_a_manual_pause() {
+    fn backup_takeover_needs_quota_and_health_not_binaries() {
+        use crate::providers::StubHealth;
         let tmp = tempfile::tempdir().unwrap();
         let paths = crate::paths::SparPaths::new(tmp.path());
-        let mut store = QuotaStore::default();
-        assert!(backup_eligible(
+        let cfg = crate::config::Config::default();
+        let role = crate::state::SlotRole::Implementer;
+        let healthy = StubHealth::allow_all();
+        let store = QuotaStore::default();
+        assert!(takeover(
             "cli:codex",
+            role,
+            &cfg,
             &store,
-            None,
             &paths,
-            false,
-            crate::providers::RecordedRoute::ambient()
-        ));
+            true,
+            true,
+            crate::providers::RecordedRoute::ambient(),
+            &healthy
+        )
+        .is_some());
 
-        store.pause_quota("cli:codex", "possible quota signal: quota");
+        let mut paused = QuotaStore::default();
+        paused.pause_quota("cli:codex", "possible quota signal: quota");
         assert!(
-            !backup_eligible(
+            takeover(
                 "cli:codex",
-                &store,
-                None,
+                role,
+                &cfg,
+                &paused,
                 &paths,
                 true,
-                crate::providers::RecordedRoute::ambient()
-            ),
+                true,
+                crate::providers::RecordedRoute::ambient(),
+                &healthy
+            )
+            .is_none(),
             "dry-run decides on the file alone"
         );
 
-        store.pause_manual("cli:grok", None);
+        let sick = StubHealth::refuse("cli:codex", "probe failed: not logged in");
         assert!(
-            !backup_eligible(
-                "cli:grok",
+            takeover(
+                "cli:codex",
+                role,
+                &cfg,
                 &store,
-                None,
+                &paths,
+                true,
+                true,
+                crate::providers::RecordedRoute::ambient(),
+                &sick
+            )
+            .is_none(),
+            "a quota-fine file backup still skips probe-failed readiness"
+        );
+
+        let mut manual = QuotaStore::default();
+        manual.pause_manual("cli:grok", None);
+        assert!(
+            takeover(
+                "cli:grok",
+                role,
+                &cfg,
+                &manual,
                 &paths,
                 false,
-                crate::providers::RecordedRoute::ambient()
-            ),
+                false,
+                crate::providers::RecordedRoute::ambient(),
+                &healthy
+            )
+            .is_none(),
             "a manual pause is never probed past"
         );
         assert!(
             !paths.quota_file().exists(),
             "no probe ran, so nothing was written"
+        );
+    }
+
+    #[test]
+    fn cli_backup_pin_dispatches_despite_probe_failure() {
+        use crate::providers::StubHealth;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let mut cfg = crate::config::Config::default();
+        cfg.cli_backup_keys
+            .insert(crate::state::SlotRole::Implementer);
+        let sick = StubHealth::refuse("cli:codex", "probe failed: not logged in");
+        let store = QuotaStore::default();
+        assert_eq!(
+            takeover(
+                "cli:codex",
+                crate::state::SlotRole::Implementer,
+                &cfg,
+                &store,
+                &paths,
+                true,
+                true,
+                crate::providers::RecordedRoute::ambient(),
+                &sick,
+            ),
+            Some(crate::state::SeatSource::CliBackup)
+        );
+    }
+
+    #[test]
+    fn cli_backup_without_a_binary_is_ineligible() {
+        use crate::providers::StubHealth;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let mut cfg = crate::config::Config::default();
+        cfg.cli_backup_keys
+            .insert(crate::state::SlotRole::Implementer);
+        let health = StubHealth::allow_all();
+        let store = QuotaStore::default();
+        assert!(
+            takeover(
+                "cli:no-such-provider",
+                crate::state::SlotRole::Implementer,
+                &cfg,
+                &store,
+                &paths,
+                false,
+                false,
+                crate::providers::RecordedRoute::ambient(),
+                &health,
+            )
+            .is_none(),
+            "a CLI backup whose binary does not resolve never takes the seat"
+        );
+    }
+
+    #[test]
+    fn cli_backup_without_a_binary_stays_projected_under_dry_run() {
+        use crate::providers::StubHealth;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let mut cfg = crate::config::Config::default();
+        cfg.cli_backup_keys
+            .insert(crate::state::SlotRole::Implementer);
+        let health = StubHealth::allow_all();
+        let store = QuotaStore::default();
+        assert_eq!(
+            takeover(
+                "cli:no-such-provider",
+                crate::state::SlotRole::Implementer,
+                &cfg,
+                &store,
+                &paths,
+                true,
+                true,
+                crate::providers::RecordedRoute::ambient(),
+                &health,
+            ),
+            Some(crate::state::SeatSource::CliBackup)
         );
     }
 
@@ -1047,8 +1446,8 @@ mod tests {
             dispatch_stop_cause(
                 &slot,
                 &store,
-                None,
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Environmental
         );
@@ -1066,14 +1465,12 @@ mod tests {
         assert!(!is_provider_eligible(
             "cli:agy@flash",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         assert!(store.blocks_live_dispatch("cli:agy@flash"));
         assert!(is_provider_eligible(
             "cli:agy@pro",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         assert!(!store.blocks_live_dispatch("cli:agy@pro"));
@@ -1084,13 +1481,11 @@ mod tests {
         assert!(!is_provider_eligible(
             "cli:agy@pro",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         assert!(is_provider_eligible(
             "cli:agy@flash",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
     }
@@ -1102,19 +1497,16 @@ mod tests {
         assert!(!is_provider_eligible(
             "cli:agy@flash",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         assert!(!is_provider_eligible(
             "cli:agy@pro",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         assert!(!is_provider_eligible(
             "cli:agy",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
 
@@ -1128,13 +1520,11 @@ mod tests {
         assert!(!is_provider_eligible(
             "cli:agy@flash",
             &legacy,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         assert!(!is_provider_eligible(
             "cli:agy@pro",
             &legacy,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         assert!(legacy.blocks_live_dispatch("cli:agy@flash"));
@@ -1143,12 +1533,14 @@ mod tests {
 
     #[test]
     fn a_selected_model_decides_whether_the_backup_takes_the_seat() {
+        use crate::providers::StubHealth;
         let tmp = tempfile::tempdir().unwrap();
         let paths = crate::paths::SparPaths::new(tmp.path());
         let mut cfg = crate::config::Config::default();
         cfg.backups.planner = Some("cli:codex".into());
         let mut store = QuotaStore::default();
         store.pause_manual("cli:agy@flash", None);
+        let health = StubHealth::allow_all();
         let pool = vec!["cli:agy".to_string()];
         let seat = |model| {
             resolve_with_backup(
@@ -1160,10 +1552,12 @@ mod tests {
                 &cfg,
                 model,
                 &store,
-                None,
                 &paths,
                 true,
+                true,
                 crate::providers::RecordedRoute::ambient(),
+                &health,
+                &[],
             )
             .unwrap()
             .0
@@ -1184,8 +1578,8 @@ mod tests {
             dispatch_stop_cause(
                 &slot,
                 &store,
-                None,
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Work
         );
@@ -1194,8 +1588,8 @@ mod tests {
             dispatch_stop_cause(
                 &slot,
                 &store,
-                None,
-                crate::providers::RecordedRoute::ambient()
+                crate::providers::RecordedRoute::ambient(),
+                true
             ),
             StopCause::Environmental
         );
@@ -1224,25 +1618,21 @@ mod tests {
         assert!(!is_provider_eligible(
             "cli:claude@opus",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         assert!(is_provider_eligible(
             "cli:claude@sonnet",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         assert!(is_provider_eligible(
             "cli:claude@haiku",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         assert!(is_provider_eligible(
             "cli:claude",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
     }
@@ -1260,12 +1650,7 @@ mod tests {
             let mut store = QuotaStore::default();
             store.pause_quota(&crate::quota::quota_key(seat), "limit");
             assert!(
-                !is_provider_eligible(
-                    other,
-                    &store,
-                    None,
-                    crate::providers::RecordedRoute::ambient()
-                ),
+                !is_provider_eligible(other, &store, crate::providers::RecordedRoute::ambient()),
                 "{seat} must hold {other}"
             );
             assert_eq!(
@@ -1276,27 +1661,17 @@ mod tests {
     }
 
     #[test]
-    fn agy_model_seat_survives_the_detected_cli_set() {
+    fn a_quota_pause_holds_the_paused_model_only() {
         let mut store = QuotaStore::default();
         store.pause_quota("cli:agy@flash", "flash limit");
-        let mut set = std::collections::HashSet::new();
-        set.insert("cli:agy".to_string());
         assert!(!is_provider_eligible(
             "cli:agy@flash",
             &store,
-            Some(&set),
             crate::providers::RecordedRoute::ambient()
         ));
         assert!(is_provider_eligible(
             "cli:agy@pro",
             &store,
-            Some(&set),
-            crate::providers::RecordedRoute::ambient()
-        ));
-        assert!(!is_provider_eligible(
-            "cli:codex",
-            &store,
-            Some(&set),
             crate::providers::RecordedRoute::ambient()
         ));
     }

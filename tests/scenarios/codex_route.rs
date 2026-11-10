@@ -83,7 +83,7 @@ impl Sandbox {
         std::fs::write(
             &p,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fake; exit 0; fi\necho x >> \"$FAKE_COUNT_DIR/{name}.count\"\n{body}\n"
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fake; exit 0; fi\ncase \"$1\" in auth|login) exit 0;; esac\necho x >> \"$FAKE_COUNT_DIR/{name}.count\"\n{body}\n"
             ),
         )
         .unwrap();

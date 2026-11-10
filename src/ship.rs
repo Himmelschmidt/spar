@@ -327,7 +327,7 @@ pub struct ShipOverride {
 }
 
 /// The same findings `brief` and the escalation show: each surviving seat's latest
-/// recorded review (O184). The round rides along from the history entry the
+/// recorded review (O186). The round rides along from the history entry the
 /// finding survived from.
 fn open_findings(state: &RunState) -> Vec<OpenFinding> {
     let open = crate::workflow::review_result::open_findings(

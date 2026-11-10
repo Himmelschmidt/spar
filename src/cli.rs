@@ -236,8 +236,12 @@ pub enum Command {
         /// `+N`, and keep going. A run that reaches `[rounds] max` parks at the
         /// `awaiting_round_extension` gate (exit 2) rather than buying another cold
         /// re-dispatch; this is the operator saying the next one is worth paying for.
-        /// Sticky: it persists on the run. Must land above the current round, and is
-        /// queued (not refused) while an orchestrator is driving the run. Must be >= 1:
+        /// Sticky: it persists on the run. On any re-entry after implementer slots
+        /// exist the flag only ever raises: a value resolving at or under the
+        /// ceiling keeps it, and an uncapped run stays uncapped. The first
+        /// implement entry still sets the ceiling outright. Must land above the
+        /// current round, and is queued (not refused) while an orchestrator is
+        /// driving the run. Must be >= 1:
         /// turning the ceiling off entirely is `[rounds] max = 0` in `spar.toml`, a
         /// deliberate project setting rather than a flag typed under pressure at a gate.
         #[arg(long, value_parser = parse_max_rounds)]
@@ -249,6 +253,14 @@ pub enum Command {
         /// first: this is how a criterion gets deleted on the way to the ship gate.
         #[arg(long)]
         accept_contract: bool,
+        /// Send the unchanged HEAD back to the review panel instead of the
+        /// implementer. For the no-progress park where the operator ruled the
+        /// blocking review wrong: rule it out with `spar rule add`, then re-enter
+        /// with this flag. The panel re-judges the same commit with the ruling in
+        /// context (O121). One-shot: consumed whether or not the round stalls, and
+        /// a still-blocking re-review re-arms the stall counter from zero.
+        #[arg(long)]
+        re_review: bool,
         /// Idempotency key: refuse to start while an unfinished run with this key
         /// exists. `plan --brief` defaults it to the brief's slug.
         #[arg(long)]

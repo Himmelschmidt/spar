@@ -66,7 +66,9 @@ fn only_run_id(proj: &std::path::Path) -> String {
 /// A fake `claude` CLI. The real adapter invokes `claude -p "<prompt>" ...`,
 /// so the full prompt text arrives as `$2`; the expected artifact path is read
 /// off its `Write ... to:` line, never hardcoded. Behavior per artifact:
-/// - `summary-*.md` (implementer): always written, every round.
+/// - `summary-*.md` (implementer): always written, every round, and the tree
+///   is touched too, so the round counts as progress and the panel is genuinely
+///   re-dispatched instead of skipped as a stall.
 /// - `review-*-review-0-*.md`: approved on every dispatch, proving a fresh
 ///   write satisfies the gate (the non-vacuity guard). Carries an honest
 ///   `Reviewed-Commit` so the sha layer never fires inside this O89 test.
@@ -83,16 +85,24 @@ mkdir -p "$STATE"
 TOOL_LINE='{"type":"assistant","message":{"model":"fake","usage":{"input_tokens":10,"output_tokens":5},"content":[{"type":"text","text":"Looking."},{"type":"tool_use","name":"Read","input":{"file_path":"x"}}]}}'
 DEST=""
 CWD=""
+ICWD=""
+# Two passes: one prompt blob carries both the artifact line and the cwd line,
+# and a single case keeps only the first match per blob.
 for a in "$@"; do
   case "$a" in
     *"Write review to:"*)
       DEST=$(printf '%s' "$a" | sed -n 's/.*Write review to: \([^ ]*\).*/\1/p' | head -n 1)
       ;;
+    *"Write a summary to"*)
+      DEST=$(printf '%s' "$a" | sed -n 's/.*Write a summary to `\([^`]*\)`.*/\1/p' | head -n 1)
+      ;;
+  esac
+  case "$a" in
     *"Code under review (worktree):"*)
       CWD=$(printf '%s' "$a" | sed -n 's/.*Code under review (worktree): \([^ ]*\).*/\1/p' | head -n 1)
       ;;
-    *"Write a summary to"*)
-      DEST=$(printf '%s' "$a" | sed -n 's/.*Write a summary to `\([^`]*\)`.*/\1/p' | head -n 1)
+    *"Cwd (your worktree):"*)
+      ICWD=$(printf '%s' "$a" | sed -n 's/.*Cwd (your worktree): \([^ ]*\).*/\1/p' | head -n 1)
       ;;
   esac
 done
@@ -125,6 +135,10 @@ case "$DEST" in
     ;;
   *)
     printf '# Summary\nDid the stub thing.\n' > "$DEST"
+    # Touch the tree every round: an implementer that changes nothing while a
+    # request_changes review is open stalls, the panel is skipped, and this O89
+    # exercise never happens. Appending keeps every round progress.
+    if [ -n "$ICWD" ]; then printf 'progress\n' >> "$ICWD/README.md"; fi
     exit 0
     ;;
 esac

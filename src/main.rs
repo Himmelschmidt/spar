@@ -226,12 +226,26 @@ fn run() -> Result<ExitCode> {
                     Err(e) => return launch_refused(e, json, Some(&id)),
                 };
                 if validate_only {
-                    return launch_validated(
-                        json,
-                        Some(&id),
+                    // A replan still dispatches the stored seats through the
+                    // re-check, so show the projection, not the stored seats.
+                    // A replan re-resolves the plan panel, never the implement one.
+                    let proj = workflow::implement::project_continued_fleet(
+                        &st,
+                        &paths,
                         &cfg,
-                        Some(executor::run_fleet_seats(&st)),
+                        &[
+                            crate::state::SlotRole::Planner,
+                            crate::state::SlotRole::PlanCritic,
+                        ],
                     );
+                    if let Some(stop) = proj.stop {
+                        let err = anyhow::anyhow!("{}", stop.message());
+                        if stop.quota() {
+                            return launch_quota_stopped(err, json, Some(&id));
+                        }
+                        return launch_refused(err, json, Some(&id));
+                    }
+                    return launch_validated(json, Some(&id), &cfg, Some(proj.fleet));
                 }
                 cfg.reapply_captured_env();
                 return workflow::plan::replan(&paths, &cfg, &id, directive, json);
@@ -300,6 +314,7 @@ fn run() -> Result<ExitCode> {
                     big,
                     max_rounds: None,
                     accept_contract: false,
+                    re_review: false,
                     // `plan` / `run` mint their config fresh; there is no frozen one to
                     // reload against, so seats are resolved for the first time either way.
                     reload_config: false,
@@ -334,6 +349,8 @@ fn run() -> Result<ExitCode> {
                     crate::cli::WorkflowKind::Plan,
                     &opts,
                     &cfg,
+                    &crate::providers::LiveHealth::for_dry(opts.dry_run),
+                    &paths,
                 ) {
                     Ok(f) => f,
                     Err(e) => return launch_refused(e, json, None),
@@ -399,6 +416,7 @@ fn run() -> Result<ExitCode> {
             recapture_env,
             max_rounds,
             accept_contract,
+            re_review,
             key,
             key_scope,
             reassign,
@@ -474,6 +492,7 @@ fn run() -> Result<ExitCode> {
                     big,
                     max_rounds,
                     accept_contract,
+                    re_review,
                     reload_config,
                     key,
                     reassign,
@@ -488,6 +507,7 @@ fn run() -> Result<ExitCode> {
                 )?;
                 let mut fleet = None;
                 let mut shown_cfg = None;
+                let mut precheck_stop: Option<workflow::implement::ProjectionStop> = None;
                 match &run_id {
                     Some(id) => {
                         let st = state::RunState::load(&paths, id)?;
@@ -544,7 +564,30 @@ fn run() -> Result<ExitCode> {
                                     .into());
                                 }
                             }
-                            let mut seats = executor::run_fleet_seats(&moved);
+                            if let Some(preview) = &preview {
+                                shown_cfg = Some(preview.cfg.clone());
+                            }
+                            let proj_cfg = shown_cfg.as_ref().unwrap_or(&cfg);
+                            // A continued run re-resolves stored seats on dispatch, so
+                            // show the projection, not the stored seats. A
+                            // projection that would stop the dispatch fails the
+                            // pre-check the same way the dispatch would. Only the
+                            // implement panel re-resolves here; the plan phase's
+                            // seats are history the dispatch leaves untouched. The
+                            // tester re-resolves only under the suite channel,
+                            // exactly as the dispatch rechecks it.
+                            let mut panel = vec![
+                                crate::state::SlotRole::Implementer,
+                                crate::state::SlotRole::Reviewer,
+                            ];
+                            if proj_cfg.suite.enabled {
+                                panel.push(crate::state::SlotRole::Tester);
+                            }
+                            let proj = workflow::implement::project_continued_fleet(
+                                &moved, &paths, proj_cfg, &panel,
+                            );
+                            precheck_stop = proj.stop;
+                            let mut seats = proj.fleet;
                             if let Some(preview) = &preview {
                                 // Show the fleet after the drop: gone seats vanish and
                                 // survivors keep their ids.
@@ -573,7 +616,6 @@ fn run() -> Result<ExitCode> {
                                     seats.retain(|s| !simulated.contains(s.seat.as_str()));
                                     seats.extend(resynced.iter().cloned());
                                 }
-                                shown_cfg = Some(preview.cfg.clone());
                             }
                             fleet = Some(seats);
                         }
@@ -597,17 +639,35 @@ fn run() -> Result<ExitCode> {
                                 crate::cli::WorkflowKind::Loop,
                                 &opts,
                                 &cfg,
+                                &crate::providers::LiveHealth::for_dry(opts.dry_run),
+                                &paths,
                             )?;
                         }
                     }
                     None => {}
                 }
-                Ok((paths, cfg, opts, task, fleet, amend, shown_cfg))
+                Ok((
+                    paths,
+                    cfg,
+                    opts,
+                    task,
+                    fleet,
+                    amend,
+                    shown_cfg,
+                    precheck_stop,
+                ))
             })();
-            let (paths, cfg, opts, task, fleet, amend, shown_cfg) = match prepared {
+            let (paths, cfg, opts, task, fleet, amend, shown_cfg, precheck_stop) = match prepared {
                 Ok(v) => v,
                 Err(e) => return launch_refused(e, json, run_id.as_deref()),
             };
+            if let Some(stop) = precheck_stop {
+                let err = anyhow::anyhow!("{}", stop.message());
+                if stop.quota() {
+                    return launch_quota_stopped(err, json, run_id.as_deref());
+                }
+                return launch_refused(err, json, run_id.as_deref());
+            }
             if run_id.is_none() {
                 if let Some(code) =
                     runkey::guard(&paths, opts.key.as_deref(), key_scope, json, opts.dry_run)?
@@ -713,6 +773,7 @@ fn run() -> Result<ExitCode> {
                     big,
                     max_rounds: None,
                     accept_contract: false,
+                    re_review: false,
                     // `plan` / `run` mint their config fresh; there is no frozen one to
                     // reload against, so seats are resolved for the first time either way.
                     reload_config: false,
@@ -721,7 +782,13 @@ fn run() -> Result<ExitCode> {
                 };
                 workflow::preflight(&opts, &paths, &cfg)?;
                 let fleet = if validate_only {
-                    workflow::roles_resolve::launch_fleet(workflow, &opts, &cfg)?
+                    workflow::roles_resolve::launch_fleet(
+                        workflow,
+                        &opts,
+                        &cfg,
+                        &crate::providers::LiveHealth::for_dry(opts.dry_run),
+                        &paths,
+                    )?
                 } else {
                     None
                 };
@@ -987,6 +1054,23 @@ fn subcommand_of(args: &[String]) -> Option<&str> {
 
 /// A launch refused before it made a run. `--json` callers get one parseable shape on
 /// stdout instead of an `error:` line to grep; the exit code is 1 either way.
+fn launch_quota_stopped(err: anyhow::Error, json: bool, run_id: Option<&str>) -> Result<ExitCode> {
+    if !json {
+        eprintln!("error: {err:#}");
+        return Ok(ExitCode::Quota);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": false,
+            "error": format!("{err:#}"),
+            "run_id": run_id,
+            "kind": "validation",
+        }))?
+    );
+    Ok(ExitCode::Quota)
+}
+
 fn launch_refused(err: anyhow::Error, json: bool, run_id: Option<&str>) -> Result<ExitCode> {
     if !json {
         return Err(err);
@@ -1403,7 +1487,7 @@ fn bus_deliver(
 
 /// Seat shapers for a fresh launch: pool resolution, drops, and role/backup/
 /// effort overrides, in launch order. A surviving drop records without pinning
-/// the panel (O181).
+/// the panel (O183).
 #[allow(clippy::too_many_arguments)]
 fn fresh_seat_shapers(
     cfg: &mut Config,
@@ -1433,7 +1517,7 @@ fn fresh_seat_shapers(
     let dropped = cfg.apply_without(&resolved.providers, origin, dry_run, without)?;
     cfg.apply_role_overrides(role)?;
     // Record after the drops and role overrides shaped the panel, so the
-    // stored width and roles are the question the dispatch asks (O181). The
+    // stored width and roles are the question the dispatch asks (O183). The
     // providers stay the pre-shape resolution the ordinals indexed.
     let preselected = if selected {
         Some(workflow::roles_resolve::PreselectedPool::for_shaped_panel(
@@ -3587,7 +3671,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                             .collect();
                         let mut v = serde_json::json!({
                             "name": p.name,
-                            "available": p.available,
+                            "available": p.is_available(),
                             "path": p.path,
                             "version": p.version,
                             "readiness": p.readiness,
@@ -3621,7 +3705,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                 println!("{}", serde_json::to_string_pretty(&enriched)?);
             } else {
                 for (p, u) in report.iter().zip(&usages) {
-                    let mark = if !p.available {
+                    let mark = if !p.is_available() {
                         "missing"
                     } else if p.readiness == providers::Readiness::Unhealthy {
                         "unhealthy"
@@ -3646,7 +3730,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
                             println!("           {line}");
                         }
                     }
-                    if p.available {
+                    if p.is_available() {
                         println!(
                             "         headless={} interactive={} version={}",
                             p.capabilities.headless,

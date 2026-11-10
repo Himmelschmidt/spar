@@ -56,6 +56,20 @@ test("a verb runs only after a typed yes", async () => {
 	assert.match(plain(yes), /spar approve r1: done, phase plan_approved/);
 });
 
+test("extend at a stall park re-enters bare instead of raising the ceiling", async () => {
+	const spar = installSpar({
+		"status r1 --json": status("r1", { phase: "awaiting_round_extension", round: 3, max_rounds: 8, needs_human: true, resumable: true }),
+		"brief r1 --json": BRIEF,
+		"implement --run r1 --detach --json": { phase: "fix" },
+	});
+	installHerdr();
+	const io = scripted(["2", "yes", "q"]);
+	assert.deepEqual(await act(io, config, "r1", ROOT), ["extend"]);
+	assert.deepEqual(spar.argv().find((a) => a[0] === "implement"), ["implement", "--run", "r1", "--detach", "--json"]);
+	assert.match(plain(io), /Re-enters the run without raising the ceiling/);
+	assert.doesNotMatch(plain(io), /Rounds to add/);
+});
+
 test("ship passes --confirm once the human confirms in the popup", async () => {
 	const spar = installSpar({
 		"status r1 --json": status("r1", { phase: "awaiting_ship_confirm", needs_human: true }),
