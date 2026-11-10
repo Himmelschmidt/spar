@@ -140,6 +140,11 @@ pub fn preview_bound_amend(
     };
     let dropped = cfg.apply_without(&pool, pool_origin, dry, &without)?;
     cfg.apply_role_overrides(&inputs.role)?;
+    if crate::config::role_pins_reviewer(&inputs.role) {
+        // The role replaces the panel outright: the live-slot pin is no longer
+        // the panel's source, so a later reassign must not refresh it back.
+        panel_pinned = false;
+    }
     cfg.refuse_emptied_reviewer_panel(&dropped)?;
     crate::config::warn_if_role_discards_reviewer_drop(&inputs.role, &dropped);
     cfg.apply_backup_overrides(&inputs.backup)?;

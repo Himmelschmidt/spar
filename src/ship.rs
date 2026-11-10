@@ -313,20 +313,29 @@ pub struct ShipOverride {
     findings: Vec<OpenFinding>,
 }
 
-/// Every finding the judged panel left, from the same panel `brief` and the
-/// escalation show (O155): the latest round any surviving seat judged, or the
-/// slots' own records when no history entry names one. Approving reviewers'
-/// findings and synthetic ones count too, the latter tagged `[synthetic]`.
+/// The same findings `brief` and the escalation show: each surviving seat's latest
+/// recorded review (O156). The round rides along from the history entry the
+/// finding survived from.
 fn open_findings(state: &RunState) -> Vec<OpenFinding> {
-    crate::workflow::review_result::judged_panel(state)
-        .into_iter()
-        .flat_map(|judged| {
-            judged.review.findings.iter().map(move |f| OpenFinding {
-                slot_id: judged.slot_id.to_string(),
-                round: judged.round,
-                reviewed_commit: judged.review.reviewed_commit.clone(),
-                finding: f.clone(),
-            })
+    let open = crate::workflow::review_result::open_findings(
+        state,
+        &crate::workflow::review_result::findings_cwd(state),
+    );
+    open.into_iter()
+        .map(|f| {
+            let round = state
+                .review_history
+                .iter()
+                .filter(|e| e.slot_id == f.slot_id)
+                .map(|e| e.round)
+                .max()
+                .unwrap_or_default();
+            OpenFinding {
+                slot_id: f.slot_id,
+                round,
+                reviewed_commit: f.reviewed_commit,
+                finding: f.finding,
+            }
         })
         .collect()
 }
@@ -1622,11 +1631,11 @@ mod tests {
         }
     }
 
-    /// O155: the gate judges the latest round any surviving seat judged, filtered
-    /// to live seats, never `state.round`: a round begun but not yet reviewed has
-    /// no reviews to judge.
+    /// O156: the gate judges each surviving seat's latest recorded review,
+    /// whatever round it judged, never `state.round`: a round begun but not yet
+    /// reviewed has no reviews to judge.
     #[test]
-    fn open_findings_judge_the_latest_reviewed_rounds_live_seats() {
+    fn open_findings_judge_each_surviving_seats_latest_review() {
         use crate::workflow::review_result::Severity;
         let mut state = RunState::new("r1", WorkflowKind::Loop, PathBuf::from("/x"));
         for id in ["review-0", "review-1"] {
@@ -1700,15 +1709,32 @@ mod tests {
             "- **critical**: old (review-0, round 1, Reviewed-Commit `aaaa`)"
         );
 
-        // A round begun but not yet reviewed has no reviews to judge: the gate
-        // still judges the latest reviewed round, never `state.round`.
+        // Seats judge at their own pace: with review-0's round 2 gone, its
+        // latest is round 1 while review-1's is still round 2, and the gate
+        // shows both.
         state.review_history.extend(round_two);
+        state
+            .review_history
+            .retain(|e| !(e.round == 2 && e.slot_id == "review-0"));
+        let found = open_findings(&state);
+        assert_eq!(found.len(), 2);
+        assert_eq!(
+            finding_line(&found[0]),
+            "- **critical**: old (review-0, round 1, Reviewed-Commit `aaaa`)"
+        );
+        assert_eq!(
+            finding_line(&found[1]),
+            "- **minor**: nit (review-1, round 2, Reviewed-Commit `0123456789ab`)"
+        );
+
+        // A round begun but not yet reviewed has no reviews to judge: the gate
+        // still judges each seat's latest, never `state.round`.
         state.round = 3;
         let found = open_findings(&state);
         assert_eq!(found.len(), 2);
         assert_eq!(
             finding_line(&found[0]),
-            "- **major** `src/a.rs:12`: off by one (review-0, round 2, Reviewed-Commit `0123456789ab`)"
+            "- **critical**: old (review-0, round 1, Reviewed-Commit `aaaa`)"
         );
     }
 

@@ -1070,21 +1070,26 @@ pub fn without_has_reviewer_item(without: &[String]) -> bool {
         .any(|w| parse_reviewer_without(w.trim()).is_ok())
 }
 
+/// Whether any `--role` assignment pins the reviewer panel outright, replacing
+/// whatever the file or a `--without` drop built.
+pub fn role_pins_reviewer(role: &[String]) -> bool {
+    role.iter().any(|r| {
+        r.split('=').next().is_some_and(|k| {
+            crate::state::SlotRole::from_config_key(k.trim())
+                == Some(crate::state::SlotRole::Reviewer)
+        })
+    })
+}
+
 /// Warn when an explicit `--role reviewer=...` replaces a panel a `--without
 /// reviewer[N]` just cut: the pin wins and the dropped seats are lost. Every
 /// amend path applies `--without` before `--role`, so each one calls this after
 /// both have run.
 pub fn warn_if_role_discards_reviewer_drop(role: &[String], dropped: &[usize]) {
-    use crate::state::SlotRole;
     if dropped.is_empty() {
         return;
     }
-    let pins_reviewer = role.iter().any(|r| {
-        r.split('=')
-            .next()
-            .is_some_and(|k| SlotRole::from_config_key(k.trim()) == Some(SlotRole::Reviewer))
-    });
-    if pins_reviewer {
+    if role_pins_reviewer(role) {
         eprintln!(
             "warning: --role reviewer=... replaces the reviewer panel, discarding the --without reviewer seat drop"
         );
