@@ -2096,8 +2096,9 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
 
 **`--one-pass`** (on `implement` and `run --workflow loop`) is the small-change mode:
 it implies `--fleet small` (an explicit `--fleet` still wins), caps a fresh run at one
-round (on a bound `--run <id>` it resets the ceiling to one more round instead,
-even on a never-dispatched reused round, unless `--max-rounds` is passed), and ships
+round (on a bound `--run <id>` it resets the ceiling to one more round instead
+(a never-dispatched reused round counts as that round, so the ceiling stays
+on it), unless `--max-rounds` is passed), and ships
 at the end of a passed gate through the real ship path (push plus draft PR,
 including the base forward merge). Only a passed gate ships: a sub-threshold
 `request_changes` already counts as approve-with-notes, so minor findings ship
@@ -2107,7 +2108,8 @@ list in the PR body. Anything that fails the gate (a finding at or above
 seat) parks at the existing gate (exit 2), as without the flag. If the ship
 itself fails (or the orchestrator dies after the gate passed), the run sits at
 `awaiting_ship_confirm`; resume and `__internal_continue` do not re-run the
-ship, so retry it with `spar ship <id> --confirm`. Frozen into the run's
+ship, so retry it with a plain `spar ship <id>` (the passed gate already
+recorded its confirm). Frozen into the run's
 `config.json`; nothing changes for runs launched without it (O196).
 
 **`--suite-command "<cmd>"`** (repeatable, on `plan` and `implement`) sets this run's

@@ -164,14 +164,15 @@ the PR body; anything that fails the gate (a finding at or above `[review]
 block_on`, a failed or missing acceptance line, a failing suite, a
 missing/synthetic/verdict-less review, a dead reviewer seat) parks at the
 round-ceiling gate (exit 2) exactly as without the flag. On an existing run,
-`implement --run <id> --one-pass` resets the ceiling to one more round (even on
-a never-dispatched reused round) and then applies the same verdict. The mode is
+`implement --run <id> --one-pass` resets the ceiling to one more round (a
+never-dispatched reused round counts as that round, so the ceiling stays on
+it) and then applies the same verdict. The mode is
 frozen into the run's `config.json`; an explicit `--fleet` or `--max-rounds`
 still wins over the implied preset and ceiling. If the ship itself fails (or
 the orchestrator dies after the gate passed), the run sits at
 `awaiting_ship_confirm`; resume and `__internal_continue` do not re-run the
-ship, so retry it with `spar ship <id> --confirm` (draft stays the frozen
-default).
+ship, so retry it with a plain `spar ship <id>` (the passed gate already
+recorded its confirm; draft stays the frozen default).
 
 `--providers` is **required** for plan / implement / run (no implicit fleet).
 
