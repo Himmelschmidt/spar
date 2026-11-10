@@ -172,31 +172,49 @@ impl LiveHealth {
 
 impl HealthSource for LiveHealth {
     fn check(&self, provider: &str) -> HealthVerdict {
-        if !self.probe {
+        if !self.probe || crate::util::env_truthy("SPAR_DRY_RUN") {
             return HealthVerdict {
                 usable: ProviderRef::parse(provider).is_ok(),
                 probe_message: None,
             };
         }
-        let usable = is_provider_usable(provider, false);
-        let probe_message = (!usable).then(|| probe_detail(provider)).flatten();
-        HealthVerdict {
-            usable,
-            probe_message,
+        let Ok(pref) = ProviderRef::parse(provider) else {
+            return HealthVerdict {
+                usable: false,
+                probe_message: None,
+            };
+        };
+        match pref.backend {
+            ExecBackend::NativeCli => match native_adapter(provider) {
+                Some(adapter) => {
+                    let report = adapter.detect();
+                    HealthVerdict {
+                        usable: report.usable(),
+                        probe_message: probe_detail(&report, adapter.as_ref()),
+                    }
+                }
+                None => HealthVerdict {
+                    usable: false,
+                    probe_message: None,
+                },
+            },
+            ExecBackend::ApiSdk => HealthVerdict {
+                usable: api_provider_supported(&pref.name),
+                probe_message: None,
+            },
         }
     }
 }
 
 /// The failed probe's detail for an error or a warning: the probe argv that
 /// ran plus its own message. `None` when no probe failed this provider, that is
-/// when it is healthy, unprobed, or missing rather than probe-failed.
-fn probe_detail(provider: &str) -> Option<String> {
-    let adapter = native_adapter(provider)?;
-    let report = adapter.detect();
+/// when it is healthy, unprobed, or missing rather than probe-failed. Takes
+/// the already-run detection so one check costs one detection.
+fn probe_detail(report: &ProviderReport, adapter: &dyn ProviderAdapter) -> Option<String> {
     if report.readiness != Readiness::Unhealthy {
         return None;
     }
-    let message = report.readiness_message?;
+    let message = report.readiness_message.clone()?;
     match adapter.readiness_probe() {
         Some(argv) => Some(format!(
             "probe `{} {}` failed: {message}",

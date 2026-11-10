@@ -262,8 +262,8 @@ fn all_unhealthy_order_fails_readiness_never_quota() {
         "readiness error names the failure: {combined}"
     );
     assert!(
-        combined.contains("cli:codex is unhealthy"),
-        "names the sick provider: {combined}"
+        combined.contains("cli:codex: probe `codex login status` failed"),
+        "names the failed probe: {combined}"
     );
     assert!(
         combined.contains("probe `codex login status` failed"),
@@ -497,4 +497,79 @@ fn pinned_unhealthy_provider_warns_and_still_dispatches() {
     let state = read_state(&p.proj, &run_id);
     assert_eq!(implementer_of(&state)["provider"], "cli:codex", "{state}");
     assert!(calls(&p.bin, "codex") >= 1, "pinned codex still dispatches");
+}
+
+#[test]
+fn singleton_past_a_sick_order_head_keeps_its_pool_position() {
+    let (_tmp, p) = project("[providers]\norder = [\"cli:claude\", \"cli:grok\", \"cli:codex\"]\n");
+    write_fake(&p.bin, "claude", "auth", failing_probe(), "approve");
+    write_fake(&p.bin, "grok", "grok", "exit 0", "approve");
+    write_fake(&p.bin, "codex", "login", "exit 0", "approve");
+    let out = spar_cmd()
+        .current_dir(&p.proj)
+        .env("SPAR_HOME", &p.home)
+        .env("PATH", &p.path_env)
+        .env("FAKE_PROJECT_ROOT", &p.proj)
+        .env("FAKE_COUNT_DIR", &p.bin)
+        .args([
+            "plan",
+            "-t",
+            "singleton keeps pool position",
+            "--role",
+            "planner=cli:grok@model",
+            "--validate-only",
+            "--json",
+        ])
+        .assert()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        out.status.success(),
+        "validate-only must project the later singleton past the sick order head: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("cli:codex"),
+        "projected panel seats test-author on cli:codex: {stdout}"
+    );
+    assert_eq!(calls(&p.bin, "codex"), 0, "validate-only must not dispatch");
+}
+
+#[test]
+fn unrelated_backups_entry_does_not_park_an_unhealthy_seat_at_quota() {
+    let (_tmp, p) = project(
+        "[providers]\norder = [\"cli:claude\", \"cli:codex\", \"cli:grok\"]\n[roles]\nimplementer = \"cli:codex\"\n[backups]\nreviewer = [\"cli:grok@backup\"]\n",
+    );
+    write_fake(&p.bin, "claude", "auth", "exit 0", "approve");
+    write_fake(&p.bin, "codex", "login", failing_probe(), "approve");
+    write_fake(&p.bin, "grok", "grok", "exit 0", "approve");
+    let out = spar_cmd()
+        .current_dir(&p.proj)
+        .env("SPAR_HOME", &p.home)
+        .env("PATH", &p.path_env)
+        .env("FAKE_PROJECT_ROOT", &p.proj)
+        .env("FAKE_COUNT_DIR", &p.bin)
+        .args([
+            "implement",
+            "-t",
+            "unrelated backup",
+            "--without",
+            "suite",
+            "--json",
+        ])
+        .assert()
+        .code(predicate::in_iter([0, 2]))
+        .get_output()
+        .clone();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_no_quota_park(&combined);
+    let run_id = run_id_from_state_dir(&p.proj);
+    let state = read_state(&p.proj, &run_id);
+    assert_eq!(implementer_of(&state)["provider"], "cli:claude", "{state}");
+    assert_eq!(calls(&p.bin, "codex"), 0, "sick file seat never dispatches");
 }

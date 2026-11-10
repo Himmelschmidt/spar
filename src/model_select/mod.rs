@@ -144,23 +144,17 @@ fn synthesize_from_roles(
             None => {
                 let skips = crate::workflow::roles_resolve::health_skips_for_seat(
                     role,
+                    ridx,
                     &[],
                     crate::state::PoolOrigin::Synth,
                     cfg,
                     health,
                 );
-                if skips.is_empty() {
-                    anyhow::bail!(
-                        "slot {i} (role '{label}'): no provider in [roles] and [providers].order is exhausted"
-                    );
+                if let Some(err) = crate::backup::readiness_error(&skips) {
+                    return Err(err.context(format!("slot {i} (role '{label}')")));
                 }
                 anyhow::bail!(
-                    "slot {i} (role '{label}'): no healthy provider: {}",
-                    skips
-                        .iter()
-                        .map(|(p, m)| format!("{p} is unhealthy ({m})"))
-                        .collect::<Vec<_>>()
-                        .join("; ")
+                    "slot {i} (role '{label}'): no provider in [roles] and [providers].order is exhausted"
                 );
             }
         };

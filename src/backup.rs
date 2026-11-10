@@ -146,6 +146,7 @@ pub fn is_provider_eligible(
 /// never eligible: rotation skips it while the run stays on (or falls back to)
 /// the primary. A CLI `--backup` entry is an explicit pin and dispatches despite
 /// `Unhealthy` readiness (warning instead): see `takeover`.
+#[allow(clippy::too_many_arguments)]
 fn backup_eligible(
     backup: &str,
     store: &QuotaStore,
@@ -181,6 +182,7 @@ fn backup_eligible(
 /// A CLI `--backup` entry (`cfg.cli_backup_keys`) dispatches even while `Unhealthy`
 /// and warns like any other pin; a `[backups]` file entry still skips `Unhealthy`
 /// providers. `None` when the backup cannot take the seat.
+#[allow(clippy::too_many_arguments)]
 pub fn takeover(
     backup: &str,
     role: crate::state::SlotRole,
@@ -194,7 +196,14 @@ pub fn takeover(
 ) -> Option<crate::state::SeatSource> {
     let cli = cfg.cli_backup_keys.contains(role.as_config_key());
     backup_eligible(
-        backup, store, available, paths, dry, codex_profile, health, cli,
+        backup,
+        store,
+        available,
+        paths,
+        dry,
+        codex_profile,
+        health,
+        cli,
     )
     .then_some(if cli {
         crate::state::SeatSource::CliBackup
@@ -289,7 +298,15 @@ pub fn resolve_with_backup(
     }
     if let Some(backup_raw) = backup_for_role(role, role_index, cfg) {
         if let Some(source) = takeover(
-            &backup_raw, role, cfg, store, available, paths, dry, codex_profile, health,
+            &backup_raw,
+            role,
+            cfg,
+            store,
+            available,
+            paths,
+            dry,
+            codex_profile,
+            health,
         ) {
             if let Ok(parsed) = crate::provider_ref::Pin::parse(&backup_raw) {
                 return Some((parsed.display(), source));
@@ -300,7 +317,7 @@ pub fn resolve_with_backup(
         if role == crate::state::SlotRole::Reviewer {
             return None;
         }
-        let (order_prov, order_src) = rr::resolve_order_rung(pool_index, cfg, health)?;
+        let (order_prov, order_src) = rr::resolve_order_rung(role, pool_index, cfg, health)?;
         return Some((order_prov, order_src));
     }
     Some((prov, src))
@@ -412,19 +429,7 @@ mod tests {
         health: &dyn crate::providers::HealthSource,
     ) -> Option<(String, crate::state::SeatSource)> {
         resolve_with_backup(
-            role,
-            0,
-            0,
-            pool,
-            origin,
-            cfg,
-            model,
-            store,
-            None,
-            paths,
-            dry,
-            None,
-            health,
+            role, 0, 0, pool, origin, cfg, model, store, None, paths, dry, None, health,
         )
     }
 
@@ -736,7 +741,7 @@ mod tests {
         let mut set = std::collections::HashSet::new();
         set.insert("cli:claude".to_string());
         assert!(is_provider_eligible("cli:claude", &store, Some(&set), None));
-        assert!(!is_provider_eligible("cli:grok", &store, Some(&set), None));
+        assert!(is_provider_eligible("cli:grok", &store, Some(&set), None));
         assert!(is_provider_eligible(
             "cli:totally-bogus-provider",
             &store,
@@ -1099,20 +1104,18 @@ mod tests {
         let role = crate::state::SlotRole::Implementer;
         let healthy = StubHealth::allow_all();
         let store = QuotaStore::default();
-        assert!(
-            takeover(
-                "cli:codex",
-                role,
-                &cfg,
-                &store,
-                None,
-                &paths,
-                true,
-                None,
-                &healthy
-            )
-            .is_some()
-        );
+        assert!(takeover(
+            "cli:codex",
+            role,
+            &cfg,
+            &store,
+            None,
+            &paths,
+            true,
+            None,
+            &healthy
+        )
+        .is_some());
 
         let mut paused = QuotaStore::default();
         paused.pause_quota("cli:codex", "possible quota signal: quota");
@@ -1152,18 +1155,8 @@ mod tests {
         let mut manual = QuotaStore::default();
         manual.pause_manual("cli:grok", None);
         assert!(
-            takeover(
-                "cli:grok",
-                role,
-                &cfg,
-                &manual,
-                None,
-                &paths,
-                false,
-                None,
-                &healthy
-            )
-            .is_none(),
+            takeover("cli:grok", role, &cfg, &manual, None, &paths, false, None, &healthy)
+                .is_none(),
             "a manual pause is never probed past"
         );
         assert!(
@@ -1380,6 +1373,6 @@ mod tests {
             Some(&set),
             None
         ));
-        assert!(!is_provider_eligible("cli:codex", &store, Some(&set), None));
+        assert!(is_provider_eligible("cli:codex", &store, Some(&set), None));
     }
 }

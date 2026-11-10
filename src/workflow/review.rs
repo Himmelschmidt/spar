@@ -255,21 +255,20 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     let health = crate::providers::LiveHealth::for_dry(state.dry_run);
     let has_backup = !cfg.backups.reviewer.is_empty();
-    let available: Option<std::collections::HashSet<String>> =
-        if state.dry_run || !has_backup {
+    let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
+        None
+    } else {
+        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+            .into_iter()
+            .filter(|r| r.is_available())
+            .map(|r| format!("cli:{}", r.name))
+            .collect();
+        if detected.is_empty() {
             None
         } else {
-            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                .into_iter()
-                .filter(|r| r.is_available())
-                .map(|r| format!("cli:{}", r.name))
-                .collect();
-            if detected.is_empty() {
-                None
-            } else {
-                Some(detected)
-            }
-        };
+            Some(detected)
+        }
+    };
     for (idx, job) in jobs.iter().enumerate() {
         let slot_state = match state.slots.iter().find(|s| s.id == job.slot_id).cloned() {
             Some(s) => s,

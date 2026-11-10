@@ -167,34 +167,53 @@ pub fn resolve_seat(
     } else {
         pool_index
     };
-    resolve_order_rung(order_idx, cfg, health)
+    resolve_order_rung(role, order_idx, cfg, health)
 }
 
-/// The `[providers].order` last-resort rung on its own: the order filtered to
-/// usable entries first, then indexed by ordinal, so a probe-failed entry never
-/// annexes a seat and surviving seats never collapse onto one provider. An
-/// ordinal past the usable entries is `None`, never a wrong provider.
+/// The `[providers].order` last-resort rung on its own. Reviewers keep their
+/// ordinal: the order filtered to usable entries first, then indexed, so a
+/// probe-failed entry never annexes a seat and surviving reviewers never
+/// collapse onto one provider. A singleton keeps its pool-position index into
+/// the raw order and falls forward to the next usable entry: the filtered
+/// list is shorter by every skipped entry, so indexing it by pool position
+/// fails later singletons while healthy providers stand unused. Past the
+/// usable entries the seat is `None`, never a wrong provider.
 pub fn resolve_order_rung(
+    role: SlotRole,
     order_idx: usize,
     cfg: &Config,
     health: &dyn crate::providers::HealthSource,
 ) -> Option<(String, SeatSource)> {
+    if role == SlotRole::Reviewer {
+        return cfg
+            .providers
+            .order
+            .iter()
+            .filter(|p| health.check(p).usable)
+            .nth(order_idx)
+            .cloned()
+            .map(|p| (p, SeatSource::ProvidersOrder));
+    }
     cfg.providers
         .order
         .iter()
-        .filter(|p| health.check(p).usable)
-        .nth(order_idx)
+        .skip(order_idx)
+        .find(|p| health.check(p).usable)
         .cloned()
         .map(|p| (p, SeatSource::ProvidersOrder))
 }
 
 /// Every provider a non-pin rung named but health refused, with the failed
 /// probe's detail: the `[roles]` singleton file seat plus the `[providers].order`
-/// entries. Reviewer file lists are excluded (an exact panel narrows rather
-/// than errors). Callers use this on the `None` path to fail with a
-/// readiness-specific message instead of a generic "no provider" one.
+/// entries the seat actually consulted. Reviewer file lists are excluded (an
+/// exact panel narrows rather than errors). A singleton scans the order from
+/// its pool position forward, so earlier entries belong to earlier seats and
+/// are not its failure; a reviewer ordinal draws from the whole usable list,
+/// so every failed entry shrank it. Callers use this on the `None` path to
+/// fail with a readiness-specific message instead of a generic "no provider" one.
 pub fn health_skips_for_seat(
     role: SlotRole,
+    order_idx: usize,
     pool: &[String],
     pool_origin: PoolOrigin,
     cfg: &Config,
@@ -211,7 +230,12 @@ pub fn health_skips_for_seat(
             }
         }
     }
-    for entry in &cfg.providers.order {
+    let consulted = if role == SlotRole::Reviewer {
+        &cfg.providers.order[..]
+    } else {
+        cfg.providers.order.get(order_idx..).unwrap_or(&[])
+    };
+    for entry in consulted {
         if let Some(message) = health.check(entry).probe_message {
             skips.push((entry.clone(), message));
         }
@@ -281,7 +305,7 @@ pub fn build_implement_seats(
         }
         None => {
             let skips =
-                health_skips_for_seat(SlotRole::Implementer, pool, pool_origin, cfg, health);
+                health_skips_for_seat(SlotRole::Implementer, 0, pool, pool_origin, cfg, health);
             if let Some(err) = crate::backup::readiness_error(&skips) {
                 return Err(err);
             }
@@ -488,25 +512,16 @@ pub fn launch_fleet(
             let mut skips = Vec::new();
             for (idx, (role, prefix)) in specs.into_iter().enumerate() {
                 match crate::backup::resolve_with_backup(
-                    role,
-                    idx,
-                    idx,
-                    &pool,
-                    origin,
-                    cfg,
-                    None,
-                    &store,
-                    None,
-                    paths,
-                    dry,
-                    None,
+                    role, idx, idx, &pool, origin, cfg, None, &store, None, paths, dry, None,
                     health,
                 ) {
                     Some((raw, source)) => {
                         let id = format!("{prefix}-{}", sanitize_slot(&raw));
                         out.push(seat(role, id, raw, source, false));
                     }
-                    None => skips.extend(health_skips_for_seat(role, &pool, origin, cfg, health)),
+                    None => {
+                        skips.extend(health_skips_for_seat(role, idx, &pool, origin, cfg, health))
+                    }
                 }
             }
             if out.is_empty() {
@@ -669,7 +684,7 @@ mod tests {
             Some(("cli:agy".into(), SeatSource::ProvidersOrder))
         );
         assert_eq!(
-            resolve_order_rung(2, &cfg, &health),
+            resolve_order_rung(SlotRole::Reviewer, 2, &cfg, &health),
             None,
             "past the usable entries is None, never a wrong provider"
         );
@@ -683,11 +698,64 @@ mod tests {
         ]);
         let mut cfg = Config::default();
         cfg.roles.implementer = Some("cli:roles".into());
-        let skips =
-            health_skips_for_seat(SlotRole::Implementer, &[], PoolOrigin::Synth, &cfg, &health);
+        let skips = health_skips_for_seat(
+            SlotRole::Implementer,
+            0,
+            &[],
+            PoolOrigin::Synth,
+            &cfg,
+            &health,
+        );
         assert_eq!(skips.len(), 2);
         assert!(skips.iter().any(|(p, _)| p == "cli:roles"));
         assert!(skips.iter().any(|(p, _)| p == "cli:claude"));
+    }
+
+    #[test]
+    fn singleton_keeps_pool_position_and_falls_forward() {
+        let health = StubHealth::refuse("cli:claude", "probe failed: not logged in");
+        let cfg = Config::default();
+        assert_eq!(
+            resolve_seat(
+                SlotRole::Implementer,
+                0,
+                0,
+                &[],
+                PoolOrigin::Synth,
+                &cfg,
+                &health
+            ),
+            Some(("cli:grok".into(), SeatSource::ProvidersOrder))
+        );
+        assert_eq!(
+            resolve_order_rung(SlotRole::Implementer, 2, &cfg, &health),
+            Some(("cli:agy".into(), SeatSource::ProvidersOrder)),
+            "a later singleton is not failed by an earlier sick entry"
+        );
+        assert_eq!(
+            resolve_order_rung(SlotRole::Implementer, 3, &cfg, &health),
+            None,
+            "past the end is None, never a wrong provider"
+        );
+    }
+
+    #[test]
+    fn singleton_skips_name_only_consulted_entries() {
+        let health = StubHealth::refuse_all(&[
+            ("cli:claude", "probe failed: not logged in"),
+            ("cli:agy", "probe failed: not logged in"),
+        ]);
+        let cfg = Config::default();
+        let skips = health_skips_for_seat(
+            SlotRole::TestAuthor,
+            2,
+            &[],
+            PoolOrigin::Synth,
+            &cfg,
+            &health,
+        );
+        assert_eq!(skips.len(), 1);
+        assert!(skips.iter().any(|(p, _)| p == "cli:agy"));
     }
 
     #[test]
@@ -696,6 +764,7 @@ mod tests {
         let cfg = Config::default();
         assert!(health_skips_for_seat(
             SlotRole::Implementer,
+            0,
             &[],
             PoolOrigin::Synth,
             &cfg,

@@ -2409,9 +2409,7 @@ pub fn execute_loop(
                     available.as_ref(),
                     state.codex_profile.as_deref(),
                 );
-                if cause.engages_backup()
-                    && !slot_state.source.is_some_and(SeatSource::is_backup)
-                {
+                if cause.engages_backup() && !slot_state.source.is_some_and(SeatSource::is_backup) {
                     if let Some(backup_raw) =
                         crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
                     {
@@ -3517,7 +3515,7 @@ fn recheck_seat(
     let sub = seat.storage_key();
     // A live run trusts only pauses it can trust: manual and strong (O106). A
     // weak heuristic pause ("429" in "429 passed") written by this very dispatch
-    // must not park it or reseat it — but a weak pause written before this
+    // must not park it or reseat it, but a weak pause written before this
     // dispatch started steers the seat onto its backup, so the first dispatch
     // reads it strict while later dispatches stay trust-only. The line is the
     // dispatch start, not the run creation: one id threads plan, implement, and
@@ -3882,12 +3880,7 @@ fn try_rotate_reviewer_provider(
     }
     let eligible = |p: &String| -> bool {
         *p != cur
-            && crate::backup::is_provider_eligible(
-                p,
-                &store,
-                None,
-                state.codex_profile.as_deref(),
-            )
+            && crate::backup::is_provider_eligible(p, &store, None, state.codex_profile.as_deref())
     };
     let healthy = |p: &String| -> bool { eligible(p) && health.check(p).usable };
     let reviewer_role_source = if cfg
@@ -4259,7 +4252,7 @@ mod carried_rejection_tests {
     }
 
     fn verdict_on(verdict: &str, sha: &str) -> String {
-        format!("## Verdict\n{verdict}\n\nReviewed-Commit: {sha}\n\n## Findings\n- severity: major — x\n")
+        format!("## Verdict\n{verdict}\n\nReviewed-Commit: {sha}\n\n## Findings\n- severity: major - x\n")
     }
 
     #[test]
@@ -4296,7 +4289,7 @@ mod carried_rejection_tests {
 
     #[test]
     fn a_failure_stub_names_no_commit_so_it_carries_nothing() {
-        let s = stood_down("## Verdict\nrequest_changes\n\n## Findings\n- severity: major — x\n");
+        let s = stood_down("## Verdict\nrequest_changes\n\n## Findings\n- severity: major - x\n");
         assert!(carried_rejection(&s, Some(HEAD)).is_none());
     }
 }

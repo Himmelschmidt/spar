@@ -1906,8 +1906,9 @@ provider is not a validation failure: that still creates a run parked in `quota`
 To pre-check without launching, add `--validate-only` (any of the three commands): it runs
 the same checks, writes nothing (no run dir, no brief intake, no `--reload-config`
 snapshot) and exits 0 with `{"ok": true, "run_id": null, "kind": "validation", "fleet": [...],
-"gates": {...}}`. It does not rank `--select` (that needs the bench cache) or probe PATH and
-quota. Usage errors on any command exit 1, not clap's default 2.
+"gates": {...}}`. It does not rank `--select` (that needs the bench cache) or re-probe
+quota pauses; readiness probes run for real, so the fleet below is the panel launch
+would seat. Usage errors on any command exit 1, not clap's default 2.
 
 The `--validate-only` JSON also says what the launch would do (O147), so a front end can show
 it before anyone confirms:
@@ -1916,9 +1917,11 @@ it before anyone confirms:
   projected}`), resolved by the same functions the launch uses: plan-phase seats plus the
   projected implement panel for `plan`, the implement panel for `implement -t` and
   `--workflow loop`, the reviewers for `--workflow review`, and the run's own seats for
-  `implement --run <id>` and `plan --run <id>`. Availability, quota pauses and backups are
-  not applied, so a paused primary shows as itself. `null` with `--select` and for arena,
-  peer and roles.
+  `implement --run <id>` and `plan --run <id>`. Quota pauses are not re-probed, so a
+  paused primary with no backup shows as itself. Readiness is probed for real: an
+  unhealthy seat shows the fallback launch would take, and a panel with nothing
+  healthy fails with the same readiness error launch would print. `null` with
+  `--select` and for arena, peer and roles.
 - `gates`: `autonomy` plus `auto_plan`, `auto_winner`, `auto_ship`, true when the config
   (`autonomy`, `[gates]`, `[ship].auto_confirm`) would pass that gate without the operator.
 - `implement --run <id> --validate-only` also refuses, as data, a run that is not resumable

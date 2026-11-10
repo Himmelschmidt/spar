@@ -263,21 +263,20 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> anyhow::Result<Vec<PlanSea
     let has_backup = cfg.backups.planner.is_some()
         || cfg.backups.plan_critic.is_some()
         || cfg.backups.test_author.is_some();
-    let available: Option<std::collections::HashSet<String>> =
-        if state.dry_run || !has_backup {
+    let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
+        None
+    } else {
+        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+            .into_iter()
+            .filter(|r| r.is_available())
+            .map(|r| format!("cli:{}", r.name))
+            .collect();
+        if detected.is_empty() {
             None
         } else {
-            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                .into_iter()
-                .filter(|r| r.is_available())
-                .map(|r| format!("cli:{}", r.name))
-                .collect();
-            if detected.is_empty() {
-                None
-            } else {
-                Some(detected)
-            }
-        };
+            Some(detected)
+        }
+    };
     let mut out = Vec::with_capacity(specs.len());
     let mut skips: Vec<(String, String)> = Vec::new();
     for (idx, (role, prefix, template)) in specs.into_iter().enumerate() {
@@ -315,6 +314,7 @@ fn plan_slot_specs(state: &RunState, cfg: &Config) -> anyhow::Result<Vec<PlanSea
         }) else {
             skips.extend(crate::workflow::roles_resolve::health_skips_for_seat(
                 role,
+                idx,
                 &state.providers,
                 state.pool_origin,
                 cfg,
@@ -374,22 +374,22 @@ pub fn execute_plan(
             let has_backup_global = cfg.backups.planner.is_some()
                 || cfg.backups.plan_critic.is_some()
                 || cfg.backups.test_author.is_some();
-            let available: Option<std::collections::HashSet<String>> =
-                if state.dry_run || !has_backup_global {
+            let available: Option<std::collections::HashSet<String>> = if state.dry_run
+                || !has_backup_global
+            {
+                None
+            } else {
+                let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                    .into_iter()
+                    .filter(|r| r.is_available())
+                    .map(|r| format!("cli:{}", r.name))
+                    .collect();
+                if detected.is_empty() {
                     None
                 } else {
-                    let detected: std::collections::HashSet<String> =
-                        crate::providers::detect_all()
-                            .into_iter()
-                            .filter(|r| r.is_available())
-                            .map(|r| format!("cli:{}", r.name))
-                            .collect();
-                    if detected.is_empty() {
-                        None
-                    } else {
-                        Some(detected)
-                    }
-                };
+                    Some(detected)
+                }
+            };
             let mut handled_via_backup = false;
             if let Some(slot_state) = slot_state {
                 let cause = crate::backup::dispatch_stop_cause(
@@ -398,9 +398,7 @@ pub fn execute_plan(
                     available.as_ref(),
                     state.codex_profile.as_deref(),
                 );
-                if cause.engages_backup()
-                    && !slot_state.source.is_some_and(SeatSource::is_backup)
-                {
+                if cause.engages_backup() && !slot_state.source.is_some_and(SeatSource::is_backup) {
                     if let Some(raw) = crate::backup::backup_for_role(job.role, 0, cfg) {
                         if let Some(source) = crate::backup::takeover(
                             &raw,
@@ -643,21 +641,20 @@ fn resolve_test_author(
         });
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     let has_backup = cfg.backups.test_author.is_some();
-    let available: Option<std::collections::HashSet<String>> =
-        if state.dry_run || !has_backup {
+    let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
+        None
+    } else {
+        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+            .into_iter()
+            .filter(|r| r.is_available())
+            .map(|r| format!("cli:{}", r.name))
+            .collect();
+        if detected.is_empty() {
             None
         } else {
-            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                .into_iter()
-                .filter(|r| r.is_available())
-                .map(|r| format!("cli:{}", r.name))
-                .collect();
-            if detected.is_empty() {
-                None
-            } else {
-                Some(detected)
-            }
-        };
+            Some(detected)
+        }
+    };
     let seat_ref =
         crate::provider_ref::ProviderRef::for_seat(&provider, model.as_deref()).display();
     if !crate::backup::is_provider_eligible(
@@ -768,22 +765,20 @@ fn run_test_author(
         let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
         let health = providers::LiveHealth::for_dry(state.dry_run);
         let has_backup = cfg.backups.test_author.is_some();
-        let available: Option<std::collections::HashSet<String>> =
-            if state.dry_run || !has_backup {
+        let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
+            None
+        } else {
+            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                .into_iter()
+                .filter(|r| r.is_available())
+                .map(|r| format!("cli:{}", r.name))
+                .collect();
+            if detected.is_empty() {
                 None
             } else {
-                let detected: std::collections::HashSet<String> =
-                    crate::providers::detect_all()
-                        .into_iter()
-                        .filter(|r| r.is_available())
-                        .map(|r| format!("cli:{}", r.name))
-                        .collect();
-                if detected.is_empty() {
-                    None
-                } else {
-                    Some(detected)
-                }
-            };
+                Some(detected)
+            }
+        };
         let mut handled = false;
         if let Some(slot_state) = slot_state {
             let cause = crate::backup::dispatch_stop_cause(
