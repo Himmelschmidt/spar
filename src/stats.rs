@@ -467,7 +467,7 @@ pub fn report(
                 quota_row(
                     &mut quota,
                     crate::provider_ref::ProviderRef::for_seat(&r.provider, r.model.as_deref())
-                        .quota_key(None),
+                        .quota_key(run.row.recorded_route()),
                 )
                 .backup_engagements += 1;
             }
@@ -481,7 +481,7 @@ pub fn report(
                 .filter(|r| r.parked_run)
                 .map(|r| {
                     crate::provider_ref::ProviderRef::for_seat(&r.provider, r.model.as_deref())
-                        .quota_key(None)
+                        .quota_key(run.row.recorded_route())
                 })
                 .collect();
             hit.sort();
@@ -896,7 +896,7 @@ mod tests {
     fn groups_by_provider_without_mixing_context_semantics() {
         // Park attribution resolves the null-model history role through the
         // profile route, which is process env shared with every test thread.
-        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
+        let _pin = crate::providers::codex::pin_codex_env();
         std::env::remove_var("SPAR_CODEX_PROFILE");
         let tmp = fixture();
         let now = DateTime::parse_from_rfc3339("2026-10-30T00:00:00Z")
