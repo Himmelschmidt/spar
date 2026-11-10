@@ -335,20 +335,11 @@ fn open_findings(state: &RunState) -> Vec<OpenFinding> {
         &crate::workflow::review_result::findings_cwd(state),
     );
     open.into_iter()
-        .map(|f| {
-            let round = state
-                .review_history
-                .iter()
-                .filter(|e| e.slot_id == f.slot_id)
-                .map(|e| e.round)
-                .max()
-                .unwrap_or_default();
-            OpenFinding {
-                slot_id: f.slot_id,
-                round,
-                reviewed_commit: f.reviewed_commit,
-                finding: f.finding,
-            }
+        .map(|f| OpenFinding {
+            slot_id: f.slot_id,
+            round: f.round,
+            reviewed_commit: f.reviewed_commit,
+            finding: f.finding,
         })
         .collect()
 }

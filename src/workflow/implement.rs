@@ -607,29 +607,41 @@ fn repoint_existing_seats(state: &mut RunState, cfg: &Config) -> Result<()> {
         if slot.source == Some(SeatSource::Reassigned) {
             continue;
         }
-        // **Model only.** A reviewer seat's id is `review-{r}-{sanitized provider}`
-        // (`roles_resolve::build_implement_seats`), so the id *encodes* the provider:
-        // a matching id already means a matching provider, and writing
-        // `seat.provider` over it can only ever make the id contradict its own
-        // contents. The first cut of this did write it, and on a run whose reviewer
-        // pins were re-stated it put `cli:claude` behind the seat named
-        // `review-1-cli-codex` — silently collapsing a deliberate two-vendor panel to
-        // one vendor (the exact thing feature 011 exists to keep exact) and then
-        // blaming codex in the rate-limit error when claude's limit was the one hit.
-        //
-        // A genuinely *different* provider therefore resolves to a seat id that does
-        // not exist yet, falls through the `find` above, and is left to the seat
-        // machinery rather than smuggled in here. Changing who fills a seat is a
-        // different operation from changing which model they use, and only the
-        // second one is safe to do to a slot that already carries a worktree, a
-        // branch and a round history.
-        // Enforced, not asserted: a seat id that names one provider while the slot
-        // carries another is how a two-vendor panel becomes one vendor without
-        // anybody being told, and how a rate-limit error ends up blaming the wrong
-        // provider. If this ever does not hold, the seat machinery and the id
-        // formula have diverged, and refusing is the only safe answer — writing
-        // either field would bake the disagreement in.
+        // A seat serving its engaged backup is not governed by the config either:
+        // the failover picked the provider deliberately, and the resolved seat
+        // names the primary, so re-pointing would undo the failover.
+        if slot.source == Some(SeatSource::Backup) {
+            continue;
+        }
         if slot.provider != seat.provider {
+            // The implementer's id is `impl`: it names no provider, so a provider
+            // change re-points the seat instead of refusing. A reviewer seat's id
+            // is `review-{r}-{sanitized provider}`
+            // (`roles_resolve::build_implement_seats`), so the id *encodes* the
+            // provider: a matching id already means a matching provider, and
+            // writing `seat.provider` over it can only ever make the id contradict
+            // its own contents. The first cut of this did write it, and on a run
+            // whose reviewer pins were re-stated it put `cli:claude` behind the
+            // seat named `review-1-cli-codex`, silently collapsing a deliberate
+            // two-vendor panel to one vendor (the exact thing feature 011 exists
+            // to keep exact) and then blaming codex in the rate-limit error when
+            // claude's limit was the one hit.
+            //
+            // A genuinely *different* reviewer provider therefore resolves to a
+            // seat id that does not exist yet, falls through the `find` above, and
+            // is left to the seat machinery rather than smuggled in here.
+            // Enforced, not asserted: a reviewer seat id that names one provider
+            // while the slot carries another is how a two-vendor panel becomes one
+            // vendor without anybody being told, and how a rate-limit error ends up
+            // blaming the wrong provider. If this ever does not hold, the seat
+            // machinery and the id formula have diverged, and refusing is the only
+            // safe answer: writing either field would bake the disagreement in.
+            if seat.role == SlotRole::Implementer {
+                slot.provider = seat.provider.clone();
+                slot.model = seat.model.clone();
+                slot.source = Some(seat.source);
+                continue;
+            }
             bail!(
                 "seat `{}` resolves to {} but the run carries {}; the seat id encodes \
                  its provider, so these cannot both be right. Refusing to re-point it \
@@ -1772,6 +1784,35 @@ mod suite_reap_tests {
             Some("muse-spark-1.3"),
             "a live dispatch keeps the provider that spawned it"
         );
+    }
+
+    /// The implementer's seat id names no provider, so a provider change on amend
+    /// re-points the seat instead of refusing after the amend is already saved.
+    #[test]
+    fn an_implementer_provider_change_repoints_instead_of_refusing() {
+        let mut st = run_with_impl("cli:claude", "opus", SlotStatus::Pending);
+        let cfg = cfg_with_implementer("cli:grok");
+
+        repoint_existing_seats(&mut st, &cfg).unwrap();
+
+        let impl_slot = st.slots.iter().find(|s| s.id == "impl").unwrap();
+        assert_eq!(impl_slot.provider.as_str(), "cli:grok");
+    }
+
+    /// A seat on its engaged backup keeps the failover provider: the config names
+    /// the primary, so re-pointing would undo the failover and then refuse, since
+    /// the backup provider disagrees with the resolved seat.
+    #[test]
+    fn a_backup_served_seat_is_never_repointed() {
+        let mut st = run_with_impl("cli:grok", "grok-model", SlotStatus::Pending);
+        st.slots[0].source = Some(SeatSource::Backup);
+        st.providers = vec!["cli:claude".into(), "cli:grok".into()];
+        let cfg = cfg_with_implementer("cli:claude");
+
+        repoint_existing_seats(&mut st, &cfg).unwrap();
+
+        let impl_slot = st.slots.iter().find(|s| s.id == "impl").unwrap();
+        assert_eq!(impl_slot.provider.as_str(), "cli:grok");
     }
 
     /// The cap must reserve what is about to run.
@@ -5813,9 +5854,10 @@ fn scoped_review_section(state: &RunState, cfg: &Config, review_cwd: &Path) -> S
         return String::new();
     }
     // A critical filed under Follow-up blocked its round, so it is re-judged too.
-    let prior: Vec<_> = review_result::panel_findings(&panel)
+    let prior: Vec<(&str, &review_result::Finding)> = review_result::panel_findings(&panel)
         .into_iter()
         .filter(|(_, f)| !f.follow_up || f.severity == review_result::Severity::Critical)
+        .map(|(e, f)| (e.slot_id.as_str(), f))
         .collect();
     let stat = commit
         .as_deref()

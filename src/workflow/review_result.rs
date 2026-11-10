@@ -708,10 +708,12 @@ pub fn panel_before(
 
 /// A panel's reviewer findings with duplicates across reviewers folded: same severity,
 /// location and whitespace-normalized text, the way history counts them (O102).
-/// Synthetic findings are spar's, not a reviewer's, and are left out.
+/// Synthetic findings are spar's, not a reviewer's, and are left out. Each finding
+/// rides with the entry that wrote it, never a bare slot id: renumbering reuses ids
+/// across seats, so a writer id alone cannot say which entry judged the finding.
 pub fn panel_findings<'a>(
     panel: &[&'a crate::state::ReviewHistoryEntry],
-) -> Vec<(&'a str, &'a Finding)> {
+) -> Vec<(&'a crate::state::ReviewHistoryEntry, &'a Finding)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for e in panel {
@@ -723,7 +725,7 @@ pub fn panel_findings<'a>(
                 .join(" ")
                 .to_lowercase();
             if seen.insert((f.severity, f.file.clone(), f.line, f.follow_up, text)) {
-                out.push((e.slot_id.as_str(), f));
+                out.push((*e, f));
             }
         }
     }
@@ -778,6 +780,11 @@ pub fn finding_line(slot_id: &str, f: &Finding) -> String {
 #[derive(Debug, Clone, Serialize)]
 pub struct OpenFinding {
     pub slot_id: String,
+    /// The round of the entry that wrote the finding. In-process only: renumbering
+    /// reuses writer ids across seats, so the round rides along instead of being
+    /// re-derived from history by id string.
+    #[serde(skip_serializing)]
+    pub round: u32,
     /// The commit the finding's reviewer judged.
     pub reviewed_commit: Option<String>,
     #[serde(flatten)]
@@ -828,11 +835,8 @@ pub fn open_findings(state: &RunState, cwd: &std::path::Path) -> Vec<OpenFinding
         std::collections::HashMap::new();
     panel_findings(&panel)
         .into_iter()
-        .map(|(slot, f)| {
-            let reviewed_commit = panel
-                .iter()
-                .find(|e| e.slot_id == slot)
-                .and_then(|e| e.review.reviewed_commit.clone());
+        .map(|(entry, f)| {
+            let reviewed_commit = entry.review.reviewed_commit.clone();
             let touched_since = match (&reviewed_commit, &f.file) {
                 (Some(sha), Some(file)) => cache
                     .entry((sha.clone(), file.clone()))
@@ -841,7 +845,8 @@ pub fn open_findings(state: &RunState, cwd: &std::path::Path) -> Vec<OpenFinding
                 _ => None,
             };
             OpenFinding {
-                slot_id: slot.to_string(),
+                slot_id: entry.slot_id.clone(),
+                round: entry.round,
                 reviewed_commit,
                 finding: f.clone(),
                 possibly_addressed: touched_since.as_ref().is_some_and(|c| !c.is_empty()),
@@ -897,9 +902,18 @@ pub fn record_review(state: &mut RunState, paths: &SparPaths, slot_id: &str, res
     let provider = slot.provider.clone();
     let model = slot.model.clone();
     let key = slot.seat_key().to_string();
-    state
-        .review_history
-        .retain(|e| !(e.round == round && e.slot_id == slot_id));
+    // Keyed by seat, not by id string: renumbering reuses ids across seats, so a
+    // same-round entry under this id can be another seat's. Legacy entries carry
+    // no key and keep the old id match.
+    state.review_history.retain(|e| {
+        if e.round != round {
+            return true;
+        }
+        match &e.seat_key {
+            Some(k) => k != &key,
+            None => e.slot_id != slot_id,
+        }
+    });
     state.review_history.push(crate::state::ReviewHistoryEntry {
         round,
         slot_id: slot_id.to_string(),
@@ -2176,13 +2190,150 @@ The loop at src/resolver.rs:88 never stops.\n\
         assert_eq!(latest.len(), 2);
         let f = panel_findings(&latest);
         assert_eq!(f.len(), 2, "{f:?}");
-        assert_eq!(f[0].0, "r1");
+        assert_eq!(f[0].0.slot_id.as_str(), "r1");
         assert_eq!(panel_before(&history, 3)[0].round, 2);
         assert!(panel_before(&history, 2).is_empty());
         assert_eq!(
-            finding_line(f[0].0, f[0].1),
+            finding_line(&f[0].0.slot_id, f[0].1),
             "- major `src/a.rs:1` (r1): Same   thing at src/a.rs:1"
         );
+    }
+
+    fn keyed_entry(
+        round: u32,
+        slot_id: &str,
+        seat_key: &str,
+        commit: &str,
+        finding: &str,
+    ) -> crate::state::ReviewHistoryEntry {
+        crate::state::ReviewHistoryEntry {
+            round,
+            slot_id: slot_id.into(),
+            seat_key: Some(seat_key.into()),
+            review: ReviewResult {
+                verdict: Some(Verdict::RequestChanges),
+                reviewed_commit: Some(commit.into()),
+                findings: vec![Finding {
+                    severity: Severity::Major,
+                    file: None,
+                    line: None,
+                    text: finding.into(),
+                    synthetic: false,
+                    follow_up: false,
+                }],
+                ..Default::default()
+            },
+        }
+    }
+
+    fn reviewer_slot(id: &str, former_ids: &[&str]) -> crate::state::SlotState {
+        let mut slot =
+            crate::executor::init_slot(id, "cli:codex", crate::state::SlotRole::Reviewer);
+        slot.former_ids = former_ids.iter().map(ToString::to_string).collect();
+        slot
+    }
+
+    /// After a drop renumbers a survivor onto another seat's former id, both
+    /// seats' entries share one writer id. Each finding still carries its own
+    /// entry's commit: the lookup by id string gave both the older entry's.
+    #[test]
+    fn open_findings_attribute_shared_writer_ids_to_their_own_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = crate::state::RunState::new(
+            "r-reuse",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        // B stood down in round 2; C was renumbered onto B's round-1 id and
+        // judged a new commit there.
+        state
+            .slots
+            .push(reviewer_slot("review-0-cli-codex", &["review-1-cli-codex"]));
+        state
+            .slots
+            .push(reviewer_slot("review-1-cli-codex", &["review-2-cli-codex"]));
+        state.review_history = vec![
+            keyed_entry(
+                1,
+                "review-1-cli-codex",
+                "review-1-cli-codex",
+                "aaaa",
+                "B finding",
+            ),
+            keyed_entry(
+                2,
+                "review-1-cli-codex",
+                "review-2-cli-codex",
+                "bbbb",
+                "C finding",
+            ),
+        ];
+        assert_ne!(
+            state.slots[0].seat_key(),
+            state.slots[1].seat_key(),
+            "panel seats mint distinct first ids, so derived keys never collide"
+        );
+
+        let open = open_findings(&state, tmp.path());
+        assert_eq!(open.len(), 2, "{open:?}");
+        for f in &open {
+            if f.finding.text.contains('B') {
+                assert_eq!(f.reviewed_commit.as_deref(), Some("aaaa"), "{f:?}");
+                assert_eq!(f.round, 1, "{f:?}");
+            } else {
+                assert_eq!(f.reviewed_commit.as_deref(), Some("bbbb"), "{f:?}");
+                assert_eq!(f.round, 2, "{f:?}");
+            }
+            assert_eq!(f.slot_id.as_str(), "review-1-cli-codex", "{f:?}");
+        }
+    }
+
+    /// A same-round re-review replaces only its own seat's entry. Without the
+    /// seat-key match, renumbering onto another seat's id deleted that seat's
+    /// same-round entry by id string.
+    #[test]
+    fn record_review_replaces_only_its_own_seats_same_round_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = crate::state::RunState::new(
+            "r-rereview",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        // B was renumbered onto review-0; C judged round 1 from review-0 first.
+        state.slots.push(reviewer_slot("review-0", &["review-9"]));
+        state.slots.push(reviewer_slot("review-1", &[]));
+        state.review_history = vec![
+            keyed_entry(1, "review-0", "review-1", "aaaa", "C finding"),
+            keyed_entry(1, "review-9", "review-9", "aaaa", "B finding"),
+        ];
+
+        record_review(
+            &mut state,
+            &paths,
+            "review-0",
+            &parse_review(
+                "## Verdict\nrequest_changes\n\n## Findings\n- severity: major - B finding v2\n",
+            ),
+        );
+
+        let kept: Vec<(&str, &str)> = state
+            .review_history
+            .iter()
+            .map(|e| {
+                (
+                    e.slot_id.as_str(),
+                    e.seat_key.as_deref().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            vec![("review-0", "review-1"), ("review-0", "review-9")],
+            "{kept:?}"
+        );
+        let open = open_findings(&state, tmp.path());
+        assert_eq!(open.len(), 2, "{open:?}");
     }
     fn git(dir: &std::path::Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")

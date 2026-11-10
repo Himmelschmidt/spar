@@ -2795,3 +2795,58 @@ fn role_amend_repoints_existing_seats_without_reload_config() {
         state["slots"]
     );
 }
+
+/// `--role implementer=<other provider>` on an existing run re-points the live
+/// seat: the `impl` seat id names no provider, so there is nothing to contradict.
+/// Before, the amend saved the pin and then refused, leaving config and state
+/// disagreeing and every later amend on the run failing the same way.
+#[test]
+fn role_amend_with_new_implementer_provider_repoints_the_live_seat() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(tmp.path(), &["--providers", "cli:claude,cli:grok"]);
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        2,
+    );
+    run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--role",
+            "implementer=cli:grok",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let cfg = read_run_config(tmp.path(), &run_id);
+    assert_eq!(
+        cfg["roles"]["implementer"],
+        serde_json::json!("cli:grok"),
+        "the amend freezes the role pin: {:?}",
+        cfg["roles"]["implementer"]
+    );
+    let state = read_state(tmp.path(), &run_id);
+    let providers: Vec<&str> = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["role"] == "implementer")
+        .map(|s| s["provider"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        providers,
+        vec!["cli:grok"],
+        "the live seat tracks the amended pin: {:?}",
+        state["slots"]
+    );
+}
