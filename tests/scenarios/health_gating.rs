@@ -669,7 +669,8 @@ fn continued_run_reseats_an_implementer_whose_provider_went_sick() {
 
 /// Continuing a run re-checks reviewer seats through the same point as launch:
 /// a reviewer whose provider went sick between rounds is re-seated onto the
-/// healthy order entry, never redispatched.
+/// healthy order entry no sibling seat holds (the implementer keeps cli:claude),
+/// never redispatched.
 #[test]
 fn continued_run_reseats_a_reviewer_whose_provider_went_sick() {
     let (_tmp, p) = project("[providers]\norder = [\"cli:claude\", \"cli:codex\", \"cli:grok\"]\n[roles]\nimplementer = \"cli:claude\"\nreviewer = [\"cli:codex\"]\n");
@@ -746,7 +747,7 @@ fn continued_run_reseats_a_reviewer_whose_provider_went_sick() {
     let state = read_state(&p.proj, &run_id);
     assert_eq!(
         reviewers_of(&state)[0]["provider"],
-        "cli:claude",
+        "cli:grok",
         "continuation re-seats the sick reviewer: {state}"
     );
     assert_eq!(
@@ -755,7 +756,7 @@ fn continued_run_reseats_a_reviewer_whose_provider_went_sick() {
         "sick codex is never redispatched"
     );
     assert!(
-        reviewers_of(&state)[0]["id"] == "review-0-cli-claude",
+        reviewers_of(&state)[0]["id"] == "review-0-cli-grok",
         "the reviewer slot is renamed for its new provider: {state}"
     );
 }

@@ -78,21 +78,6 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     let pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
     state.pool_origin = pool_origin;
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-    let has_backup = !cfg.backups.reviewer.is_empty();
-    let available: Option<std::collections::HashSet<String>> = if dry || !has_backup {
-        None
-    } else {
-        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-            .into_iter()
-            .filter(|r| r.is_available())
-            .map(|r| format!("cli:{}", r.name))
-            .collect();
-        if detected.is_empty() {
-            None
-        } else {
-            Some(detected)
-        }
-    };
     let sources = crate::workflow::roles_resolve::resolve_seat_sources(
         SlotRole::Reviewer,
         state.providers.len(),
@@ -124,30 +109,31 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             .and_then(|p| p.model);
         let unhealthy_auto = !source.is_some_and(crate::state::SeatSource::is_explicit_pin)
             && !health.check(&provider).usable;
-        let backup_pin = if !crate::backup::is_provider_eligible(
-            &provider,
-            &store,
-            available.as_ref(),
-            state.recorded_route(),
-        ) || unhealthy_auto
-        {
-            if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Reviewer, i, cfg) {
-                if let Some(takeover) = crate::backup::takeover(
-                    &backup_raw,
-                    SlotRole::Reviewer,
-                    cfg,
-                    &store,
-                    available.as_ref(),
-                    paths,
-                    dry,
-                    state.recorded_route(),
-                    &health,
-                ) {
-                    if let Ok(bpin) = crate::provider_ref::Pin::parse(&backup_raw) {
-                        provider = bpin.display();
-                        source = Some(takeover);
-                        model = bpin.model.clone();
-                        Some(bpin)
+        let backup_pin =
+            if !crate::backup::is_provider_eligible(&provider, &store, state.recorded_route())
+                || unhealthy_auto
+            {
+                if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Reviewer, i, cfg)
+                {
+                    if let Some(takeover) = crate::backup::takeover(
+                        &backup_raw,
+                        SlotRole::Reviewer,
+                        cfg,
+                        &store,
+                        paths,
+                        dry,
+                        dry,
+                        state.recorded_route(),
+                        &health,
+                    ) {
+                        if let Ok(bpin) = crate::provider_ref::Pin::parse(&backup_raw) {
+                            provider = bpin.display();
+                            source = Some(takeover);
+                            model = bpin.model.clone();
+                            Some(bpin)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -156,10 +142,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
                 }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
         let id = if source.is_some_and(crate::state::SeatSource::is_backup) {
             if let Some(bpin) = backup_pin {
                 format!("review-{}-{}", i, sanitize_slot(&bpin.provider))
@@ -260,21 +243,6 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
 
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     let health = crate::providers::LiveHealth::for_dry(state.dry_run);
-    let has_backup = !cfg.backups.reviewer.is_empty();
-    let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
-        None
-    } else {
-        let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-            .into_iter()
-            .filter(|r| r.is_available())
-            .map(|r| format!("cli:{}", r.name))
-            .collect();
-        if detected.is_empty() {
-            None
-        } else {
-            Some(detected)
-        }
-    };
     for (idx, job) in jobs.iter().enumerate() {
         let slot_state = match state.slots.iter().find(|s| s.id == job.slot_id).cloned() {
             Some(s) => s,
@@ -286,8 +254,8 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         let cause = crate::backup::dispatch_stop_cause(
             &slot_state,
             &store,
-            available.as_ref(),
             state.recorded_route(),
+            providers::is_provider_present(&slot_state.provider, state.dry_run),
         );
         if !cause.engages_backup()
             || slot_state
@@ -305,8 +273,8 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             SlotRole::Reviewer,
             cfg,
             &store,
-            available.as_ref(),
             paths,
+            state.dry_run,
             state.dry_run,
             state.recorded_route(),
             &health,

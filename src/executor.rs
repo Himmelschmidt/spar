@@ -7766,13 +7766,11 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(crate::backup::is_provider_eligible(
             "cli:agy@flash",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         assert!(crate::backup::is_provider_eligible(
             "cli:agy@pro",
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
     }
@@ -7832,7 +7830,6 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(!crate::backup::is_provider_eligible(
             &slot.provider_ref().display(),
             &store,
-            None,
             crate::providers::RecordedRoute::ambient()
         ));
         let plan_job = SlotJob {

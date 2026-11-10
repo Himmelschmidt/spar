@@ -175,7 +175,9 @@ pub fn resolve_seat(
 /// The `[providers].order` last-resort rung on its own. Reviewers keep their
 /// ordinal: the order filtered to usable entries first, then indexed, so a
 /// probe-failed entry never annexes a seat and surviving reviewers never
-/// collapse onto one provider. A singleton consults the usable entries from
+/// collapse onto one provider. A held ordinal entry falls forward to the
+/// first unheld usable entry, so a re-seated reviewer never lands on a
+/// sibling's provider. A singleton consults the usable entries from
 /// its pool position forward and takes the first one no earlier seat holds,
 /// so parallel singletons spread across the order instead of collapsing onto
 /// one provider; when every usable entry already seats an earlier singleton
@@ -190,14 +192,25 @@ pub fn resolve_order_rung(
     used: &[String],
 ) -> Option<(String, SeatSource)> {
     if role == SlotRole::Reviewer {
-        return cfg
+        let usable: Vec<&String> = cfg
             .providers
             .order
             .iter()
             .filter(|p| health.check(p).usable)
-            .nth(order_idx)
-            .cloned()
-            .map(|p| (p, SeatSource::ProvidersOrder));
+            .collect();
+        // Past the usable entries the seat is `None`: falling back to the
+        // first unheld entry here would wrap the ordinal around the order.
+        // The fallback runs only when the indexed entry exists but is held.
+        return match usable.get(order_idx).copied() {
+            None => None,
+            Some(p) if !seated(used, p) => Some((p.clone(), SeatSource::ProvidersOrder)),
+            Some(_) => usable
+                .iter()
+                .copied()
+                .find(|p| !seated(used, p))
+                .cloned()
+                .map(|p| (p, SeatSource::ProvidersOrder)),
+        };
     }
     let usable_from_here = cfg
         .providers
@@ -296,6 +309,8 @@ pub fn build_implement_seats(
     store: &crate::quota::QuotaStore,
     paths: &crate::paths::SparPaths,
     dry: bool,
+    presence_dry: bool,
+    route: crate::providers::RecordedRoute<'_>,
     model_for: &dyn Fn(usize) -> Option<String>,
 ) -> anyhow::Result<Vec<FleetSeat>> {
     let mut out = Vec::new();
@@ -310,10 +325,10 @@ pub fn build_implement_seats(
         cfg,
         model.as_deref(),
         store,
-        None,
         paths,
         dry,
-        crate::providers::RecordedRoute::ambient(),
+        presence_dry,
+        route,
         health,
         &used,
     ) {
@@ -341,6 +356,9 @@ pub fn build_implement_seats(
     for r in 0..panel_size(cfg) {
         let pool_index = r + 1;
         let model = model_for(pool_index);
+        // Launch reviewers seat by plain ordinal into the usable order (O173):
+        // they may share the implementer's provider. The held set only applies
+        // on the continue re-seat path, which passes the siblings' providers.
         let Some((raw, source)) = crate::backup::resolve_with_backup(
             SlotRole::Reviewer,
             pool_index,
@@ -350,12 +368,12 @@ pub fn build_implement_seats(
             cfg,
             model.as_deref(),
             store,
-            None,
             paths,
             dry,
-            crate::providers::RecordedRoute::ambient(),
+            presence_dry,
+            route,
             health,
-            &used,
+            &[],
         ) else {
             continue;
         };
@@ -430,6 +448,7 @@ pub fn project_implement_fleet(
     paths: &crate::paths::SparPaths,
     dry: bool,
     pool_dry: bool,
+    route: crate::providers::RecordedRoute<'_>,
     run_id: Option<&str>,
 ) -> anyhow::Result<Vec<FleetSeat>> {
     let width = pool_width(cfg);
@@ -459,6 +478,8 @@ pub fn project_implement_fleet(
         store,
         paths,
         dry,
+        pool_dry,
+        route,
         &model_for,
     )
 }
@@ -512,6 +533,8 @@ pub fn launch_fleet(
         }
     };
     let implement_panel = |pool: &[String], projected: bool| -> anyhow::Result<Vec<FleetSeat>> {
+        // A fresh launch has no run to record a route yet: the ambient
+        // environment is the route the launch would stamp.
         let mut out = project_implement_fleet(
             cfg,
             pool,
@@ -521,6 +544,7 @@ pub fn launch_fleet(
             paths,
             dry,
             opts.dry_run,
+            crate::providers::RecordedRoute::ambient(),
             None,
         )?;
         let used: Vec<String> = out.iter().map(|s| s.provider.clone()).collect();
@@ -571,9 +595,9 @@ pub fn launch_fleet(
                     cfg,
                     None,
                     &store,
-                    None,
                     paths,
                     dry,
+                    opts.dry_run,
                     crate::providers::RecordedRoute::ambient(),
                     health,
                     &used,
@@ -948,5 +972,119 @@ mod tests {
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:codex".into()];
         assert!(reviewer_panel_has_pins(&cfg));
+    }
+
+    #[test]
+    fn reviewer_rung_skips_a_held_ordinal_entry() {
+        let health = StubHealth::allow_all();
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["cli:a".into(), "cli:b".into(), "cli:c".into()];
+        assert_eq!(
+            resolve_order_rung(SlotRole::Reviewer, 1, &cfg, &health, &[]),
+            Some(("cli:b".to_string(), SeatSource::ProvidersOrder)),
+            "nothing held: ordinal indexing is unchanged"
+        );
+        assert_eq!(
+            resolve_order_rung(SlotRole::Reviewer, 0, &cfg, &health, &["cli:a".to_string()]),
+            Some(("cli:b".to_string(), SeatSource::ProvidersOrder)),
+            "a held ordinal entry falls forward instead of double-seating"
+        );
+        assert_eq!(
+            resolve_order_rung(
+                SlotRole::Reviewer,
+                0,
+                &cfg,
+                &health,
+                &[
+                    "cli:a".to_string(),
+                    "cli:b".to_string(),
+                    "cli:c".to_string()
+                ]
+            ),
+            None,
+            "no unheld usable entry narrows the panel, never double-seats"
+        );
+    }
+
+    #[test]
+    fn implement_seats_key_quota_against_the_recorded_route() {
+        // Bare `cli:codex` bills OpenRouter under the recorded `muse` profile
+        // but native under an empty ambient one: pausing the recorded bucket
+        // must yield the implementer to its backup, while ambient keeps it.
+        let _pin = crate::providers::codex::pin_codex_env();
+        std::env::set_var("SPAR_CODEX_PROFILE", "");
+        let health = StubHealth::allow_all();
+        let mut cfg = Config::default();
+        cfg.roles.implementer = Some("cli:codex".into());
+        cfg.backups.implementer = Some("cli:claude".into());
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:codex@openrouter", "test");
+        let mut state = crate::state::RunState::new(
+            "route-test",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.codex_profile = Some("muse".into());
+        let seats = |route: crate::providers::RecordedRoute<'_>| {
+            build_implement_seats(
+                &cfg,
+                &[],
+                PoolOrigin::Synth,
+                false,
+                &health,
+                &store,
+                &paths,
+                true,
+                true,
+                route,
+                &|_| None,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            seats(state.recorded_route())[0].provider,
+            "cli:claude",
+            "the paused recorded bucket yields to the backup"
+        );
+        assert_eq!(
+            seats(crate::providers::RecordedRoute::ambient())[0].provider,
+            "cli:codex",
+            "the unpaused ambient bucket keeps the primary"
+        );
+    }
+
+    #[test]
+    fn launch_reviewers_seat_plain_ordinal_alongside_the_implementer() {
+        // Launch reviewers take no held set (O173): the first reviewer shares
+        // the implementer's provider instead of sliding to the next usable
+        // one. The held-set skip applies only on the continue re-seat path.
+        let health = StubHealth::allow_all();
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["cli:a".into(), "cli:b".into(), "cli:c".into()];
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let store = crate::quota::QuotaStore::default();
+        let seats = build_implement_seats(
+            &cfg,
+            &[],
+            PoolOrigin::Synth,
+            false,
+            &health,
+            &store,
+            &paths,
+            true,
+            true,
+            crate::providers::RecordedRoute::ambient(),
+            &|_| None,
+        )
+        .unwrap();
+        let providers: Vec<&str> = seats.iter().map(|s| s.provider.as_str()).collect();
+        assert_eq!(
+            providers,
+            vec!["cli:a", "cli:a", "cli:b"],
+            "review-0 shares the implementer's provider by ordinal"
+        );
     }
 }

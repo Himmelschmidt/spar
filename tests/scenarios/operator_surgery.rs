@@ -68,7 +68,7 @@ impl Fixture {
     /// A fake CLI that answers `--version` and otherwise counts the dispatch in
     /// `$FAKE_COUNT_DIR/<name>.count` before running `body`. Readiness probes
     /// (`auth`/`login`) run `body` uncounted: a probe is not a dispatch, and
-    /// counting it breaks dispatch-count assertions now that selection probes.
+    /// counting one breaks dispatch-count assertions.
     fn cli(&self, name: &str, body: &str) {
         let p = self.bin.join(name);
         fs::write(
