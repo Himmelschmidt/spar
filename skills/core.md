@@ -73,7 +73,7 @@ failed, with the probe's own one-line message, e.g. pi with no OpenRouter key),
 300 chars) when unhealthy. `doctor` exits failure only when no usable provider remains,
 so one unhealthy provider alongside working ones does not block a run. `available`
 (binary resolves) is display-only; auto-selection reads `usable()` (available and not
-`unhealthy`) instead, so the wrong check cannot be written at a selection site. Probes wired:
+`unhealthy`) instead. Probes wired:
 `cli:pi` runs `pi auth check --provider openrouter --json --no-refresh` (or `--model
 <SPAR_PI_MODEL routed>` when that is set; detection is per adapter, so it cannot see a
 slot's own `@model`), which catches a missing key, not a dead one; (O107) `cli:claude` runs `claude auth status` with nonessential traffic off (logged out) and
@@ -86,7 +86,8 @@ fault. An `unhealthy` provider is skipped by auto-selection and backup rotation
 it, or a `--role` seat) still dispatches, with a launch warning carried on the
 run as `warnings` (stderr and `--json`); a dispatched `--backup` records source
 `cli-backup`. A `[backups]`-file entry stays a fallback and is skipped while
-unhealthy.
+unhealthy. Launch resolves readiness once per pinned provider, so a hung
+login can delay that launch up to the readiness timeout before dispatch.
 
 **A reviewer that cannot run is not a verdict (O103).** In the implement loop, a
 reviewer dispatch that fails because the provider could not serve it (rate limit, auth

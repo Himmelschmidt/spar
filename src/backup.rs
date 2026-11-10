@@ -89,12 +89,6 @@ pub fn scrape_auth_signal(text: &str) -> Option<String> {
         .map(|l| l.trim().chars().take(300).collect())
 }
 
-/// Quota-aware: also ineligible when the provider's fleet key sits under a pause
-/// record (O106) or when the availability set (when provided) excludes it.
-/// The set is built from `ProviderReport::usable`, so probe-failed providers
-/// are excluded upstream; a `None` set means dry-run or no detection and
-/// checks quota only. Readiness itself is gated in `backup_eligible` and
-/// `resolve_with_backup`, which know whether probing is allowed.
 /// Whether a seat may stay on its provider: explicit CLI pins dispatch despite
 /// probe-failed readiness (they warn at launch instead), so only a quota or
 /// manual pause benches them; any other seat must also sit in the usable set.
@@ -112,6 +106,12 @@ pub fn seat_eligible(
     is_provider_eligible(provider, store, available)
 }
 
+/// Quota-aware: also ineligible when the provider's fleet key sits under a pause
+/// record (O106) or when the availability set (when provided) excludes it.
+/// The set is built from `ProviderReport::usable`, so probe-failed providers
+/// are excluded upstream; a `None` set means dry-run or no detection and
+/// checks quota only. Readiness itself is gated in `backup_eligible` and
+/// `resolve_with_backup`, which know whether probing is allowed.
 pub fn is_provider_eligible(
     provider: &str,
     store: &QuotaStore,
