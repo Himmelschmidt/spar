@@ -1221,35 +1221,47 @@ filter** on the drain: each unique id has its own inbox, so a slot never sees an
 run's messages, and a bare agent and a run slot can directed-message each other by id.
 
 ```bash
-spar bus send -m "hello" [--from human] [--to broadcast|agent|impl] [--run <id>]
+spar bus send -m "hello" [--from <agent>] [--to broadcast|agent|impl] [--run <id>]
               [--requires-ack] [--persist] [--supersedes <msg_id>] [--expires-after-round [N]]
 spar bus log [--run <id>] [--json]                 # each message with per-recipient receipts
 spar bus presence [--run <id>]
 spar bus inbox <agent> [--claim] [--run <id>] [--json]
-spar bus reserve path/to/file --holder <agent> [--run <id>]
-spar bus release path/to/file --holder <agent> [--run <id>]
+spar bus reserve path/to/file [--holder <agent>] [--run <id>]
+spar bus release path/to/file [--holder <agent>] [--run <id>]
 spar bus deliver <agent> [--run <id>]              # drain inbox + dispatch to the agent's channel
-spar bus ack <msg_id> --from <agent> [--run <id>]  # stop a requires_ack redelivery
+spar bus ack <msg_id> [--from <agent>] [--run <id>]  # stop a requires_ack redelivery
 ```
 
 **Send options (O135).**
 
 - `--to impl` needs `--run` and resolves to that run's implementer slot; it errors without
   `--run`, or when the run has none or several (arena), naming them.
-- `--requires-ack` redelivers on backoff until the recipient runs `spar bus ack <id>
-  --from <agent>`, then escalates to `@human`.
+- `--requires-ack` redelivers on backoff until acked
+  (inside a slot `--from`/`--run` default to `$SPAR_AGENT_ID`/`$SPAR_RUN_ID`, so a
+  bare ack records the slot, not the human), then escalates to `@human`. Any ack
+  stops the redelivery: the operator's is the escape hatch for a wedged slot.
+  Only the recipient's ack records the read, so a stranger's ack is filed and
+  shown in the log but never flips the word to `acknowledged` and never drops
+  the item from the slot's file (a withdrawal still does both).
+- Inside a slot, `--from` (send, ack) and `--holder` (reserve, release) default to
+  `$SPAR_AGENT_ID`, so a bare command from a slot is recorded as the slot. An
+  operator ack from outside the run (`--from <run>:<slot>` without `--run`) is
+  stamped with that run when the `--from` names a live one.
 - `--persist` (with `--run`, to the implementer) also puts the message at the top of the
   implementer's carry-forward on **every** dispatch, under "Operator messages", until it
   is superseded, acked by the implementer, or expired. A relaunch or a new round cannot
   drop it. Use it for rulings, not chatter: it repeats every dispatch.
-- `--supersedes <msg_id>` withdraws an earlier message **you** sent: every inbox copy not
-  yet taken is removed and its redelivery stops; a persisted one leaves the carry-forward.
-  A copy already delivered cannot be unread; `--json` reports
+- `--supersedes <msg_id>` withdraws an earlier message **you** sent: the replacement
+  sends first, then every inbox copy not yet taken is removed and its redelivery stops,
+  so a rejected replacement leaves the original filed, listed and logged; a persisted one
+  leaves the carry-forward. A copy already injected into a model's input cannot be unread,
+  but a PollFile slot's copy is taken back out of its poll file; `--json` reports
   `withdrawal: {msg_id, withdrawn_from: [...], already_delivered: [...]}`.
 - `--expires-after-round [N]` (with `--run`; `N` defaults to the round a slot is dispatching
   in, or the next round when the run waits at a gate, the first round anyone reads it in): once
   the run passes round `N` the message is never delivered. A claim withdraws it, `inbox`
-  hides it, redelivery stops, and a persisted one leaves the carry-forward.
+  hides it, the poll file drops it on its next render, redelivery stops, and a persisted
+  one leaves the carry-forward.
 
 **Receipts (O134).** `.spar/bus/receipts.jsonl` gets a line per recipient as a message
 moves: `queued` (written to the inbox), `delivered` (claimed into the agent's channel or
@@ -1268,17 +1280,44 @@ recipient acked it), `withdrawn` (superseded or expired). A poll file or codex q
 ```
 
 Each time is the earliest of its kind. `delivery` reads one word off disk per message
-(O155): `acknowledged` once a recipient's ack answers it (terminal, even with copies
-still waiting; a broadcast's send-time recipients are unknowable, so any acker counts
-there), else `delivered` once anything landed — a claimed copy on disk, or a
-`Delivered`/`Read` receipt from a prompt inclusion that left the inbox copy behind —
-else `queued` while a copy still waits in an inbox, else `withdrawn` when no copy
-waits anywhere and nothing ever landed. It is derived at read time from the inbox
-directories, the receipts and the ack events — never stored, so there is no second
-copy of the state to drift. Every inbox filing fans PollFile recipients (agy, pi)
-straight into their poll files, so the batch is there at the slot's next poll with no
-explicit `bus deliver`, whoever filed it (a send, a broadcast, an ack, a redelivery);
-dry runs skip the fan-out and leave the inbox for the turn-boundary drain.
+(O156, O157): `acknowledged` once a recipient's ack answers it (terminal, even with
+copies still waiting; a broadcast's send-time recipients are unknowable, so any acker
+counts there), else `delivered` while a claimed copy sits on disk — a withdrawal that
+arrives after the claim cannot unread a message already in the model's input — or a
+`Delivered`/`Read` receipt from a prompt inclusion that left the inbox copy behind,
+else `withdrawn` once a withdrawal postdates every landing, no copy remains, and the
+message was never read (the poll-file case: a claim records no `Read`, and the
+claimed copy is deleted on withdrawal), else `queued` while a copy still waits in
+an inbox, else `withdrawn` when no copy waits anywhere and nothing ever landed.
+For poll-file slots `withdrawn` means taken back out of the file, not never seen:
+reading the file leaves no receipt, so the slot may have read it before the withdrawal.
+A landing the model already saw — any `Read` receipt, from a prompt inclusion,
+a Stop-hook injection, an inbox claim or an ack — stays `delivered` under a
+later withdrawal. It is derived at read time from the inbox directories, the receipts and the
+ack events — never stored, so there is no second copy of the state to drift. A slot's
+poll file (agy, pi) renders its inbox, not an append-only log (O156–O161): every filing,
+withdrawal and round start rewrites it from the pending messages, so a withdrawn or
+expired message disappears from the file. A superseding send skips its own filing
+render; the withdrawal renders holders of the old message and the send path then
+renders the new message's own targets (even if the withdrawal fails), so a
+replacement addressed to a slot that never held the old one still reaches its file. Messages addressed to the slot render (never acks or system prompts), plus
+`Chat` broadcasts from humans, peer slots and the orchestrator — the default
+`--to broadcast` reaches every poll-file slot — while acks and system prompts stay in the
+inbox and the bus log but never become action items. Posting into the live poll file
+counts as `delivered`, and the drain claims only what renders, so `delivered` never
+describes a message the slot cannot see. Dry-run runs skip the fan-out (nothing live polls their
+files); the messages stay in the inbox for inspection and no poll file is
+written. A message leaves the file once the slot acks it — the ack filing re-renders
+the acker's own file at once, and the heading names the exact ack command for the
+slot — and a message that asks for no ack also leaves once the slot has finished
+a dispatch that started after the round it was filed in; a render mid-turn never
+drops what the slot may not have opened. `requires-ack` items survive until the
+slot acks them, so the file cannot grow without bound. Claiming alone never clears
+an item. Message kinds the file never renders are never filed to a poll slot's
+inbox at all (the slot reads the file, not the inbox); the workspace log still
+records them.
+`bus deliver --json` reports `delivered` as the messages actually listed in the
+poll file, which can exceed what that call just claimed.
 `receipts.jsonl` rolls to `receipts.jsonl.1` at
 8 MiB (about the last 16 MiB are kept); `bus log` streams both. `bus send --json` returns the message with
 `schema_version` (and `withdrawal` under `--supersedes`). The human `bus log` shows the
