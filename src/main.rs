@@ -1148,8 +1148,12 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             persist,
             supersedes,
             expires_after_round,
+            urgent,
         } => {
-            let needs_run = persist || expires_after_round.is_some();
+            let needs_run = persist || expires_after_round.is_some() || urgent;
+            if urgent && run.is_none() {
+                anyhow::bail!("--urgent needs --run to name the slot's run");
+            }
             if needs_run && run.is_none() {
                 anyhow::bail!("--persist and --expires-after-round need --run");
             }
@@ -1249,15 +1253,34 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                 providers::delivery::drain_poll_files(&paths, targets);
             }
             let withdrawal = withdrawal?;
+            // Past the filed message, `--urgent` stops a mid-turn slot so the
+            // orchestrator resumes the same session with this message first.
+            let urgent_outcome = if urgent {
+                Some(urgent_send(
+                    &paths,
+                    run.as_deref(),
+                    &to,
+                    &msg,
+                    run_state.as_ref(),
+                )?)
+            } else {
+                None
+            };
             if json {
                 let mut v = serde_json::to_value(&msg)?;
                 v["schema_version"] = serde_json::json!(bus::LOG_SCHEMA);
                 if let Some(w) = &withdrawal {
                     v["withdrawal"] = serde_json::to_value(w)?;
                 }
+                if let Some(u) = &urgent_outcome {
+                    v["urgent"] = serde_json::json!({"status": u.status, "detail": u.detail});
+                }
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 println!("sent {} → {} ({})", msg.from, msg.to, msg.id);
+                if let Some(u) = &urgent_outcome {
+                    println!("urgent: {}", u.detail);
+                }
                 if let Some(w) = &withdrawal {
                     println!(
                         "withdrew {} from {} inbox(es); already delivered to: {}",
@@ -1423,6 +1446,87 @@ fn implementer_id(st: &state::RunState) -> Result<String> {
             many.join(", ")
         ),
     }
+}
+
+struct UrgentSend {
+    status: &'static str,
+    detail: String,
+}
+
+fn urgent_send(
+    paths: &paths::SparPaths,
+    run: Option<&str>,
+    to: &str,
+    msg: &bus::BusMessage,
+    state: Option<&state::RunState>,
+) -> Result<UrgentSend> {
+    let interrupt = |detail: String| {
+        Ok(UrgentSend {
+            status: "interrupted",
+            detail,
+        })
+    };
+    let normal = |status: &'static str, detail: String| Ok(UrgentSend { status, detail });
+    if to == "broadcast" || to == "*" {
+        return normal(
+            "needs_single_slot",
+            "--urgent targets one slot; the message was sent normally".into(),
+        );
+    }
+    let Some(run) = run else {
+        anyhow::bail!("--urgent needs --run to name the slot's run");
+    };
+    let Some(st) = state else {
+        anyhow::bail!("--urgent needs an existing run (no state for {run})");
+    };
+    let short = to.strip_prefix(&format!("{run}:")).unwrap_or(to);
+    let Some(slot) = st.slots.iter().find(|s| s.id == short) else {
+        return normal(
+            "unknown_slot",
+            format!("no slot {short} in run {run}; the message was queued normally"),
+        );
+    };
+    if slot.status != state::SlotStatus::Running || !state::slot_process_alive(paths, run, slot) {
+        return normal(
+            "idle",
+            format!("slot {short} is not mid-turn (no live process); delivered normally"),
+        );
+    }
+    if !providers::adapter_named(&slot.provider).is_some_and(|a| a.supports_resume()) {
+        return normal(
+            "no_resume",
+            format!(
+                "urgent interrupt is not possible for provider {}; delivered normally",
+                slot.provider
+            ),
+        );
+    }
+    let Some(token) =
+        markers::read_pid(paths, run, short).filter(|t| t.starttime.is_some() && t.alive())
+    else {
+        return normal(
+            "idle",
+            format!("slot {short} is not mid-turn (no live process); delivered normally"),
+        );
+    };
+    markers::write_urgent_interrupt(
+        paths,
+        run,
+        short,
+        &markers::UrgentInterrupt {
+            msg_id: msg.id.clone(),
+            from: msg.from.clone(),
+            body: msg.body.clone(),
+            ts: chrono::Utc::now(),
+        },
+    )?;
+    // Only the turn's process group stops here; the orchestrator resumes the
+    // same session with this message first when the dispatch returns.
+    process::terminate_tree(token.pid, true);
+    interrupt(format!(
+        "stopped {}'s turn; resuming the same session with your message first",
+        short
+    ))
 }
 
 fn bus_deliver(

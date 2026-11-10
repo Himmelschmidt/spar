@@ -845,6 +845,13 @@ pub enum BusCmd {
         /// is dispatching in, else the next round). Needs `--run`
         #[arg(long, value_name = "N", num_args = 0..=1)]
         expires_after_round: Option<Option<u32>>,
+        /// Interrupt the slot's live turn: stop its process group and resume the
+        /// same session with this message first, ahead of the normal
+        /// continuation. Needs `--run` and a single slot `--to`. When the slot
+        /// is idle, or its provider cannot resume, the message is delivered
+        /// normally instead and the send says so.
+        #[arg(long)]
+        urgent: bool,
     },
     /// List bus events (all runs + bare traffic; `--run` filters to one run)
     Log {

@@ -159,6 +159,70 @@ pub fn write_session_id(
     )
 }
 
+/// One `--urgent` bus message waiting to interrupt a slot's live turn. Written by
+/// `spar bus send --urgent` before it kills the slot's process group, consumed
+/// once by the orchestrator when the killed dispatch returns: the resume
+/// prompt leads with these bodies, oldest first, ahead of the normal
+/// continuation. One file per message so concurrent urgents do not overwrite
+/// each other; the orchestrator drains and deletes them all together.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UrgentInterrupt {
+    pub msg_id: String,
+    pub from: String,
+    pub body: String,
+    pub ts: chrono::DateTime<chrono::Utc>,
+}
+
+fn urgent_name(slot_id: &str, msg_id: &str) -> String {
+    format!("{slot_id}.urgent.{msg_id}.json")
+}
+
+/// File an urgent interrupt for `slot_id`'s current turn. The sender kills the
+/// slot's process group right after, so a request is never left pointing at a
+/// turn the orchestrator already reaped: on wake it either resumes with these
+/// bodies first or, when the turn ended on its own, drops them and lets the
+/// message flow through the normal turn-boundary channels.
+pub fn write_urgent_interrupt(
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+    urgent: &UrgentInterrupt,
+) -> Result<()> {
+    let body = serde_json::to_string(urgent)?;
+    write_marker(paths, run_id, &urgent_name(slot_id, &urgent.msg_id), &body)
+}
+
+/// Drain every pending urgent interrupt for `slot_id`, oldest first, deleting
+/// each file as it is read so a later dispatch never replays it. A torn write
+/// the sender never finished renaming into place is simply not there yet.
+pub fn take_urgent_interrupts(
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+) -> Vec<UrgentInterrupt> {
+    let prefix = format!("{slot_id}.urgent.");
+    let mut out = Vec::new();
+    let Ok(dir) = std::fs::read_dir(paths.markers_dir(run_id)) else {
+        return out;
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(&prefix) || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(urgent) = serde_json::from_str::<UrgentInterrupt>(&text) else {
+            continue;
+        };
+        let _ = std::fs::remove_file(entry.path());
+        out.push(urgent);
+    }
+    out.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.msg_id.cmp(&b.msg_id)));
+    out
+}
+
 pub fn read_session_id(
     paths: &SparPaths,
     run_id: &str,
@@ -253,6 +317,31 @@ mod tests {
             read_session_id(&paths, "r1", "slot-a", "codex"),
             Some("thread-abc".to_string())
         );
+    }
+
+    #[test]
+    fn urgent_interrupts_drain_oldest_first_and_delete() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let first = UrgentInterrupt {
+            msg_id: "m1".into(),
+            from: "@human".into(),
+            body: "stop, wrong direction".into(),
+            ts: chrono::Utc::now(),
+        };
+        let second = UrgentInterrupt {
+            msg_id: "m2".into(),
+            body: "also check the logs".into(),
+            ts: first.ts + chrono::Duration::seconds(1),
+            ..first.clone()
+        };
+        write_urgent_interrupt(&paths, "r1", "slot-a", &second).unwrap();
+        write_urgent_interrupt(&paths, "r1", "slot-a", &first).unwrap();
+        let drained = take_urgent_interrupts(&paths, "r1", "slot-a");
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].msg_id, "m1");
+        assert_eq!(drained[1].msg_id, "m2");
+        assert!(take_urgent_interrupts(&paths, "r1", "slot-a").is_empty());
     }
 
     #[test]

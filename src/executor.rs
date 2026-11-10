@@ -1375,7 +1375,8 @@ fn execute_prepared(
         args,
         cwd: prep.cwd.clone(),
         log_path: prep.log_path.clone(),
-        env: dispatch_env,
+        // Cloned, not moved: an urgent interrupt re-dispatches with the same env.
+        env: dispatch_env.clone(),
         timeout,
     };
     let pid_cell = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1444,7 +1445,42 @@ fn execute_prepared(
         &tick,
         &|d| sleep_ticking(d, &tick),
     )?;
-    let pid = load_pid(&pid_cell);
+    let mut pid = load_pid(&pid_cell);
+    // An `--urgent` send kills this turn's process group and files its message;
+    // when the killed dispatch returns, resume the same session in place with
+    // the urgent bodies first. The killed attempt never becomes an outcome: no
+    // rotation, no round cost, no ceiling-kill WIP path.
+    let pending_urgent =
+        markers::take_urgent_interrupts(&prep.paths, &prep.run_id, &prep.job.slot_id);
+    let mut urgent_resumed_sid: Option<String> = None;
+    if interrupt_cause_for(&res, &pending_urgent) == Some(InterruptCause::UrgentMessage) {
+        let captured = res.stats.session_id.clone();
+        let (resumed_res, resumed_sid) = resume_urgent_turn(
+            adapter.as_ref(),
+            &bin,
+            &mut opts,
+            isolation,
+            &prep.cwd,
+            &prep.log_path,
+            &prep.prompt_path,
+            &dispatch_env,
+            timeout,
+            &prep.paths,
+            &prep.run_id,
+            &prep.job.slot_id,
+            &prep.session_provider,
+            prep.round,
+            captured,
+            &pending_urgent,
+            &sink,
+            &tick,
+            &|d| sleep_ticking(d, &tick),
+        )?;
+        res = resumed_res;
+        urgent_resumed_sid = resumed_sid;
+        pid = load_pid(&pid_cell);
+    }
+    let resume_attempt = urgent_resumed_sid.as_deref().or(resume_attempt);
     // Before the gates below, and before any state save: markers outlive an orchestrator
     // that dies between here and the save, `state.json` does not (O49).
     let mut verdict = markers::DispatchVerdict {
@@ -2320,6 +2356,174 @@ fn recovery_prompt_path(prompt_path: &Path, slot_id: &str) -> PathBuf {
         .parent()
         .unwrap_or(Path::new("."))
         .join(format!("prompt-{slot_id}-artifact.md"))
+}
+
+/// Why the orchestrator itself stopped a dispatch's turn, as opposed to the
+/// agent exiting, a failure, the slot timeout, a ceiling kill or quota. Routing
+/// on this instead of the raw signal is what keeps an `--urgent` interrupt
+/// from counting toward rotation, costing a round, or triggering the
+/// ceiling-kill WIP path: the killed attempt never becomes an outcome at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptCause {
+    UrgentMessage,
+}
+
+/// `<run_dir>/prompt-<slot>-urgent.md` — the resume prompt after an urgent
+/// interrupt, kept beside the slot's original like the recovery prompt.
+fn urgent_prompt_path(prompt_path: &Path, slot_id: &str) -> PathBuf {
+    prompt_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("prompt-{slot_id}-urgent.md"))
+}
+
+/// Sibling of [`lost_resume_log_path`]: the killed turn's log, preserved before
+/// the urgent resume truncates the slot log, so what the agent did before the
+/// interrupt stays readable.
+fn urgent_killed_log_path(log_path: &Path) -> PathBuf {
+    let stem = log_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("slot");
+    log_path.with_file_name(format!("{stem}.urgent-killed.log"))
+}
+
+/// The resume prompt after an urgent interrupt: every urgent body first, oldest
+/// first, then a note that the previous turn was stopped mid-flight with the
+/// worktree untouched, then the normal continuation.
+fn urgent_resume_prompt(urgents: &[markers::UrgentInterrupt], normal_prompt: &str) -> String {
+    let mut out = String::new();
+    for u in urgents {
+        out.push_str(&format!(
+            "[Urgent message from {}: your previous turn was stopped mid-flight so this could reach you first. Your worktree is unchanged; read this before anything else, then pick up where you left off.]\n\n{}\n\n---\n\n",
+            u.from, u.body
+        ));
+    }
+    out.push_str(normal_prompt);
+    out
+}
+
+/// Classify a returned dispatch against drained urgent interrupts. `Some` only
+/// when the turn was signal-killed while interrupts were pending: the sender
+/// kills the process group, so a signal here with a pending request is the
+/// interrupt landing. A normal exit or a ceiling timeout with pending requests
+/// is not an interrupt (the turn the request targeted is already over) and the
+/// drained requests fall through to the normal turn-boundary channels.
+fn interrupt_cause_for(
+    res: &process::SpawnResult,
+    pending: &[markers::UrgentInterrupt],
+) -> Option<InterruptCause> {
+    if pending.is_empty() || res.timed_out {
+        return None;
+    }
+    process::ended_by_signal(res.signal, res.exit_code).then_some(InterruptCause::UrgentMessage)
+}
+
+/// Re-dispatch the killed turn in place: the same session it ran in (or a cold
+/// dispatch with the urgent bodies first when the kill landed before any
+/// session existed), the urgent bodies leading the prompt ahead of the normal
+/// continuation. Returns the resume dispatch's result plus the session it ran
+/// in, if it resumed one. The killed attempt's result is discarded by the
+/// caller: it never becomes an outcome, so no rotation, no round cost, no WIP
+/// salvage. Callers refresh their pid from the spawn sink afterwards.
+#[allow(clippy::too_many_arguments)]
+fn resume_urgent_turn(
+    adapter: &dyn providers::ProviderAdapter,
+    bin: &Path,
+    opts: &mut SpawnOpts,
+    isolation: IsolationMode,
+    cwd: &Path,
+    log_path: &Path,
+    prompt_path: &Path,
+    env: &[(String, String)],
+    timeout: Duration,
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+    session_provider: &str,
+    round: u32,
+    captured_session: Option<String>,
+    urgents: &[markers::UrgentInterrupt],
+    sink: &dyn Fn(u32),
+    tick: &dyn Fn(),
+    sleep: &dyn Fn(Duration),
+) -> Result<(process::SpawnResult, Option<String>)> {
+    if let Some(sid) = captured_session {
+        let _ = markers::write_session_id(paths, run_id, slot_id, session_provider, &sid);
+    }
+    let prior = markers::read_session_id(paths, run_id, slot_id, session_provider);
+    let prompt = urgent_resume_prompt(urgents, &opts.prompt);
+    let urgent_path = urgent_prompt_path(prompt_path, slot_id);
+    std::fs::write(&urgent_path, &prompt)
+        .with_context(|| format!("write urgent prompt {}", urgent_path.display()))?;
+    opts.prompt = prompt;
+    opts.prompt_file = Some(urgent_path);
+    let (cmd, used_resume) = build_dispatch_command(adapter, bin, opts, prior.as_deref());
+    let resumed_sid = if used_resume { prior } else { None };
+    let (program_bin, initial_args) = providers::command_to_parts(&cmd);
+    let (program, args) = sandbox::maybe_wrap(isolation, cwd, &program_bin, &initial_args);
+    let _ = std::fs::copy(log_path, urgent_killed_log_path(log_path));
+    let req = SpawnRequest {
+        program,
+        args,
+        cwd: cwd.to_path_buf(),
+        log_path: log_path.to_path_buf(),
+        stdin: adapter.prompt_stdin(opts),
+        env: env.to_vec(),
+        timeout,
+    };
+    let recipient = format!("{run_id}:{slot_id}");
+    for u in urgents {
+        crate::bus::record_receipt(
+            paths,
+            &u.msg_id,
+            &recipient,
+            crate::bus::ReceiptEvent::Delivered,
+            "urgent",
+        );
+        crate::bus::record_receipt(
+            paths,
+            &u.msg_id,
+            &recipient,
+            crate::bus::ReceiptEvent::Read,
+            "urgent",
+        );
+    }
+    let froms: Vec<&str> = urgents.iter().map(|u| u.from.as_str()).collect();
+    let continued = match &resumed_sid {
+        Some(_) => "resumed the same session with the message first",
+        None => "restarted the turn cold with the message first (no session existed yet)",
+    };
+    let _ = crate::events::append(
+        paths,
+        run_id,
+        &crate::events::Event::slot_note(
+            slot_id,
+            format!(
+                "urgent interrupt from {}: stopped the turn and {continued}",
+                froms.join(", ")
+            ),
+        ),
+    );
+    let classifier = crate::classifier::Classifier::live();
+    let res = dispatch_with_resume_recovery(
+        classifier,
+        adapter,
+        bin,
+        opts,
+        resumed_sid.as_deref(),
+        isolation,
+        req,
+        paths,
+        run_id,
+        slot_id,
+        session_provider,
+        round,
+        sink,
+        tick,
+        sleep,
+    )?;
+    Ok((res, resumed_sid))
 }
 
 /// Derive `<run_dir>/markers/<slot>.pid` from a slot log path (`<run_dir>/logs/<slot>.log`).
@@ -4667,7 +4871,8 @@ fn run_headless(
         args,
         cwd: cwd.to_path_buf(),
         log_path: log_path.to_path_buf(),
-        env: dispatch_env,
+        // Cloned, not moved: an urgent interrupt re-dispatches with the same env.
+        env: dispatch_env.clone(),
         timeout,
     };
     let pid_cell = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -4735,7 +4940,41 @@ fn run_headless(
         &tick,
         &|d| sleep_ticking(d, &tick),
     )?;
-    let pid = load_pid(&pid_cell);
+    let mut pid = load_pid(&pid_cell);
+    // An `--urgent` send kills this turn's process group and files its message;
+    // when the killed dispatch returns, resume the same session in place with
+    // the urgent bodies first. The killed attempt never becomes an outcome: no
+    // rotation, no round cost, no ceiling-kill WIP path.
+    let pending_urgent = markers::take_urgent_interrupts(paths, &state.id, &job.slot_id);
+    let mut urgent_resumed_sid: Option<String> = None;
+    if interrupt_cause_for(&res, &pending_urgent) == Some(InterruptCause::UrgentMessage) {
+        let captured = res.stats.session_id.clone();
+        let (resumed_res, resumed_sid) = resume_urgent_turn(
+            adapter.as_ref(),
+            &bin,
+            &mut opts,
+            state.isolation,
+            cwd,
+            log_path,
+            prompt_path,
+            &dispatch_env,
+            timeout,
+            paths,
+            &state.id,
+            &job.slot_id,
+            cli_name,
+            state.round,
+            captured,
+            &pending_urgent,
+            &sink,
+            &tick,
+            &|d| sleep_ticking(d, &tick),
+        )?;
+        res = resumed_res;
+        urgent_resumed_sid = resumed_sid;
+        pid = load_pid(&pid_cell);
+    }
+    let resume_attempt = urgent_resumed_sid.as_deref().or(resume_attempt);
     // See `execute_prepared`: the verdict lands on disk before the gates and before any
     // state save, so an orchestrator that dies from here on still leaves a terminal
     // record behind (O49).
@@ -6035,6 +6274,56 @@ mod tests {
         }
     }
 
+    fn urgent_sample(body: &str) -> markers::UrgentInterrupt {
+        markers::UrgentInterrupt {
+            msg_id: body.to_string(),
+            from: "@human".to_string(),
+            body: body.to_string(),
+            ts: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn urgent_interrupt_needs_signal_death_with_a_pending_request() {
+        let killed = process::SpawnResult {
+            signal: Some(15),
+            exit_code: None,
+            ..refused_result()
+        };
+        assert_eq!(
+            interrupt_cause_for(&killed, &[urgent_sample("stop")]),
+            Some(InterruptCause::UrgentMessage)
+        );
+        assert_eq!(interrupt_cause_for(&killed, &[]), None);
+        let clean = process::SpawnResult {
+            exit_code: Some(0),
+            signal: None,
+            ..refused_result()
+        };
+        assert_eq!(interrupt_cause_for(&clean, &[urgent_sample("late")]), None);
+        let timed_out = process::SpawnResult {
+            timed_out: true,
+            ..killed
+        };
+        assert_eq!(
+            interrupt_cause_for(&timed_out, &[urgent_sample("late")]),
+            None
+        );
+    }
+
+    #[test]
+    fn urgent_resume_prompt_leads_with_the_urgent_bodies() {
+        let prompt = urgent_resume_prompt(
+            &[urgent_sample("first"), urgent_sample("second")],
+            "normal work",
+        );
+        let first = prompt.find("first").unwrap();
+        let second = prompt.find("second").unwrap();
+        let normal = prompt.find("normal work").unwrap();
+        assert!(first < second && second < normal);
+        assert!(prompt.contains("worktree is unchanged"));
+    }
+
     /// The marker is the same file whichever way the id arrived: the assign path
     /// pre-writes exactly what the capture path writes post-dispatch, keyed per
     /// `(slot, provider)`.
@@ -6579,18 +6868,18 @@ mod tests {
 
     #[test]
     fn build_dispatch_command_ignores_prior_session_id_for_an_adapter_without_resume() {
-        // Grok's `build_resume` is the trait default (`None`), so a prior session id
-        // must not change its dispatch shape even when one is present.
+        // agy has no `build_resume` (unwired `--continue`/`--conversation`), so a
+        // prior session id must not change its dispatch shape even when present.
         let mut opts = dispatch_opts("go");
         let (with_prior, used_resume) = build_dispatch_command(
-            &providers::GrokAdapter,
-            Path::new("grok"),
+            &providers::AgyAdapter,
+            Path::new("agy"),
             &mut opts,
             Some("some-id"),
         );
         assert!(!used_resume);
         let (without_prior, _) =
-            build_dispatch_command(&providers::GrokAdapter, Path::new("grok"), &mut opts, None);
+            build_dispatch_command(&providers::AgyAdapter, Path::new("agy"), &mut opts, None);
         assert_eq!(
             providers::command_to_parts(&with_prior).1,
             providers::command_to_parts(&without_prior).1
