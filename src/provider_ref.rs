@@ -113,13 +113,13 @@ impl ProviderRef {
     fn recorded_route_bucket(
         &self,
         route: crate::providers::RecordedRoute<'_>,
-    ) -> Option<Option<&'static str>> {
+    ) -> crate::providers::RecordedRouteBucket {
         if self.model.is_none() {
             if let Some(adapter) = crate::providers::adapter_named(&self.storage_key()) {
                 return adapter.recorded_route_bucket(route);
             }
         }
-        None
+        crate::providers::RecordedRouteBucket::Ambient
     }
 
     pub fn quota_key(&self, route: crate::providers::RecordedRoute<'_>) -> String {
@@ -134,11 +134,12 @@ impl ProviderRef {
         // A model-less seat dispatches under the adapter's default route; without
         // one the seat keys at the login (O151). A recorded route overrides the
         // ambient one (`Some("")` records a set-but-empty env value).
-        if let Some(recorded) = self.recorded_route_bucket(route) {
-            return match recorded {
-                Some(bucket) => format!("{}@{bucket}", self.storage_key()),
-                None => self.storage_key(),
-            };
+        match self.recorded_route_bucket(route) {
+            crate::providers::RecordedRouteBucket::Bucket(bucket) => {
+                return format!("{}@{bucket}", self.storage_key());
+            }
+            crate::providers::RecordedRouteBucket::Login => return self.storage_key(),
+            crate::providers::RecordedRouteBucket::Ambient => {}
         }
         let bucket = match self.model.as_deref() {
             Some(model) => crate::providers::adapter_named(&self.storage_key())
@@ -162,11 +163,12 @@ impl ProviderRef {
         signal: crate::providers::QuotaSignal<'_>,
         route: crate::providers::RecordedRoute<'_>,
     ) -> String {
-        if let Some(recorded) = self.recorded_route_bucket(route) {
-            return match recorded {
-                Some(bucket) => format!("{}@{bucket}", self.storage_key()),
-                None => self.storage_key(),
-            };
+        match self.recorded_route_bucket(route) {
+            crate::providers::RecordedRouteBucket::Bucket(bucket) => {
+                return format!("{}@{bucket}", self.storage_key());
+            }
+            crate::providers::RecordedRouteBucket::Login => return self.storage_key(),
+            crate::providers::RecordedRouteBucket::Ambient => {}
         }
         if self.backend != ExecBackend::NativeCli {
             return self.quota_key(route);

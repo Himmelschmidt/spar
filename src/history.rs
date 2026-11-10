@@ -142,12 +142,10 @@ pub struct HistoryRow {
     /// Times the run entered the `quota` phase.
     #[serde(default)]
     pub quota_parks: u32,
-    /// The codex route the run's last dispatch stamped. Old lines predate it
-    /// and key from the ambient environment instead.
+    /// The route the run's last dispatch stamped, in provider-neutral shape.
+    /// Old lines predate it and key from the ambient environment instead.
     #[serde(default)]
-    pub codex_profile: Option<String>,
-    #[serde(default)]
-    pub codex_model: Option<String>,
+    pub route: Option<crate::providers::StoredRoute>,
     /// `[review] block_on` the `blocking` counts were taken at.
     #[serde(default)]
     pub block_on: Option<Severity>,
@@ -165,13 +163,13 @@ impl HistoryRow {
     }
 
     /// The dispatch route this run recorded at stamp time, for quota keying.
-    /// Both `None` on an old line means no record: key from this process's
+    /// No route on an old line means no record: key from this process's
     /// environment, exactly as a reader without the run would.
     pub fn recorded_route(&self) -> crate::providers::RecordedRoute<'_> {
-        crate::providers::RecordedRoute {
-            profile: self.codex_profile.as_deref(),
-            model: self.codex_model.as_deref(),
-        }
+        self.route
+            .as_ref()
+            .map(crate::providers::StoredRoute::as_recorded)
+            .unwrap_or_else(crate::providers::RecordedRoute::ambient)
     }
 }
 
@@ -368,8 +366,13 @@ pub fn row(
             .iter()
             .filter(|e| e.kind == EventKind::Phase && e.phase == Some(Phase::Quota))
             .count() as u32,
-        codex_profile: state.codex_profile.clone(),
-        codex_model: state.codex_model.clone(),
+        route: {
+            let route = crate::providers::StoredRoute {
+                profile: state.codex_profile.clone(),
+                model: state.codex_model.clone(),
+            };
+            (route.profile.is_some() || route.model.is_some()).then_some(route)
+        },
         block_on: Some(block_on),
         compact: false,
     }

@@ -166,10 +166,6 @@ struct PreparedSlot {
     /// sizes its budgets and nudge cadence off the same document every other phase reads.
     cfg: Config,
     dry_run: bool,
-    /// The dispatch route recorded in run state (`RunState::codex_route`),
-    /// carried across the thread boundary so the spawn keys the seat this run
-    /// actually dispatched instead of this worker's ambient environment.
-    route: Option<crate::providers::codex::CodexRoute>,
     /// Held for the dispatch's lifetime; dropped (and the directory removed) once the
     /// outcome has been applied.
     _tmp: SlotTmp,
@@ -300,11 +296,7 @@ fn prepare_slot_execution(
     cfg: &Config,
     job: &SlotJob,
 ) -> Result<PreparedSlot> {
-    // The route backstop: entries stamp the dispatch horizon, but an entry that
-    // forgot still records its route here, before any seat of this dispatch
-    // builds its spawn or its quota key. Idempotent within a process, so the
-    // horizon stamp staying authoritative is unaffected.
-    state.stamp_codex_route();
+    // No route stamp here: the dispatch entry stamps it; see `stamp_dispatch`.
     let slot = state
         .slots
         .iter()
@@ -419,6 +411,9 @@ fn prepare_slot_execution(
         &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
     );
     let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
+    // The turn that can read the poll file starts here: claim what piled up
+    // while the slot was idle so the word flips from `queued` to `delivered`.
+    crate::providers::delivery::drain_slot_backlog(paths, state, &job.slot_id);
     let tmp = SlotTmp::create(paths, &state.id, &job.slot_id, state.isolation);
     let mut env = wire_slot_presence(state, paths, &job, &cwd, &pref);
     env.extend(tmp.env());
@@ -448,7 +443,6 @@ fn prepare_slot_execution(
         session_provider,
         cfg: cfg.clone(),
         dry_run: state.dry_run,
-        route: state.codex_route(),
         _tmp: tmp,
         _fleet_lease: fleet_lease,
         _build_cache: build_cache.and_then(|(lease, _)| lease),
@@ -613,6 +607,37 @@ fn build_dispatch_command(
     (adapter.build_headless(bin, opts), false)
 }
 
+/// Build the command for a same-dispatch retry: the transient retry inside
+/// `dispatch_with_resume_recovery` and the credential-refresh retry below it.
+/// A retry that resolves to a resume keeps the captured session, so the work
+/// the failed attempt did stays in context. A retry that stays cold must never
+/// reuse the session id the attempt it follows carried: that attempt already
+/// created the session vendor-side, and the vendor refuses the id as already
+/// in use (#241). `attempt` counts the retries this dispatch already issued,
+/// so every attempt of the round carries a distinct id.
+#[allow(clippy::too_many_arguments)]
+fn build_retry_command(
+    adapter: &dyn providers::ProviderAdapter,
+    bin: &Path,
+    opts: &mut SpawnOpts,
+    paths: &SparPaths,
+    run_id: &str,
+    slot_id: &str,
+    session_provider: &str,
+    round: u32,
+    attempt: u32,
+    prior_session_id: Option<&str>,
+) -> (std::process::Command, bool) {
+    let (cmd, used_resume) = build_dispatch_command(adapter, bin, opts, prior_session_id);
+    if used_resume || !adapter.capabilities().assigns_session_id {
+        return (cmd, used_resume);
+    }
+    let id = session_id::derive_retry(run_id, slot_id, round, attempt);
+    opts.session_id = Some(id.clone());
+    let _ = markers::write_session_id(paths, run_id, slot_id, session_provider, &id);
+    (adapter.build_headless(bin, opts), false)
+}
+
 /// True when a resume dispatch exited without ever establishing a session (no
 /// `thread.started` captured). Necessary but not sufficient evidence that the vendor's
 /// rollout is gone (pruned, a different `CODEX_HOME`, a moved box) — plenty of other
@@ -770,6 +795,7 @@ fn name_cold_retry(
 /// so tests never sleep the real schedule.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_with_resume_recovery(
+    classifier: &crate::classifier::Classifier,
     adapter: &dyn providers::ProviderAdapter,
     bin: &Path,
     opts: &mut SpawnOpts,
@@ -857,7 +883,7 @@ fn dispatch_with_resume_recovery(
     let backoff = transient_backoff_secs();
     let mut retries = 0usize;
     let advise = |res: &process::SpawnResult| {
-        classifier_dispatch_advice(adapter, paths, run_id, slot_id, res, &log_path)
+        classifier_dispatch_advice(classifier, adapter, paths, run_id, slot_id, res, &log_path)
     };
     let mut advice = advise(&res);
     while retries < backoff.len()
@@ -897,11 +923,23 @@ fn dispatch_with_resume_recovery(
         );
         sleep(wait);
         let prior = markers::read_session_id(paths, run_id, slot_id, session_provider);
-        // D2 is enforced inside `build_dispatch_command`: a retry that resolves
-        // to a resume drops the cold dispatch's assigned id there, so muse can
-        // never emit `--session-id` twice.
-        let (cmd, retry_used_resume) =
-            build_dispatch_command(adapter, bin, &mut *opts, prior.as_deref());
+        // D2 is enforced inside `build_dispatch_command` (via
+        // `build_retry_command`): a retry that resolves to a resume drops the
+        // cold dispatch's assigned id there, so muse can never emit
+        // `--session-id` twice; a retry that stays cold takes a fresh
+        // `derive_retry` id instead of reusing the refused one.
+        let (cmd, retry_used_resume) = build_retry_command(
+            adapter,
+            bin,
+            &mut *opts,
+            paths,
+            run_id,
+            slot_id,
+            session_provider,
+            round,
+            retries as u32,
+            prior.as_deref(),
+        );
         let (program, args) = providers::command_to_parts(&cmd);
         let (program, args) = sandbox::maybe_wrap(isolation, &cwd, &program, &args);
         let req = SpawnRequest {
@@ -986,7 +1024,22 @@ fn dispatch_with_resume_recovery(
         );
         sleep(wait);
         let prior = markers::read_session_id(paths, run_id, slot_id, session_provider);
-        let (cmd, _) = build_dispatch_command(adapter, bin, &mut *opts, prior.as_deref());
+        // Same rule as the transient retry above: a resume keeps the captured
+        // session, a cold retry takes a fresh `derive_retry` id (#241). `retries`
+        // counts the transient retries already issued, so the auth retry's id
+        // is distinct from every attempt before it.
+        let (cmd, _) = build_retry_command(
+            adapter,
+            bin,
+            &mut *opts,
+            paths,
+            run_id,
+            slot_id,
+            session_provider,
+            round,
+            retries as u32,
+            prior.as_deref(),
+        );
         let (program, args) = providers::command_to_parts(&cmd);
         let (program, args) = sandbox::maybe_wrap(isolation, &cwd, &program, &args);
         let req = SpawnRequest {
@@ -1188,7 +1241,6 @@ fn execute_prepared(
         effort: prep.job.effort,
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(prep.paths.sessions_dir(&prep.run_id, &prep.job.slot_id)),
-        route: prep.route.clone(),
     };
     let (mut cmd, used_resume) = build_dispatch_command(
         adapter.as_ref(),
@@ -1280,6 +1332,7 @@ fn execute_prepared(
         .then(|| git_output(&prep.cwd, &["rev-parse", "HEAD"]))
         .flatten();
     let mut res = dispatch_with_resume_recovery(
+        crate::classifier::Classifier::live(),
         adapter.as_ref(),
         &bin,
         &mut opts,
@@ -1339,7 +1392,6 @@ fn execute_prepared(
                     slot_id: &prep.job.slot_id,
                     round: prep.round,
                     role: prep.job.role,
-                    route: prep.route.clone(),
                     owns_cwd: prep.owns_cwd,
                     provider: &prep.job.provider,
                     model: prep.job.model.clone(),
@@ -1514,7 +1566,6 @@ fn execute_prepared(
                 slot_id: &prep.job.slot_id,
                 round: prep.round,
                 role: prep.job.role,
-                route: prep.route.clone(),
                 owns_cwd: prep.owns_cwd,
                 provider: &prep.job.provider,
                 model: prep.job.model.clone(),
@@ -1579,7 +1630,6 @@ struct ArtifactRecovery<'a> {
     slot_id: &'a str,
     round: u32,
     role: SlotRole,
-    route: Option<crate::providers::codex::CodexRoute>,
     /// `cwd` is this slot's own worktree. See [`owns_cwd`].
     owns_cwd: bool,
     provider: &'a str,
@@ -1760,7 +1810,6 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
         effort: r.effort,
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(r.paths.sessions_dir(r.run_id, r.slot_id)),
-        route: r.route.clone(),
     };
     let cmd = adapter.build_headless(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
@@ -2135,6 +2184,7 @@ fn apply_parallel_outcome(
                 result.signal,
             );
             let (quota_hit, auth, classified) = classifier_verdict(
+                crate::classifier::Classifier::live(),
                 paths,
                 &state.id,
                 &prep.job,
@@ -2409,9 +2459,7 @@ pub fn run_slot(
     cfg: &Config,
     job: &SlotJob,
 ) -> Result<()> {
-    // Same backstop as `prepare_slot_execution`: the first seat of a dispatch
-    // whose entry forgot the horizon stamp still records its route.
-    state.stamp_codex_route();
+    // No route stamp here: the dispatch entry stamps it; see `stamp_dispatch`.
     let slot = state
         .slots
         .iter()
@@ -2523,6 +2571,9 @@ pub fn run_slot(
         &crate::events::Event::slot(&job.slot_id, SlotStatus::Running),
     );
     let _ = crate::bus::heartbeat(paths, Some(&state.id), &job.slot_id, "running");
+    // The turn that can read the poll file starts here: claim what piled up
+    // while the slot was idle so the word flips from `queued` to `delivered`.
+    crate::providers::delivery::drain_slot_backlog(paths, state, &job.slot_id);
     let mut build_cache = lease_build_cache(state, paths, cfg, job, &cwd);
     state.save(paths)?;
 
@@ -2742,6 +2793,7 @@ pub fn run_slot(
         let err = result.error.as_deref().unwrap_or("failed");
         auth_rejection = auth_fault_for(&log_path, err, quota_hit, result.exit_code, result.signal);
         let (quota_hit, auth, classified) = classifier_verdict(
+            crate::classifier::Classifier::live(),
             paths,
             &state.id,
             job,
@@ -3165,6 +3217,7 @@ fn auth_fault_for(
 /// work into a transient retry or the O104 auth retry. Asked only about a non-zero exit
 /// that no rule already explains; `None` whenever it is off, silent or below threshold.
 fn classifier_dispatch_advice(
+    classifier: &crate::classifier::Classifier,
     adapter: &dyn providers::ProviderAdapter,
     paths: &SparPaths,
     run_id: &str,
@@ -3214,7 +3267,7 @@ fn classifier_dispatch_advice(
         )),
         log_path,
     );
-    let rec = crate::classifier::consult(
+    let rec = classifier.consult(
         &cfg,
         paths,
         run_id,
@@ -3238,6 +3291,7 @@ fn classifier_dispatch_advice(
 /// scrape ([`PauseWitness`]): a veto only weakens a pause that scrape made.
 #[allow(clippy::too_many_arguments)]
 fn classifier_verdict(
+    classifier: &crate::classifier::Classifier,
     paths: &SparPaths,
     run_id: &str,
     job: &SlotJob,
@@ -3295,7 +3349,7 @@ fn classifier_verdict(
         Some(err),
         log_path,
     );
-    let Some(rec) = crate::classifier::consult(
+    let Some(rec) = classifier.consult(
         &cfg,
         paths,
         run_id,
@@ -3998,7 +4052,6 @@ fn run_headless(
         effort: slot_effort_for(cfg, Some(state), job),
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(paths.sessions_dir(&state.id, &job.slot_id)),
-        route: state.codex_route(),
     };
     let prior_session_id =
         prior_session_for_role(paths, &state.id, &job.slot_id, cli_name, job.role);
@@ -4085,6 +4138,7 @@ fn run_headless(
         .then(|| git_output(cwd, &["rev-parse", "HEAD"]))
         .flatten();
     let mut res = dispatch_with_resume_recovery(
+        crate::classifier::Classifier::live(),
         adapter.as_ref(),
         &bin,
         &mut opts,
@@ -4138,7 +4192,6 @@ fn run_headless(
                     slot_id: &job.slot_id,
                     round: state.round,
                     role: job.role,
-                    route: state.codex_route(),
                     owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                     provider: &job.provider,
                     model: slot_model_for(Some(state), job),
@@ -4293,7 +4346,6 @@ fn run_headless(
                 slot_id: &job.slot_id,
                 round: state.round,
                 role: job.role,
-                route: state.codex_route(),
                 owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                 provider: &job.provider,
                 model: slot_model_for(Some(state), job),
@@ -4514,7 +4566,6 @@ fn run_tmux(
         effort,
         timeout_secs: None,
         session_dir: Some(paths.sessions_dir(&state.id, &job.slot_id)),
-        route: state.codex_route(),
     };
     // The pane is teed to a log, never run through `StreamCoalescer`, so no id is
     // ever captured here (O65). An adapter that accepts a caller-supplied id gets
@@ -5111,7 +5162,6 @@ mod tests {
 
     fn dispatch_opts(prompt: &str) -> SpawnOpts {
         SpawnOpts {
-            route: None,
             prompt: prompt.into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
@@ -5128,10 +5178,10 @@ mod tests {
     #[test]
     fn build_dispatch_command_resumes_codex_when_a_prior_session_id_is_known() {
         // build_resume (opts.model: None) falls through to profile_model_args, which
-        // reads $CODEX_HOME/<profile>.config.toml — lock and isolate CODEX_HOME so this
+        // reads $CODEX_HOME/<profile>.config.toml — pin and isolate CODEX_HOME so this
         // doesn't read the machine's real ~/.codex or race codex.rs's own env-mutating
         // tests, matching neither of which this test's assertions depend on.
-        let _guard = providers::codex::ENV_LOCK.lock().unwrap();
+        let _pin = providers::codex::pin_codex_env();
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("CODEX_HOME", home.path());
         let mut opts = dispatch_opts("go");
@@ -5280,6 +5330,44 @@ mod tests {
             _session_id: Option<&str>,
         ) -> bool {
             false
+        }
+    }
+
+    /// An adapter that names its own sessions (claude/grok) but cannot resume
+    /// them: every dispatch incl. retries builds cold.
+    struct AssigningColdAdapter {
+        script: String,
+        transient_marker: Option<String>,
+    }
+
+    impl providers::ProviderAdapter for AssigningColdAdapter {
+        fn name(&self) -> &'static str {
+            "assigning-cold"
+        }
+        fn binary_names(&self) -> &[&'static str] {
+            &["sh"]
+        }
+        fn capabilities(&self) -> providers::Capabilities {
+            providers::Capabilities {
+                assigns_session_id: true,
+                ..providers::Capabilities::default()
+            }
+        }
+        fn permission_args(&self, _policy: TrustPolicy) -> Vec<String> {
+            Vec::new()
+        }
+        fn build_headless(&self, _bin: &Path, _opts: &SpawnOpts) -> std::process::Command {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg(&self.script);
+            cmd
+        }
+        fn build_interactive(&self, bin: &Path, opts: &SpawnOpts) -> std::process::Command {
+            self.build_headless(bin, opts)
+        }
+        fn dispatch_failure_is_transient(&self, log_text: &str) -> bool {
+            self.transient_marker
+                .as_deref()
+                .is_some_and(|m| log_text.contains(m))
         }
     }
 
@@ -5433,6 +5521,7 @@ mod tests {
         opts.session_id = Some("abc".into());
         let req = shell_req(&adapter.script, &log_path);
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -5482,6 +5571,127 @@ mod tests {
         );
     }
 
+    /// #241: the credential-refresh retry on an adapter that names its own
+    /// sessions but cannot resume them (claude/grok) must not reuse the first
+    /// attempt's id: the vendor already created that session and refuses the
+    /// id as already in use. The retry takes a fresh `derive_retry` id instead.
+    #[test]
+    fn auth_retry_on_an_assigning_adapter_without_resume_uses_a_fresh_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("run1").unwrap();
+        let log_path = tmp.path().join("slot.log");
+        let ctr = tmp.path().join("attempts");
+        let adapter = AssigningColdAdapter {
+            script: format!(
+                r#"n=$(cat "{ctr}" 2>/dev/null || echo 0); echo $((n+1)) > "{ctr}"; if [ "$n" -lt 1 ]; then echo '{CLAUDE_REVOKED}'; exit 1; fi; echo ok; exit 0"#,
+                ctr = ctr.display()
+            ),
+            transient_marker: None,
+        };
+        let cold = session_id::derive("run1", "slotA", 1);
+        markers::write_session_id(&paths, "run1", "slotA", "assigning-cold", &cold).unwrap();
+        let mut opts = dispatch_opts("go");
+        opts.session_id = Some(cold);
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
+            &adapter,
+            Path::new("/bin/sh"),
+            &mut opts,
+            None,
+            crate::config::IsolationMode::None,
+            shell_req(&adapter.script, &log_path),
+            &paths,
+            "run1",
+            "slotA",
+            "assigning-cold",
+            1,
+            &|_pid| {},
+            &|| {},
+            &|d| {
+                waits.borrow_mut().push(d);
+            },
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, Some(0), "the retry has the refreshed token");
+        assert_eq!(
+            *waits.borrow(),
+            vec![Duration::from_secs(AUTH_RETRY_WAIT_SECS)]
+        );
+        let fresh = session_id::derive_retry("run1", "slotA", 1, 0);
+        assert_eq!(
+            opts.session_id.as_deref(),
+            Some(fresh.as_str()),
+            "the retry carries a fresh id, never the refused one"
+        );
+        assert_eq!(
+            markers::read_session_id(&paths, "run1", "slotA", "assigning-cold").as_deref(),
+            Some(fresh.as_str()),
+            "the marker follows the retry's id"
+        );
+    }
+
+    /// #241, second half: the same rule covers the transient retry. An
+    /// assigning adapter without resume support (claude/grok) fails the same
+    /// "already in use" refusal when the retry reuses the cold id, so the
+    /// retry takes a fresh `derive_retry` id; resume-capable adapters still
+    /// resume (see the test below) and are untouched.
+    #[test]
+    fn transient_retry_on_an_assigning_adapter_without_resume_uses_a_fresh_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        paths.ensure_run_dirs("run1").unwrap();
+        let log_path = tmp.path().join("slot.log");
+        let ctr = tmp.path().join("attempts");
+        let adapter = AssigningColdAdapter {
+            script: format!(
+                concat!(
+                    r#"n=$(cat "{ctr}" 2>/dev/null || echo 0); echo $((n+1)) > "{ctr}"; "#,
+                    r#"if [ "$n" -lt 1 ]; then "#,
+                    r#"echo '{{"type":"thread.started","thread_id":"sess-9"}}'; "#,
+                    r#"echo '{{"type":"tool_call","name":"edit"}}'; "#,
+                    r#"echo 'TRANSIENT-BOOM' >&2; exit 1; fi; echo ok; exit 0"#,
+                ),
+                ctr = ctr.display()
+            ),
+            transient_marker: Some("TRANSIENT-BOOM".into()),
+        };
+        let cold = session_id::derive("run1", "slotT", 1);
+        markers::write_session_id(&paths, "run1", "slotT", "assigning-cold", &cold).unwrap();
+        let mut opts = dispatch_opts("go");
+        opts.session_id = Some(cold);
+        let waits = std::cell::RefCell::new(Vec::new());
+        let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
+            &adapter,
+            Path::new("/bin/sh"),
+            &mut opts,
+            None,
+            crate::config::IsolationMode::None,
+            shell_req(&adapter.script, &log_path),
+            &paths,
+            "run1",
+            "slotT",
+            "assigning-cold",
+            1,
+            &|_pid| {},
+            &|| {},
+            &|d| {
+                waits.borrow_mut().push(d);
+            },
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, Some(0), "the retry runs past the transient");
+        let fresh = session_id::derive_retry("run1", "slotT", 1, 0);
+        assert_eq!(
+            opts.session_id.as_deref(),
+            Some(fresh.as_str()),
+            "the retry carries a fresh id, never the refused one"
+        );
+        assert!(!waits.borrow().is_empty());
+    }
+
     /// The transient-retry double-flag regression: a retry that resolves to a
     /// resume must drop the cold dispatch's assigned id, so `build_resume` sees
     /// `session_id: None` and the vendor gets exactly one `--session-id`. D2 is
@@ -5508,6 +5718,7 @@ mod tests {
         opts.session_id = Some("derived-1".into());
         let req = shell_req(&adapter.cold_script, &log_path);
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -5903,6 +6114,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let adapter = crate::providers::PiAdapter;
         let mut opts = dispatch_opts("go");
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -5941,6 +6153,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let script = r#"echo "agent quoted: No project session found with id 'other'; creating a new session" >&2
 echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut dispatch_opts("go"),
@@ -5976,6 +6189,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let mut opts = dispatch_opts("go");
         let req = shell_req(&adapter.script, &log_path);
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6017,6 +6231,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &log_path,
         );
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6061,6 +6276,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &log_path,
         );
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6114,6 +6330,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         // the real 60s/150s/300s schedule.
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6191,6 +6408,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let req = shell_req(&adapter.script, &log_path);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6233,6 +6451,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     ) -> process::SpawnResult {
         let mut opts = dispatch_opts("go");
         dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6413,6 +6632,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let bad_req = shell_req("exit 2", &log_path);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6462,6 +6682,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let req = shell_req(&adapter.script, &log_path);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6514,6 +6735,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &log_path,
         );
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6549,6 +6771,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let log_path = tmp.path().join("slot.log");
         let mut opts = dispatch_opts("go");
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6606,6 +6829,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let req = shell_req(&adapter.script, &log_path);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -8889,10 +9113,14 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     fn classifier_run(
         tmp: &Path,
         answer: (&str, f64),
-    ) -> (SparPaths, crate::classifier::tests::FakeSystemOne) {
+    ) -> (
+        SparPaths,
+        crate::classifier::Classifier,
+        crate::classifier::tests::StubSystemOne,
+    ) {
         let paths = SparPaths::new(tmp);
         paths.ensure_run_dirs("run1").unwrap();
-        let fake = crate::classifier::tests::fake_system_one(
+        let (cls, fake) = crate::classifier::tests::stub_system_one(
             200,
             crate::classifier::tests::answer_body(answer.0, answer.1),
             Duration::ZERO,
@@ -8910,7 +9138,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             .slots
             .push(init_slot("impl", "cli:muse", SlotRole::Implementer));
         state.save(&paths).unwrap();
-        (paths, fake)
+        (paths, cls, fake)
     }
 
     fn failed_with(exit_code: Option<i32>, signal: Option<i32>, err: &str) -> SlotOutcome {
@@ -8926,7 +9154,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_fills_a_quota_gap_with_a_strong_pause() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.86));
+        let (paths, cls, fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.86));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(
             &log_path,
@@ -8936,7 +9164,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let job = impl_job("impl");
         let outcome = failed_with(Some(1), None, "exit 1");
         let (quota, auth, rec) = classifier_verdict(
-            &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None, None,
+            &cls, &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None,
+            None,
         );
         assert!(quota && auth.is_none());
         assert_eq!(rec.unwrap().action, crate::classifier::Action::PauseQuota);
@@ -8945,7 +9174,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert_eq!(fake.bodies.lock().unwrap().len(), 1);
 
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.6));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.6));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(
             &log_path,
@@ -8953,7 +9182,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         )
         .unwrap();
         let (quota, auth, rec) = classifier_verdict(
-            &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None, None,
+            &cls, &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None,
+            None,
         );
         assert!(!quota && auth.is_none(), "below threshold: today's verdict");
         assert!(!rec.unwrap().acted);
@@ -8967,7 +9197,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_veto_downgrades_a_text_quota_verdict_to_a_weak_pause() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.95));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.95));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, WEEKLY_LIMIT_LOG).unwrap();
         let job = impl_job("impl");
@@ -8979,6 +9209,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             .unwrap()
             .blocks_live_dispatch("cli:muse"));
         let (quota, auth, rec) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -8999,6 +9230,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(!store.blocks_live_dispatch("cli:muse"), "but weak");
 
         let (quota, auth, _) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9021,7 +9253,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_veto_weakens_only_the_family_bucket_it_vetoes() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.95));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.95));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, "You've reached your Fable limit\n").unwrap();
         let job = impl_job("impl");
@@ -9032,6 +9264,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert_eq!(key, "cli:claude@fable");
         let witness = witness.after_scrape(&paths, "cli:claude@fable");
         let (quota, auth, rec) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9060,7 +9293,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_veto_leaves_a_prior_strong_pause_and_never_pauses_on_auth() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
         let mut store = crate::quota::QuotaStore::load(&paths).unwrap();
         store.pause_quota("cli:muse", "typed five_hour rejection");
         store.mark_strong("cli:muse");
@@ -9072,6 +9305,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let job = impl_job("impl");
         let outcome = failed_with(Some(1), None, "exit 1");
         let (quota, _, rec) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9093,7 +9327,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         );
 
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, WEEKLY_LIMIT_LOG).unwrap();
         let witness = PauseWitness::before(&paths, "run1", "cli:muse").unwrap();
@@ -9108,6 +9342,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         store.mark_strong("cli:muse");
         store.save(&paths).unwrap();
         let (quota, _, _) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9128,10 +9363,11 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         );
 
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, "! not logged in: run `muse login` first\n").unwrap();
         let (quota, auth, _) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9157,7 +9393,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_is_never_asked_about_state_decided_failures() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.99));
+        let (paths, cls, fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.99));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, "something odd\n").unwrap();
         let job = impl_job("impl");
@@ -9197,14 +9433,16 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         ];
         for (outcome, err, quota_hit) in cases {
             let (quota, auth, rec) = classifier_verdict(
-                &paths, "run1", &job, "cli:muse", &log_path, &outcome, &err, quota_hit, None, None,
+                &cls, &paths, "run1", &job, "cli:muse", &log_path, &outcome, &err, quota_hit, None,
+                None,
             );
             assert_eq!((quota, auth, rec), (quota_hit, None, None), "{err}");
         }
         std::fs::write(&log_path, "! model `m` does not exist or you lack access\n").unwrap();
         let outcome = failed_with(Some(1), None, "exit 1");
         let (_, _, rec) = classifier_verdict(
-            &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None, None,
+            &cls, &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None,
+            None,
         );
         assert!(
             rec.is_none(),
@@ -9218,7 +9456,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_transient_answer_takes_the_retry_loop_after_tool_calls() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, fake) = classifier_run(tmp.path(), ("transient_infra", 0.9));
+        let (paths, cls, fake) = classifier_run(tmp.path(), ("transient_infra", 0.9));
         let log_path = tmp.path().join("slot.log");
         let ctr = tmp.path().join("attempts");
         let script = format!(
@@ -9228,6 +9466,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let adapter = ShellAdapter::cold(&script);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &cls,
             &adapter,
             Path::new("/bin/sh"),
             &mut dispatch_opts("go"),
@@ -9251,11 +9490,12 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(events.contains("\"type\":\"classifier\"") && events.contains("\"retry\""));
 
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("transient_infra", 0.9));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("transient_infra", 0.9));
         let log_path = tmp.path().join("slot.log");
         let script = "echo 'upstream wobble, please hold' >&2; exit 1";
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &cls,
             &ShellAdapter::cold(script),
             Path::new("/bin/sh"),
             &mut dispatch_opts("go"),

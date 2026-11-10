@@ -24,8 +24,9 @@ impl ProviderAdapter for AgyAdapter {
         seat.and_then(|m| self.quota_bucket(m))
     }
 
-    // No turn-boundary push spar drives, so messages wait for the next turn and
-    // presence is degraded to the process/output heuristic. agy does have hooks
+    // No push channel into the running process, so bus messages land in the
+    // slot's poll file, which every role prompt (including agy's) names as the
+    // file to read before starting any new major step. agy does have hooks
     // (agy 1.4.9 changelog: workspace `<workspace>/.agents/hooks.json` with
     // `Stop`, pre-tool and `PostToolUse` events), but spar has not probed their
     // stdin shape or block semantics, so they stay unwired. `--input-format
@@ -36,8 +37,9 @@ impl ProviderAdapter for AgyAdapter {
     // for mid-turn injection. Also deliberately not wired, each its own decision:
     // `--json-schema`, `--add-dir`, `--sandbox`, `--conversation`/`--continue`
     // (see `supports_resume`). `cli:agy` is out of both fleets on this machine.
+    // Presence stays degraded to the process/output heuristic (no hooks probed).
     fn delivery_strategy(&self) -> DeliveryStrategy {
-        DeliveryStrategy::None
+        DeliveryStrategy::PollFile
     }
 
     fn presence_source(&self) -> PresenceSource {
@@ -170,7 +172,6 @@ mod tests {
         extra_args: Vec<String>,
     ) -> SpawnOpts {
         SpawnOpts {
-            route: None,
             prompt: prompt.into(),
             prompt_file: file.map(PathBuf::from),
             cwd: PathBuf::from("/tmp"),
@@ -182,6 +183,14 @@ mod tests {
             timeout_secs: None,
             session_dir: None,
         }
+    }
+
+    #[test]
+    fn bus_messages_land_in_the_poll_file() {
+        assert_eq!(
+            AgyAdapter.delivery_strategy(),
+            crate::providers::DeliveryStrategy::PollFile
+        );
     }
 
     #[test]

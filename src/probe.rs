@@ -184,19 +184,21 @@ fn call(
         return CallOutcome::without_output(Verdict::Skipped, Some("not on PATH".into()));
     };
     let opts = SpawnOpts {
-        route: route.into_carrier(),
         prompt: PROBE_PROMPT.into(),
         prompt_file: None,
         cwd: paths.project_root.clone(),
         trust: TrustPolicy::Prompt,
         extra_args: vec![],
         session_id: None,
+        // Only an explicit ref model; a `--run` probe's recorded route reaches
+        // the spawn through the adapter (`build_probe`), never as a generic
+        // model every adapter would render.
         model: pref.model.clone(),
         effort: None,
         timeout_secs: Some(PROBE_TIMEOUT.as_secs()),
         session_dir: None,
     };
-    let mut cmd = adapter.build_headless(&bin, &opts);
+    let mut cmd = adapter.build_probe(&bin, &opts, route);
     if dry {
         let (program, args) = providers::command_to_parts(&cmd);
         return CallOutcome::without_output(
