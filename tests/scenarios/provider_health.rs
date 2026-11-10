@@ -567,7 +567,7 @@ fn a_bucket_paused_codex_backup_is_probed_and_used_when_it_answers() {
         .code(1);
     let slot = fx.slot("implementer");
     assert_eq!(slot["provider"], "cli:codex", "{slot}");
-    assert_eq!(slot["source"], "backup");
+    assert_eq!(slot["source"], "cli-backup");
     assert_eq!(fx.count("codex"), 2, "one probe, one dispatch");
     assert_eq!(
         fx.quota()["providers"]["cli:codex@openrouter"]["status"],

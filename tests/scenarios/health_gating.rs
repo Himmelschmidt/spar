@@ -666,3 +666,96 @@ fn continued_run_reseats_an_implementer_whose_provider_went_sick() {
         "the fix round dispatches claude"
     );
 }
+
+/// Continuing a run re-checks reviewer seats through the same point as launch:
+/// a reviewer whose provider went sick between rounds is re-seated onto the
+/// healthy order entry, never redispatched.
+#[test]
+fn continued_run_reseats_a_reviewer_whose_provider_went_sick() {
+    let (_tmp, p) = project("[providers]\norder = [\"cli:claude\", \"cli:codex\", \"cli:grok\"]\n[roles]\nimplementer = \"cli:claude\"\nreviewer = [\"cli:codex\"]\n");
+    write_fake(&p.bin, "claude", "auth", "exit 0", "approve");
+    write_fake(
+        &p.bin,
+        "codex",
+        "login",
+        "if [ -f \"$FAKE_COUNT_DIR/sick\" ]; then echo \"Error: credentials missing\" >&2; exit 1; fi\nexit 0",
+        "request_changes",
+    );
+    write_fake(&p.bin, "grok", "grok", "exit 0", "approve");
+    let out = spar_cmd()
+        .current_dir(&p.proj)
+        .env("SPAR_HOME", &p.home)
+        .env("PATH", &p.path_env)
+        .env("FAKE_PROJECT_ROOT", &p.proj)
+        .env("FAKE_COUNT_DIR", &p.bin)
+        .args([
+            "implement",
+            "-t",
+            "continuation reseats sick reviewer",
+            "--without",
+            "suite",
+            "--max-rounds",
+            "1",
+            "--json",
+        ])
+        .assert()
+        .code(predicate::in_iter([2, 3]))
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let run_id: String = serde_json::from_str::<serde_json::Value>(&stdout).expect("run json")
+        ["id"]
+        .as_str()
+        .expect("run id")
+        .to_string();
+    let state = read_state(&p.proj, &run_id);
+    assert_eq!(
+        reviewers_of(&state)[0]["provider"],
+        "cli:codex",
+        "round 1 seats the reviewer on the healthy order entry: {state}"
+    );
+    let codex_round_1 = calls(&p.bin, "codex");
+    assert!(codex_round_1 >= 1, "round 1 dispatches codex");
+
+    fs::write(p.bin.join("sick"), "codex went sick between rounds").unwrap();
+
+    let out = spar_cmd()
+        .current_dir(&p.proj)
+        .env("SPAR_HOME", &p.home)
+        .env("PATH", &p.path_env)
+        .env("FAKE_PROJECT_ROOT", &p.proj)
+        .env("FAKE_COUNT_DIR", &p.bin)
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--max-rounds",
+            "+2",
+            "--json",
+        ])
+        .assert()
+        .code(predicate::in_iter([0, 2, 3]))
+        .get_output()
+        .clone();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_no_quota_park(&combined);
+    let state = read_state(&p.proj, &run_id);
+    assert_eq!(
+        reviewers_of(&state)[0]["provider"],
+        "cli:claude",
+        "continuation re-seats the sick reviewer: {state}"
+    );
+    assert_eq!(
+        calls(&p.bin, "codex"),
+        codex_round_1,
+        "sick codex is never redispatched"
+    );
+    assert!(
+        reviewers_of(&state)[0]["id"] == "review-0-cli-claude",
+        "the reviewer slot is renamed for its new provider: {state}"
+    );
+}
