@@ -327,7 +327,7 @@ pub struct ShipOverride {
 }
 
 /// The same findings `brief` and the escalation show: each surviving seat's latest
-/// recorded review (O170). The round rides along from the history entry the
+/// recorded review (O171). The round rides along from the history entry the
 /// finding survived from.
 fn open_findings(state: &RunState) -> Vec<OpenFinding> {
     let open = crate::workflow::review_result::open_findings(
@@ -1170,7 +1170,6 @@ mod tests {
             state.review_history.push(crate::state::ReviewHistoryEntry {
                 round,
                 slot_id: slot.into(),
-                seat_key: None,
                 review: parse(body),
             });
         }
@@ -1636,7 +1635,7 @@ mod tests {
         }
     }
 
-    /// O170: the gate judges each surviving seat's latest recorded review,
+    /// O171: the gate judges each surviving seat's latest recorded review,
     /// whatever round it judged, never `state.round`: a round begun but not yet
     /// reviewed has no reviews to judge.
     #[test]
@@ -1655,13 +1654,11 @@ mod tests {
             crate::state::ReviewHistoryEntry {
                 round: 1,
                 slot_id: "review-0".into(),
-                seat_key: None,
                 review: review_with("aaaa", vec![finding(Severity::Critical, None, None, "old")]),
             },
             crate::state::ReviewHistoryEntry {
                 round: 2,
                 slot_id: "review-0".into(),
-                seat_key: None,
                 review: review_with(
                     "0123456789abcdef",
                     vec![finding(
@@ -1675,7 +1672,6 @@ mod tests {
             crate::state::ReviewHistoryEntry {
                 round: 2,
                 slot_id: "review-1".into(),
-                seat_key: None,
                 review: review_with(
                     "0123456789abcdef",
                     vec![finding(Severity::Minor, None, None, "nit")],
@@ -1684,7 +1680,6 @@ mod tests {
             crate::state::ReviewHistoryEntry {
                 round: 2,
                 slot_id: "review-9-dropped".into(),
-                seat_key: None,
                 review: review_with(
                     "0123456789abcdef",
                     vec![finding(Severity::Critical, None, None, "gone seat")],

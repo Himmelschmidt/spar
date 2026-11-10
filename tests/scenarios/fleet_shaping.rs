@@ -1285,11 +1285,11 @@ fn without_reviewer_ordinal_drops_seat_and_its_findings() {
     );
 }
 
-/// #234: the same drop by seat id. Dropping `reviewer[0]` renumbers the survivor
-/// down; its history entries keep the writing id (mapped in `former_ids`), and
-/// its artifacts are renamed to the new id.
+/// #234: the same drop by seat id. Dropping `review-0-cli-grok` removes that seat
+/// only: the survivor keeps its id, its history still names the live seat, and
+/// the dropped id retires so no later seat reuses it.
 #[test]
-fn without_reviewer_seat_id_drops_and_renumbers() {
+fn without_reviewer_seat_id_drops_and_the_survivor_keeps_its_id() {
     let tmp = project("[suite]\nenabled = false\n");
     let v = plan_json(tmp.path(), &["--providers", "cli:claude,cli:grok"]);
     let run_id = v["run_id"].as_str().unwrap().to_string();
@@ -1332,8 +1332,8 @@ fn without_reviewer_seat_id_drops_and_renumbers() {
     let state = read_state(tmp.path(), &run_id);
     assert_eq!(
         slot_ids_for(&state, "reviewer"),
-        vec!["review-0-cli-claude"],
-        "the survivor renumbers down: {:?}",
+        vec!["review-1-cli-claude"],
+        "the survivor keeps its id: {:?}",
         state["slots"]
     );
     let history: Vec<&str> = state["review_history"]
@@ -1344,31 +1344,33 @@ fn without_reviewer_seat_id_drops_and_renumbers() {
         .collect();
     assert!(
         history.iter().all(|s| *s == "review-1-cli-claude"),
-        "history keeps the id of the seat that wrote it: {history:?}"
+        "history still names the live seat: {history:?}"
     );
-    let survivor = state["slots"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["id"] == "review-0-cli-claude")
-        .unwrap();
     assert!(
-        survivor["former_ids"]
+        state["retired_seat_ids"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|f| f == "review-1-cli-claude"),
-        "the renamed seat maps its old id: {:?}",
-        survivor["former_ids"]
+            .any(|s| s == "review-0-cli-grok"),
+        "the dropped id retires: {:?}",
+        state["retired_seat_ids"]
     );
     for ext in ["md", "json"] {
         assert!(
             tmp.path()
                 .join(".spar/runs")
                 .join(&run_id)
-                .join(format!("artifacts/review-review-0-cli-claude.{ext}"))
+                .join(format!("artifacts/review-review-1-cli-claude.{ext}"))
                 .is_file(),
-            "the survivor's artifacts follow the rename"
+            "the survivor's artifacts stay on its id"
+        );
+        assert!(
+            !tmp.path()
+                .join(".spar/runs")
+                .join(&run_id)
+                .join(format!("artifacts/review-review-0-cli-grok.{ext}"))
+                .exists(),
+            "the dropped seat's artifacts go with it"
         );
     }
     let pin = read_run_config(tmp.path(), &run_id)["roles"]["reviewer"].clone();
@@ -1591,10 +1593,11 @@ fn reload_config_keeps_the_shifted_reviewer_backups() {
     );
 }
 
-/// #234 (M4): dropping the middle seat of a three-seat panel renumbers only the
-/// seats above it, prunes the dropped seat's history, and pins the survivors.
+/// #234 (M4): dropping the middle seat of a three-seat panel removes that seat
+/// only, prunes the dropped seat's history, and pins the survivors. The seats
+/// above the drop keep their ids: nothing renumbers.
 #[test]
-fn without_reviewer_middle_ordinal_drops_and_renumbers_above_only() {
+fn without_reviewer_middle_ordinal_drops_without_renumbering() {
     let tmp = project(
         "[roles]\nreviewer = [\"cli:codex\", \"cli:grok\", \"cli:agy\"]\n[suite]\nenabled = false\n",
     );
@@ -1651,8 +1654,8 @@ fn without_reviewer_middle_ordinal_drops_and_renumbers_above_only() {
     let state = read_state(tmp.path(), &run_id);
     assert_eq!(
         slot_ids_for(&state, "reviewer"),
-        vec!["review-0-cli-codex", "review-1-cli-agy"],
-        "only the seats above the drop renumber: {:?}",
+        vec!["review-0-cli-codex", "review-2-cli-agy"],
+        "the seats above the drop keep their ids: {:?}",
         state["slots"]
     );
     let history: Vec<&str> = state["review_history"]
@@ -1665,20 +1668,9 @@ fn without_reviewer_middle_ordinal_drops_and_renumbers_above_only() {
         !history.contains(&"review-1-cli-grok"),
         "the dropped seat's history goes with it: {history:?}"
     );
-    let survivor = state["slots"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["id"] == "review-1-cli-agy")
-        .unwrap();
     assert!(
-        survivor["former_ids"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|f| f == "review-2-cli-agy"),
-        "the renamed seat maps its old id: {:?}",
-        survivor["former_ids"]
+        history.contains(&"review-2-cli-agy"),
+        "the surviving seat's history stays on its id: {history:?}"
     );
     let pin = read_run_config(tmp.path(), &run_id)["roles"]["reviewer"].clone();
     assert_eq!(
@@ -1785,8 +1777,8 @@ fn reload_after_amend_disengages_a_spent_reviewer_backup() {
         ])
         .assert();
     // Fabricate the failover the dispatch would do when agy's seat dies: the
-    // seat serves its backup under a backup source. The ordinal still reads
-    // off the id, so the pin and the backup shift index it as before.
+    // seat serves its backup under a backup source. The drop resolves the live
+    // panel position, so the pin and the backup shift index it as before.
     let p = tmp
         .path()
         .join(".spar/runs")
@@ -1819,8 +1811,8 @@ fn reload_after_amend_disengages_a_spent_reviewer_backup() {
     let state = read_state(tmp.path(), &run_id);
     assert_eq!(
         slot_ids_for(&state, "reviewer"),
-        vec!["review-0-cli-agy"],
-        "the rotated survivor renumbers down keeping its id: {:?}",
+        vec!["review-1-cli-agy"],
+        "the rotated survivor keeps its id: {:?}",
         state["slots"]
     );
     let cfg = read_run_config(tmp.path(), &run_id);
@@ -2478,7 +2470,7 @@ fn without_refuses_to_drop_the_last_reviewer_seat() {
 }
 
 /// #234 follow-up (item 6): `--validate-only` with `--without reviewer[N]`
-/// shows the fleet after the drop, with the surviving seat renumbered.
+/// shows the fleet after the drop. The surviving seat keeps its id.
 #[test]
 fn validate_only_shows_the_fleet_after_the_drop() {
     let tmp = project("[suite]\nenabled = false\n");
@@ -2513,8 +2505,8 @@ fn validate_only_shows_the_fleet_after_the_drop() {
         .collect();
     assert_eq!(
         seats,
-        vec!["review-0-cli-claude"],
-        "the dropped seat is gone and the survivor renumbered down: {seats:?}"
+        vec!["review-1-cli-claude"],
+        "the dropped seat is gone and the survivor keeps its id: {seats:?}"
     );
 }
 

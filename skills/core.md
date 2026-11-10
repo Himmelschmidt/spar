@@ -1908,7 +1908,7 @@ it before anyone confirms:
   projected implement panel for `plan`, the implement panel for `implement -t` and
   `--workflow loop`, the reviewers for `--workflow review`, and the run's own seats for
   `implement --run <id>` and `plan --run <id>`, with a `--without reviewer[N]` amend
-  applied to the shown fleet, so the dropped seat is gone and survivors show renumbered. Availability, quota pauses and backups are
+  applied to the shown fleet, so the dropped seat is gone and survivors keep their ids. Availability, quota pauses and backups are
   not applied, so a paused primary shows as itself. `null` with `--select` and for arena,
   peer and roles.
 - `gates`: `autonomy` plus `auto_plan`, `auto_winner`, `auto_ship`, true when the config
@@ -1994,13 +1994,15 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
   slot (and the spec bus protocol coordinates with the planner alone, addressing nothing to
   a critic that does not exist); `spec` -> `[spec] enabled = false` for this run (no
   `test_author`, no `test-contract.md`); `suite` -> `[suite] enabled = false` for this run
-  (no `tester` slot); `reviewer[N]` -> the panel's Nth seat (0-based) is removed, with its
-  per-ordinal backup, or an existing seat id (`review-1-cli-claude`) names the seat
-  directly. The ordinal indexes the panel the dispatch would use: an explicit
-  `--providers`/`--select` pool beats a `[roles].reviewer` file pin. Dropping a reviewer
-  removes it from the panel, the run's state slots, and
-  the review history, so its verdicts stop gating the ship; the higher remaining seats
-  are renumbered down so ordinals stay contiguous. Unknown names are refused, naming
+  (no `tester` slot); `reviewer[N]` -> the panel's Nth live seat (0-based) is removed,
+  with its per-ordinal backup, or an existing seat id (`review-1-cli-claude`) names
+  the seat directly. The ordinal resolves against the live panel when `--without`
+  is parsed: an explicit `--providers`/`--select` pool beats a `[roles].reviewer`
+  file pin. Dropping a reviewer removes it from the panel, the run's state slots, and
+  the review history, so its verdicts stop gating the ship. Seats keep their ids for
+  the life of the run: nothing renumbers, and a dropped id retires and is never
+  reminted, so a later ordinal always indexes the seats that are actually there.
+  Unknown names are refused, naming
   the valid ones, and dropping every reviewer is refused, since the run would reach
   the ship gate unreviewed. On an existing `--run <id>` it amends the frozen config, exactly
   like `--role`.
@@ -2011,7 +2013,7 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
   the `--fleet small` reviewer-width override, and any pinned suite command) are recorded in the frozen
   `config.json`, so a later `--reload-config` re-reads `spar.toml` and then re-applies
   them in composition order, so nothing given before is lost unless restated differently
-  (O167). A run's later round with no flags at all still picks the snapshot up unchanged
+  (O168). A run's later round with no flags at all still picks the snapshot up unchanged
   (O27).
 
 **`--suite-command "<cmd>"`** (repeatable, on `plan` and `implement`) sets this run's
@@ -2063,7 +2065,7 @@ spar implement --run <id> --reload-config   # deliberately re-read spar.toml and
 
 `--reload-config` re-reads `spar.toml` into an existing run's snapshot and then re-applies the overrides the run was launched or amended with, so later resumes keep both the file edits and the earlier flags. `--role`, `--backup`, `--effort`, `--without` and `--fleet` amend a `--run <id>` resume's frozen config directly, without `--reload-config`; only `--suite-command` still needs it. Amending and reloading are both refused while the run's orchestrator is alive. Runs created before snapshots existed fall back to the live file.
 
-`--reload-config` re-points an existing seat's **model**, never its provider (O80): a seat id encodes its provider. To change **who** fills a seat that already exists, reassign it:
+An amend that changes the implementer pin re-points the live `impl` seat (provider, model, source) instead of only its model: that id names no provider. The re-point is validated read-only in the amend preview, so a refused one persists nothing (O174). Any other amend leaves existing seats alone, and a reviewer seat only ever re-points its model, since its id encodes its provider. To change **who** fills a seat that already exists, reassign it:
 
 ```bash
 spar implement --run <id> --reassign implementer=cli:claude@sonnet

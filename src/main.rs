@@ -439,7 +439,7 @@ fn run() -> Result<ExitCode> {
                     None => task,
                 };
                 // Seat shapers ride along into the dispatch: a bound run amends under
-                // its own lock, after the preconditions below pass (O168). The
+                // its own lock, after the preconditions below pass (O169). The
                 // preset parses here, so a `--fleet` typo fails at the pre-check
                 // instead of after the dispatch acquired its lock.
                 let amend = workflow::implement::BoundAmendInputs {
@@ -542,24 +542,14 @@ fn run() -> Result<ExitCode> {
                             }
                             let mut seats = executor::run_fleet_seats(&st);
                             if let Some(preview) = &preview {
-                                // Show the fleet after the drop: gone seats vanish, and
-                                // survivors show the ids they renumber to.
+                                // Show the fleet after the drop: gone seats vanish and
+                                // survivors keep their ids.
                                 if let Some(plan) =
                                     workflow::implement::plan_reviewer_drop(&st, &preview.dropped)?
                                 {
                                     let doomed: std::collections::BTreeSet<&str> =
                                         plan.removed.iter().map(|s| s.as_str()).collect();
-                                    let renames: std::collections::HashMap<&str, &str> = plan
-                                        .renames
-                                        .iter()
-                                        .map(|(old, new)| (old.as_str(), new.as_str()))
-                                        .collect();
                                     seats.retain(|s| !doomed.contains(s.seat.as_str()));
-                                    for s in &mut seats {
-                                        if let Some(new) = renames.get(s.seat.as_str()) {
-                                            s.seat = new.to_string();
-                                        }
-                                    }
                                 }
                                 shown_cfg = Some(preview.cfg.clone());
                             }
@@ -611,7 +601,7 @@ fn run() -> Result<ExitCode> {
             // A round extension refused or found busy after the pre-check is still a
             // refusal: nothing was dispatched, so `--json` gets the same shape. An
             // amend refusal is one too: the frozen config and run state were left
-            // untouched under the dispatch's lock (O168).
+            // untouched under the dispatch's lock (O169).
             workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg, amend)
                 .or_else(|e| {
                     if e.is::<workflow::implement::RoundExtensionRefused>()
@@ -1406,7 +1396,7 @@ fn bus_deliver(
 /// `--reload-config` is the deliberate way out: it re-reads the file and re-freezes the
 /// run against it. A bound run amends under the dispatch's own lock, after every
 /// launch precondition passes. Nothing here amends anything before those checks,
-/// so a refused launch changes nothing (O168); this context returns the frozen
+/// so a refused launch changes nothing (O169); this context returns the frozen
 /// config untouched.
 #[allow(clippy::too_many_arguments)]
 fn implement_ctx(

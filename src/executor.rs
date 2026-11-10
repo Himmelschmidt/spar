@@ -4857,7 +4857,6 @@ pub fn init_slot_model(
         source: None,
         auth_fault: false,
         build_cache: None,
-        former_ids: Vec::new(),
         classifier: None,
     }
 }

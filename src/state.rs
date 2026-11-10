@@ -7,6 +7,7 @@ use crate::provider_ref::ExecBackend;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +221,12 @@ pub struct RunState {
     /// run is put back exactly as this records (O137).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amend_in_progress: Option<AmendInProgress>,
+    /// Reviewer seat ids a `--without` drop retired. A seat keeps its id for the
+    /// life of the run: ids are never renumbered onto survivors and never
+    /// reminted, so history and findings stay pinned to the seat that wrote
+    /// them. Runs saved before this field existed read it back empty.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retired_seat_ids: BTreeSet<String>,
 }
 
 /// What an interrupted `spar amend` must put back.
@@ -261,26 +268,11 @@ pub struct ContractAmendment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewHistoryEntry {
     pub round: u32,
+    /// The seat that wrote this entry. Seats keep their ids for the life of
+    /// the run, and a rename migrates the entries it already wrote, so the
+    /// writing id always names the writing seat.
     pub slot_id: String,
-    /// Stable seat identity: the seat's first id, which renumbering never
-    /// changes. Entries written before the key existed carry `None` and match
-    /// by id as before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seat_key: Option<String>,
     pub review: crate::workflow::review_result::ReviewResult,
-}
-
-impl ReviewHistoryEntry {
-    /// Whether this entry is this seat's own record. Keyed entries match the
-    /// seat's stable key, so two seats never claim one entry no matter how
-    /// renumbering reused the writing id. Legacy entries match the id the seat
-    /// carries now or carried before.
-    pub fn names_seat(&self, slot: &SlotState) -> bool {
-        match &self.seat_key {
-            Some(key) => key == slot.seat_key(),
-            None => self.slot_id == slot.id || slot.former_ids.contains(&self.slot_id),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,9 +408,15 @@ impl RunState {
         }
         if let Some(s) = self.slots.iter_mut().find(|s| s.id == old_id) {
             s.id = new_id.to_string();
-            s.former_ids.push(old_id.to_string());
             if let Some(a) = &s.artifact {
                 s.artifact = Some(a.replace(old_id, new_id));
+            }
+        }
+        // The seat continues under its new id, so the entries it already wrote
+        // move with it: identity is the current id, never an alias chain.
+        for e in self.review_history.iter_mut() {
+            if e.slot_id == old_id {
+                e.slot_id = new_id.to_string();
             }
         }
     }
@@ -590,10 +588,6 @@ pub struct SlotState {
     /// dispatch ends so the next one prefers the same warm directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_cache: Option<PathBuf>,
-    /// Ids this seat carried before a backup or `--reassign` renamed it (O85, O136),
-    /// oldest first, so lookups keyed on the id it judged under still find it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub former_ids: Vec<String>,
     /// The failure classifier's last word on this dispatch's routing (O148). Reset at
     /// dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -606,16 +600,6 @@ impl SlotState {
     /// the work is known.
     pub fn parks_on_quota(&self) -> bool {
         self.quota_hit || self.auth_fault
-    }
-
-    /// This seat's stable identity: the first id it ever held. Renames rewrite
-    /// `id` and push onto `former_ids` (oldest first), so the head never moves
-    /// while the seat lives, and review history keyed by it survives renumbering.
-    pub fn seat_key(&self) -> &str {
-        self.former_ids
-            .first()
-            .map(String::as_str)
-            .unwrap_or(&self.id)
     }
 
     /// Put `provider` (`cli:x` or `cli:x@model`) in this seat, pending its first
@@ -920,6 +904,7 @@ impl RunState {
             contract_amendments: Vec::new(),
             amend_in_progress: None,
             pr_state: None,
+            retired_seat_ids: BTreeSet::new(),
         }
     }
 
