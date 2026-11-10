@@ -333,6 +333,8 @@ fn run() -> Result<ExitCode> {
                     crate::cli::WorkflowKind::Plan,
                     &opts,
                     &cfg,
+                    &crate::providers::LiveHealth::probing(),
+                    &paths,
                 ) {
                     Ok(f) => f,
                     Err(e) => return launch_refused(e, json, None),
@@ -513,6 +515,8 @@ fn run() -> Result<ExitCode> {
                                 crate::cli::WorkflowKind::Loop,
                                 &opts,
                                 &cfg,
+                                &crate::providers::LiveHealth::probing(),
+                                &paths,
                             )?;
                         }
                     }
@@ -633,7 +637,13 @@ fn run() -> Result<ExitCode> {
                 };
                 workflow::preflight(&opts, &paths, &cfg)?;
                 let fleet = if validate_only {
-                    workflow::roles_resolve::launch_fleet(workflow, &opts, &cfg)?
+                    workflow::roles_resolve::launch_fleet(
+                        workflow,
+                        &opts,
+                        &cfg,
+                        &crate::providers::LiveHealth::probing(),
+                        &paths,
+                    )?
                 } else {
                     None
                 };

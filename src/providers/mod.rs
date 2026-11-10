@@ -138,18 +138,115 @@ pub fn test_report(name: &str, available: bool, readiness: Readiness) -> Provide
 }
 
 /// Usable native-CLI providers as `cli:name` keys, or `None` when no provider is
-/// usable. The one constructor for the availability sets the selection paths
-/// thread through, so workflow code never filters on the raw report fields.
-pub fn usable_set() -> Option<std::collections::HashSet<String>> {
-    let detected: std::collections::HashSet<String> = detect_all()
-        .into_iter()
-        .filter(|r| r.usable())
-        .map(|r| format!("cli:{}", r.name))
-        .collect();
-    if detected.is_empty() {
-        None
-    } else {
-        Some(detected)
+/// One readiness verdict for a provider: whether it may be auto-selected, plus
+/// the failed probe's detail when a probe ran and failed it.
+#[derive(Debug, Clone)]
+pub struct HealthVerdict {
+    pub usable: bool,
+    pub probe_message: Option<String>,
+}
+
+/// Where a seat's provider is resolved and its source is known, health is read
+/// through this rather than through the quota availability set: auto-selection
+/// skips a provider whose probe failed, while pins warn and dispatch anyway.
+/// One method, so a check costs one detection and unit tests inject canned
+/// readiness without spawning host CLIs.
+pub trait HealthSource {
+    fn check(&self, provider: &str) -> HealthVerdict;
+}
+
+/// Production health: real detection when probing, blind parse checks wherever
+/// a probe must not spawn (dry runs and the projection-only paths).
+pub struct LiveHealth {
+    probe: bool,
+}
+
+impl LiveHealth {
+    pub fn probing() -> Self {
+        Self { probe: true }
+    }
+    pub fn for_dry(dry: bool) -> Self {
+        Self { probe: !dry }
+    }
+}
+
+impl HealthSource for LiveHealth {
+    fn check(&self, provider: &str) -> HealthVerdict {
+        if !self.probe {
+            return HealthVerdict {
+                usable: ProviderRef::parse(provider).is_ok(),
+                probe_message: None,
+            };
+        }
+        let usable = is_provider_usable(provider, false);
+        let probe_message = (!usable).then(|| probe_detail(provider)).flatten();
+        HealthVerdict {
+            usable,
+            probe_message,
+        }
+    }
+}
+
+/// The failed probe's detail for an error or a warning: the probe argv that
+/// ran plus its own message. `None` when no probe failed this provider, that is
+/// when it is healthy, unprobed, or missing rather than probe-failed.
+fn probe_detail(provider: &str) -> Option<String> {
+    let adapter = native_adapter(provider)?;
+    let report = adapter.detect();
+    if report.readiness != Readiness::Unhealthy {
+        return None;
+    }
+    let message = report.readiness_message?;
+    match adapter.readiness_probe() {
+        Some(argv) => Some(format!(
+            "probe `{} {}` failed: {message}",
+            adapter.name(),
+            argv.join(" ")
+        )),
+        None => Some(message),
+    }
+}
+
+/// Canned readiness for unit tests: named providers are probe-failed, everything
+/// else stays usable. Hermetic: no host CLI is ever spawned.
+#[cfg(test)]
+pub struct StubHealth {
+    refusals: std::collections::HashMap<String, String>,
+}
+
+#[cfg(test)]
+impl StubHealth {
+    pub fn allow_all() -> Self {
+        Self {
+            refusals: std::collections::HashMap::new(),
+        }
+    }
+    pub fn refuse(provider: &str, message: &str) -> Self {
+        Self::refuse_all(&[(provider, message)])
+    }
+    pub fn refuse_all(entries: &[(&str, &str)]) -> Self {
+        Self {
+            refusals: entries
+                .iter()
+                .map(|(p, m)| (p.to_string(), m.to_string()))
+                .collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl HealthSource for StubHealth {
+    fn check(&self, provider: &str) -> HealthVerdict {
+        match self.refusals.get(provider) {
+            Some(message) => HealthVerdict {
+                usable: false,
+                probe_message: Some(message.clone()),
+            },
+            None => HealthVerdict {
+                usable: true,
+                probe_message: None,
+            },
+        }
     }
 }
 
@@ -881,7 +978,8 @@ pub fn ensure_known(raw: &str) -> anyhow::Result<()> {
 
 /// Providers eligible for auto-selection, as `cli:name` keys, optionally filtered
 /// by `order`. Skips probe-failed (`Unhealthy`) providers; `Unknown` stays in.
-pub fn available_providers(order: &[String]) -> Vec<String> {
+/// The empty-order branch live-detects: unit tests never pass an empty order.
+pub fn available_providers(order: &[String], health: &dyn HealthSource) -> Vec<String> {
     if order.is_empty() {
         detect_all()
             .into_iter()
@@ -891,7 +989,7 @@ pub fn available_providers(order: &[String]) -> Vec<String> {
     } else {
         order
             .iter()
-            .filter(|n| is_provider_usable(n, false))
+            .filter(|n| health.check(n).usable)
             .cloned()
             .collect()
     }
@@ -909,6 +1007,7 @@ pub fn pick_providers(
     requested: Option<&[String]>,
     allow_missing: bool,
     pool_origin: PoolOrigin,
+    health: &dyn HealthSource,
 ) -> Vec<String> {
     let allow_missing = allow_missing || crate::util::env_truthy("SPAR_DRY_RUN");
     let base = if let Some(req) = requested {
@@ -922,7 +1021,7 @@ pub fn pick_providers(
                 .filter_map(|n| ProviderRef::parse(n).ok().map(|p| p.display()))
                 .collect::<Vec<_>>()
         } else {
-            available_providers(req)
+            available_providers(req, health)
         }
     } else if allow_missing {
         if order.is_empty() {
@@ -934,7 +1033,7 @@ pub fn pick_providers(
                 .collect()
         }
     } else {
-        available_providers(order)
+        available_providers(order, health)
     };
 
     if base.is_empty() {
@@ -1000,6 +1099,7 @@ mod tests {
             Some(&["api:openai".into(), "cli:grok".into()]),
             true,
             PoolOrigin::CliProviders,
+            &StubHealth::allow_all(),
         );
         assert_eq!(picked.len(), 2);
         assert_eq!(picked[0], "api:openai");
@@ -1017,6 +1117,7 @@ mod tests {
             ]),
             true,
             PoolOrigin::CliProviders,
+            &StubHealth::allow_all(),
         );
         assert_eq!(picked.len(), 2);
         assert_eq!(picked[0], "cli:codex@openai/gpt-4o-mini");

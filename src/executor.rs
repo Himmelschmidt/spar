@@ -7465,16 +7465,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
                 "{key} must carry no pause record at all"
             );
         }
-        assert!(crate::backup::is_provider_eligible(
-            "cli:agy@flash",
-            &store,
-            None
-        ));
-        assert!(crate::backup::is_provider_eligible(
-            "cli:agy@pro",
-            &store,
-            None
-        ));
+        assert!(crate::backup::is_provider_eligible("cli:agy@flash", &store));
+        assert!(crate::backup::is_provider_eligible("cli:agy@pro", &store));
     }
 
     /// The writer and every gate resolve a seat's model from the same source: the
@@ -7524,8 +7516,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert_eq!(slot.provider_ref().quota_key(), "cli:agy@gemini-flash");
         assert!(!crate::backup::is_provider_eligible(
             &slot.provider_ref().display(),
-            &store,
-            None
+            &store
         ));
         let plan_job = SlotJob {
             model: slot.model.clone(),

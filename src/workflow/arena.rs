@@ -36,8 +36,15 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     let roles: Vec<&str> = (0..n).map(|_| "implementer").collect();
     let requested = opts.resolve_pool(n, &roles, paths, cfg, &state.id)?;
     state.pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
-    state.providers =
-        providers::pick_providers(&requested, n, Some(&requested), dry, state.pool_origin);
+    let health = providers::LiveHealth::for_dry(dry);
+    state.providers = providers::pick_providers(
+        &requested,
+        n,
+        Some(&requested),
+        dry,
+        state.pool_origin,
+        &health,
+    );
     if !dry {
         match crate::quota::apply_quota_filter(paths, &state.providers) {
             Ok(p) => state.providers = p,
@@ -62,7 +69,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         &state.providers,
         state.pool_origin,
         cfg,
-        dry,
+        &health,
     );
     for (i, prov) in state.providers.iter().enumerate() {
         let id = format!("arena-{i}-{}", sanitize_slot(prov));
@@ -405,7 +412,7 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
         &state.providers,
         state.pool_origin,
         cfg,
-        state.dry_run,
+        &crate::providers::LiveHealth::for_dry(state.dry_run),
     );
 
     let recon_prov = state

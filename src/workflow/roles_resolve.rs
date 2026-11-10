@@ -106,6 +106,11 @@ fn singleton_role_value(role: SlotRole, cfg: &Config) -> Option<String> {
 /// never be read back as if it were an explicit override — every seat drawn from it is
 /// resolved fresh from `cfg` instead, which is what keeps a `Synth` pool's own values
 /// consistent with what this function would say anyway.
+///
+/// Health is read here, once, where the source is known: the order rung skips
+/// probe-failed entries, while pins and `[roles]` file entries return unchecked
+/// (pins warn at launch; an unhealthy file seat yields to its backup in the
+/// backup-resolution layer, never to the quota gate).
 pub fn resolve_seat(
     role: SlotRole,
     pool_index: usize,
@@ -113,7 +118,7 @@ pub fn resolve_seat(
     pool: &[String],
     pool_origin: PoolOrigin,
     cfg: &Config,
-    dry: bool,
+    health: &dyn crate::providers::HealthSource,
 ) -> Option<(String, SeatSource)> {
     // 1. CLI --role for this role always wins, even under an explicit pool (Bug B).
     if cfg.cli_role_keys.contains(role.as_config_key()) {
@@ -156,21 +161,62 @@ pub fn resolve_seat(
     }
     // 4. [providers].order last resort: reviewer keys by its own ordinal (so an unpinned
     // panel reads order[0], order[1], … regardless of pool width); singles key by pool
-    // position. Either way the rung scans forward for the first usable provider, so
-    // one Unhealthy entry yields to the next instead of refusing the whole launch.
-    // `dry` stays unprobed: `is_provider_usable` allows everything unprobed.
+    // position.
     let order_idx = if role == SlotRole::Reviewer {
         role_index
     } else {
         pool_index
     };
+    resolve_order_rung(order_idx, cfg, health)
+}
+
+/// The `[providers].order` last-resort rung on its own: the order filtered to
+/// usable entries first, then indexed by ordinal, so a probe-failed entry never
+/// annexes a seat and surviving seats never collapse onto one provider. An
+/// ordinal past the usable entries is `None`, never a wrong provider.
+pub fn resolve_order_rung(
+    order_idx: usize,
+    cfg: &Config,
+    health: &dyn crate::providers::HealthSource,
+) -> Option<(String, SeatSource)> {
     cfg.providers
         .order
         .iter()
-        .skip(order_idx)
-        .find(|p| crate::providers::is_provider_usable(p, dry))
+        .filter(|p| health.check(p).usable)
+        .nth(order_idx)
         .cloned()
         .map(|p| (p, SeatSource::ProvidersOrder))
+}
+
+/// Every provider a non-pin rung named but health refused, with the failed
+/// probe's detail: the `[roles]` singleton file seat plus the `[providers].order`
+/// entries. Reviewer file lists are excluded (an exact panel narrows rather
+/// than errors). Callers use this on the `None` path to fail with a
+/// readiness-specific message instead of a generic "no provider" one.
+pub fn health_skips_for_seat(
+    role: SlotRole,
+    pool: &[String],
+    pool_origin: PoolOrigin,
+    cfg: &Config,
+    health: &dyn crate::providers::HealthSource,
+) -> Vec<(String, String)> {
+    if matches!(pool_origin, PoolOrigin::CliProviders | PoolOrigin::Selected) && !pool.is_empty() {
+        return Vec::new();
+    }
+    let mut skips = Vec::new();
+    if role != SlotRole::Reviewer {
+        if let Some(entry) = singleton_role_value(role, cfg) {
+            if let Some(message) = health.check(&entry).probe_message {
+                skips.push((entry, message));
+            }
+        }
+    }
+    for entry in &cfg.providers.order {
+        if let Some(message) = health.check(entry).probe_message {
+            skips.push((entry.clone(), message));
+        }
+    }
+    skips
 }
 
 /// Split a resolved ref into `(storage_key, model)`, matching `executor::init_slot_model`:
@@ -186,38 +232,75 @@ pub(crate) fn split_model(raw: &str, fallback_model: Option<String>) -> (String,
 /// `FleetSeat`s. Used both to create the real slots (`projected: false`) and to report
 /// the panel a plan gate has not dispatched yet (`projected: true`); the id formula is
 /// identical either way; so a projection can never drift from what gets dispatched.
+///
+/// Every seat settles through `backup::resolve_with_backup`, the same single point
+/// plan slots resolve through: an unhealthy non-pin provider yields to its backup,
+/// then the `[providers].order` rung (a reviewer entry narrows the panel instead),
+/// and only when nothing healthy remains does the missing implementer fail with a
+/// readiness error naming the failed probes. Pins stay and warn at launch. Health
+/// never reaches the quota gate, so an unhealthy seat can never park with exit 4.
+#[allow(clippy::too_many_arguments)]
 pub fn build_implement_seats(
     cfg: &Config,
     pool: &[String],
     pool_origin: PoolOrigin,
     projected: bool,
+    health: &dyn crate::providers::HealthSource,
+    store: &crate::quota::QuotaStore,
+    paths: &crate::paths::SparPaths,
     dry: bool,
     model_for: &dyn Fn(usize) -> Option<String>,
-) -> Vec<FleetSeat> {
+) -> anyhow::Result<Vec<FleetSeat>> {
     let mut out = Vec::new();
-    if let Some((raw, source)) =
-        resolve_seat(SlotRole::Implementer, 0, 0, pool, pool_origin, cfg, dry)
-    {
-        let (provider, model) = split_model(&raw, model_for(0));
-        out.push(FleetSeat {
-            seat: "impl".into(),
-            role: SlotRole::Implementer,
-            provider,
-            model,
-            source,
-            projected,
-        });
+    let model = model_for(0);
+    match crate::backup::resolve_with_backup(
+        SlotRole::Implementer,
+        0,
+        0,
+        pool,
+        pool_origin,
+        cfg,
+        model.as_deref(),
+        store,
+        paths,
+        dry,
+        health,
+    ) {
+        Some((raw, source)) => {
+            let (provider, model) = split_model(&raw, model_for(0));
+            out.push(FleetSeat {
+                seat: "impl".into(),
+                role: SlotRole::Implementer,
+                provider,
+                model,
+                source,
+                projected,
+            });
+        }
+        None => {
+            let skips =
+                health_skips_for_seat(SlotRole::Implementer, pool, pool_origin, cfg, health);
+            if let Some(err) = crate::backup::readiness_error(&skips) {
+                return Err(err);
+            }
+            anyhow::bail!("no provider resolved for implementer");
+        }
     }
     for r in 0..panel_size(cfg) {
         let pool_index = r + 1;
-        let Some((raw, source)) = resolve_seat(
+        let model = model_for(pool_index);
+        let Some((raw, source)) = crate::backup::resolve_with_backup(
             SlotRole::Reviewer,
             pool_index,
             r,
             pool,
             pool_origin,
             cfg,
+            model.as_deref(),
+            store,
+            paths,
             dry,
+            health,
         ) else {
             continue;
         };
@@ -231,7 +314,7 @@ pub fn build_implement_seats(
             projected,
         });
     }
-    out
+    Ok(out)
 }
 
 /// Per-seat `SeatSource` for a workflow that dispatches `count` uniform-role slots
@@ -246,11 +329,11 @@ pub fn resolve_seat_sources(
     pool: &[String],
     pool_origin: PoolOrigin,
     cfg: &Config,
-    dry: bool,
+    health: &dyn crate::providers::HealthSource,
 ) -> Vec<SeatSource> {
     (0..count)
         .map(|i| {
-            resolve_seat(role, i, i, pool, pool_origin, cfg, dry)
+            resolve_seat(role, i, i, pool, pool_origin, cfg, health)
                 .map(|(_, s)| s)
                 .unwrap_or(SeatSource::Unknown)
         })
@@ -278,19 +361,23 @@ pub fn resolve_seat_sources(
 /// otherwise a pool shorter than the panel (e.g. one explicit `--providers` entry with the
 /// two-reviewer default) resolves `None` past its own length and the projection silently
 /// drops reviewer seats the implement panel still dispatches, cycled from that same entry.
+#[allow(clippy::too_many_arguments)]
 pub fn project_implement_fleet(
     cfg: &Config,
     pool: &[String],
     pool_origin: PoolOrigin,
+    health: &dyn crate::providers::HealthSource,
+    store: &crate::quota::QuotaStore,
+    paths: &crate::paths::SparPaths,
     dry: bool,
-    paths: Option<&crate::paths::SparPaths>,
     run_id: Option<&str>,
-) -> Vec<FleetSeat> {
+) -> anyhow::Result<Vec<FleetSeat>> {
     let width = pool_width(cfg);
-    let expanded = crate::providers::pick_providers(pool, width, Some(pool), dry, pool_origin);
+    let expanded =
+        crate::providers::pick_providers(pool, width, Some(pool), false, pool_origin, health);
     let pool = if expanded.is_empty() { pool } else { &expanded };
-    let art = match (paths, run_id) {
-        (Some(paths), Some(run_id)) => crate::model_select::load_select_artifact(paths, run_id)
+    let art = match run_id {
+        Some(run_id) => crate::model_select::load_select_artifact(paths, run_id)
             .ok()
             .flatten(),
         _ => None,
@@ -303,19 +390,31 @@ pub fn project_implement_fleet(
                 .and_then(|c| c.model.clone())
         })
     };
-    build_implement_seats(cfg, pool, pool_origin, true, dry, &model_for)
+    build_implement_seats(
+        cfg,
+        pool,
+        pool_origin,
+        true,
+        health,
+        store,
+        paths,
+        dry,
+        &model_for,
+    )
 }
 
 /// The seats a NEW launch of `kind` would fill, for `--validate-only` (O147): the pool the
 /// launch resolves (`model_select::resolve_providers`, the plan gate's own projection for
-/// the implement panel) without the availability, quota and backup checks dispatch runs,
-/// so a seat whose provider is paused shows its primary here. `None` for `--select`,
-/// which ranks the bench cache at launch, and for the positional workflows (arena, peer,
-/// roles), whose seats are not role-resolved.
+/// the implement panel), probed for real through `health`, so the projection seats the
+/// same panel dispatch would. `None` for `--select`, which ranks the bench cache at
+/// launch, and for the positional workflows (arena, peer, roles), whose seats are not
+/// role-resolved.
 pub fn launch_fleet(
     kind: crate::cli::WorkflowKind,
     opts: &CommonOpts,
     cfg: &Config,
+    health: &dyn crate::providers::HealthSource,
+    paths: &crate::paths::SparPaths,
 ) -> anyhow::Result<Option<Vec<FleetSeat>>> {
     use crate::cli::WorkflowKind;
     if !opts.select.is_empty() {
@@ -323,6 +422,11 @@ pub fn launch_fleet(
     }
     let urgency = crate::model_select::Urgency::parse(&opts.urgency)?;
     let origin = pool_origin_for(opts);
+    let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+    // Validate-only never re-probes a quota pause and never records anything:
+    // `probe::probe` writes the store, so a projection always resolves dry.
+    // Primary health still probes for real through `health`.
+    let dry = true;
     let resolve = |n: usize, roles: &[&str]| -> anyhow::Result<Vec<String>> {
         Ok(crate::model_select::resolve_providers(
             &opts.providers,
@@ -332,6 +436,7 @@ pub fn launch_fleet(
             roles,
             cfg,
             true,
+            health,
         )?
         .providers)
     };
@@ -346,15 +451,15 @@ pub fn launch_fleet(
             projected,
         }
     };
-    let implement_panel = |pool: &[String], projected: bool| {
-        let mut out = project_implement_fleet(cfg, pool, origin, true, None, None);
+    let implement_panel = |pool: &[String], projected: bool| -> anyhow::Result<Vec<FleetSeat>> {
+        let mut out = project_implement_fleet(cfg, pool, origin, health, &store, paths, dry, None)?;
         out.extend(crate::workflow::implement::project_tester_seat(
-            cfg, true, pool, origin, None, None,
+            cfg, false, health, pool, origin, None, None,
         ));
         for s in &mut out {
             s.projected = projected;
         }
-        out
+        Ok(out)
     };
     Ok(match kind {
         WorkflowKind::Plan => {
@@ -371,25 +476,37 @@ pub fn launch_fleet(
                 &requested,
                 roles.len(),
                 Some(&requested),
-                true,
+                false,
                 origin,
+                health,
             );
             let mut out = Vec::new();
+            let mut skips = Vec::new();
             for (idx, (role, prefix)) in specs.into_iter().enumerate() {
-                if let Some((raw, source)) = resolve_seat(role, idx, idx, &pool, origin, cfg, true)
-                {
-                    let id = format!("{prefix}-{}", sanitize_slot(&raw));
-                    out.push(seat(role, id, raw, source, false));
+                match crate::backup::resolve_with_backup(
+                    role, idx, idx, &pool, origin, cfg, None, &store, paths, dry, health,
+                ) {
+                    Some((raw, source)) => {
+                        let id = format!("{prefix}-{}", sanitize_slot(&raw));
+                        out.push(seat(role, id, raw, source, false));
+                    }
+                    None => skips.extend(health_skips_for_seat(role, &pool, origin, cfg, health)),
+                }
+            }
+            if out.is_empty() {
+                if let Some(err) = crate::backup::readiness_error(&skips) {
+                    return Err(err);
                 }
             }
             if cfg.spec.enabled {
                 let used: Vec<String> = out.iter().map(|s| s.provider.clone()).collect();
-                let (raw, source) =
-                    crate::workflow::plan::resolve_spec_provider(cfg, true, &pool, origin, &used)?;
+                let (raw, source) = crate::workflow::plan::resolve_spec_provider(
+                    cfg, health, &pool, origin, &used,
+                )?;
                 let id = format!("test-author-{}", sanitize_slot(&raw));
                 out.push(seat(SlotRole::TestAuthor, id, raw, source, false));
             }
-            out.extend(implement_panel(&requested, true));
+            out.extend(implement_panel(&requested, true)?);
             Some(out)
         }
         WorkflowKind::Loop => {
@@ -398,7 +515,7 @@ pub fn launch_fleet(
                 .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
                 .take(n)
                 .collect();
-            Some(implement_panel(&resolve(n, &roles)?, false))
+            Some(implement_panel(&resolve(n, &roles)?, false)?)
         }
         WorkflowKind::Review => {
             let n = if opts.providers.is_empty() {
@@ -408,15 +525,21 @@ pub fn launch_fleet(
             };
             let roles: Vec<&str> = (0..n).map(|_| SlotRole::Reviewer.as_config_key()).collect();
             let requested = resolve(n, &roles)?;
-            let pool =
-                crate::providers::pick_providers(&requested, n, Some(&requested), true, origin);
+            let pool = crate::providers::pick_providers(
+                &requested,
+                n,
+                Some(&requested),
+                false,
+                origin,
+                health,
+            );
             let sources = resolve_seat_sources(
                 SlotRole::Reviewer,
                 pool.len(),
                 &requested,
                 origin,
                 cfg,
-                true,
+                health,
             );
             let out = pool
                 .iter()
@@ -436,38 +559,138 @@ pub fn launch_fleet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::StubHealth;
 
     #[test]
     fn pinned_reviewer_list_is_exact_no_order_fallback() {
+        let health = StubHealth::allow_all();
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:codex".into()];
         assert_eq!(
-            resolve_seat(SlotRole::Reviewer, 1, 0, &[], PoolOrigin::Synth, &cfg, true)
-                .map(|(p, _)| p),
+            resolve_seat(
+                SlotRole::Reviewer,
+                1,
+                0,
+                &[],
+                PoolOrigin::Synth,
+                &cfg,
+                &health
+            )
+            .map(|(p, _)| p),
             Some("cli:codex".into())
         );
         // Past the one-entry list: None, never [providers].order[1].
         assert_eq!(
-            resolve_seat(SlotRole::Reviewer, 2, 1, &[], PoolOrigin::Synth, &cfg, true),
+            resolve_seat(
+                SlotRole::Reviewer,
+                2,
+                1,
+                &[],
+                PoolOrigin::Synth,
+                &cfg,
+                &health
+            ),
             None
         );
     }
 
     #[test]
     fn unpinned_reviewer_uses_order_by_ordinal() {
+        let health = StubHealth::allow_all();
         let cfg = Config::default();
         assert_eq!(
-            resolve_seat(SlotRole::Reviewer, 1, 0, &[], PoolOrigin::Synth, &cfg, true),
+            resolve_seat(
+                SlotRole::Reviewer,
+                1,
+                0,
+                &[],
+                PoolOrigin::Synth,
+                &cfg,
+                &health
+            ),
             Some(("cli:claude".into(), SeatSource::ProvidersOrder))
         );
         assert_eq!(
-            resolve_seat(SlotRole::Reviewer, 2, 1, &[], PoolOrigin::Synth, &cfg, true),
+            resolve_seat(
+                SlotRole::Reviewer,
+                2,
+                1,
+                &[],
+                PoolOrigin::Synth,
+                &cfg,
+                &health
+            ),
             Some(("cli:grok".into(), SeatSource::ProvidersOrder))
         );
     }
 
     #[test]
+    fn order_rung_filters_unhealthy_first_then_indexes() {
+        let health = StubHealth::refuse("cli:claude", "probe failed: not logged in");
+        let cfg = Config::default();
+        assert_eq!(
+            resolve_seat(
+                SlotRole::Reviewer,
+                1,
+                0,
+                &[],
+                PoolOrigin::Synth,
+                &cfg,
+                &health
+            ),
+            Some(("cli:grok".into(), SeatSource::ProvidersOrder))
+        );
+        assert_eq!(
+            resolve_seat(
+                SlotRole::Reviewer,
+                2,
+                1,
+                &[],
+                PoolOrigin::Synth,
+                &cfg,
+                &health
+            ),
+            Some(("cli:agy".into(), SeatSource::ProvidersOrder))
+        );
+        assert_eq!(
+            resolve_order_rung(2, &cfg, &health),
+            None,
+            "past the usable entries is None, never a wrong provider"
+        );
+    }
+
+    #[test]
+    fn unhealthy_singleton_and_order_are_reported_as_skips() {
+        let health = StubHealth::refuse_all(&[
+            ("cli:roles", "probe failed: not logged in"),
+            ("cli:claude", "probe failed: not logged in"),
+        ]);
+        let mut cfg = Config::default();
+        cfg.roles.implementer = Some("cli:roles".into());
+        let skips =
+            health_skips_for_seat(SlotRole::Implementer, &[], PoolOrigin::Synth, &cfg, &health);
+        assert_eq!(skips.len(), 2);
+        assert!(skips.iter().any(|(p, _)| p == "cli:roles"));
+        assert!(skips.iter().any(|(p, _)| p == "cli:claude"));
+    }
+
+    #[test]
+    fn skips_are_empty_when_nothing_named_a_probe_failure() {
+        let health = StubHealth::allow_all();
+        let cfg = Config::default();
+        assert!(health_skips_for_seat(
+            SlotRole::Implementer,
+            &[],
+            PoolOrigin::Synth,
+            &cfg,
+            &health,
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn cli_role_outranks_explicit_pool() {
+        let health = StubHealth::allow_all();
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:codex".into()];
         cfg.cli_role_keys.insert("reviewer".into());
@@ -480,7 +703,7 @@ mod tests {
                 &pool,
                 PoolOrigin::CliProviders,
                 &cfg,
-                true
+                &health
             ),
             Some(("cli:codex".into(), SeatSource::CliRole))
         );
@@ -488,6 +711,7 @@ mod tests {
 
     #[test]
     fn explicit_pool_beats_roles_file() {
+        let health = StubHealth::allow_all();
         let mut cfg = Config::default();
         cfg.roles.implementer = Some("cli:roles".into());
         let pool = vec!["cli:explicit".into()];
@@ -499,7 +723,7 @@ mod tests {
                 &pool,
                 PoolOrigin::CliProviders,
                 &cfg,
-                true
+                &health
             )
             .map(|(p, _)| p),
             Some("cli:explicit".into())

@@ -253,28 +253,57 @@ struct Reentry {
 /// **A `Running` seat is never re-pointed.** Its provider is the one that is mid-flight;
 /// rewriting it would make the run's own record disagree with the process it is
 /// waiting on, and the slot's pid marker is filed against what actually spawned.
-fn repoint_existing_seats(state: &mut RunState, cfg: &Config) -> Result<()> {
+fn repoint_existing_seats(
+    state: &mut RunState,
+    cfg: &Config,
+    health: &dyn crate::providers::HealthSource,
+) -> Result<()> {
     let pool = state.providers.clone();
-    let seats = crate::workflow::roles_resolve::build_implement_seats(
-        cfg,
-        &pool,
-        state.pool_origin,
-        false,
-        false,
-        &|_| None,
-    );
-    for seat in seats {
-        let Some(slot) = state.slots.iter_mut().find(|s| s.id == seat.seat) else {
+    for slot in state
+        .slots
+        .iter_mut()
+        .filter(|s| s.status != SlotStatus::Running && s.source != Some(SeatSource::Reassigned))
+    {
+        // Never touch the seat that is mid-flight (filtered above): its provider is
+        // the one that spawned, and its pid marker is filed against exactly that.
+        // A hand-moved seat (O136, filtered above) is likewise left alone: the
+        // config never named its provider, so it has nothing to say about its
+        // model either.
+        //
+        // Resolve the seat this slot fills raw and unsettled: re-pointing is
+        // model-only, so the provider must come out exactly as the slot carries
+        // it. Settling here (a backup or order substitution) would resolve a
+        // different provider and trip the mismatch refusal below on every
+        // continue whose primary went unhealthy, without changing anything the
+        // seat machinery owns. Canonical seats only: a rotated or widened seat
+        // is not the config's seat and stays with the seat machinery.
+        let (role, pool_index, role_index) = match slot.role {
+            SlotRole::Implementer if slot.id == "impl" => (SlotRole::Implementer, 0, 0),
+            SlotRole::Reviewer => match reviewer_ordinal(&slot.id) {
+                Some(r) => (SlotRole::Reviewer, r + 1, r),
+                None => continue,
+            },
+            _ => continue,
+        };
+        let Some((raw, source)) = crate::workflow::roles_resolve::resolve_seat(
+            role,
+            pool_index,
+            role_index,
+            &pool,
+            state.pool_origin,
+            cfg,
+            health,
+        ) else {
             continue;
         };
-        // Never touch the seat that is mid-flight: its provider is the one that
-        // spawned, and its pid marker is filed against exactly that.
-        if slot.status == SlotStatus::Running {
-            continue;
-        }
-        // The operator moved this seat by hand (O136); the config never named its
-        // provider, so it has nothing to say about its model either.
-        if slot.source == Some(SeatSource::Reassigned) {
+        let (provider, model) = crate::workflow::roles_resolve::split_model(&raw, None);
+        if role == SlotRole::Reviewer
+            && slot.id
+                != format!(
+                    "review-{role_index}-{}",
+                    crate::util::sanitize_slot(&provider)
+                )
+        {
             continue;
         }
         // **Model only.** A reviewer seat's id is `review-{r}-{sanitized provider}`
@@ -287,33 +316,32 @@ fn repoint_existing_seats(state: &mut RunState, cfg: &Config) -> Result<()> {
         // one vendor (the exact thing feature 011 exists to keep exact) and then
         // blaming codex in the rate-limit error when claude's limit was the one hit.
         //
-        // A genuinely *different* provider therefore resolves to a seat id that does
-        // not exist yet, falls through the `find` above, and is left to the seat
-        // machinery rather than smuggled in here. Changing who fills a seat is a
-        // different operation from changing which model they use, and only the
-        // second one is safe to do to a slot that already carries a worktree, a
-        // branch and a round history.
+        // A genuinely *different* provider therefore fails the canonical-id check
+        // above and is left to the seat machinery rather than smuggled in here.
+        // Changing who fills a seat is a different operation from changing which
+        // model they use, and only the second one is safe to do to a slot that
+        // already carries a worktree, a branch and a round history.
         // Enforced, not asserted: a seat id that names one provider while the slot
         // carries another is how a two-vendor panel becomes one vendor without
         // anybody being told, and how a rate-limit error ends up blaming the wrong
         // provider. If this ever does not hold, the seat machinery and the id
-        // formula have diverged, and refusing is the only safe answer — writing
+        // formula have diverged, and refusing is the only safe answer: writing
         // either field would bake the disagreement in.
-        if slot.provider != seat.provider {
+        if slot.provider != provider {
             bail!(
                 "seat `{}` resolves to {} but the run carries {}; the seat id encodes \
                  its provider, so these cannot both be right. Refusing to re-point it \
                  rather than leave a seat whose id contradicts what fills it.",
-                seat.seat,
-                seat.provider,
+                slot.id,
+                provider,
                 slot.provider
             );
         }
-        if slot.model == seat.model {
+        if slot.model == model {
             continue;
         }
-        slot.model = seat.model.clone();
-        slot.source = Some(seat.source);
+        slot.model = model;
+        slot.source = Some(source);
     }
     Ok(())
 }
@@ -778,12 +806,14 @@ fn run_from_approved(
                 Vec::new()
             };
     }
+    let health = providers::LiveHealth::for_dry(state.dry_run);
     state.providers = providers::pick_providers(
         &requested,
         n,
         Some(&requested),
         state.dry_run,
         state.pool_origin,
+        &health,
     );
     // Quota gate is now backup-aware; it runs after seats are materialized.
     // A bare pool gate before prepare_implement_slots would see the pool entry as paused
@@ -834,25 +864,13 @@ fn run_from_approved(
     )?;
     if !dry {
         let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-        let has_backup = cfg.backups.implementer.is_some()
-            || !cfg.backups.reviewer.is_empty()
-            || cfg.backups.tester.is_some();
-        let available: Option<std::collections::HashSet<String>> = if !has_backup {
-            None
-        } else {
-            crate::providers::usable_set()
-        };
         let mut still_paused: Vec<String> = Vec::new();
         for slot in &state.slots {
             if matches!(
                 slot.role,
                 SlotRole::Implementer | SlotRole::Reviewer | SlotRole::Tester
-            ) && !crate::backup::seat_eligible(
-                &slot.provider_ref().display(),
-                slot.source,
-                &store,
-                available.as_ref(),
-            ) {
+            ) && !crate::backup::seat_eligible(&slot.provider_ref().display(), &store)
+            {
                 let key = slot.provider_ref().quota_key();
                 if !still_paused.contains(&key) {
                     still_paused.push(key);
@@ -927,7 +945,7 @@ fn prepare_implement_slots(
         // and nothing that runs. `skills/core.md` documents `--reload-config` as the
         // way to change a running run's fleet, so the contract was real and unhonoured.
         if reload_config {
-            repoint_existing_seats(state, cfg)?;
+            repoint_existing_seats(state, cfg, &crate::providers::LiveHealth::for_dry(dry))?;
         }
         ensure_suite_slot(state, dry, cfg, paths)?;
         return Ok(());
@@ -935,7 +953,8 @@ fn prepare_implement_slots(
 
     let req = requested.unwrap_or_default();
     let n = crate::workflow::roles_resolve::pool_width(cfg);
-    state.providers = providers::pick_providers(req, n, Some(req), dry, state.pool_origin);
+    let health = providers::LiveHealth::for_dry(dry);
+    state.providers = providers::pick_providers(req, n, Some(req), dry, state.pool_origin, &health);
     if state.providers.is_empty() {
         bail!("no usable providers (pass --providers, set a [roles] block, or --select)");
     }
@@ -955,67 +974,26 @@ fn prepare_implement_slots(
     };
 
     // One resolver for slot creation and for the plan gate's projection of this same
-    // panel (feature 011, item C): the id formula cannot drift between the two.
+    // panel (feature 011, item C): the id formula cannot drift between the two. Every
+    // seat settles through the single resolution point, so an unhealthy non-pin
+    // provider yields to its backup or the order rung here exactly as the projection
+    // shows; when nothing healthy remains the builder fails with a readiness error
+    // (exit 1, never the quota-only exit 4).
+    let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     let seats = crate::workflow::roles_resolve::build_implement_seats(
         cfg,
         &pool,
         pool_origin,
         false,
+        &health,
+        &store,
+        paths,
         dry,
         &model_for,
-    );
-    if seats.iter().all(|s| s.role != SlotRole::Implementer) {
-        anyhow::bail!("no provider resolved for implementer");
-    }
-    let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-    let has_backup = cfg.backups.implementer.is_some()
-        || !cfg.backups.reviewer.is_empty()
-        || cfg.backups.tester.is_some();
-    let available: Option<std::collections::HashSet<String>> = if dry || !has_backup {
-        None
-    } else {
-        crate::providers::usable_set()
-    };
+    )?;
     for seat in seats {
-        let mut provider = seat.provider.clone();
-        let mut source = seat.source;
-        let mut model = seat.model.clone();
-        let mut seat_id = seat.seat.clone();
-        let seat_ref =
-            crate::provider_ref::ProviderRef::for_seat(&provider, model.as_deref()).display();
-        if !crate::backup::seat_eligible(&seat_ref, Some(source), &store, available.as_ref()) {
-            let ordinal = if seat.role == SlotRole::Reviewer {
-                reviewer_ordinal(&seat.seat).unwrap_or(0)
-            } else {
-                0
-            };
-            if let Some(backup_raw) = crate::backup::backup_for_role(seat.role, ordinal, cfg) {
-                if let Some(takeover) = crate::backup::takeover(
-                    &backup_raw,
-                    seat.role,
-                    cfg,
-                    &store,
-                    available.as_ref(),
-                    paths,
-                    dry,
-                ) {
-                    if let Ok(pin) = crate::provider_ref::Pin::parse(&backup_raw) {
-                        provider = pin.display();
-                        source = takeover;
-                        model = pin.model.clone();
-                        if seat.role == SlotRole::Reviewer {
-                            seat_id = format!(
-                                "review-{}-{}",
-                                ordinal,
-                                crate::util::sanitize_slot(&pin.provider)
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        let mut slot = executor::init_slot_model(&seat_id, &provider, seat.role, model);
-        slot.source = Some(source);
+        let mut slot = executor::init_slot_model(&seat.seat, &seat.provider, seat.role, seat.model);
+        slot.source = Some(seat.source);
         state.slots.push(slot);
     }
     // The projected panel has graduated into real slots; a stale projection would only
@@ -1073,6 +1051,7 @@ fn ensure_suite_slot(
     let (suite_prov, suite_model, source) = resolve_suite_provider(
         cfg,
         dry,
+        &crate::providers::LiveHealth::for_dry(dry),
         &state.providers,
         state.pool_origin,
         Some(paths),
@@ -1105,6 +1084,7 @@ fn ensure_suite_slot(
 pub fn project_tester_seat(
     cfg: &Config,
     dry: bool,
+    health: &dyn crate::providers::HealthSource,
     pool: &[String],
     pool_origin: PoolOrigin,
     paths: Option<&SparPaths>,
@@ -1132,7 +1112,7 @@ pub fn project_tester_seat(
         }
     }
     let (provider, model, source) =
-        resolve_suite_provider(cfg, dry, pool, pool_origin, None, None).ok()?;
+        resolve_suite_provider(cfg, dry, health, pool, pool_origin, None, None).ok()?;
     Some(FleetSeat {
         seat: format!("suite-{}", sanitize_slot(&provider)),
         role: SlotRole::Tester,
@@ -1150,6 +1130,7 @@ pub fn project_tester_seat(
 fn resolve_suite_provider(
     cfg: &Config,
     dry: bool,
+    health: &dyn crate::providers::HealthSource,
     fleet: &[String],
     pool_origin: PoolOrigin,
     paths: Option<&SparPaths>,
@@ -1163,7 +1144,7 @@ fn resolve_suite_provider(
             || (if pinned {
                 providers::is_provider_present(p, false)
             } else {
-                providers::is_provider_usable(p, false)
+                health.check(p).usable
             })
         {
             let source = if pinned {
@@ -1209,7 +1190,7 @@ fn resolve_suite_provider(
     }
     if let Some(p) = PREFS
         .iter()
-        .find(|p| providers::is_provider_usable(p, false))
+        .find(|p| health.check(p).usable)
         .map(|s| (*s).to_string())
     {
         return Ok((p, None, SeatSource::SuitePreferences));
@@ -1223,14 +1204,26 @@ fn resolve_suite_provider(
             if pool_pinned {
                 providers::is_provider_present(p, false)
             } else {
-                providers::is_provider_usable(p, false)
+                health.check(p).usable
             }
         })
         .cloned()
     {
         return Ok((p, None, pool_origin.as_seat_source()));
     }
-    bail!("suite.enabled but no usable suite provider (set [roles].tester or install a CLI)")
+    let probes = PREFS
+        .iter()
+        .filter_map(|p| {
+            let verdict = health.check(p);
+            (!verdict.usable).then(|| {
+                verdict
+                    .probe_message
+                    .unwrap_or_else(|| format!("{p} unavailable"))
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    bail!("suite.enabled but no usable suite provider ({probes}; set [roles].tester or install a CLI)")
 }
 
 #[cfg(test)]
@@ -1307,7 +1300,7 @@ mod suite_reap_tests {
         let mut st = run_with_impl("cli:muse", "muse-spark-1.3", SlotStatus::Failed);
         let cfg = cfg_with_implementer("cli:muse@muse-spark-1.2");
 
-        repoint_existing_seats(&mut st, &cfg).unwrap();
+        repoint_existing_seats(&mut st, &cfg, &crate::providers::StubHealth::allow_all()).unwrap();
 
         let impl_slot = st.slots.iter().find(|s| s.id == "impl").unwrap();
         assert_eq!(impl_slot.model.as_deref(), Some("muse-spark-1.2"));
@@ -1346,7 +1339,7 @@ mod suite_reap_tests {
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:claude@opus".into(), "cli:codex@gpt-5.6-terra".into()];
 
-        repoint_existing_seats(&mut st, &cfg).unwrap();
+        repoint_existing_seats(&mut st, &cfg, &crate::providers::StubHealth::allow_all()).unwrap();
 
         let panel: Vec<(&str, &str)> = st
             .slots
@@ -1380,7 +1373,7 @@ mod suite_reap_tests {
         let mut st = run_with_impl("cli:muse", "muse-spark-1.3", SlotStatus::Running);
         let cfg = cfg_with_implementer("cli:muse@muse-spark-1.2");
 
-        repoint_existing_seats(&mut st, &cfg).unwrap();
+        repoint_existing_seats(&mut st, &cfg, &crate::providers::StubHealth::allow_all()).unwrap();
 
         let impl_slot = st.slots.iter().find(|s| s.id == "impl").unwrap();
         assert_eq!(
@@ -1889,7 +1882,9 @@ fn run_with_task(
     // via `run_from_approved`'s frozen-pool reuse, so it has to be recorded here too, not
     // just at the plan phase.
     state.pool_origin = pool_origin;
-    state.providers = providers::pick_providers(&requested, n, Some(&requested), dry, pool_origin);
+    let health = providers::LiveHealth::for_dry(dry);
+    state.providers =
+        providers::pick_providers(&requested, n, Some(&requested), dry, pool_origin, &health);
     // Quota gate is now backup-aware and runs after seat resolution: a paused primary
     // with an eligible backup must not park the run.
     prepare_implement_slots(
@@ -1906,22 +1901,9 @@ fn run_with_task(
     )?;
     if !dry {
         let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-        let has_backup = cfg.backups.implementer.is_some()
-            || !cfg.backups.reviewer.is_empty()
-            || cfg.backups.tester.is_some();
-        let available: Option<std::collections::HashSet<String>> = if !has_backup {
-            None
-        } else {
-            crate::providers::usable_set()
-        };
         let mut still_paused: Vec<String> = Vec::new();
         for slot in &state.slots {
-            if !crate::backup::seat_eligible(
-                &slot.provider_ref().display(),
-                slot.source,
-                &store,
-                available.as_ref(),
-            ) {
+            if !crate::backup::seat_eligible(&slot.provider_ref().display(), &store) {
                 let key = slot.provider_ref().quota_key();
                 if !still_paused.contains(&key) {
                     still_paused.push(key);
@@ -2290,21 +2272,14 @@ pub fn execute_loop(
                     crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
                 {
                     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-                    let has_backup = cfg.backups.implementer.is_some();
-                    let available: Option<std::collections::HashSet<String>> =
-                        if state.dry_run || !has_backup {
-                            None
-                        } else {
-                            crate::providers::usable_set()
-                        };
+                    let health = providers::LiveHealth::for_dry(state.dry_run);
                     let slot_state = state
                         .slots
                         .iter()
                         .find(|s| s.id == impl_job.slot_id)
                         .cloned()
                         .unwrap();
-                    let cause =
-                        crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
+                    let cause = crate::backup::dispatch_stop_cause(&slot_state, &store);
                     if cause.engages_backup()
                         && !slot_state.source.is_some_and(SeatSource::is_backup)
                     {
@@ -2320,9 +2295,9 @@ pub fn execute_loop(
                                 SlotRole::Implementer,
                                 cfg,
                                 &store,
-                                available.as_ref(),
                                 paths,
                                 state.dry_run,
+                                &health,
                             ) {
                                 crate::backup::engage(
                                     state,
@@ -2371,21 +2346,14 @@ pub fn execute_loop(
                 }
             } else {
                 let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-                let has_backup = cfg.backups.implementer.is_some();
-                let available: Option<std::collections::HashSet<String>> =
-                    if state.dry_run || !has_backup {
-                        None
-                    } else {
-                        crate::providers::usable_set()
-                    };
+                let health = providers::LiveHealth::for_dry(state.dry_run);
                 let slot_state = state
                     .slots
                     .iter()
                     .find(|s| s.id == impl_job.slot_id)
                     .cloned()
                     .unwrap();
-                let cause =
-                    crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
+                let cause = crate::backup::dispatch_stop_cause(&slot_state, &store);
                 if cause.engages_backup() && !slot_state.source.is_some_and(SeatSource::is_backup) {
                     if let Some(backup_raw) =
                         crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
@@ -2395,9 +2363,9 @@ pub fn execute_loop(
                             SlotRole::Implementer,
                             cfg,
                             &store,
-                            available.as_ref(),
                             paths,
                             state.dry_run,
+                            &health,
                         ) {
                             let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
                                 .map(|r| r.storage_key())
@@ -2850,6 +2818,7 @@ pub fn execute_loop(
                     &review_cwd,
                     cfg,
                     infra.is_some(),
+                    &providers::LiveHealth::for_dry(state.dry_run),
                 )? {
                     let rev_cwd =
                         reviewer_cwd(state, paths, cfg, &id, panel_head.as_deref(), &review_cwd);
@@ -3102,11 +3071,24 @@ pub fn execute_loop(
             // always beats the ceiling gate (exit 2, "this is costing too much"). The
             // other order let a run whose ladder was already exhausted present as a
             // question for the operator instead of a verdict.
-            if !state.rotated_implementer && try_rotate_implementer(state, paths, cfg)? {
+            if !state.rotated_implementer
+                && try_rotate_implementer(
+                    state,
+                    paths,
+                    cfg,
+                    &providers::LiveHealth::for_dry(state.dry_run),
+                )?
+            {
                 state.rotated_implementer = true;
                 state.fix_rounds = 0;
             } else if !state.widened_reviewers
-                && try_widen_reviewers(state, paths, &review_cwd, cfg)?
+                && try_widen_reviewers(
+                    state,
+                    paths,
+                    &review_cwd,
+                    cfg,
+                    &providers::LiveHealth::for_dry(state.dry_run),
+                )?
             {
                 state.widened_reviewers = true;
                 state.fix_rounds = 0;
@@ -3370,8 +3352,16 @@ fn recheck_seat(
         .and_then(|o| crate::backup::backup_for_role(slot.role, o, cfg))
         .filter(|b| crate::quota::sub_key(b) != sub)
         .and_then(|b| {
-            crate::backup::takeover(&b, slot.role, cfg, &store, None, paths, state.dry_run)
-                .map(|source| (b, source))
+            crate::backup::takeover(
+                &b,
+                slot.role,
+                cfg,
+                &store,
+                paths,
+                state.dry_run,
+                &providers::LiveHealth::for_dry(state.dry_run),
+            )
+            .map(|source| (b, source))
         });
     let Some((backup_raw, source)) = backup else {
         return Ok(SeatCheck::Park(format!(
@@ -3391,7 +3381,12 @@ fn recheck_seat(
 }
 
 /// Change implementer **provider** only; keep stable slot id and worktree.
-fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<bool> {
+fn try_rotate_implementer(
+    state: &mut RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+    health: &dyn crate::providers::HealthSource,
+) -> Result<bool> {
     let slot = state
         .slots
         .iter()
@@ -3410,13 +3405,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
     {
         let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
         let has_backup = cfg.backups.implementer.is_some();
-        let available_opt: Option<std::collections::HashSet<String>> =
-            if state.dry_run || !has_backup {
-                None
-            } else {
-                crate::providers::usable_set()
-            };
-        let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, available_opt.as_ref());
+        let cause = crate::backup::dispatch_stop_cause(&slot_state, &store);
         if has_backup {
             if cause.engages_backup() {
                 if let Some(backup_raw) =
@@ -3439,9 +3428,9 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                             SlotRole::Implementer,
                             cfg,
                             &store,
-                            available_opt.as_ref(),
                             paths,
                             state.dry_run,
+                            health,
                         ) {
                             let impl_id = slot_state.id.clone();
                             crate::backup::engage(state, paths, &impl_id, &backup_raw, source)?;
@@ -3476,7 +3465,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
         &state.providers,
         state.pool_origin,
         cfg,
-        state.dry_run,
+        health,
     );
     let next = cfg
         .roles
@@ -3496,7 +3485,11 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                 .map(|s| s.as_str())
                 .zip(pool_sources.iter().copied()),
         )
-        .find(|(p, _)| *p != cur.as_str() && !used.iter().any(|u| u == p))
+        .find(|(p, src)| {
+            *p != cur.as_str()
+                && !used.iter().any(|u| u == p)
+                && (src.is_explicit_pin() || health.check(p).usable)
+        })
         .map(|(p, src)| (p.to_string(), src));
     let Some((next, source)) = next else {
         return Ok(false);
@@ -3516,6 +3509,7 @@ fn try_widen_reviewers(
     paths: &SparPaths,
     review_cwd: &std::path::Path,
     cfg: &Config,
+    health: &dyn crate::providers::HealthSource,
 ) -> Result<bool> {
     // A pinned panel (CLI `--role reviewer=…` or file `[roles].reviewer`) is an
     // exclusion list, not a floor: widening it must duplicate a pin the run actually
@@ -3576,7 +3570,7 @@ fn try_widen_reviewers(
         &state.providers,
         state.pool_origin,
         cfg,
-        state.dry_run,
+        health,
     );
     let candidate = state
         .providers
@@ -3590,7 +3584,9 @@ fn try_widen_reviewers(
                 .cloned()
                 .map(|p| (p, SeatSource::ProvidersOrder)),
         )
-        .find(|(p, _)| !existing.contains(&normalize(p)));
+        .find(|(p, src)| {
+            !existing.contains(&normalize(p)) && (src.is_explicit_pin() || health.check(p).usable)
+        });
     let Some((prov, source)) = candidate else {
         // still widen with a synthetic extra reviewer on a repeated provider
         let dispatched = state
@@ -3636,6 +3632,7 @@ fn try_rotate_reviewer_provider(
     review_cwd: &std::path::Path,
     cfg: &Config,
     infra: bool,
+    health: &dyn crate::providers::HealthSource,
 ) -> Result<Option<String>> {
     let Some(slot) = state.slots.iter().find(|s| s.id == rev_id).cloned() else {
         return Ok(None);
@@ -3652,9 +3649,9 @@ fn try_rotate_reviewer_provider(
                     SlotRole::Reviewer,
                     cfg,
                     &store,
-                    None,
                     paths,
                     state.dry_run,
+                    health,
                 )
                 .map(|source| (b, source))
             });
@@ -3668,7 +3665,8 @@ fn try_rotate_reviewer_provider(
         }
     }
     let eligible =
-        |p: &String| -> bool { *p != cur && crate::backup::is_provider_eligible(p, &store, None) };
+        |p: &String| -> bool { *p != cur && crate::backup::is_provider_eligible(p, &store) };
+    let healthy = |p: &String| -> bool { eligible(p) && health.check(p).usable };
     let reviewer_role_source = if cfg
         .cli_role_keys
         .contains(SlotRole::Reviewer.as_config_key())
@@ -3685,12 +3683,13 @@ fn try_rotate_reviewer_provider(
     // must fall through like an unpinned panel. Bound the pin candidates to `panel_size`
     // too, so rotating a `small`-truncated two-pin panel duplicates the dispatched pin
     // rather than restoring the pin the preset dropped.
+    let role_pinned = reviewer_role_source.is_explicit_pin();
     let next = if crate::workflow::roles_resolve::reviewer_panel_has_pins(cfg) {
         cfg.roles
             .reviewer
             .iter()
             .take(crate::workflow::roles_resolve::panel_size(cfg))
-            .find(|p| eligible(p))
+            .find(|p| eligible(p) && (role_pinned || health.check(p).usable))
             .cloned()
             .map(|p| (p, reviewer_role_source))
     } else {
@@ -3701,10 +3700,11 @@ fn try_rotate_reviewer_provider(
             .cloned()
             .map(|p| (p, reviewer_role_source))
             .or_else(|| {
+                let pool_pinned = matches!(state.pool_origin, PoolOrigin::CliProviders);
                 state
                     .providers
                     .iter()
-                    .find(|p| eligible(p))
+                    .find(|p| if pool_pinned { eligible(p) } else { healthy(p) })
                     .cloned()
                     .map(|p| (p, state.pool_origin.as_seat_source()))
             })
@@ -3712,7 +3712,7 @@ fn try_rotate_reviewer_provider(
                 cfg.providers
                     .order
                     .iter()
-                    .find(|p| eligible(p))
+                    .find(|p| healthy(p))
                     .cloned()
                     .map(|p| (p, SeatSource::ProvidersOrder))
             })
@@ -3995,6 +3995,7 @@ mod reviewer_infra_tests {
             tmp.path(),
             &cfg,
             true,
+            &crate::providers::StubHealth::allow_all(),
         )
         .unwrap();
         assert_eq!(id.as_deref(), Some("review-0-cli-grok"));
@@ -4028,6 +4029,7 @@ mod reviewer_infra_tests {
             tmp.path(),
             &cfg,
             false,
+            &crate::providers::StubHealth::allow_all(),
         )
         .unwrap();
         assert_eq!(id.as_deref(), Some("review-0-cli-codex"));
@@ -4096,10 +4098,17 @@ mod rotate_reviewer_tests {
         st.pool_origin = PoolOrigin::CliProviders;
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:codex".into()];
-        let changed =
-            try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg, false)
-                .unwrap()
-                .is_some();
+        let changed = try_rotate_reviewer_provider(
+            &mut st,
+            &paths,
+            "review-0",
+            tmp.path(),
+            &cfg,
+            false,
+            &crate::providers::StubHealth::allow_all(),
+        )
+        .unwrap()
+        .is_some();
         assert!(!changed, "single-pin panel has no alternate to rotate to");
         assert_eq!(st.slots[0].provider, "cli:codex");
     }
@@ -4114,10 +4123,17 @@ mod rotate_reviewer_tests {
         st.pool_origin = PoolOrigin::CliProviders;
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:codex".into(), "api:openai".into()];
-        let changed =
-            try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg, false)
-                .unwrap()
-                .is_some();
+        let changed = try_rotate_reviewer_provider(
+            &mut st,
+            &paths,
+            "review-0",
+            tmp.path(),
+            &cfg,
+            false,
+            &crate::providers::StubHealth::allow_all(),
+        )
+        .unwrap()
+        .is_some();
         assert!(changed);
         assert_eq!(st.slots[0].provider, "api:openai");
     }
@@ -4150,9 +4166,17 @@ mod rotate_reviewer_tests {
         }
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:claude".into(), "cli:codex@gpt-5.6-terra".into()];
-        try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg, false)
-            .unwrap()
-            .expect("rotates to the other pin");
+        try_rotate_reviewer_provider(
+            &mut st,
+            &paths,
+            "review-0",
+            tmp.path(),
+            &cfg,
+            false,
+            &crate::providers::StubHealth::allow_all(),
+        )
+        .unwrap()
+        .expect("rotates to the other pin");
         let s = &st.slots[0];
         assert_eq!(s.provider, "cli:codex");
         assert_eq!(s.model.as_deref(), Some("gpt-5.6-terra"));
@@ -4182,10 +4206,17 @@ mod rotate_reviewer_tests {
             fleet_reviewer_override: Some(1),
             ..Config::default()
         };
-        let changed =
-            try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg, false)
-                .unwrap()
-                .is_some();
+        let changed = try_rotate_reviewer_provider(
+            &mut st,
+            &paths,
+            "review-0",
+            tmp.path(),
+            &cfg,
+            false,
+            &crate::providers::StubHealth::allow_all(),
+        )
+        .unwrap()
+        .is_some();
         assert!(changed, "narrowed-but-unpinned panel must still retry");
         assert_eq!(st.slots[0].provider, "cli:claude");
     }
@@ -4207,12 +4238,46 @@ mod rotate_reviewer_tests {
             },
             ..Config::default()
         };
-        let changed =
-            try_rotate_reviewer_provider(&mut st, &paths, "review-0", tmp.path(), &cfg, false)
-                .unwrap()
-                .is_some();
+        let changed = try_rotate_reviewer_provider(
+            &mut st,
+            &paths,
+            "review-0",
+            tmp.path(),
+            &cfg,
+            false,
+            &crate::providers::StubHealth::allow_all(),
+        )
+        .unwrap()
+        .is_some();
         assert!(!changed, "truncated panel has no alternate within its size");
         assert_eq!(st.slots[0].provider, "cli:codex");
+    }
+
+    /// A `[roles].reviewer` entry is a non-pin seat: rotation passes over an entry
+    /// whose login probe fails instead of seating it.
+    #[test]
+    fn file_pinned_panel_skips_an_unhealthy_entry() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with_reviewer("cli:claude");
+        st.providers = vec![];
+        st.pool_origin = PoolOrigin::Synth;
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:codex".into(), "cli:claude".into(), "cli:grok".into()];
+        let health =
+            crate::providers::StubHealth::refuse("cli:codex", "probe `codex login` failed");
+        let id = try_rotate_reviewer_provider(
+            &mut st,
+            &paths,
+            "review-0",
+            tmp.path(),
+            &cfg,
+            false,
+            &health,
+        )
+        .unwrap();
+        assert_eq!(id.as_deref(), Some("review-0"));
+        assert_eq!(st.slots[0].provider, "cli:grok");
     }
 }
 
@@ -4258,7 +4323,8 @@ mod try_rotate_implementer_tests {
         cfg.cli_role_keys.insert("implementer".into());
         cfg.backups.implementer = Some("cli:grok@backup".into());
         // ensure backup provider is available (detect_all would list claude,grok,codex as available if binaries exist? But we use store only, and available None because we didn't set detect. is_provider_eligible will check store and available; with available None, only store matters. backup grok is not paused, so eligible)
-        let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
+        let health = crate::providers::StubHealth::allow_all();
+        let changed = try_rotate_implementer(&mut st, &paths, &cfg, &health).unwrap();
         assert!(changed, "environmental should rotate to backup");
         assert_eq!(st.slots[0].provider, "cli:grok");
         assert_eq!(st.slots[0].model.as_deref(), Some("backup"));
@@ -4275,7 +4341,8 @@ mod try_rotate_implementer_tests {
         cfg.roles.implementer = Some("cli:claude".into());
         cfg.cli_role_keys.insert("implementer".into());
         cfg.backups.implementer = Some("cli:grok@backup".into());
-        let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
+        let health = crate::providers::StubHealth::allow_all();
+        let changed = try_rotate_implementer(&mut st, &paths, &cfg, &health).unwrap();
         assert!(
             !changed,
             "work failure with backup declared must not rotate at all (no backup, no pool)"
@@ -4290,7 +4357,7 @@ mod try_rotate_implementer_tests {
             store.pause_quota("cli:claude", "test");
             store.save(&paths).unwrap();
         }
-        let changed_env = try_rotate_implementer(&mut st_env, &paths, &cfg).unwrap();
+        let changed_env = try_rotate_implementer(&mut st_env, &paths, &cfg, &health).unwrap();
         assert!(
             changed_env,
             "environmental with same backup must activate, proving branch not neutralised"
@@ -4307,7 +4374,8 @@ mod try_rotate_implementer_tests {
         cfg.roles.implementer = Some("cli:claude".into());
         cfg.cli_role_keys.insert("implementer".into());
         cfg.backups.implementer = None;
-        let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
+        let health = crate::providers::StubHealth::allow_all();
+        let changed = try_rotate_implementer(&mut st, &paths, &cfg, &health).unwrap();
         assert!(
             changed,
             "work failure without backup should rotate via pool"
@@ -4326,7 +4394,8 @@ mod try_rotate_implementer_tests {
         cfg.roles.implementer = Some("cli:claude".into());
         cfg.cli_role_keys.insert("implementer".into());
         cfg.backups.implementer = Some("cli:grok@backup".into());
-        let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
+        let health = crate::providers::StubHealth::allow_all();
+        let changed = try_rotate_implementer(&mut st, &paths, &cfg, &health).unwrap();
         assert!(
             !changed,
             "neutralisation check: work with backup must not activate backup"
@@ -4341,7 +4410,7 @@ mod try_rotate_implementer_tests {
         }
         let mut st2 = state_with_impl("cli:claude", Some(SeatSource::CliRole), true);
         st2.slots[0].error = Some("rate limit exceeded".into());
-        let changed2 = try_rotate_implementer(&mut st2, &paths, &cfg).unwrap();
+        let changed2 = try_rotate_implementer(&mut st2, &paths, &cfg, &health).unwrap();
         assert!(changed2, "environmental with same backup must activate");
         assert_eq!(st2.slots[0].source, Some(SeatSource::Backup));
     }
@@ -4363,7 +4432,8 @@ mod try_rotate_implementer_tests {
         cfg.cli_role_keys.insert("implementer".into());
         cfg.backups.implementer = Some("cli:grok@backup".into());
         st.providers = vec!["cli:grok".into(), "cli:codex".into()];
-        let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
+        let health = crate::providers::StubHealth::allow_all();
+        let changed = try_rotate_implementer(&mut st, &paths, &cfg, &health).unwrap();
         assert!(!changed, "consumed backup must not be reselected");
         assert_eq!(st.slots[0].provider, "cli:grok");
     }
@@ -4388,7 +4458,8 @@ mod try_rotate_implementer_tests {
         cfg.roles.implementer = Some("cli:claude".into());
         cfg.cli_role_keys.insert("implementer".into());
         cfg.backups.implementer = Some("cli:grok@backup".into());
-        let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
+        let health = crate::providers::StubHealth::allow_all();
+        let changed = try_rotate_implementer(&mut st, &paths, &cfg, &health).unwrap();
         assert!(!changed, "ineligible backup must not be selected");
     }
 
@@ -4408,11 +4479,63 @@ mod try_rotate_implementer_tests {
         cfg.roles.implementer = Some("cli:claude".into());
         cfg.cli_role_keys.insert("implementer".into());
         cfg.backups.implementer = Some("cli:grok@backup".into());
-        let changed = try_rotate_implementer(&mut st, &paths, &cfg).unwrap();
+        let health = crate::providers::StubHealth::allow_all();
+        let changed = try_rotate_implementer(&mut st, &paths, &cfg, &health).unwrap();
         assert!(changed);
         assert_eq!(st.slots[0].provider, "cli:grok");
         // If Environmental branch were deleted, rotation would fall to codex
         // This test documents that deleting the if cause == Environmental block changes behavior
+    }
+
+    /// The `[providers].order` rung of stuck-ladder rotation passes over an entry
+    /// whose login probe fails instead of seating it.
+    #[test]
+    fn rotation_passes_over_an_unhealthy_order_entry() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with_impl("cli:claude", Some(SeatSource::RolesFile), false);
+        st.providers = vec![];
+        st.pool_origin = PoolOrigin::Synth;
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
+        let health =
+            crate::providers::StubHealth::refuse("cli:codex", "probe `codex login` failed");
+        let changed = try_rotate_implementer(&mut st, &paths, &cfg, &health).unwrap();
+        assert!(changed, "rotation must pass over the unhealthy order entry");
+        assert_eq!(st.slots[0].provider, "cli:grok");
+        assert_eq!(st.slots[0].source, Some(SeatSource::ProvidersOrder));
+    }
+}
+
+#[cfg(test)]
+mod try_widen_reviewers_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Widening an unpinned panel never seats a provider whose login probe fails:
+    /// the `[providers].order` fallback passes over it.
+    #[test]
+    fn widening_never_adds_an_unhealthy_order_entry() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = RunState::new(
+            "r-widen",
+            crate::cli::WorkflowKind::Loop,
+            PathBuf::from("/tmp/x"),
+        );
+        let mut slot = executor::init_slot("review-0", "cli:claude", SlotRole::Reviewer);
+        slot.source = Some(SeatSource::ProvidersOrder);
+        st.slots.push(slot);
+        st.providers = vec![];
+        st.pool_origin = PoolOrigin::Synth;
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["cli:codex".into(), "cli:grok".into()];
+        let health =
+            crate::providers::StubHealth::refuse("cli:codex", "probe `codex login` failed");
+        let widened = try_widen_reviewers(&mut st, &paths, tmp.path(), &cfg, &health).unwrap();
+        assert!(widened);
+        let added = st.slots.iter().find(|s| s.id != "review-0").unwrap();
+        assert_eq!(added.provider, "cli:grok");
     }
 }
 

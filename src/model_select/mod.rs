@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Resolve a fleet of provider refs from explicit list or `--select`.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_providers(
     providers: &[String],
     select: Option<&[String]>,
@@ -31,6 +32,7 @@ pub fn resolve_providers(
     roles: &[&str],
     cfg: &Config,
     dry: bool,
+    health: &dyn crate::providers::HealthSource,
 ) -> Result<ResolvedProviders> {
     if !providers.is_empty() && select.is_some() {
         bail!("use either --providers or --select, not both");
@@ -47,7 +49,7 @@ pub fn resolve_providers(
     // No explicit `--providers`: a populated `[roles]` block satisfies the requirement,
     // synthesizing the fleet per role (precedence [roles] > [providers].order).
     if select.is_none() && !cfg.roles.is_empty() {
-        return synthesize_from_roles(n, roles, cfg, dry);
+        return synthesize_from_roles(n, roles, cfg, health);
     }
     let Some(select) = select else {
         bail!("--providers is required (or set a [roles] block, or pass --select <profile>, e.g. --select value)");
@@ -108,7 +110,7 @@ fn synthesize_from_roles(
     n: usize,
     roles: &[&str],
     cfg: &Config,
-    dry: bool,
+    health: &dyn crate::providers::HealthSource,
 ) -> Result<ResolvedProviders> {
     if n == 0 {
         bail!("need at least one slot to select");
@@ -128,20 +130,40 @@ fn synthesize_from_roles(
         } else {
             i
         };
-        let (p, _source) = crate::workflow::roles_resolve::resolve_seat(
+        let seat = crate::workflow::roles_resolve::resolve_seat(
             role,
             i,
             ridx,
             &[],
             crate::state::PoolOrigin::Synth,
             cfg,
-            dry,
-        )
-        .with_context(|| {
-            format!(
-                "slot {i} (role '{label}'): no provider in [roles] and [providers].order is exhausted"
-            )
-        })?;
+            health,
+        );
+        let (p, _source) = match seat {
+            Some(seat) => seat,
+            None => {
+                let skips = crate::workflow::roles_resolve::health_skips_for_seat(
+                    role,
+                    &[],
+                    crate::state::PoolOrigin::Synth,
+                    cfg,
+                    health,
+                );
+                if skips.is_empty() {
+                    anyhow::bail!(
+                        "slot {i} (role '{label}'): no provider in [roles] and [providers].order is exhausted"
+                    );
+                }
+                anyhow::bail!(
+                    "slot {i} (role '{label}'): no healthy provider: {}",
+                    skips
+                        .iter()
+                        .map(|(p, m)| format!("{p} is unhealthy ({m})"))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+            }
+        };
         out.push(p);
     }
     Ok(ResolvedProviders {

@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::executor::{self, SlotJob};
 use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
-use crate::providers;
+use crate::providers::{self, HealthSource};
 use crate::state::{Phase, RunState, SlotRole, SlotStatus};
 use crate::util::{self, sanitize_slot};
 use crate::worktree;
@@ -51,7 +51,9 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     let roles: Vec<&str> = (0..n).map(|_| "reviewer").collect();
     let requested = opts.resolve_pool(n, &roles, paths, cfg, &state.id)?;
     let pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
-    state.providers = providers::pick_providers(&requested, n, Some(&requested), dry, pool_origin);
+    let health = providers::LiveHealth::for_dry(dry);
+    state.providers =
+        providers::pick_providers(&requested, n, Some(&requested), dry, pool_origin, &health);
     if state.providers.is_empty() {
         state.error = Some("no usable providers".into());
         state.set_phase(Phase::Failed);
@@ -71,19 +73,13 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     let pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
     state.pool_origin = pool_origin;
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-    let has_backup = !cfg.backups.reviewer.is_empty();
-    let available: Option<std::collections::HashSet<String>> = if dry || !has_backup {
-        None
-    } else {
-        crate::providers::usable_set()
-    };
     let sources = crate::workflow::roles_resolve::resolve_seat_sources(
         SlotRole::Reviewer,
         state.providers.len(),
         &requested,
         pool_origin,
         cfg,
-        dry,
+        &health,
     );
     for (i, prov) in state.providers.iter().enumerate() {
         let mut provider = prov.clone();
@@ -95,7 +91,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
             &requested,
             pool_origin,
             cfg,
-            dry,
+            &health,
         ) {
             if pin_source.is_explicit_pin() {
                 provider = pin_provider;
@@ -105,27 +101,24 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         let mut model = crate::provider_ref::Pin::parse(&provider)
             .ok()
             .and_then(|p| p.model);
-        let backup_pin =
-            if !crate::backup::seat_eligible(&provider, source, &store, available.as_ref()) {
-                if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Reviewer, i, cfg)
-                {
-                    if let Some(takeover) = crate::backup::takeover(
-                        &backup_raw,
-                        SlotRole::Reviewer,
-                        cfg,
-                        &store,
-                        available.as_ref(),
-                        paths,
-                        dry,
-                    ) {
-                        if let Ok(bpin) = crate::provider_ref::Pin::parse(&backup_raw) {
-                            provider = bpin.display();
-                            source = Some(takeover);
-                            model = bpin.model.clone();
-                            Some(bpin)
-                        } else {
-                            None
-                        }
+        let unhealthy_auto = !source.is_some_and(crate::state::SeatSource::is_explicit_pin)
+            && !health.check(&provider).usable;
+        let backup_pin = if !crate::backup::seat_eligible(&provider, &store) || unhealthy_auto {
+            if let Some(backup_raw) = crate::backup::backup_for_role(SlotRole::Reviewer, i, cfg) {
+                if let Some(takeover) = crate::backup::takeover(
+                    &backup_raw,
+                    SlotRole::Reviewer,
+                    cfg,
+                    &store,
+                    paths,
+                    dry,
+                    &health,
+                ) {
+                    if let Ok(bpin) = crate::provider_ref::Pin::parse(&backup_raw) {
+                        provider = bpin.display();
+                        source = Some(takeover);
+                        model = bpin.model.clone();
+                        Some(bpin)
                     } else {
                         None
                     }
@@ -134,7 +127,10 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
                 }
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
         let id = if source.is_some_and(crate::state::SeatSource::is_backup) {
             if let Some(bpin) = backup_pin {
                 format!("review-{}-{}", i, sanitize_slot(&bpin.provider))
@@ -234,12 +230,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
     executor::run_slots_parallel(state, paths, cfg, &jobs)?;
 
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-    let has_backup = !cfg.backups.reviewer.is_empty();
-    let available: Option<std::collections::HashSet<String>> = if state.dry_run || !has_backup {
-        None
-    } else {
-        crate::providers::usable_set()
-    };
+    let health = crate::providers::LiveHealth::for_dry(state.dry_run);
     for (idx, job) in jobs.iter().enumerate() {
         let slot_state = match state.slots.iter().find(|s| s.id == job.slot_id).cloned() {
             Some(s) => s,
@@ -248,7 +239,7 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         if slot_state.status != SlotStatus::Failed {
             continue;
         }
-        let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
+        let cause = crate::backup::dispatch_stop_cause(&slot_state, &store);
         if !cause.engages_backup()
             || slot_state
                 .source
@@ -265,9 +256,9 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
             SlotRole::Reviewer,
             cfg,
             &store,
-            available.as_ref(),
             paths,
             state.dry_run,
+            &health,
         ) {
             Some(source) => source,
             None => continue,
