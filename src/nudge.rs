@@ -526,7 +526,6 @@ mod tests {
             DeliveryStrategy::StopHookInject,
             None,
             false,
-            &std::collections::HashSet::new(),
         )
         .unwrap();
         assert_eq!(d.delivered, 1);

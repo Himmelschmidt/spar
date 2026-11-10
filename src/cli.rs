@@ -873,8 +873,10 @@ pub enum BusCmd {
     Ack {
         /// Id of the message being acknowledged
         msg_id: String,
-        #[arg(long, default_value = "human")]
-        from: String,
+        /// Defaults to `$SPAR_AGENT_ID` inside a slot, else `human`.
+        #[arg(long)]
+        from: Option<String>,
+        /// Defaults to `$SPAR_RUN_ID` inside a run.
         #[arg(long)]
         run: Option<String>,
         #[arg(long)]

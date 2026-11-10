@@ -1049,6 +1049,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                 requires_ack,
                 persist,
                 expires_after_round,
+                filed_round: None,
                 meta: std::collections::HashMap::new(),
             };
             // Send first: a failed send leaves the old instruction untouched. The
@@ -1195,6 +1196,11 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             run,
             json,
         } => {
+            // Inside a slot the env names the caller, so a bare
+            // `spar bus ack <id>` records the slot, not the human.
+            let (env_agent, env_run) = bus::slot_caller();
+            let run = run.or(env_run);
+            let from = from.or(env_agent).unwrap_or_else(|| "human".to_string());
             let msg = bus::ack(&paths, run.as_deref(), &from, &msg_id)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&msg)?);
@@ -1286,7 +1292,6 @@ fn bus_deliver(
         strategy,
         session_id.as_deref(),
         dry_run,
-        &bus::acked_by(paths, &unique),
     )?;
     if json {
         println!("{}", serde_json::to_string_pretty(&d)?);
