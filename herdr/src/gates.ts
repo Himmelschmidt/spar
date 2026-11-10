@@ -96,7 +96,7 @@ export function isStallPark(run: { round: number; max_rounds?: number }): boolea
 	return (run.max_rounds ?? 0) === 0 || run.round < (run.max_rounds ?? 0);
 }
 
-export function buildArgv(verb: Verb, id: string, input: ActionInput = {}): string[] {
+export function buildArgv(verb: Verb, id: string, input: ActionInput = {}, run?: { round: number; max_rounds?: number }): string[] {
 	switch (verb) {
 		case "approve":
 			return ["approve", id, "--json"];
@@ -111,6 +111,9 @@ export function buildArgv(verb: Verb, id: string, input: ActionInput = {}): stri
 		case "reconcile":
 			return ["reconcile", id, "--json"];
 		case "extend":
+			// One argv owner for both parks: a stall needs a bare re-entry, and
+			// the flag would resolve under a ceiling the run never reached.
+			if (run !== undefined && isStallPark(run)) return ["implement", "--run", id, "--detach", "--json"];
 			return ["implement", "--run", id, "--max-rounds", `+${input.rounds ?? 1}`, "--detach", "--json"];
 		case "resume":
 			return ["resume", id, "--detach", "--json"];

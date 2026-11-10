@@ -115,7 +115,7 @@ export function isStallPark(run: { round: number; max_rounds?: number }): boolea
 	return (run.max_rounds ?? 0) === 0 || run.round < (run.max_rounds ?? 0);
 }
 
-export function buildArgv(verb: Verb, id: string, input: ActionInput = {}): string[] {
+export function buildArgv(verb: Verb, id: string, input: ActionInput = {}, run?: { round: number; max_rounds?: number }): string[] {
 	switch (verb) {
 		case "approve":
 			return ["approve", id, "--json"];
@@ -130,6 +130,9 @@ export function buildArgv(verb: Verb, id: string, input: ActionInput = {}): stri
 		case "reconcile":
 			return ["reconcile", id, "--json"];
 		case "extend":
+			// One argv owner for both parks: a stall needs a bare re-entry, and
+			// the flag would resolve under a ceiling the run never reached.
+			if (run !== undefined && isStallPark(run)) return ["implement", "--run", id, "--detach", "--json"];
 			return ["implement", "--run", id, "--max-rounds", `+${input.rounds ?? 1}`, "--detach", "--json"];
 		case "resume":
 			return ["resume", id, "--detach", "--json"];
@@ -374,7 +377,7 @@ async function plan(ctx: GateContext, verb: Verb, run: GateRun, preset: string):
 		case "extend": {
 			if (isStallPark(run)) {
 				return done(
-					["implement", "--run", id, "--detach", "--json"],
+					buildArgv(verb, id, {}, run),
 					`Re-enter run ${id}?`,
 					`Re-enters without raising the ceiling: round ${run.round} stalled below it, so the next dispatch carries the no-progress warning.`,
 				);
@@ -387,7 +390,7 @@ async function plan(ctx: GateContext, verb: Verb, run: GateRun, preset: string):
 				return undefined;
 			}
 			return done(
-				buildArgv(verb, id, { rounds }),
+				buildArgv(verb, id, { rounds }, run),
 				`Buy ${rounds} more round${rounds === 1 ? "" : "s"} for run ${id}?`,
 				`Raises the ceiling to round ${run.round + rounds} and continues the run detached.`,
 			);
@@ -520,7 +523,7 @@ export function cliCommand(verb: Verb, id: string): string {
 		override: `spar ship ${id} --override-gate --reason=<why>`,
 		confirm: `spar confirm ${id} [--winner <slot>]`,
 		reconcile: `spar reconcile ${id}`,
-		extend: `spar implement --run ${id} --max-rounds +<N> --detach`,
+		extend: `spar implement --run ${id} [--max-rounds +<N>] --detach`,
 		resume: `spar resume ${id} --detach`,
 		stop: `spar stop ${id}`,
 		rule: `spar rule add --run ${id} [--waive AC-<n>] -- "<text>"`,

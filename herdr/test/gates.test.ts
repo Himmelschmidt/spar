@@ -31,6 +31,22 @@ test("a run below its ceiling is a stall park, which re-enters bare", () => {
 	assert.equal(isStallPark({ round: 5, max_rounds: 0 }), true);
 	assert.equal(isStallPark({ round: 8, max_rounds: 8 }), false);
 	assert.equal(isStallPark({ round: 9, max_rounds: 8 }), false);
+	assert.deepEqual(buildArgv("extend", "r1", { rounds: 2 }, { round: 3, max_rounds: 8 }), [
+		"implement",
+		"--run",
+		"r1",
+		"--detach",
+		"--json",
+	]);
+	assert.deepEqual(buildArgv("extend", "r1", { rounds: 2 }, { round: 8, max_rounds: 8 }), [
+		"implement",
+		"--run",
+		"r1",
+		"--max-rounds",
+		"+2",
+		"--detach",
+		"--json",
+	]);
 });
 
 test("ship carries --confirm, which the popup's typed yes stands for", () => {

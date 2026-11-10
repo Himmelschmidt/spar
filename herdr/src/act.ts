@@ -242,9 +242,7 @@ export async function act(io: Io, config: Config, id?: string, root?: string): P
 		}
 		const input = await inputsFor(io, verb, run);
 		if (!input) continue;
-		const args = verb === "extend" && isStallPark(run)
-			? ["implement", "--run", id, "--detach", "--json"]
-			: buildArgv(verb, id, input);
+		const args = buildArgv(verb, id, input, run);
 		for (const l of wrap(`Runs: ${displayCommand(args)}`, io.width, 6)) io.print(l);
 		for (const l of wrap(effect(verb, run, input), io.width, 0)) io.print(l);
 		const yes = await io.ask("Type yes to run it, anything else cancels: ");
