@@ -213,7 +213,11 @@ slot, `bus send`/`ack` (`--from`) and `reserve`/`release` (`--holder`) default t
 From outside, `spar bus ack <id> --run <id>` stops a `requires-ack` redelivery
 without dropping the slot's file copy and without flipping the log word; it is the
 escape hatch for a wedged slot. To take the item back entirely, withdraw the message
-instead.
+instead. `spar bus send --urgent --run <id> --to <slot>` interrupts a mid-turn slot instead
+of waiting for the turn boundary: the orchestrator stops the turn and resumes the same
+session with the message first, at no rotation or round cost. A turn killed before it
+established any session restarts cold under a fresh id. Idle slots and providers
+without resume (agy) get a normal delivery, and the send says so.
 
 ## Event feed
 

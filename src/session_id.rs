@@ -38,6 +38,20 @@ pub fn derive_recovery(run_id: &str, slot_id: &str, round: u32) -> String {
     )
 }
 
+/// Name an urgent resume's cold session (`executor::resume_urgent_turn`): the
+/// kill landed before the turn established any session, so the resume dispatches
+/// cold, but it must not reuse the killed turn's assigned id (that attempt may
+/// already have created it vendor-side, and the vendor refuses the id as
+/// already in use). Keyed on the urgent request's id: distinct from every other
+/// derivation by construction, and distinct across back-to-back urgents of the
+/// round because each request carries its own id.
+pub fn derive_urgent(run_id: &str, slot_id: &str, round: u32, urgent_msg_id: &str) -> String {
+    v5(
+        &SESSION_NAMESPACE,
+        &format!("spar:{run_id}:{slot_id}:{round}:urgent:{urgent_msg_id}"),
+    )
+}
+
 /// Name a same-dispatch retry's session (`executor::build_retry_command`). The
 /// attempt that is being retried already created its session vendor-side, so the
 /// retry needs a session no earlier attempt of this round has carried: distinct
@@ -220,6 +234,24 @@ mod tests {
         let rec = derive_recovery("8506ddde", "impl", 1);
         assert_ne!(base, rec);
         assert!(is_uuid_shape(&rec), "not a v5 UUID: {rec}");
+    }
+
+    #[test]
+    fn urgent_ids_are_fresh_per_message_and_collide_with_nothing() {
+        let base = derive("8506ddde", "impl", 1);
+        let rec = derive_recovery("8506ddde", "impl", 1);
+        let retry = derive_retry("8506ddde", "impl", 1, 0);
+        let first = derive_urgent("8506ddde", "impl", 1, "m1");
+        let second = derive_urgent("8506ddde", "impl", 1, "m2");
+        assert_ne!(first, base);
+        assert_ne!(first, rec);
+        assert_ne!(first, retry);
+        assert_ne!(first, second);
+        assert_eq!(first, derive_urgent("8506ddde", "impl", 1, "m1"));
+        assert_ne!(first, derive_urgent("8506ddde", "impl", 2, "m1"));
+        for id in [first, second] {
+            assert!(is_uuid_shape(&id), "not a v5 UUID: {id}");
+        }
     }
 
     #[test]

@@ -1150,10 +1150,16 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             persist,
             supersedes,
             expires_after_round,
+            urgent,
         } => {
-            let needs_run = persist || expires_after_round.is_some();
-            if needs_run && run.is_none() {
-                anyhow::bail!("--persist and --expires-after-round need --run");
+            let needs_run = persist || expires_after_round.is_some() || urgent;
+            if run.is_none() {
+                if urgent {
+                    anyhow::bail!("--urgent needs --run to name the slot's run");
+                }
+                if persist || expires_after_round.is_some() {
+                    anyhow::bail!("--persist and --expires-after-round need --run");
+                }
             }
             if to == "impl" && run.is_none() {
                 anyhow::bail!("--to impl needs --run to know whose implementer");
@@ -1242,7 +1248,55 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                 .is_some()
                 .then(|| bus::message_targets(&paths, &msg))
                 .transpose()?;
-            let msg = bus::send(&paths, msg, bus::MessageBudget::Normal)?;
+            // `--urgent` against a live slot files its interrupt request before
+            // the message: the file-time drain below defers exactly the ids
+            // with a pending request, so the body never reaches a poll file
+            // the slot may still be reading, and the resume prompt carries it
+            // first instead. A send that fails afterwards drops the request
+            // again, so no dispatch resumes for a message that was never filed.
+            let urgent_plan = if urgent {
+                Some(plan_urgent_interrupt(
+                    &paths,
+                    run.as_deref()
+                        .expect("bus_cmd bails above when --urgent lacks --run"),
+                    &to,
+                    run_state.as_ref(),
+                )?)
+            } else {
+                None
+            };
+            if let Some(UrgentPlan::Kill { slot, token }) = &urgent_plan {
+                markers::write_urgent_interrupt(
+                    &paths,
+                    run.as_deref()
+                        .expect("bus_cmd bails above when --urgent lacks --run"),
+                    slot,
+                    &markers::UrgentInterrupt {
+                        msg_id: msg.id.clone(),
+                        from: msg.from.clone(),
+                        body: msg.body.clone(),
+                        ts: chrono::Utc::now(),
+                        target_pid: token.pid,
+                        target_starttime: token.starttime,
+                    },
+                )?;
+            }
+            let msg_id = msg.id.clone();
+            let msg = match bus::send(&paths, msg, bus::MessageBudget::Normal) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    if let Some(UrgentPlan::Kill { slot, .. }) = &urgent_plan {
+                        markers::remove_urgent_interrupt(
+                            &paths,
+                            run.as_deref()
+                                .expect("bus_cmd bails above when --urgent lacks --run"),
+                            slot,
+                            &msg_id,
+                        );
+                    }
+                    return Err(e);
+                }
+            };
             let withdrawal = supersedes
                 .as_deref()
                 .map(|old| bus::withdraw(&paths, old))
@@ -1251,15 +1305,24 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
                 providers::delivery::drain_poll_files(&paths, targets);
             }
             let withdrawal = withdrawal?;
+            // Past the filed message, `--urgent` stops a mid-turn slot so the
+            // orchestrator resumes the same session with this message first.
+            let urgent_outcome = urgent_plan.map(finish_urgent_interrupt).transpose()?;
             if json {
                 let mut v = serde_json::to_value(&msg)?;
                 v["schema_version"] = serde_json::json!(bus::LOG_SCHEMA);
                 if let Some(w) = &withdrawal {
                     v["withdrawal"] = serde_json::to_value(w)?;
                 }
+                if let Some(u) = &urgent_outcome {
+                    v["urgent"] = serde_json::json!({"status": u.status, "detail": u.detail});
+                }
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 println!("sent {} → {} ({})", msg.from, msg.to, msg.id);
+                if let Some(u) = &urgent_outcome {
+                    println!("urgent: {}", u.detail);
+                }
                 if let Some(w) = &withdrawal {
                     println!(
                         "withdrew {} from {} inbox(es); already delivered to: {}",
@@ -1425,6 +1488,101 @@ fn implementer_id(st: &state::RunState) -> Result<String> {
             many.join(", ")
         ),
     }
+}
+
+struct UrgentSend {
+    status: &'static str,
+    detail: String,
+}
+
+/// Pre-send verdict for `--urgent`: the kill path (the slot plus the live pid
+/// token the kill is gated on), or the fallback outcome to report after the
+/// normal send. Decided before filing so the sender can write the interrupt
+/// request first: the message id is minted before `bus::send`, and the
+/// file-time drain defers exactly the ids with a pending request, so the body
+/// never reaches a poll file the slot may still be reading.
+enum UrgentPlan {
+    Kill {
+        slot: String,
+        token: process::PidToken,
+    },
+    Pass(UrgentSend),
+}
+
+fn plan_urgent_interrupt(
+    paths: &paths::SparPaths,
+    run: &str,
+    to: &str,
+    state: Option<&state::RunState>,
+) -> Result<UrgentPlan> {
+    let normal =
+        |status: &'static str, detail: String| UrgentPlan::Pass(UrgentSend { status, detail });
+    if to == "broadcast" || to == "*" {
+        return Ok(normal(
+            "needs_single_slot",
+            "--urgent targets one slot; the message was sent normally".into(),
+        ));
+    }
+    let Some(st) = state else {
+        anyhow::bail!("--urgent needs an existing run (no state for {run})");
+    };
+    let short = to.strip_prefix(&format!("{run}:")).unwrap_or(to);
+    let Some(slot) = st.slots.iter().find(|s| s.id == short) else {
+        return Ok(normal(
+            "unknown_slot",
+            format!("no slot {short} in run {run}; the message was queued normally"),
+        ));
+    };
+    if slot.status != state::SlotStatus::Running || !state::slot_process_alive(paths, run, slot) {
+        return Ok(normal(
+            "idle",
+            format!("slot {short} is not mid-turn (no live process); delivered normally"),
+        ));
+    }
+    if !providers::adapter_named(&slot.provider).is_some_and(|a| a.supports_resume()) {
+        return Ok(normal(
+            "no_resume",
+            format!(
+                "urgent interrupt is not possible for provider {}; delivered normally",
+                slot.provider
+            ),
+        ));
+    }
+    let Some(token) =
+        markers::read_pid(paths, run, short).filter(|t| t.starttime.is_some() && t.alive())
+    else {
+        return Ok(normal(
+            "idle",
+            format!("slot {short} is not mid-turn (no live process); delivered normally"),
+        ));
+    };
+    Ok(UrgentPlan::Kill {
+        slot: short.to_string(),
+        token,
+    })
+}
+
+fn finish_urgent_interrupt(plan: UrgentPlan) -> Result<UrgentSend> {
+    let (slot, token) = match plan {
+        UrgentPlan::Kill { slot, token } => (slot, token),
+        UrgentPlan::Pass(outcome) => return Ok(outcome),
+    };
+    if !token.alive() {
+        return Ok(UrgentSend {
+            status: "idle",
+            detail: format!("slot {slot} ended before the kill landed; delivered normally"),
+        });
+    }
+    // Only the turn's process group stops here; the orchestrator resumes the
+    // same session with this message first when the dispatch returns.
+    // Token-gated (the starttime the plan just validated), group-scoped:
+    // the same SIGTERM-then-SIGKILL the executor applies to a process group. No
+    // Child handle survives the process boundary, so the token stands in.
+    process::terminate_token_tree(&token, true);
+    Ok(UrgentSend {
+        status: "interrupted",
+        detail: format!("stopped {slot}'s turn; resuming the same session with your message first"),
+    })
 }
 
 fn bus_deliver(

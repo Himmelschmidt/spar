@@ -763,22 +763,84 @@ fn signal_process_group(pid: i32, sig: i32) {
     raw_kill(-pid, sig);
 }
 
+/// Whether a killed turn left a vendor-side session worth resuming: a captured
+/// session id, a completed tool call, or reported token usage all prove the
+/// vendor created the session the dispatch named. Output text alone does not
+/// (CLI banners and progress chatter reach the stream before any session
+/// exists), and neither does a bare assigned id: the turn may have died before
+/// the vendor persisted it (a grok `--session-id` refused as already in use
+/// fails exactly this way). The `tools >= 1` bar mirrors the transient gate's
+/// reasoning.
+pub fn session_established(stats: &StreamStats) -> bool {
+    stats.session_id.is_some()
+        || stats.tools >= 1
+        || stats.input_tokens > 0
+        || stats.output_tokens > 0
+}
+
+/// True if any member of process group `pgid` is still addressable
+/// (`kill(-pgid, 0) == 0`). A pid is never recycled while its number is still
+/// in use as a live pgid, so a group check after a positive token check cannot
+/// drift onto an unrelated group.
+#[cfg(unix)]
+fn group_alive(pgid: u32) -> bool {
+    unsafe {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        kill(-(pgid as i32), 0) == 0
+    }
+}
+
+/// SIGTERM a live target, brief grace, then SIGKILL. With `group`, signals the
+/// whole process group (negative pid) so nested suite children are reaped too.
+/// Slots run in their own group (`process_group(0)`); the orchestrator does not,
+/// so it must be signalled by its bare pid.
+///
+/// Every signal is gated on the target still being ours. The entry gate is the
+/// token: a reaped leader whose pid was recycled fails it, so nothing is ever
+/// signalled on a stale identity. Past entry the gates diverge: a bare pid is
+/// re-checked by identity, but a group is re-checked by existence. A reaped
+/// leader fails the identity gate while its SIGTERM-ignoring grandchildren are
+/// still alive, which used to drop the final SIGKILL; the existence gate keeps
+/// the recycling protection and still reaps the group.
+#[cfg(unix)]
+pub fn terminate_token_tree(token: &PidToken, group: bool) {
+    if !token.alive() {
+        return;
+    }
+    let target = if group {
+        -(token.pid as i32)
+    } else {
+        token.pid as i32
+    };
+    let target_alive = |t: &PidToken| {
+        if group {
+            group_alive(t.pid)
+        } else {
+            t.alive()
+        }
+    };
+    raw_kill(target, SIGTERM);
+    let grace = Instant::now();
+    while grace.elapsed() < Duration::from_secs(2) {
+        if !target_alive(token) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if target_alive(token) {
+        raw_kill(target, SIGKILL);
+    }
+}
+
 /// SIGTERM a live target, brief grace, then SIGKILL. With `group`, signals the
 /// whole process group (negative pid) so nested suite children are reaped too.
 /// Slots run in their own group (`process_group(0)`); the orchestrator does not,
 /// so it must be signalled by its bare pid.
 #[cfg(unix)]
 pub fn terminate_tree(pid: u32, group: bool) {
-    let target = if group { -(pid as i32) } else { pid as i32 };
-    raw_kill(target, SIGTERM);
-    let grace = Instant::now();
-    while grace.elapsed() < Duration::from_secs(2) {
-        if !pid_alive(pid) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    raw_kill(target, SIGKILL);
+    terminate_token_tree(&PidToken::from_pid(pid), group)
 }
 
 #[cfg(not(unix))]
@@ -2910,6 +2972,140 @@ mod tests {
         let res = run_captured(&req, None, None).expect("run");
         assert_eq!(res.exit_code, Some(137));
         assert_eq!(res.signal, None);
+    }
+
+    #[test]
+    fn session_established_needs_session_tools_or_tokens() {
+        let mut stats = StreamStats::default();
+        assert!(
+            !session_established(&stats),
+            "an untouched stream proves nothing"
+        );
+        stats.chars_out = 500;
+        assert!(
+            !session_established(&stats),
+            "banner text alone does not prove a session"
+        );
+        stats.tools = 1;
+        assert!(
+            session_established(&stats),
+            "a tool call proves the session"
+        );
+        stats.tools = 0;
+        stats.output_tokens = 3;
+        assert!(session_established(&stats), "usage proves the session");
+        stats.output_tokens = 0;
+        stats.session_id = Some("sess-1".into());
+        assert!(
+            session_established(&stats),
+            "a captured id proves the session"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_token_tree_kills_a_live_group() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("sleep")
+            .arg("120")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let token = PidToken::capture(child.id());
+        terminate_token_tree(&token, true);
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "terminated sleep must not exit 0");
+        assert!(!pid_alive(token.pid));
+    }
+
+    /// The leader dies on SIGTERM while the member ignores it (inherited
+    /// SIG_IGN survives the exec), and the leader is reaped mid-grace the way
+    /// the orchestrator's try_wait loop reaps it. Gating the final SIGKILL on
+    /// leader identity drops the kill and the grandchild outlives the call,
+    /// holding the pipes; the group-existence gate reaps it.
+    #[cfg(unix)]
+    #[test]
+    fn terminate_token_tree_sigkills_a_group_whose_leader_dies_first() {
+        use std::os::unix::process::CommandExt;
+        let tmp = tempdir().unwrap();
+        let pid_file = tmp.path().join("member.pid");
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "sh -c 'trap \"\" TERM; echo $$ > {}; exec sleep 300' & wait",
+                pid_file.display()
+            ))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let token = PidToken::capture(child.id());
+        // The tree needs a moment to fork: the kill must not beat the outer
+        // shell's first fork, or no member exists yet and the kill proves
+        // nothing. The trap precedes the pid write, so the file's appearance
+        // also proves the member already ignores SIGTERM: every SIGTERM in
+        // this test is sent strictly after that point.
+        let started = Instant::now();
+        while !pid_file.is_file() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(pid_file.is_file(), "the member must fork before the kill");
+        let child = std::sync::Mutex::new(child);
+        std::thread::scope(|s| {
+            // The orchestrator's reap loop: the leader is gone (reaped, not a
+            // zombie) within milliseconds of the SIGTERM.
+            s.spawn(|| loop {
+                let reaped = child.lock().unwrap().try_wait().unwrap().is_some();
+                if reaped {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            });
+            terminate_token_tree(&token, true);
+        });
+        let member: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The member is orphaned when the leader dies, so init reaps it after
+        // the SIGKILL. A zombie still answers `kill(pid, 0)`, so wait for the
+        // state to leave Z (or the pid to vanish) rather than bare liveness.
+        let gone = |p: u32| {
+            std::fs::read_to_string(format!("/proc/{p}/stat"))
+                .ok()
+                .and_then(|s| {
+                    s.rfind(')')
+                        .and_then(|i| s[i + 2..].split_whitespace().next().map(str::to_owned))
+                })
+                .is_none_or(|st| st == "Z")
+        };
+        let reaped = Instant::now();
+        while !gone(member) && reaped.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            gone(member),
+            "the SIGTERM-ignoring member must die with its group"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_token_tree_skips_a_token_from_another_boot() {
+        let mut child = Command::new("sleep").arg("120").spawn().unwrap();
+        let pid = child.id();
+        let stale = PidToken {
+            pid,
+            starttime: Some(1),
+        };
+        assert!(!stale.alive(), "starttime 1 cannot match a live process");
+        terminate_token_tree(&stale, true);
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a stale token must not signal the live process"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]
