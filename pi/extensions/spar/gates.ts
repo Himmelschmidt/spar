@@ -108,6 +108,13 @@ export interface ActionInput {
 	provider?: string;
 }
 
+// At the extension gate a run below its ceiling (or with none) is a no-progress
+// stall, not an exhausted budget: re-entry needs no flag, and the flag would
+// resolve under the ceiling it never reached.
+export function isStallPark(run: { round: number; max_rounds?: number }): boolean {
+	return (run.max_rounds ?? 0) === 0 || run.round < (run.max_rounds ?? 0);
+}
+
 export function buildArgv(verb: Verb, id: string, input: ActionInput = {}): string[] {
 	switch (verb) {
 		case "approve":
@@ -365,6 +372,13 @@ async function plan(ctx: GateContext, verb: Verb, run: GateRun, preset: string):
 				"Dispatches a reconciler to merge the good parts of every attempt, then a review panel, then parks at the ship gate. Runs in the background.",
 			);
 		case "extend": {
+			if (isStallPark(run)) {
+				return done(
+					["implement", "--run", id, "--detach", "--json"],
+					`Re-enter run ${id}?`,
+					`Re-enters without raising the ceiling: round ${run.round} stalled below it, so the next dispatch carries the no-progress warning.`,
+				);
+			}
 			const text = await ask(ui, `Extend run ${id}: rounds to add (default 1)`, "1", preset);
 			if (text === undefined) return undefined;
 			const rounds = text === "" ? 1 : Number(text.replace(/^\+/, ""));

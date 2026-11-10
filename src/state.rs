@@ -88,12 +88,18 @@ pub struct RunState {
     /// cannot silently re-ceiling a run in flight. `0` disables the ceiling.
     #[serde(default = "crate::config::default_max_rounds")]
     pub max_rounds: u32,
-    /// Consecutive implementer rounds that ended with HEAD and the tree unchanged
-    /// while a `request_changes` review against that same HEAD stayed open.
+    /// Consecutive implementer dispatches that ended with HEAD and the tree unchanged
+    /// while a still-blocking review against that same HEAD stayed open.
     /// Reset the moment a round moves HEAD or dirties the tree; the second in a row
     /// parks the run at the round-extension gate instead of buying another review.
     #[serde(default)]
     pub no_progress_rounds: u32,
+    /// One-shot operator override set by `implement --run <id> --re-review`: the
+    /// next no-progress dispatch sends the unchanged HEAD back to the panel
+    /// instead of counting toward a stall park (O171). Consumed (cleared) at the
+    /// stall branch whether or not it fires, so it never leaks into a later stall.
+    #[serde(default)]
+    pub panel_rerun: bool,
     /// The warning a no-progress round put at the top of the next implementer
     /// prompt. Persisted so a re-entry after the park renders it again instead
     /// of parking silently; cleared the moment a round makes progress.
@@ -879,6 +885,7 @@ impl RunState {
             max_rounds: crate::config::default_max_rounds(),
             no_progress_rounds: 0,
             no_progress_warning: None,
+            panel_rerun: false,
             tmux_session: None,
             providers: Vec::new(),
             rotated_implementer: false,

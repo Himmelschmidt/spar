@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { actionsFor, buildArgv } from "../src/gates.ts";
+import { actionsFor, buildArgv, isStallPark } from "../src/gates.ts";
 
 const at = (phase: string, over: { holds_seat?: boolean; resumable?: boolean } = {}) =>
 	actionsFor({ phase, holds_seat: false, resumable: false, ...over });
@@ -24,6 +24,13 @@ test("a run holding a seat only offers stop and rule", () => {
 	assert.deepEqual(at("dispatch", { holds_seat: true }), ["stop", "rule"]);
 	assert.deepEqual(at("awaiting_reconcile", { holds_seat: true }), ["stop", "rule"]);
 	assert.deepEqual(at("shipping", { holds_seat: true }), ["rule"]);
+});
+
+test("a run below its ceiling is a stall park, which re-enters bare", () => {
+	assert.equal(isStallPark({ round: 3, max_rounds: 8 }), true);
+	assert.equal(isStallPark({ round: 5, max_rounds: 0 }), true);
+	assert.equal(isStallPark({ round: 8, max_rounds: 8 }), false);
+	assert.equal(isStallPark({ round: 9, max_rounds: 8 }), false);
 });
 
 test("ship carries --confirm, which the popup's typed yes stands for", () => {

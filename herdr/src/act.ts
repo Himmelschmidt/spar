@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import type { Config } from "./config.ts";
-import { type ActionInput, actionsFor, BACKGROUND, buildArgv, displayCommand, effect, isGate, outcome, type Raw, VERBS, type Verb } from "./gates.ts";
+import { type ActionInput, actionsFor, BACKGROUND, buildArgv, displayCommand, effect, isGate, isStallPark, outcome, type Raw, VERBS, type Verb } from "./gates.ts";
 import { type Brief, clean, firstLine, flag, type RunRow, type RunStatus, sparBin, sparJson } from "./spar.ts";
 import { listRuns } from "./sync.ts";
 import { paint, renderView } from "./view.ts";
@@ -101,6 +101,7 @@ async function inputsFor(io: Io, verb: Verb, run: RunStatus): Promise<ActionInpu
 			return { winner: n === 0 ? undefined : implementers[n - 1] };
 		}
 		case "extend": {
+			if (isStallPark(run)) return {};
 			const text = await io.ask("Rounds to add [1]: ");
 			if (text === undefined) return undefined;
 			const rounds = text === "" ? 1 : Number(text.replace(/^\+/, ""));
@@ -241,7 +242,9 @@ export async function act(io: Io, config: Config, id?: string, root?: string): P
 		}
 		const input = await inputsFor(io, verb, run);
 		if (!input) continue;
-		const args = buildArgv(verb, id, input);
+		const args = verb === "extend" && isStallPark(run)
+			? ["implement", "--run", id, "--detach", "--json"]
+			: buildArgv(verb, id, input);
 		for (const l of wrap(`Runs: ${displayCommand(args)}`, io.width, 6)) io.print(l);
 		for (const l of wrap(effect(verb, run, input), io.width, 0)) io.print(l);
 		const yes = await io.ask("Type yes to run it, anything else cancels: ");

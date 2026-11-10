@@ -241,6 +241,14 @@ pub enum Command {
         /// first: this is how a criterion gets deleted on the way to the ship gate.
         #[arg(long)]
         accept_contract: bool,
+        /// Send the unchanged HEAD back to the review panel instead of the
+        /// implementer. For the no-progress park where the operator ruled the
+        /// blocking review wrong: rule it out with `spar rule add`, then re-enter
+        /// with this flag. The panel re-judges the same commit with the ruling in
+        /// context (O121). One-shot: consumed whether or not the round stalls, and
+        /// a still-blocking re-review re-arms the stall counter from zero.
+        #[arg(long)]
+        re_review: bool,
         /// Idempotency key: refuse to start while an unfinished run with this key
         /// exists. `plan --brief` defaults it to the brief's slug.
         #[arg(long)]

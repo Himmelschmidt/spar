@@ -123,8 +123,13 @@ pub(crate) fn next_command(state: &crate::state::RunState) -> String {
         crate::state::Phase::AwaitingWinnerConfirm => format!("spar confirm {id}"),
         crate::state::Phase::AwaitingReconcile => format!("spar reconcile {id}"),
         crate::state::Phase::AwaitingShipConfirm => format!("spar ship {id} --confirm"),
-        crate::state::Phase::AwaitingRoundExtension => {
+        crate::state::Phase::AwaitingRoundExtension if state.no_progress_warning.is_none() => {
             format!("spar implement --run {id} --max-rounds <N>")
+        }
+        // A no-progress stall parks at the same gate below the ceiling: the
+        // flag would resolve under it, so re-entry is bare.
+        crate::state::Phase::AwaitingRoundExtension => {
+            format!("spar implement --run {id}")
         }
         // Finished runs cannot resume; what is left is reclaiming their worktrees.
         crate::state::Phase::Done => format!("spar cleanup {id} --if-merged"),
@@ -353,6 +358,23 @@ mod tests {
         ] {
             assert_eq!(classify(phase), Some("gate"), "{phase:?}");
         }
+    }
+
+    #[test]
+    fn extension_gate_names_the_flag() {
+        assert_eq!(
+            next_command(&state_at(Phase::AwaitingRoundExtension)),
+            "spar implement --run r1 --max-rounds <N>"
+        );
+    }
+
+    /// A no-progress stall parks at the same gate below the ceiling, where the
+    /// flag would resolve under it: the alert re-enters bare.
+    #[test]
+    fn stall_park_re_enters_bare() {
+        let mut s = state_at(Phase::AwaitingRoundExtension);
+        s.no_progress_warning = Some("## No-progress warning".to_string());
+        assert_eq!(next_command(&s), "spar implement --run r1");
     }
 
     #[test]
