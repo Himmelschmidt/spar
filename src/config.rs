@@ -1017,8 +1017,7 @@ impl FleetPreset {
 
 /// Whole channels an explicit `--without` can drop. Recorded on the frozen config so
 /// a later `--reload-config` re-applies the operator's drops; serialized as the same
-/// lowercase names the flag spells, so snapshots written before the typed records
-/// still parse.
+/// lowercase names the flag spells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DroppedChannel {
@@ -1070,41 +1069,53 @@ pub fn without_has_reviewer_item(without: &[String]) -> bool {
         .any(|w| parse_reviewer_without(w.trim()).is_ok())
 }
 
+/// Split one `--role <role>=<provider>` assignment into its typed role and raw
+/// provider, the single parse `apply_role_overrides` and the panel helpers share.
+fn split_role_override(raw: &str) -> Result<(crate::state::SlotRole, &str)> {
+    let (role, provider) = raw
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("--role expects <role>=<provider>, got {raw:?}"))?;
+    let (role, provider) = (role.trim(), provider.trim());
+    if provider.is_empty() {
+        anyhow::bail!("--role {role}= has no provider");
+    }
+    let slot = crate::state::SlotRole::from_config_key(role).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--role {role}: unknown role (planner, plan_critic, implementer, \
+             reviewer, tester, test_author)"
+        )
+    })?;
+    Ok((slot, provider))
+}
+
+/// The refusal a drop-all without a re-seat gets, on fresh and bound runs alike:
+/// the run would otherwise reach the ship gate with no reviewer judging it.
+pub(crate) fn emptied_reviewer_panel_message() -> String {
+    "--without reviewer[N]: cannot drop the last reviewer panel seat; the run would reach the ship gate unreviewed (--role reviewer=<provider> re-seats the panel; widened extras sit outside the panel and review on)".to_string()
+}
+
 /// Whether any `--role` assignment pins the reviewer panel outright, replacing
 /// whatever the file or a `--without` drop built.
 pub fn role_pins_reviewer(role: &[String]) -> bool {
     role.iter().any(|r| {
-        r.split('=').next().is_some_and(|k| {
-            crate::state::SlotRole::from_config_key(k.trim())
-                == Some(crate::state::SlotRole::Reviewer)
-        })
+        split_role_override(r).is_ok_and(|(slot, _)| slot == crate::state::SlotRole::Reviewer)
     })
 }
 
 /// Warn when an explicit `--role reviewer=...` replaces a panel a `--without
-/// reviewer[N]` just cut on a bound run: the pin wins for the frozen panel,
-/// the dropped seat still leaves the run. The bound amend path applies
-/// `--without` before `--role`, so it calls this after both have run.
-pub fn warn_if_role_replaces_dropped_panel(role: &[String], dropped: &[usize]) {
-    if dropped.is_empty() {
+/// reviewer[N]` just cut: the pin wins outright and the live panel is re-seated
+/// to match it. On a fresh launch no slots exist yet, so the drop is discarded;
+/// on a bound run the drop still retires its seat's history. Callers apply
+/// `--without` before `--role`, so this runs after both.
+pub fn warn_if_role_supersedes_reviewer_drop(role: &[String], dropped: &[usize], bound: bool) {
+    if dropped.is_empty() || !role_pins_reviewer(role) {
         return;
     }
-    if role_pins_reviewer(role) {
+    if bound {
         eprintln!(
-            "warning: --role reviewer=... replaces the reviewer panel, so the --without reviewer seat drop still removes its seat but does not narrow the frozen panel"
+            "warning: --role reviewer=... replaces the reviewer panel, so the live panel is re-seated to match it; the --without reviewer seat drop still retires its seat's history"
         );
-    }
-}
-
-/// Warn when an explicit `--role reviewer=...` replaces a panel a `--without
-/// reviewer[N]` just cut on a fresh launch: no slots exist yet, so the pin
-/// wins outright and the drop is discarded. Fresh paths call this after both
-/// overrides have run.
-pub fn warn_if_role_discards_reviewer_drop(role: &[String], dropped: &[usize]) {
-    if dropped.is_empty() {
-        return;
-    }
-    if role_pins_reviewer(role) {
+    } else {
         eprintln!(
             "warning: --role reviewer=... replaces the reviewer panel, discarding the --without reviewer seat drop"
         );
@@ -1581,11 +1592,21 @@ impl Config {
     }
 
     pub fn save_snapshot(&self, paths: &SparPaths, run_id: &str) -> Result<()> {
+        let staged = self.stage_snapshot(paths, run_id)?;
+        Self::commit_snapshot(paths, run_id, &staged)
+    }
+
+    /// Write the snapshot to a temp file and hand back its path without
+    /// publishing it: the caller renames it into place only after the paired
+    /// state write succeeds, so a failed `RunState::save` can never leave the
+    /// frozen config narrowed while the slots it narrowed are still live.
+    /// Captured `[env]` values can carry proxy credentials: owner-only, set at
+    /// creation of a temp file and renamed in, so the file is never readable
+    /// wider in between.
+    pub fn stage_snapshot(&self, paths: &SparPaths, run_id: &str) -> Result<PathBuf> {
         paths.ensure_run_dirs(run_id)?;
         let path = paths.run_config_file(run_id);
         let text = serde_json::to_string_pretty(self)?;
-        // Captured `[env]` values can carry proxy credentials: owner-only, set at creation
-        // of a temp file and renamed in, so the file is never readable wider in between.
         let mode = if self.env.captured.is_empty() {
             0o644
         } else {
@@ -1606,7 +1627,14 @@ impl Config {
             f.write_all(text.as_bytes())
                 .with_context(|| format!("write run config {}", tmp.display()))?;
         }
-        std::fs::rename(&tmp, &path).with_context(|| format!("write run config {}", path.display()))
+        Ok(tmp)
+    }
+
+    /// Publish a staged snapshot written by [`Self::stage_snapshot`].
+    pub fn commit_snapshot(paths: &SparPaths, run_id: &str, staged: &Path) -> Result<()> {
+        let path = paths.run_config_file(run_id);
+        std::fs::rename(staged, &path)
+            .with_context(|| format!("write run config {}", path.display()))
     }
 
     /// Overlay `--role <role>=<provider>` onto `[roles]`, so a run's fleet can be chosen
@@ -1619,19 +1647,8 @@ impl Config {
         }
         let mut reviewers = Vec::new();
         for raw in assignments {
-            let (role, provider) = raw
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("--role expects <role>=<provider>, got {raw:?}"))?;
-            let (role, provider) = (role.trim(), provider.trim());
-            if provider.is_empty() {
-                anyhow::bail!("--role {role}= has no provider");
-            }
-            let slot = crate::state::SlotRole::from_config_key(role).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--role {role}: unknown role (planner, plan_critic, implementer, \
-                     reviewer, tester, test_author)"
-                )
-            })?;
+            let (slot, provider) = split_role_override(raw)?;
+            let role = slot.as_config_key();
             let pin = crate::provider_ref::Pin::parse(provider)
                 .with_context(|| format!("invalid provider in --role {role}: {provider:?}"))?;
             let canonical = pin.display();
@@ -2029,9 +2046,7 @@ impl Config {
     /// final panel, not the intermediate one a `--without` alone leaves behind.
     pub fn refuse_emptied_reviewer_panel(&self, dropped: &[usize]) -> Result<()> {
         if !dropped.is_empty() && self.roles.reviewer.is_empty() {
-            anyhow::bail!(
-                "--without reviewer[N]: cannot drop the last reviewer seat; the run would reach the ship gate unreviewed (--role reviewer=<provider> re-seats the panel)"
-            );
+            anyhow::bail!("{}", emptied_reviewer_panel_message());
         }
         Ok(())
     }
@@ -2084,62 +2099,36 @@ impl Config {
     /// silence channels the operator never re-enabled.
     pub fn reapply_cli_overrides(&mut self, frozen: &Config) {
         use crate::state::SlotRole;
+        // The three sub-configs carry the same six assignable role fields
+        // (`reviewer` is a list on roles and backups, a single value on effort;
+        // `clone_from` covers both), so one copy rule serves all three.
+        macro_rules! copy_assignable_role {
+            ($dst:expr, $src:expr, $role:expr) => {
+                match $role {
+                    SlotRole::Planner => $dst.planner = $src.planner.clone(),
+                    SlotRole::PlanCritic => $dst.plan_critic = $src.plan_critic.clone(),
+                    SlotRole::Implementer => $dst.implementer = $src.implementer.clone(),
+                    SlotRole::Reviewer => $dst.reviewer.clone_from(&$src.reviewer),
+                    SlotRole::Tester => $dst.tester = $src.tester.clone(),
+                    SlotRole::TestAuthor => $dst.test_author = $src.test_author.clone(),
+                    // Only assignable roles are ever recorded; the derived workflows
+                    // (ranker, peer, reconciler) have no field to carry.
+                    SlotRole::Ranker | SlotRole::Peer | SlotRole::Reconciler => {}
+                }
+            };
+        }
         for key in &frozen.cli_role_keys {
-            match key {
-                SlotRole::Planner => self.roles.planner = frozen.roles.planner.clone(),
-                SlotRole::PlanCritic => {
-                    self.roles.plan_critic = frozen.roles.plan_critic.clone();
-                }
-                SlotRole::Implementer => {
-                    self.roles.implementer = frozen.roles.implementer.clone();
-                }
-                SlotRole::Reviewer => self.roles.reviewer.clone_from(&frozen.roles.reviewer),
-                SlotRole::Tester => self.roles.tester = frozen.roles.tester.clone(),
-                SlotRole::TestAuthor => {
-                    self.roles.test_author = frozen.roles.test_author.clone();
-                }
-                // Only assignable roles are ever recorded; the derived workflows
-                // (ranker, peer, reconciler) have no `[roles]` field to carry.
-                SlotRole::Ranker | SlotRole::Peer | SlotRole::Reconciler => {}
-            }
+            copy_assignable_role!(self.roles, frozen.roles, key);
         }
         self.cli_role_keys
             .extend(frozen.cli_role_keys.iter().cloned());
         for key in &frozen.cli_backup_keys {
-            match key {
-                SlotRole::Planner => self.backups.planner = frozen.backups.planner.clone(),
-                SlotRole::PlanCritic => {
-                    self.backups.plan_critic = frozen.backups.plan_critic.clone();
-                }
-                SlotRole::Implementer => {
-                    self.backups.implementer = frozen.backups.implementer.clone();
-                }
-                SlotRole::Reviewer => self.backups.reviewer.clone_from(&frozen.backups.reviewer),
-                SlotRole::Tester => self.backups.tester = frozen.backups.tester.clone(),
-                SlotRole::TestAuthor => {
-                    self.backups.test_author = frozen.backups.test_author.clone();
-                }
-                SlotRole::Ranker | SlotRole::Peer | SlotRole::Reconciler => {}
-            }
+            copy_assignable_role!(self.backups, frozen.backups, key);
         }
         self.cli_backup_keys
             .extend(frozen.cli_backup_keys.iter().cloned());
         for key in &frozen.cli_effort_keys {
-            match key {
-                SlotRole::Planner => self.effort.planner = frozen.effort.planner.clone(),
-                SlotRole::PlanCritic => {
-                    self.effort.plan_critic = frozen.effort.plan_critic.clone();
-                }
-                SlotRole::Implementer => {
-                    self.effort.implementer = frozen.effort.implementer.clone();
-                }
-                SlotRole::Reviewer => self.effort.reviewer = frozen.effort.reviewer.clone(),
-                SlotRole::Tester => self.effort.tester = frozen.effort.tester.clone(),
-                SlotRole::TestAuthor => {
-                    self.effort.test_author = frozen.effort.test_author.clone();
-                }
-                SlotRole::Ranker | SlotRole::Peer | SlotRole::Reconciler => {}
-            }
+            copy_assignable_role!(self.effort, frozen.effort, key);
         }
         self.cli_effort_keys
             .extend(frozen.cli_effort_keys.iter().cloned());

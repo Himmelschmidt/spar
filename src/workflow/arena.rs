@@ -461,6 +461,9 @@ pub fn reconcile(paths: &SparPaths, cfg: &Config, run_id: &str, json: bool) -> R
             let mut slot = executor::init_slot(&id, prov, SlotRole::Reviewer);
             slot.cwd = Some(recon_cwd.clone());
             slot.source = pool_sources.get(i).copied();
+            // A reconcile extra reviews one artifact, outside any panel: it holds no
+            // backup-list position and no `roles.reviewer` entry, like a widened seat.
+            slot.reviewer_kind = Some(crate::state::ReviewerSeatKind::Wide);
             state.slots.push(slot);
         }
         let mut extra = HashMap::new();
