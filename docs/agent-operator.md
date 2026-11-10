@@ -157,17 +157,21 @@ adopt a `test-contract.md` that drifted mid-round exits `1` until you pass
 
 **One-pass runs (O196).** `spar implement -t ... --one-pass` (or `run --workflow
 loop --one-pass`) implies `--fleet small` and caps a fresh run at one round: at
-the end of it a passed gate ships, and so does a gate failed on reviewer
-findings alone, reusing the `ship --override-gate` machinery with an automatic
-reason so the findings ride along as follow-ups in the PR body. Findings-alone
-means every seat's latest review is non-blocking under the gate's own predicates
-with acceptance and the suite clear; a blocking finding, a failed or missing
-acceptance line, a failing suite, or a missing/synthetic/verdict-less review
-parks at the round-ceiling gate (exit 2) exactly as without the flag. On an
-existing run, `implement --run <id> --one-pass` allows one more round and then
-applies the same verdict. The mode is frozen into the run's `config.json`; an
-explicit `--fleet` or `--max-rounds` still wins over the implied preset and
-ceiling.
+the end of it a passed gate ships through the real ship path. A sub-threshold
+`request_changes` counts as approve-with-notes, so minor findings ship clean
+with no override, listed as follow-ups under the standing non-blocking list in
+the PR body; anything that fails the gate (a finding at or above `[review]
+block_on`, a failed or missing acceptance line, a failing suite, a
+missing/synthetic/verdict-less review, a dead reviewer seat) parks at the
+round-ceiling gate (exit 2) exactly as without the flag. On an existing run,
+`implement --run <id> --one-pass` resets the ceiling to one more round (even on
+a never-dispatched reused round) and then applies the same verdict. The mode is
+frozen into the run's `config.json`; an explicit `--fleet` or `--max-rounds`
+still wins over the implied preset and ceiling. If the ship itself fails (or
+the orchestrator dies after the gate passed), the run sits at
+`awaiting_ship_confirm`; resume and `__internal_continue` do not re-run the
+ship, so retry it with `spar ship <id> --confirm` (draft stays the frozen
+default).
 
 `--providers` is **required** for plan / implement / run (no implicit fleet).
 

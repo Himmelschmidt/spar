@@ -2096,19 +2096,19 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
 
 **`--one-pass`** (on `implement` and `run --workflow loop`) is the small-change mode:
 it implies `--fleet small` (an explicit `--fleet` still wins), caps a fresh run at one
-round (on a bound `--run <id>` it allows one more round instead), and ships at the end
-of it through the real ship path (push plus draft PR, including the base forward
-merge). A passed gate ships; so does a gate failed on reviewer findings alone,
-reusing the `ship --override-gate` machinery with an automatic reason so the
-findings ride along under "Shipped over open findings" in the PR body.
-Findings-alone means every seat's latest review is non-blocking under the gate's
-own predicates and acceptance and the suite are clear; anything else (a finding
-at or above `[review] block_on`, a failed or missing acceptance line, a failing
-suite, a missing/synthetic/verdict-less review, a failed reviewer slot) parks at
-the existing gate (exit 2), as without the flag. A sub-threshold
-`request_changes` already counts as approve-with-notes, so it ships clean with no
-override. Frozen into the run's `config.json`; nothing changes for runs launched
-without it (O196).
+round (on a bound `--run <id>` it resets the ceiling to one more round instead,
+even on a never-dispatched reused round, unless `--max-rounds` is passed), and ships
+at the end of a passed gate through the real ship path (push plus draft PR,
+including the base forward merge). Only a passed gate ships: a sub-threshold
+`request_changes` already counts as approve-with-notes, so minor findings ship
+clean with no override, listed as follow-ups under the standing non-blocking
+list in the PR body. Anything that fails the gate (a finding at or above
+`[review] block_on`, a failed acceptance line, a failing suite, a dead reviewer
+seat) parks at the existing gate (exit 2), as without the flag. If the ship
+itself fails (or the orchestrator dies after the gate passed), the run sits at
+`awaiting_ship_confirm`; resume and `__internal_continue` do not re-run the
+ship, so retry it with `spar ship <id> --confirm`. Frozen into the run's
+`config.json`; nothing changes for runs launched without it (O196).
 
 **`--suite-command "<cmd>"`** (repeatable, on `plan` and `implement`) sets this run's
 deterministic suite, replacing `[suite].command` and turning the suite channel on even under
