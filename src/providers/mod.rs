@@ -19,7 +19,7 @@ use std::process::Command;
 
 pub use agy::AgyAdapter;
 pub use claude::{ClaudeAdapter, ClaudeFamily};
-pub use codex::{default_bucket_for_profile, CodexAdapter};
+pub use codex::CodexAdapter;
 pub use grok::GrokAdapter;
 pub use muse::MuseAdapter;
 pub use pi::PiAdapter;
@@ -200,6 +200,30 @@ pub enum TrustPolicy {
     Prompt,
 }
 
+/// The dispatch route a run recorded at stamp time. Only the codex adapter
+/// interprets it today: `profile` is the recorded `SPAR_CODEX_PROFILE`
+/// (`Some("")` records an empty value, `None` is no record, read ambient),
+/// and `model` the recorded `SPAR_CODEX_MODEL` with the same encoding.
+/// Readers without a run pass `ambient()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedRoute<'a> {
+    pub profile: Option<&'a str>,
+    pub model: Option<&'a str>,
+}
+
+impl<'a> RecordedRoute<'a> {
+    pub fn ambient() -> Self {
+        Self {
+            profile: None,
+            model: None,
+        }
+    }
+
+    pub fn is_recorded(self) -> bool {
+        self.profile.is_some() || self.model.is_some()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SpawnOpts {
     pub prompt: String,
@@ -237,6 +261,9 @@ pub struct SpawnOpts {
     /// `None` means no recorded dispatch, so the adapter reads this process's
     /// ambient value. Only codex reads this field.
     pub codex_profile: Option<String>,
+    /// Recorded `SPAR_CODEX_MODEL` from run state (`RunState::codex_model`),
+    /// with the same encoding. Only codex reads this field.
+    pub codex_model: Option<String>,
 }
 
 pub trait ProviderAdapter: Send + Sync {
@@ -252,6 +279,14 @@ pub trait ProviderAdapter: Send + Sync {
     /// Only adapters whose no-model dispatch routes somewhere other than the
     /// login override this: codex's default profile layers OpenRouter.
     fn default_bucket(&self) -> Option<&'static str> {
+        None
+    }
+    /// The bucket a model-less seat bills to under the run's recorded route
+    /// (`Some(None)` for the whole login). `None` means no override: the seat
+    /// keys the ambient route exactly as a reader without the run would. Only
+    /// adapters whose route depends on recorded state override this; generic
+    /// key derivation asks the adapter instead of naming it.
+    fn recorded_route_bucket(&self, _route: RecordedRoute<'_>) -> Option<Option<&'static str>> {
         None
     }
     /// The quota bucket a rejection covers, `None` for the whole login: the
@@ -883,6 +918,7 @@ mod tests {
         // Grok dispatches carry run-scoped folder trust (never operator state).
         let env = GrokAdapter.extra_env(&SpawnOpts {
             codex_profile: None,
+            codex_model: None,
             prompt: String::new(),
             prompt_file: None,
             cwd: std::path::PathBuf::from("/tmp"),
@@ -1085,6 +1121,7 @@ mod tests {
         std::env::set_var("CODEX_HOME", home.path());
         let opts = SpawnOpts {
             codex_profile: None,
+            codex_model: None,
             prompt: "go".into(),
             prompt_file: None,
             cwd: std::path::PathBuf::from("/tmp"),

@@ -1,6 +1,6 @@
 use super::{
-    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, QuotaSignal, SpawnOpts,
-    TrustPolicy,
+    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, QuotaSignal, RecordedRoute,
+    SpawnOpts, TrustPolicy,
 };
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -34,30 +34,75 @@ pub fn default_bucket_for_profile(profile: Option<&str>) -> Option<&'static str>
     }
 }
 
-/// Model override (`-m`). spar's per-slot model (`--select` or a `cli:codex@<model>` ref)
-/// wins; otherwise `SPAR_CODEX_MODEL`; otherwise none (the profile's default model applies).
-/// Empty/whitespace values are ignored so we never emit `-m ""`.
-fn codex_model(opts: &SpawnOpts) -> Option<String> {
-    opts.model
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            std::env::var("SPAR_CODEX_MODEL")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-        })
+/// `Some` only for a value worth passing on: empty means default.
+fn clean_model(raw: &str) -> Option<String> {
+    let t = raw.trim().to_string();
+    (!t.is_empty()).then_some(t)
 }
 
-/// The profile a codex spawn dispatches under: the run's recorded profile when
-/// the dispatch belongs to one, else this process's ambient
-/// `SPAR_CODEX_PROFILE`. A recorded empty string is the native route (drop
-/// `-p`); it never falls through to the ambient value.
-fn spawn_profile(opts: &SpawnOpts) -> Option<String> {
-    match opts.codex_profile.as_deref() {
-        Some(recorded) if !recorded.is_empty() => Some(recorded.into()),
-        Some(_) => None,
+/// The route a codex dispatch runs under: the effective model (the seat's
+/// model, else the recorded `SPAR_CODEX_MODEL`, else this process's ambient
+/// one) and the effective profile (recorded `SPAR_CODEX_PROFILE`, else
+/// ambient). One function resolves it for every caller: the spawn and every
+/// quota/rejection key derive from the same value, so a model-less seat keys
+/// the bucket it bills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexRoute {
+    pub model: Option<String>,
+    pub profile: Option<String>,
+}
+
+pub fn resolve_route(slot_model: Option<&str>, route: RecordedRoute<'_>) -> CodexRoute {
+    let model = slot_model
+        .and_then(clean_model)
+        .or_else(|| match route.model {
+            Some(recorded) => clean_model(recorded),
+            None => codex_model_env(),
+        });
+    let profile = match route.profile {
+        Some(recorded) => clean_model(recorded),
         None => codex_profile(),
+    };
+    CodexRoute { model, profile }
+}
+
+/// The bucket a slug bills to: a `/` slug always names an OpenRouter route, a
+/// bare model bills `native`. One helper so the trait bucket and the
+/// resolved-route bucket cannot disagree.
+pub fn codex_quota_bucket(model: &str) -> Option<&'static str> {
+    if model.contains('/') || model == "openrouter" {
+        Some("openrouter")
+    } else {
+        Some("native")
     }
+}
+
+/// The bucket a resolved route bills to: an explicit model omits `-p`, so a
+/// `/` slug bills `openrouter` and a bare model bills `native`; only a
+/// model-less seat dispatches under the default profile.
+pub fn route_bucket(route: &CodexRoute) -> Option<&'static str> {
+    match route.model.as_deref() {
+        Some(m) => codex_quota_bucket(m),
+        None => default_bucket_for_profile(route.profile.as_deref()),
+    }
+}
+
+pub fn codex_model_env() -> Option<String> {
+    std::env::var("SPAR_CODEX_MODEL")
+        .ok()
+        .and_then(|m| clean_model(&m))
+}
+
+/// The route a spawn with these options dispatches under: the recorded route
+/// when the dispatch belongs to a run, else this process's ambient route.
+fn opts_route(opts: &SpawnOpts) -> CodexRoute {
+    resolve_route(
+        opts.model.as_deref(),
+        RecordedRoute {
+            profile: opts.codex_profile.as_deref(),
+            model: opts.codex_model.as_deref(),
+        },
+    )
 }
 
 /// Flags that select a model. A `/` marks an OpenRouter slug (`openai/gpt-4o-mini`,
@@ -230,14 +275,15 @@ impl CodexAdapter {
         }
         // An explicit model is self-describing (it names its own provider), so it
         // supersedes the profile; the profile is only the no-model default.
-        match codex_model(opts) {
+        let route = opts_route(opts);
+        match route.model.as_deref() {
             Some(m) => {
-                for a in model_args(&m) {
+                for a in model_args(m) {
                     cmd.arg(a);
                 }
             }
             None => {
-                if let Some(p) = spawn_profile(opts) {
+                if let Some(p) = route.profile.as_deref() {
                     cmd.arg("-p").arg(p);
                 }
             }
@@ -291,11 +337,7 @@ impl ProviderAdapter for CodexAdapter {
     /// bucket key re-resolves instead of collapsing; no codex model is called
     /// either, so no seat model collides.
     fn quota_bucket<'m>(&self, model: &'m str) -> Option<Cow<'m, str>> {
-        if model.contains('/') || model == "openrouter" {
-            Some(Cow::Borrowed("openrouter"))
-        } else {
-            Some(Cow::Borrowed("native"))
-        }
+        codex_quota_bucket(model).map(Cow::Borrowed)
     }
 
     /// The model-less seat's bucket: the profile it dispatches under. `None`
@@ -319,6 +361,17 @@ impl ProviderAdapter for CodexAdapter {
             Some(model) => self.quota_bucket(model),
             None => self.default_bucket().map(Cow::Borrowed),
         }
+    }
+
+    /// A model-less seat's bucket under the run's recorded route. Modeled
+    /// seats never reach here (generic key derivation only asks when the seat
+    /// names no model), and an unrecorded run keys the ambient route through
+    /// the normal path.
+    fn recorded_route_bucket(&self, route: RecordedRoute<'_>) -> Option<Option<&'static str>> {
+        if !route.is_recorded() {
+            return None;
+        }
+        Some(route_bucket(&resolve_route(None, route)))
     }
 
     // `codex exec --json` emits JSONL (thread/turn/item events with turn.completed
@@ -426,15 +479,16 @@ impl ProviderAdapter for CodexAdapter {
         for a in self.permission_args(opts.trust) {
             cmd.arg(a);
         }
-        match codex_model(opts) {
+        let route = opts_route(opts);
+        match route.model.as_deref() {
             Some(m) => {
-                for a in model_args(&m) {
+                for a in model_args(m) {
                     cmd.arg(a);
                 }
             }
             None => {
-                if let Some(p) = spawn_profile(opts) {
-                    if let Some(args) = profile_model_args(&p) {
+                if let Some(p) = route.profile.as_deref() {
+                    if let Some(args) = profile_model_args(p) {
                         for a in args {
                             cmd.arg(a);
                         }
@@ -504,6 +558,7 @@ mod tests {
     fn opts(prompt: &str, model: Option<&str>) -> SpawnOpts {
         SpawnOpts {
             codex_profile: None,
+            codex_model: None,
             prompt: prompt.into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
@@ -1075,6 +1130,7 @@ mod tests {
         let run = dir.path().join("run1");
         let o = SpawnOpts {
             codex_profile: None,
+            codex_model: None,
             prompt: "x".into(),
             prompt_file: Some(run.join("prompt-rev.md")),
             cwd: PathBuf::from("/tmp"),
@@ -1112,5 +1168,60 @@ mod tests {
             Some("thread-1"),
         ));
         assert!(!CodexAdapter.resume_failure_is_missing_session("", None));
+    }
+
+    #[test]
+    fn spawn_honours_the_recorded_model_over_the_process_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("SPAR_CODEX_MODEL", "gpt-5");
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+        let mut o = opts("x", None);
+        o.codex_model = Some("x-ai/grok-4".into());
+        let (_, a) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &o));
+        let mi = a.iter().position(|x| x == "-m").expect("-m present");
+        assert_eq!(a.get(mi + 1).map(String::as_str), Some("x-ai/grok-4"));
+        assert!(
+            !a.iter().any(|x| x == "-p"),
+            "explicit model omits the profile"
+        );
+        let mut o = opts("x", None);
+        o.codex_model = Some("".into());
+        let (_, a) = command_to_parts(&CodexAdapter.build_headless(Path::new("codex"), &o));
+        assert!(
+            !a.iter().any(|x| x == "-m"),
+            "recorded set-but-empty pins model-less"
+        );
+        assert!(a.windows(2).any(|w| w[0] == "-p" && w[1] == "muse"));
+        std::env::remove_var("SPAR_CODEX_MODEL");
+    }
+
+    #[test]
+    fn recorded_route_bucket_follows_the_recorded_model() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("SPAR_CODEX_PROFILE", "muse");
+        std::env::set_var("SPAR_CODEX_MODEL", "gpt-5");
+        assert_eq!(
+            CodexAdapter.recorded_route_bucket(RecordedRoute {
+                profile: Some("muse"),
+                model: Some("x-ai/grok-4"),
+            }),
+            Some(Some("openrouter")),
+            "recorded slug bills openrouter under any ambient model"
+        );
+        assert_eq!(
+            CodexAdapter.recorded_route_bucket(RecordedRoute {
+                profile: Some("muse"),
+                model: Some("gpt-5"),
+            }),
+            Some(Some("native")),
+            "recorded bare model bills native under the recorded OpenRouter profile"
+        );
+        assert_eq!(
+            CodexAdapter.recorded_route_bucket(RecordedRoute::ambient()),
+            None,
+            "unrecorded runs key the ambient route through the normal path"
+        );
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+        std::env::remove_var("SPAR_CODEX_MODEL");
     }
 }
