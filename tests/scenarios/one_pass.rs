@@ -228,6 +228,54 @@ fn one_pass_minor_notes_ship_clean_on_bound_run() {
     );
 }
 
+/// A bound `--run --one-pass` on a never-dispatched reused round gets exactly
+/// that one dispatch: with a blocking finding the gate fails and the run parks
+/// at the ceiling gate (exit 2) without opening another round. Resetting
+/// `dispatched_round` reproduces the crash window the reuse path exists for (a
+/// round opened with nothing spawned in it).
+#[test]
+fn one_pass_reused_round_blocking_parks_after_one_dispatch() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run_id = plan_and_approve(tmp.path());
+    let state_path = run_dir(tmp.path(), &run_id).join("state.json");
+    let mut st: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let entry_round = st["round"].as_u64().unwrap();
+    st["dispatched_round"] = serde_json::json!(entry_round - 1);
+    std::fs::write(&state_path, serde_json::to_string_pretty(&st).unwrap()).unwrap();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .env("SPAR_FORCE_REVIEW_FINDING", "major")
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--providers",
+            "cli:claude,cli:grok",
+            "--dry-run",
+            "--json",
+            "--one-pass",
+        ])
+        .assert()
+        .code(2);
+    assert_eq!(
+        status_json(tmp.path(), &run_id)["phase"],
+        "awaiting_round_extension"
+    );
+    assert_eq!(
+        state_json(tmp.path(), &run_id)["round"].as_u64().unwrap(),
+        entry_round,
+        "a reused round is the one dispatch; the failed gate must not open another"
+    );
+    assert!(
+        !run_dir(tmp.path(), &run_id)
+            .join("artifacts/ship.md")
+            .exists(),
+        "parked runs ship nothing"
+    );
+}
+
 /// A finding at `block_on` parks at the existing gate (exit 2), as without
 /// the flag: no ship, no override.
 #[test]

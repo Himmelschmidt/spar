@@ -1920,11 +1920,15 @@ fn run_from_approved(
     let reuse_round = state.round > 0 && !round_dispatched;
     // `--one-pass` on a bound run is one more round, then the ship-or-park
     // verdict: the loop ends at the next ceiling either way. An explicit
-    // `--max-rounds` still wins over the implied one-round ceiling. This
-    // applies to a reused round too: the round never dispatched, so
-    // `round + 1` grants exactly that one dispatch, never two.
+    // `--max-rounds` still wins over the implied one-round ceiling. A reused
+    // round never dispatched, so it is itself that one more round: the ceiling
+    // stays on it, and its gate failure parks instead of opening another.
     if amend.one_pass && opts.max_rounds.is_none() {
-        state.max_rounds = state.round + 1;
+        state.max_rounds = if reuse_round {
+            state.round
+        } else {
+            state.round + 1
+        };
     }
     if !reuse_round && state.round_ceiling_reached() && escalate_round_ceiling(&mut state, paths)? {
         finish_out(&state, opts.json)?;
