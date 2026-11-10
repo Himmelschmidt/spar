@@ -2260,8 +2260,8 @@ pub fn execute_loop(
             .find(|s| s.role == SlotRole::Implementer)
             .map(|s| s.id.clone())
         {
-            if let SeatCheck::Park(msg) = recheck_seat(state, paths, cfg, &id, false)? {
-                return fail(state, paths, anyhow::anyhow!(msg), true);
+            if let SeatCheck::Park(cause, msg) = recheck_seat(state, paths, cfg, &id, false)? {
+                return fail(state, paths, anyhow::anyhow!(msg), cause.quota_hit());
             }
         }
 
@@ -2526,7 +2526,9 @@ pub fn execute_loop(
             let tester = match tester {
                 Some(t) => match recheck_seat(state, paths, cfg, &t.id, false)? {
                     SeatCheck::Ready(id) => state.slots.iter().find(|s| s.id == id).cloned(),
-                    SeatCheck::Park(msg) => return fail(state, paths, anyhow::anyhow!(msg), true),
+                    SeatCheck::Park(cause, msg) => {
+                        return fail(state, paths, anyhow::anyhow!(msg), cause.quota_hit())
+                    }
                 },
                 None => None,
             };
@@ -2826,7 +2828,7 @@ pub fn execute_loop(
         // A reviewer seat with no usable provider is stood down, not parked: the
         // panel keeps running its other seats. Only a panel with no usable
         // seat left parks the run (O153).
-        let mut stood_down: Vec<String> = Vec::new();
+        let mut stood_down: Vec<(ParkCause, String)> = Vec::new();
         for rev in &reviewers {
             // Stop boundary: before each reviewer job.
             if should_stop(paths, &state.id) {
@@ -2834,7 +2836,7 @@ pub fn execute_loop(
             }
             let rev_id = match recheck_seat(state, paths, cfg, &rev.id, false)? {
                 SeatCheck::Ready(id) => id,
-                SeatCheck::Park(msg) => {
+                SeatCheck::Park(cause, msg) => {
                     let note = format!("reviewer seat `{}` stood down: {msg}", rev.id);
                     eprintln!("warning: {note}");
                     let _ =
@@ -2843,7 +2845,7 @@ pub fn execute_loop(
                         s.stood_down = Some(msg.clone());
                     }
                     state.save(paths)?;
-                    stood_down.push(msg);
+                    stood_down.push((cause, msg));
                     continue;
                 }
             };
@@ -3129,21 +3131,13 @@ pub fn execute_loop(
         // reviewer) fails naming the failed probes; a quota stand-down parks
         // the run exactly as a lone reviewer with no backup always has.
         if !reviewers.is_empty() && stood_down.len() == reviewers.len() {
-            let health = crate::providers::LiveHealth::for_dry(state.dry_run);
-            let readiness = reviewers.iter().all(|rev| {
-                state
-                    .slots
-                    .iter()
-                    .find(|s| s.id == rev.id)
-                    .map(|s| !health.check(&s.provider).usable)
-                    .unwrap_or(true)
-            });
-            return fail(
-                state,
-                paths,
-                anyhow::anyhow!(stood_down.join("; ")),
-                !readiness,
-            );
+            let quota_hit = stood_down.iter().any(|(cause, _)| cause.quota_hit());
+            let messages = stood_down
+                .iter()
+                .map(|(_, msg)| msg.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return fail(state, paths, anyhow::anyhow!(messages), quota_hit);
         }
         // A stood-down seat's recorded veto still blocks when it rejects the
         // head about to ship: judged, unanswered, and unable to re-judge. The
@@ -3445,7 +3439,22 @@ fn drop_salvaged_verdict(paths: &SparPaths, run_id: &str, slot_id: &str) {
 
 enum SeatCheck {
     Ready(String),
-    Park(String),
+    Park(ParkCause, String),
+}
+
+/// Why a seat stood down: a quota-benched seat parks the run (exit 4),
+/// a seat with no healthy provider fails readiness (exit 1). Carried on
+/// the variant from where the re-check decides, never re-probed after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkCause {
+    Quota,
+    Readiness,
+}
+
+impl ParkCause {
+    fn quota_hit(self) -> bool {
+        matches!(self, ParkCause::Quota)
+    }
 }
 
 /// Run-start quota gate: only the implementer must run next at run start, so
@@ -3495,7 +3504,7 @@ fn gate_implementer_seat(
                     None => Ok(None),
                 }
             }
-            SeatCheck::Park(msg) => Ok(Some(msg)),
+            SeatCheck::Park(_, msg) => Ok(Some(msg)),
         },
     }
 }
@@ -3570,10 +3579,13 @@ fn recheck_seat(
             .map(|source| (b, source))
         });
     let Some((backup_raw, source)) = backup else {
-        return Ok(SeatCheck::Park(format!(
-            "provider {key} is paused or on cooldown and `{slot_id}` has no eligible backup. \
-             resume with `spar provider resume {key}` or reassign the role"
-        )));
+        return Ok(SeatCheck::Park(
+            ParkCause::Quota,
+            format!(
+                "provider {key} is paused or on cooldown and `{slot_id}` has no eligible backup. \
+                 resume with `spar provider resume {key}` or reassign the role"
+            ),
+        ));
     };
     let new_id = move_seat_to_backup(state, paths, slot_id, &backup_raw, source)?;
     let note = format!("{key} is paused; `{new_id}` moved to its backup {backup_raw}");
@@ -3659,7 +3671,7 @@ fn recheck_seat_health(
                 Some(err) => format!("{err:#}"),
                 None => format!("no provider resolved for `{}`", slot.id),
             };
-            return Ok(SeatCheck::Park(detail));
+            return Ok(SeatCheck::Park(ParkCause::Readiness, detail));
         }
         if let Some(err) = crate::backup::readiness_error(&skips) {
             return Err(err);
@@ -4149,14 +4161,14 @@ mod recheck_seat_tests {
         pause(&paths, "cli:claude");
         let mut st = state_with("impl", "cli:claude", SlotRole::Implementer);
         let got = recheck_seat(&mut st, &paths, &Config::default(), "impl", true).unwrap();
-        assert!(matches!(got, SeatCheck::Park(ref m) if m.contains("cli:claude")));
+        assert!(matches!(got, SeatCheck::Park(ParkCause::Quota, ref m) if m.contains("cli:claude")));
 
         pause(&paths, "cli:codex");
         let mut cfg = Config::default();
         cfg.backups.implementer = Some("cli:codex".into());
         let got = recheck_seat(&mut st, &paths, &cfg, "impl", true).unwrap();
         assert!(
-            matches!(got, SeatCheck::Park(_)),
+            matches!(got, SeatCheck::Park(ParkCause::Quota, _)),
             "a paused backup is no way out"
         );
         assert_eq!(st.slots[0].provider, "cli:claude");
@@ -4355,7 +4367,7 @@ mod recheck_seat_tests {
         let slot = st.slots[0].clone();
         let got = recheck_seat_health(&mut st, &paths, &cfg, &slot, &health).unwrap();
         assert!(
-            matches!(got, SeatCheck::Park(_)),
+            matches!(got, SeatCheck::Park(ParkCause::Readiness, _)),
             "a reviewer with no healthy seat stands down"
         );
     }
@@ -4372,7 +4384,7 @@ mod recheck_seat_tests {
         let mut st = state_with("test", "cli:codex", SlotRole::Tester);
         let got = recheck_seat(&mut st, &paths, &Config::default(), "test", false).unwrap();
         assert!(
-            matches!(got, SeatCheck::Park(_)),
+            matches!(got, SeatCheck::Park(ParkCause::Quota, _)),
             "a pre-existing weak pause parks a tester with no backup"
         );
     }
@@ -4399,7 +4411,7 @@ mod recheck_seat_tests {
         )
         .unwrap();
         assert!(
-            matches!(got, SeatCheck::Park(_)),
+            matches!(got, SeatCheck::Park(ParkCause::Quota, _)),
             "a pre-existing weak pause parks a reviewer with no backup"
         );
     }
@@ -4442,7 +4454,7 @@ mod recheck_seat_tests {
         store.save(&paths).unwrap();
         let mut st = state_with("impl", "cli:claude", SlotRole::Implementer);
         let got = recheck_seat(&mut st, &paths, &Config::default(), "impl", true).unwrap();
-        assert!(matches!(got, SeatCheck::Park(ref m) if m.contains("cli:claude")));
+        assert!(matches!(got, SeatCheck::Park(ParkCause::Quota, ref m) if m.contains("cli:claude")));
     }
 
     #[test]
@@ -4451,6 +4463,18 @@ mod recheck_seat_tests {
         assert_eq!(reviewer_ordinal("review-12-cli-codex"), Some(12));
         assert_eq!(reviewer_ordinal("review-cli-grok-wide"), None);
         assert_eq!(reviewer_ordinal("impl"), None);
+    }
+
+    #[test]
+    fn park_cause_maps_to_the_exit_code() {
+        assert!(
+            ParkCause::Quota.quota_hit(),
+            "a quota stand-down parks the run (exit 4)"
+        );
+        assert!(
+            !ParkCause::Readiness.quota_hit(),
+            "a readiness stand-down fails (exit 1)"
+        );
     }
 }
 

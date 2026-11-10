@@ -175,7 +175,9 @@ pub fn resolve_seat(
 /// The `[providers].order` last-resort rung on its own. Reviewers keep their
 /// ordinal: the order filtered to usable entries first, then indexed, so a
 /// probe-failed entry never annexes a seat and surviving reviewers never
-/// collapse onto one provider. A singleton consults the usable entries from
+/// collapse onto one provider. A held ordinal entry falls forward to the
+/// first unheld usable entry, so a re-seated reviewer never lands on a
+/// sibling's provider. A singleton consults the usable entries from
 /// its pool position forward and takes the first one no earlier seat holds,
 /// so parallel singletons spread across the order instead of collapsing onto
 /// one provider; when every usable entry already seats an earlier singleton
@@ -190,12 +192,17 @@ pub fn resolve_order_rung(
     used: &[String],
 ) -> Option<(String, SeatSource)> {
     if role == SlotRole::Reviewer {
-        return cfg
+        let usable: Vec<&String> = cfg
             .providers
             .order
             .iter()
             .filter(|p| health.check(p).usable)
-            .nth(order_idx)
+            .collect();
+        return usable
+            .get(order_idx)
+            .copied()
+            .filter(|p| !seated(used, p))
+            .or_else(|| usable.iter().copied().find(|p| !seated(used, p)))
             .cloned()
             .map(|p| (p, SeatSource::ProvidersOrder));
     }
@@ -951,6 +958,44 @@ mod tests {
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:codex".into()];
         assert!(reviewer_panel_has_pins(&cfg));
+    }
+
+    #[test]
+    fn reviewer_rung_skips_a_held_ordinal_entry() {
+        let health = StubHealth::allow_all();
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["cli:a".into(), "cli:b".into(), "cli:c".into()];
+        assert_eq!(
+            resolve_order_rung(SlotRole::Reviewer, 1, &cfg, &health, &[]),
+            Some(("cli:b".to_string(), SeatSource::ProvidersOrder)),
+            "nothing held: ordinal indexing is unchanged"
+        );
+        assert_eq!(
+            resolve_order_rung(
+                SlotRole::Reviewer,
+                0,
+                &cfg,
+                &health,
+                &["cli:a".to_string()]
+            ),
+            Some(("cli:b".to_string(), SeatSource::ProvidersOrder)),
+            "a held ordinal entry falls forward instead of double-seating"
+        );
+        assert_eq!(
+            resolve_order_rung(
+                SlotRole::Reviewer,
+                0,
+                &cfg,
+                &health,
+                &[
+                    "cli:a".to_string(),
+                    "cli:b".to_string(),
+                    "cli:c".to_string()
+                ]
+            ),
+            None,
+            "no unheld usable entry narrows the panel, never double-seats"
+        );
     }
 
     #[test]
