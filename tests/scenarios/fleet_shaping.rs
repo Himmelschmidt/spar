@@ -380,6 +380,158 @@ reviewer = ["cli:codex"]
     );
 }
 
+/// A pinned widen extra is not a panel seat: with a two-panel plus a live
+/// `-wide` extra, `--without reviewer[2]` names no panel seat and is refused
+/// instead of rewriting the config while dropping nothing.
+#[test]
+fn bound_without_reviewer_beyond_the_panel_is_refused_despite_a_live_wide_extra() {
+    let tmp = project(
+        r#"
+[suite]
+enabled = false
+[roles]
+implementer = "cli:agy"
+reviewer = ["cli:codex", "cli:grok"]
+"#,
+    );
+    let out = spar_cmd()
+        .current_dir(tmp.path())
+        .env("SPAR_FORCE_REQUEST_CHANGES", "1")
+        .args([
+            "implement",
+            "--task",
+            "force stuck path",
+            "--max-rounds",
+            "20",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(3);
+    let stdout = String::from_utf8_lossy(out.get_output().stdout.as_slice()).to_string();
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    let run_id = v["run_id"].as_str().unwrap();
+    let state = read_state(tmp.path(), run_id);
+    let ids = slot_ids_for(&state, "reviewer");
+    assert_eq!(
+        ids.len(),
+        3,
+        "the stuck ladder should have widened: {ids:?}"
+    );
+    assert!(
+        ids.iter().any(|id| id.ends_with("-wide")),
+        "expected a widened extra seat: {ids:?}"
+    );
+    let cfg_before = read_run_config(tmp.path(), run_id);
+
+    let v = run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            run_id,
+            "--without",
+            "reviewer[2]",
+            "--dry-run",
+            "--json",
+        ],
+        1,
+    );
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("only 2 reviewer seat(s)"),
+        "the refusal names the panel size: {v:?}"
+    );
+    let state = read_state(tmp.path(), run_id);
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        ids,
+        "a refused amend drops no slot"
+    );
+    assert_eq!(
+        read_run_config(tmp.path(), run_id),
+        cfg_before,
+        "a refused amend leaves the frozen config untouched"
+    );
+}
+
+/// Dropping the panel seat a widen extra duplicated does not promote the
+/// extra: `--without reviewer[1]` drops the seat, the `-wide` extra keeps
+/// reviewing outside the config, and the survivor panel is the one pin.
+#[test]
+fn bound_without_reviewer_drop_keeps_the_wide_extra_out_of_config() {
+    let tmp = project(
+        r#"
+[suite]
+enabled = false
+[roles]
+implementer = "cli:agy"
+reviewer = ["cli:codex", "cli:grok"]
+"#,
+    );
+    let out = spar_cmd()
+        .current_dir(tmp.path())
+        .env("SPAR_FORCE_REQUEST_CHANGES", "1")
+        .args([
+            "implement",
+            "--task",
+            "force stuck path",
+            "--max-rounds",
+            "20",
+            "--dry-run",
+            "--json",
+        ])
+        .assert()
+        .code(3);
+    let stdout = String::from_utf8_lossy(out.get_output().stdout.as_slice()).to_string();
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    let run_id = v["run_id"].as_str().unwrap();
+    let state = read_state(tmp.path(), run_id);
+    let ids = slot_ids_for(&state, "reviewer");
+    assert_eq!(
+        ids.len(),
+        3,
+        "the stuck ladder should have widened: {ids:?}"
+    );
+    let wide = ids.iter().find(|id| id.ends_with("-wide")).unwrap().clone();
+
+    run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            run_id,
+            "--without",
+            "reviewer[1]",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let state = read_state(tmp.path(), run_id);
+    let survivors = slot_ids_for(&state, "reviewer");
+    assert_eq!(
+        survivors.len(),
+        2,
+        "only the dropped seat goes: {survivors:?}"
+    );
+    assert!(
+        survivors.contains(&wide),
+        "the widened extra keeps reviewing: {survivors:?}"
+    );
+    assert!(
+        survivors.iter().any(|id| !id.ends_with("-wide")),
+        "the other panel seat survives too: {survivors:?}"
+    );
+    assert_eq!(
+        read_run_config(tmp.path(), run_id)["roles"]["reviewer"],
+        serde_json::json!(["cli:codex"]),
+        "the extra is not promoted into the panel"
+    );
+}
+
 /// AC-6: widening compares pins and slots by storage key, so `cli:codex@terra` and the
 /// slot it created (`provider=cli:codex`, `model=terra`) are recognised as the same seat
 /// and the panel is not silently widened onto `[providers].order`.

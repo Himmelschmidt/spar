@@ -1928,17 +1928,22 @@ impl Config {
         select: &[String],
         urgency: &str,
         dry: bool,
-    ) -> Result<(Vec<String>, crate::state::PoolOrigin)> {
-        use crate::state::{PoolOrigin, SlotRole};
+    ) -> Result<(
+        crate::model_select::ResolvedProviders,
+        crate::state::PoolOrigin,
+    )> {
+        use crate::state::PoolOrigin;
         if !providers.is_empty() {
-            return Ok((providers.to_vec(), PoolOrigin::CliProviders));
+            return Ok((
+                crate::model_select::ResolvedProviders {
+                    providers: providers.to_vec(),
+                    artifact: None,
+                },
+                PoolOrigin::CliProviders,
+            ));
         }
         if !select.is_empty() {
-            let n = crate::workflow::roles_resolve::pool_width(self);
-            let roles: Vec<&str> = std::iter::once(SlotRole::Implementer.as_config_key())
-                .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
-                .take(n)
-                .collect();
+            let (n, roles) = crate::workflow::roles_resolve::reviewer_select_question(self);
             let resolved = crate::model_select::resolve_providers(
                 &[],
                 Some(select),
@@ -1948,9 +1953,15 @@ impl Config {
                 self,
                 dry,
             )?;
-            return Ok((resolved.providers, PoolOrigin::Selected));
+            return Ok((resolved, PoolOrigin::Selected));
         }
-        Ok((self.providers.order.clone(), PoolOrigin::Synth))
+        Ok((
+            crate::model_select::ResolvedProviders {
+                providers: self.providers.order.clone(),
+                artifact: None,
+            },
+            PoolOrigin::Synth,
+        ))
     }
 
     /// `--without` drops seats from the fleet. `critic`, `spec` and `suite` drop whole
@@ -3617,5 +3628,27 @@ planner = "best"
         assert_eq!(std::env::var(name).unwrap(), "http://proxy.invalid:3128");
         assert!(std::env::var(unset).is_err());
         std::env::remove_var(name);
+    }
+
+    #[test]
+    fn a_reviewer_drop_records_the_survivor_panel_as_the_rotation_scope() {
+        let mut cfg = Config::default();
+        let pool = ["cli:claude", "cli:grok", "cli:codex"].map(String::from);
+        let dropped = cfg
+            .apply_without(
+                &pool,
+                crate::state::PoolOrigin::CliProviders,
+                true,
+                &["reviewer[0]".to_string()],
+            )
+            .unwrap();
+        assert_eq!(dropped, vec![0]);
+        assert_eq!(cfg.roles.reviewer, vec!["cli:codex".to_string()]);
+        assert!(cfg
+            .cli_role_keys
+            .contains(&crate::state::SlotRole::Reviewer));
+        assert!(crate::workflow::roles_resolve::reviewer_panel_has_pins(
+            &cfg
+        ));
     }
 }

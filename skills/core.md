@@ -1301,7 +1301,7 @@ A landing the model already saw, any `Read` receipt, from a prompt inclusion,
 a Stop-hook injection, an inbox claim or an ack, stays `delivered` under a
 later withdrawal. It is derived at read time from the inbox directories, the receipts and the
 ack events, never stored, so there is no second copy of the state to drift. A slot's
-poll file (agy, pi) renders its inbox, not an append-only log (O158–O163, O165–O166): every filing,
+poll file (agy, pi) renders its inbox, not an append-only log (O158–O166): every filing,
 withdrawal and round start rewrites it from the pending messages, so a withdrawn or
 expired message disappears from the file. A superseding send skips its own filing
 render; the withdrawal renders holders of the old message and the send path then
@@ -2000,9 +2000,10 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
   `test_author`, no `test-contract.md`); `suite` -> `[suite] enabled = false` for this run
   (no `tester` slot); `reviewer[N]` -> the panel's Nth live seat (0-based) is removed,
   with its per-ordinal backup, or an existing seat id (`review-1-cli-claude`) names
-  the seat directly. The ordinal resolves against the live panel when `--without`
-  is parsed: an explicit `--providers`/`--select` pool beats a `[roles].reviewer`
-  file pin. Dropping a reviewer removes it from the panel, the run's state slots, and
+  the seat directly. A widened `-wide` extra sits outside the panel: it holds no
+  ordinal, and its seat id cannot name it for a drop. The ordinal resolves against
+  the live panel when `--without` is parsed: an explicit `--providers`/`--select`
+  pool beats a `[roles].reviewer` file pin. Dropping a reviewer removes it from the panel, the run's state slots, and
   the review history, so its verdicts stop gating the ship. Seats keep their ids for
   the life of the run: nothing renumbers, and a dropped id retires and is never
   reminted, so a later ordinal always indexes the seats that are actually there.

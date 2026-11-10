@@ -57,6 +57,50 @@ pub fn pool_width(cfg: &Config) -> usize {
     1 + panel_size(cfg)
 }
 
+/// The `--select` question the implement panel asks: pool width with the
+/// implementer first, reviewers after. One function, since the launch shaping
+/// resolves it to index `--without` ordinals and the dispatch resolves it to
+/// seat the panel.
+pub fn reviewer_select_question(cfg: &Config) -> (usize, Vec<&'static str>) {
+    let n = pool_width(cfg);
+    let roles: Vec<&'static str> = std::iter::once(SlotRole::Implementer.as_config_key())
+        .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
+        .take(n)
+        .collect();
+    (n, roles)
+}
+
+/// A `--select` resolution the launch already ran (to index a `--without`
+/// reviewer ordinal). The dispatch reuses it instead of benchmarking twice,
+/// but only when it asks the same question: the width and roles that shaped
+/// the ranking travel with the providers, and a different panel shape
+/// re-resolves.
+#[derive(Debug, Clone)]
+pub struct PreselectedPool {
+    pub width: usize,
+    pub roles: Vec<String>,
+    pub providers: Vec<String>,
+    pub artifact: Option<crate::model_select::SelectArtifact>,
+}
+
+impl PreselectedPool {
+    /// Record a resolution against the shaped panel: drops and role overrides
+    /// already ran, so the width and roles are what the dispatch asks. The
+    /// providers stay the pre-shape resolution the `--without` ordinals indexed.
+    pub fn for_shaped_panel(
+        cfg: &Config,
+        resolved: crate::model_select::ResolvedProviders,
+    ) -> Self {
+        let (width, roles) = reviewer_select_question(cfg);
+        Self {
+            width,
+            roles: roles.into_iter().map(str::to_string).collect(),
+            providers: resolved.providers,
+            artifact: resolved.artifact,
+        }
+    }
+}
+
 /// Whether the reviewer panel is pinned (by CLI `--role`, by `[roles].reviewer`, or
 /// narrowed by `--fleet small`), i.e. an exclusion list rather than a floor. Widening a
 /// pinned panel must duplicate an already-dispatched seat, never draw from
@@ -506,5 +550,28 @@ mod tests {
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:codex".into()];
         assert!(reviewer_panel_has_pins(&cfg));
+    }
+
+    #[test]
+    fn shaped_preselection_answers_the_dispatch_question() {
+        let cfg = Config::default();
+        let recorded = PreselectedPool::for_shaped_panel(
+            &cfg,
+            crate::model_select::ResolvedProviders {
+                providers: vec!["cli:handshake-probe".into()],
+                artifact: None,
+            },
+        );
+        let opts = CommonOpts {
+            preselected_pool: Some(recorded),
+            dry_run: true,
+            ..Default::default()
+        };
+        let (n, roles) = reviewer_select_question(&cfg);
+        let paths = crate::paths::SparPaths::new("/tmp/spar-handshake-probe");
+        assert_eq!(
+            opts.resolve_pool(n, &roles, &paths, &cfg, "probe").unwrap(),
+            vec!["cli:handshake-probe".to_string()]
+        );
     }
 }

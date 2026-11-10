@@ -248,20 +248,10 @@ fn run() -> Result<ExitCode> {
                 if let Some(preset) = &fleet {
                     cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
                 }
-                // A reviewer ordinal is the only `--without` item that indexes a
-                // panel; without one the pool (and any `--select` benchmark) is
-                // skipped and the channels apply clean.
-                let (pool, origin) = if config::without_has_reviewer_item(&without) {
-                    cfg.fresh_reviewer_pool(&providers, &select, &urgency, dry_run)?
-                } else {
-                    (Vec::new(), state::PoolOrigin::Synth)
-                };
-                let dropped = cfg.apply_without(&pool, origin, dry_run, &without)?;
-                cfg.apply_role_overrides(&role)?;
-                cfg.refuse_emptied_reviewer_panel(&dropped)?;
-                config::warn_if_role_discards_reviewer_drop(&role, &dropped);
-                cfg.apply_backup_overrides(&backup)?;
-                cfg.apply_effort_overrides(&effort)?;
+                let preselected_pool = fresh_seat_shapers(
+                    &mut cfg, &providers, &select, &urgency, dry_run, &without, &role, &backup,
+                    &effort,
+                )?;
                 cfg.apply_suite_command(&suite_command, &without)?;
                 // An intaken brief (O41) is the work's identity already, so its slug is
                 // the natural key when the operator names none. Any other file is not.
@@ -300,6 +290,7 @@ fn run() -> Result<ExitCode> {
                     task: Some(task_text.clone()),
                     providers,
                     select,
+                    preselected_pool,
                     urgency,
                     base,
                     detach,
@@ -454,7 +445,7 @@ fn run() -> Result<ExitCode> {
                     suite_command,
                     recapture_env,
                 };
-                let (paths, cfg) = implement_ctx(
+                let (paths, cfg, preselected_pool) = implement_ctx(
                     run_id.as_deref(),
                     &amend.role,
                     &amend.backup,
@@ -473,6 +464,7 @@ fn run() -> Result<ExitCode> {
                     task: task.clone(),
                     providers,
                     select,
+                    preselected_pool,
                     urgency,
                     base,
                     detach,
@@ -680,24 +672,15 @@ fn run() -> Result<ExitCode> {
                 if let Some(preset) = &fleet {
                     cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
                 }
-                // A reviewer ordinal is the only `--without` item that indexes a
-                // panel; without one the pool (and any `--select` benchmark) is
-                // skipped and the channels apply clean.
-                let (pool, origin) = if config::without_has_reviewer_item(&without) {
-                    cfg.fresh_reviewer_pool(&providers, &select, &urgency, dry_run)?
-                } else {
-                    (Vec::new(), state::PoolOrigin::Synth)
-                };
-                let dropped = cfg.apply_without(&pool, origin, dry_run, &without)?;
-                cfg.apply_role_overrides(&role)?;
-                cfg.refuse_emptied_reviewer_panel(&dropped)?;
-                config::warn_if_role_discards_reviewer_drop(&role, &dropped);
-                cfg.apply_backup_overrides(&backup)?;
-                cfg.apply_effort_overrides(&effort)?;
+                let preselected_pool = fresh_seat_shapers(
+                    &mut cfg, &providers, &select, &urgency, dry_run, &without, &role, &backup,
+                    &effort,
+                )?;
                 let opts = CommonOpts {
                     task,
                     providers,
                     select,
+                    preselected_pool,
                     urgency,
                     base,
                     detach,
@@ -1395,6 +1378,54 @@ fn bus_deliver(
     Ok(ExitCode::Success)
 }
 
+/// Seat shapers for a fresh launch: pool resolution, drops, and role/backup/
+/// effort overrides, in launch order. A surviving drop records without pinning
+/// the panel (O178).
+#[allow(clippy::too_many_arguments)]
+fn fresh_seat_shapers(
+    cfg: &mut Config,
+    providers: &[String],
+    select: &[String],
+    urgency: &str,
+    dry_run: bool,
+    without: &[String],
+    role: &[String],
+    backup: &[String],
+    effort: &[String],
+) -> Result<Option<workflow::roles_resolve::PreselectedPool>> {
+    // A reviewer ordinal is the only `--without` item that indexes a panel;
+    // without one the pool (and any `--select` benchmark) is skipped and the
+    // channels apply clean.
+    if !config::without_has_reviewer_item(without) {
+        let dropped = cfg.apply_without(&[], state::PoolOrigin::Synth, dry_run, without)?;
+        cfg.apply_role_overrides(role)?;
+        cfg.refuse_emptied_reviewer_panel(&dropped)?;
+        config::warn_if_role_discards_reviewer_drop(role, &dropped);
+        cfg.apply_backup_overrides(backup)?;
+        cfg.apply_effort_overrides(effort)?;
+        return Ok(None);
+    }
+    let (resolved, origin) = cfg.fresh_reviewer_pool(providers, select, urgency, dry_run)?;
+    let selected = matches!(&origin, state::PoolOrigin::Selected);
+    let dropped = cfg.apply_without(&resolved.providers, origin, dry_run, without)?;
+    cfg.apply_role_overrides(role)?;
+    // Record after the drops and role overrides shaped the panel, so the
+    // stored width and roles are the question the dispatch asks (O179). The
+    // providers stay the pre-shape resolution the ordinals indexed.
+    let preselected = if selected {
+        Some(workflow::roles_resolve::PreselectedPool::for_shaped_panel(
+            &*cfg, resolved,
+        ))
+    } else {
+        None
+    };
+    cfg.refuse_emptied_reviewer_panel(&dropped)?;
+    config::warn_if_role_discards_reviewer_drop(role, &dropped);
+    cfg.apply_backup_overrides(backup)?;
+    cfg.apply_effort_overrides(effort)?;
+    Ok(preselected)
+}
+
 /// Config for `spar implement`.
 ///
 /// A new run (`--task` / `--plan`) starts from the project's live config; `--run <id>`
@@ -1420,29 +1451,22 @@ fn implement_ctx(
     fleet: Option<&str>,
     reload_config: bool,
     recapture_env: bool,
-) -> Result<(paths::SparPaths, Config)> {
+) -> Result<(
+    paths::SparPaths,
+    Config,
+    Option<workflow::roles_resolve::PreselectedPool>,
+)> {
     let (paths, cfg) = project_ctx()?;
     let Some(run_id) = run_id else {
         let mut cfg = cfg;
         if let Some(preset) = fleet {
             cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
         }
-        // A reviewer ordinal is the only `--without` item that indexes a panel;
-        // without one the pool (and any `--select` benchmark) is skipped and
-        // the channels apply clean.
-        let (pool, origin) = if config::without_has_reviewer_item(without) {
-            cfg.fresh_reviewer_pool(providers, select, urgency, dry_run)?
-        } else {
-            (Vec::new(), state::PoolOrigin::Synth)
-        };
-        let dropped = cfg.apply_without(&pool, origin, dry_run, without)?;
-        cfg.apply_role_overrides(role)?;
-        cfg.refuse_emptied_reviewer_panel(&dropped)?;
-        config::warn_if_role_discards_reviewer_drop(role, &dropped);
-        cfg.apply_backup_overrides(backup)?;
-        cfg.apply_effort_overrides(effort)?;
+        let preselected_pool = fresh_seat_shapers(
+            &mut cfg, providers, select, urgency, dry_run, without, role, backup, effort,
+        )?;
         cfg.apply_suite_command(suite_command, without)?;
-        return Ok((paths, cfg));
+        return Ok((paths, cfg, preselected_pool));
     };
     // `--suite-command` still needs `--reload-config`: it replaces the run's
     // deterministic suite, a file-shaped change rather than an amendment. The seat
@@ -1465,7 +1489,7 @@ fn implement_ctx(
     // persist: the frozen config goes back untouched. The only errors raised here
     // are usage errors that touch no state. (`--fleet` needs no parse here: the
     // amend inputs parsed it up front, so an unknown preset already failed.)
-    Ok((paths, frozen))
+    Ok((paths, frozen, None))
 }
 
 fn project_ctx() -> Result<(paths::SparPaths, Config)> {
