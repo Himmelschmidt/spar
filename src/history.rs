@@ -437,6 +437,7 @@ mod tests {
         ReviewHistoryEntry {
             round,
             slot_id: slot.into(),
+            seat_key: None,
             review: parse_review(body),
         }
     }

@@ -741,9 +741,7 @@ fn latest_panel(state: &RunState) -> Vec<&crate::state::ReviewHistoryEntry> {
         .iter()
         .filter(|s| s.role == crate::state::SlotRole::Reviewer)
     {
-        let names_slot = |e: &&crate::state::ReviewHistoryEntry| {
-            e.slot_id == slot.id || slot.former_ids.contains(&e.slot_id)
-        };
+        let names_slot = |e: &&crate::state::ReviewHistoryEntry| e.names_seat(slot);
         let Some(latest) = state
             .review_history
             .iter()
@@ -898,12 +896,14 @@ pub fn record_review(state: &mut RunState, paths: &SparPaths, slot_id: &str, res
     let round = slot.round;
     let provider = slot.provider.clone();
     let model = slot.model.clone();
+    let key = slot.seat_key().to_string();
     state
         .review_history
         .retain(|e| !(e.round == round && e.slot_id == slot_id));
     state.review_history.push(crate::state::ReviewHistoryEntry {
         round,
         slot_id: slot_id.to_string(),
+        seat_key: Some(key),
         review: res.clone(),
     });
     let mut v = serde_json::json!({
@@ -2164,6 +2164,7 @@ The loop at src/resolver.rs:88 never stops.\n\
         let entry = |round: u32, slot: &str, body: &str| crate::state::ReviewHistoryEntry {
             round,
             slot_id: slot.into(),
+            seat_key: None,
             review: parse_review(body),
         };
         let history = vec![
@@ -2219,6 +2220,7 @@ The loop at src/resolver.rs:88 never stops.\n\
         state.review_history.push(crate::state::ReviewHistoryEntry {
             round: 2,
             slot_id: "rev".into(),
+            seat_key: None,
             review: parse_review(&format!(
                 "## Verdict\nrequest_changes\n\nReviewed-Commit: {reviewed}\n\n## Findings\n- severity: major — off by one at src/a.rs:1\n- severity: minor — naming at src/b.rs:1\n- severity: minor — no location\n"
             )),

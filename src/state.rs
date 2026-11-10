@@ -248,7 +248,25 @@ pub struct ContractAmendment {
 pub struct ReviewHistoryEntry {
     pub round: u32,
     pub slot_id: String,
+    /// Stable seat identity: the seat's first id, which renumbering never
+    /// changes. Entries written before the key existed carry `None` and match
+    /// by id as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_key: Option<String>,
     pub review: crate::workflow::review_result::ReviewResult,
+}
+
+impl ReviewHistoryEntry {
+    /// Whether this entry is this seat's own record. Keyed entries match the
+    /// seat's stable key, so two seats never claim one entry no matter how
+    /// renumbering reused the writing id. Legacy entries match the id the seat
+    /// carries now or carried before.
+    pub fn names_seat(&self, slot: &SlotState) -> bool {
+        match &self.seat_key {
+            Some(key) => key == slot.seat_key(),
+            None => self.slot_id == slot.id || slot.former_ids.contains(&self.slot_id),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,6 +586,16 @@ impl SlotState {
     /// the work is known.
     pub fn parks_on_quota(&self) -> bool {
         self.quota_hit || self.auth_fault
+    }
+
+    /// This seat's stable identity: the first id it ever held. Renames rewrite
+    /// `id` and push onto `former_ids` (oldest first), so the head never moves
+    /// while the seat lives, and review history keyed by it survives renumbering.
+    pub fn seat_key(&self) -> &str {
+        self.former_ids
+            .first()
+            .map(String::as_str)
+            .unwrap_or(&self.id)
     }
 
     /// Put `provider` (`cli:x` or `cli:x@model`) in this seat, pending its first

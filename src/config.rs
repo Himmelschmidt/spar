@@ -1082,16 +1082,16 @@ pub fn role_pins_reviewer(role: &[String]) -> bool {
 }
 
 /// Warn when an explicit `--role reviewer=...` replaces a panel a `--without
-/// reviewer[N]` just cut: the pin wins and the dropped seats are lost. Every
-/// amend path applies `--without` before `--role`, so each one calls this after
-/// both have run.
-pub fn warn_if_role_discards_reviewer_drop(role: &[String], dropped: &[usize]) {
+/// reviewer[N]` just cut: the pin wins for the frozen panel, the dropped seat
+/// still leaves the run. Every amend path applies `--without` before `--role`,
+/// so each one calls this after both have run.
+pub fn warn_if_role_replaces_dropped_panel(role: &[String], dropped: &[usize]) {
     if dropped.is_empty() {
         return;
     }
     if role_pins_reviewer(role) {
         eprintln!(
-            "warning: --role reviewer=... replaces the reviewer panel, discarding the --without reviewer seat drop"
+            "warning: --role reviewer=... replaces the reviewer panel, so the --without reviewer seat drop still removes its seat but does not narrow the frozen panel"
         );
     }
 }
@@ -2053,8 +2053,9 @@ impl Config {
     /// loaded file config, so `--reload-config` picks up file edits without losing
     /// anything given on the command line. Composition mirrors launch order
     /// (preset, without, role): role pins land first, the suite pin next, and the
-    /// recorded channel drops last, so a recorded `--without suite` still wins over
-    /// a carried suite command.
+    /// recorded channel drops last. A `--suite-command` restated at a later amend
+    /// already cleared its recorded Suite drop (one source), so the drops here only
+    /// silence channels the operator never re-enabled.
     pub fn reapply_cli_overrides(&mut self, frozen: &Config) {
         use crate::state::SlotRole;
         for key in &frozen.cli_role_keys {
@@ -2154,6 +2155,10 @@ impl Config {
         self.suite.command = commands.to_vec();
         self.suite.command_from_cli = true;
         self.suite.enabled = true;
+        // A later amend restating the opposite replaces the recorded override: one
+        // source, so a `--without suite` recorded earlier cannot switch the suite
+        // back off on the next reload.
+        self.cli_without.retain(|c| *c != DroppedChannel::Suite);
         Ok(())
     }
 
@@ -2187,7 +2192,7 @@ impl Config {
     /// The `--fleet small` channel shutdowns, evaluated against the current file:
     /// critic and spec always go, the agent tester only when no deterministic
     /// `[suite].command` is configured (a configured suite is free and stays on).
-    /// Re-run — never recorded — on `--reload-config`, so the file's current suite
+    /// Re-run on `--reload-config` (never recorded), so the file's current suite
     /// state decides each time.
     fn apply_small_preset_channels(&mut self) {
         self.critic.enabled = false;
@@ -3435,6 +3440,30 @@ planner = "best"
             reloaded.suite.command.is_empty(),
             "file state is re-read, not carried"
         );
+    }
+
+    #[test]
+    fn suite_command_replaces_a_recorded_without_suite() {
+        // Round N: `--without suite` records the drop and switches the suite off.
+        let mut frozen = Config::default();
+        frozen.cli_without.insert(DroppedChannel::Suite);
+        frozen.suite.enabled = false;
+        // Round N+1: `--suite-command ... --reload-config` names a suite again.
+        frozen
+            .apply_suite_command(&["make test".into()], &[])
+            .unwrap();
+        assert!(frozen.suite.enabled);
+        assert!(
+            !frozen.cli_without.contains(&DroppedChannel::Suite),
+            "the restated opposite replaces the recorded override: {:?}",
+            frozen.cli_without
+        );
+        // Round N+2: a later reload replays the recording, which must no longer
+        // silence the suite the operator just named.
+        let mut reloaded = Config::default();
+        reloaded.reapply_cli_overrides(&frozen);
+        assert!(reloaded.suite.enabled, "the suite survives the next reload");
+        assert_eq!(reloaded.suite.command, vec!["make test"]);
     }
 
     #[test]

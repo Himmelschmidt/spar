@@ -146,7 +146,7 @@ pub fn preview_bound_amend(
         panel_pinned = false;
     }
     cfg.refuse_emptied_reviewer_panel(&dropped)?;
-    crate::config::warn_if_role_discards_reviewer_drop(&inputs.role, &dropped);
+    crate::config::warn_if_role_replaces_dropped_panel(&inputs.role, &dropped);
     cfg.apply_backup_overrides(&inputs.backup)?;
     cfg.apply_effort_overrides(&inputs.effort)?;
     cfg.apply_suite_command(&inputs.suite_command, &without)?;
@@ -359,7 +359,7 @@ pub fn run_from_cli(
         crate::workflow::validate_task(t).map_err(anyhow::Error::msg)?;
     }
     if let Some(id) = run_id {
-        return run_from_approved(&id, task, opts, paths, cfg, amend);
+        return run_from_approved(&id, task, opts, paths, amend);
     }
     if let Some(plan_path) = plan {
         // A plan belongs to the run that produced it. Implementing it is that run
@@ -375,7 +375,7 @@ pub fn run_from_cli(
             if !opts.json {
                 eprintln!("continuing run {id} (it wrote this plan)");
             }
-            return run_from_approved(&id, task, opts, paths, cfg, amend);
+            return run_from_approved(&id, task, opts, paths, amend);
         }
         if !new {
             bail!("{}", unlinked_plan_error(&plan_path, paths));
@@ -533,7 +533,7 @@ pub fn resume(
         dry_run: state.dry_run,
         ..CommonOpts::default()
     };
-    run_from_approved(run_id, None, opts, paths, cfg, BoundAmendInputs::default())
+    run_from_approved(run_id, None, opts, paths, BoundAmendInputs::default())
 }
 
 /// The run that wrote this plan, if spar wrote it: plan artifacts live at
@@ -568,13 +568,14 @@ struct Reentry {
     /// Lifted off the round ceiling (O52): the same escalation continuing, so the
     /// stuck ladder's rotate/widen budget is not reset.
     from_round_gate: bool,
-    /// `--reload-config`: seats that already exist are re-resolved from the fresh
-    /// config rather than keeping the provider they were minted with.
-    reload_config: bool,
+    /// An amend was applied or `--reload-config` reloaded the file: seats that
+    /// already exist are re-resolved from the amended config rather than keeping
+    /// the provider they were minted with.
+    repoint: bool,
 }
 
-/// Re-resolve the provider and model of seats that already exist, from a config the
-/// caller reloaded (`--reload-config`).
+/// Re-resolve the provider and model of seats that already exist, from the amended
+/// config (an amend was applied, or `--reload-config` reloaded the file).
 ///
 /// Matched by seat id, so a seat the new config no longer produces is left alone
 /// rather than guessed at: dropping it is `--without`'s job, and this must not become
@@ -910,7 +911,6 @@ fn run_from_approved(
     amendment: Option<String>,
     mut opts: CommonOpts,
     paths: &SparPaths,
-    cfg: &Config,
     amend: BoundAmendInputs,
 ) -> Result<ExitCode> {
     // Loaded once before the lock only so a mistyped id fails without the lock minting
@@ -960,7 +960,13 @@ fn run_from_approved(
     };
     // Every way back into a run (`--run`, `resume`, a `--plan` the run wrote) dispatches
     // under the environment the run was created in (O130), from its own snapshot.
-    Config::for_run(paths, run_id)?.reapply_captured_env();
+    // `cfg` was read before the lock for the cheap pre-checks in `implement_ctx`;
+    // re-read the frozen snapshot under the lock: another dispatch may have amended
+    // it since, and the preview below builds from the frozen base (O27), so the
+    // stale read would silently overwrite the newer snapshot.
+    let frozen = Config::for_run(paths, run_id)?;
+    frozen.reapply_captured_env();
+    let cfg = &frozen;
     let mut state = RunState::load(paths, run_id)?;
     // Read before anything below resets slot statuses for re-dispatch.
     let round_dispatched = current_round_dispatched(&state);
@@ -984,8 +990,8 @@ fn run_from_approved(
         .map_err(|e| ReassignRefused(format!("{e:#}")))?;
     // The amend previews here, read-only, before any side effect below (the
     // stopped-marker removal, the terminal-slot clearing, the base worktrees,
-    // the reassigns): a refused amend — a bad seat id, a malformed override, the
-    // last-seat drop — changes nothing on disk or in the saved state. It is
+    // the reassigns). A refused amend (a bad seat id, a malformed override, the
+    // last-seat drop) changes nothing on disk or in the saved state. It is
     // applied after the preconditions, further down.
     let preview = if live.is_none() && amend.is_noop() {
         None
@@ -1072,10 +1078,11 @@ fn run_from_approved(
     // Bound amend, applied under this same lock and after every launch
     // precondition passed (resumable, round extension, reassign resolution,
     // base): the frozen config is amended, reviewer seats are dropped with
-    // their slots, and the snapshot is re-frozen — so a refused launch changes
+    // their slots, and the snapshot is re-frozen, so a refused launch changes
     // nothing (O154). The amended config shadows the frozen one for the rest
     // of this dispatch. The `preview` above already passed every check, so a
     // refusal here means the surgery itself failed mid-apply.
+    let amend_applied = preview.is_some();
     let amended;
     let cfg: &Config = if let Some(mut preview) = preview {
         if preview.panel_pinned {
@@ -1230,7 +1237,7 @@ fn run_from_approved(
         paths,
         Reentry {
             from_round_gate,
-            reload_config: opts.reload_config,
+            repoint: amend_applied,
         },
     )?;
     if !dry {
@@ -1310,7 +1317,7 @@ fn prepare_implement_slots(
 ) -> Result<()> {
     let Reentry {
         from_round_gate: resuming_from_round_gate,
-        reload_config,
+        repoint,
     } = reentry;
     state.workflow = crate::cli::WorkflowKind::Loop;
     state.max_fix_rounds = 3;
@@ -1328,13 +1335,13 @@ fn prepare_implement_slots(
     // Keep planner slots as historical; add impl/review if missing.
     let has_impl = state.slots.iter().any(|s| s.role == SlotRole::Implementer);
     if has_impl {
-        // `--reload-config` resolved a fresh `Config` (O27's one sanctioned escape),
-        // and until now that reached `config.json` and stopped there: seats minted by
-        // an earlier round kept whatever provider they were created with, so
-        // `--role implementer=…` on a run whose slots exist changed the frozen config
-        // and nothing that runs. `skills/core.md` documents `--reload-config` as the
-        // way to change a running run's fleet, so the contract was real and unhonoured.
-        if reload_config {
+        // An amend (or `--reload-config`) resolved a fresh `Config`, and until now
+        // that reached `config.json` and stopped there on runs whose slots already
+        // exist: seats minted by an earlier round kept whatever provider they were
+        // created with, so `--role implementer=...` without `--reload-config`
+        // changed the frozen config and nothing that runs. Repoint whenever an
+        // amend was applied, so the seats track the config they resolve from.
+        if repoint {
             repoint_existing_seats(state, cfg)?;
         }
         ensure_suite_slot(state, dry, cfg, paths)?;
@@ -2298,7 +2305,7 @@ fn run_with_task(
         paths,
         Reentry {
             from_round_gate: false,
-            reload_config: opts.reload_config,
+            repoint: false,
         },
     )?;
     if !dry {
@@ -3716,6 +3723,9 @@ pub(crate) fn plan_reviewer_drop(
     for id in &doomed {
         final_ids.remove(id);
     }
+    // Only live ids collide here: history is keyed by stable seat key, so a
+    // rename target that reuses a survivor's former id stays unambiguous, and
+    // refusing those would block ordinary sequential close-ranks renames.
     for (old, new) in &renames {
         final_ids.remove(old);
         if !final_ids.insert(new.clone()) {
@@ -3745,17 +3755,9 @@ pub(crate) fn drop_reviewer_seats(
         mut renames,
     } = plan;
     let doomed: std::collections::BTreeSet<String> = removed.iter().cloned().collect();
-    // History entries keep the id of the seat that wrote them (`former_ids` maps a
-    // renamed seat back); pruning by every id the doomed seats ever held drops the
-    // whole seat, whatever it was called in earlier rounds.
-    let mut doomed_ids = doomed.clone();
-    for slot in state.slots.iter().filter(|s| doomed.contains(&s.id)) {
-        doomed_ids.extend(slot.former_ids.iter().cloned());
-    }
     // Every fallible check is done: now mutate. Gone seats lose their checkouts
-    // (renamed survivors recreate theirs on the next dispatch), their slots, their
-    // verdict artifacts and their history — the gate reads history entries directly,
-    // so pruning is what stops the seat's findings from counting.
+    // (renamed survivors recreate theirs on the next dispatch), their slots and
+    // their verdict artifacts.
     for id in doomed.iter().chain(renames.iter().map(|(old, _)| old)) {
         crate::worktree::remove_reviewer_checkout(state, id);
     }
@@ -3768,9 +3770,6 @@ pub(crate) fn drop_reviewer_seats(
             }
         }
     }
-    state
-        .review_history
-        .retain(|e| !doomed_ids.contains(&e.slot_id));
     state.slots.retain(|s| !doomed.contains(&s.id));
     renames.sort_by(|a, b| {
         reviewer_ordinal(&a.0)
@@ -3787,7 +3786,109 @@ pub(crate) fn drop_reviewer_seats(
             }
         }
     }
+    // History entries stay with the seat that wrote them: keep every entry a
+    // surviving reviewer seat still names by stable key, and drop the rest. The
+    // gate reads history entries directly, so pruning is what stops the dropped
+    // seat's findings from counting. Pruning by id string instead would delete a
+    // survivor's entries whenever renumbering reused the dropped id.
+    let live: Vec<SlotState> = state
+        .slots
+        .iter()
+        .filter(|s| s.role == SlotRole::Reviewer)
+        .cloned()
+        .collect();
+    state
+        .review_history
+        .retain(|e| live.iter().any(|s| e.names_seat(s)));
     Ok(removed)
+}
+
+#[cfg(test)]
+mod reviewer_drop_history_tests {
+    use super::*;
+
+    fn finding_body(text: &str) -> String {
+        format!("## Verdict\nrequest_changes\n\n## Findings\n- severity: major - {text}\n")
+    }
+
+    fn seat_with_finding(
+        state: &mut RunState,
+        paths: &SparPaths,
+        id: &str,
+        provider: &str,
+        finding: &str,
+    ) {
+        state
+            .slots
+            .push(executor::init_slot(id, provider, SlotRole::Reviewer));
+        let review = review_result::parse_review(&finding_body(finding));
+        review_result::record_review(state, paths, id, &review);
+    }
+
+    /// Sequential drops renumber survivors onto ids other seats used to hold.
+    /// History is keyed by stable seat key, so the remaining seat keeps its own
+    /// round-1 finding instead of sharing it with a seat that is then dropped,
+    /// which pruned the shared id and took the finding with it.
+    #[test]
+    fn sequential_drops_keep_the_survivors_own_findings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r-drops",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        seat_with_finding(
+            &mut state,
+            &paths,
+            "review-0-cli-claude",
+            "cli:claude",
+            "claude finding",
+        );
+        seat_with_finding(
+            &mut state,
+            &paths,
+            "review-1-cli-codex",
+            "cli:codex",
+            "codex one finding",
+        );
+        seat_with_finding(
+            &mut state,
+            &paths,
+            "review-2-cli-codex",
+            "cli:codex",
+            "codex two finding",
+        );
+
+        drop_reviewer_seats(&mut state, &paths, &[0]).unwrap();
+        let renamed: Vec<&str> = state.slots.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(renamed, ["review-0-cli-codex", "review-1-cli-codex"]);
+        let written = state
+            .review_history
+            .iter()
+            .find(|e| e.slot_id == "review-1-cli-codex")
+            .expect("the renumbered seat's round-1 entry survives its own drop");
+        assert!(
+            written.names_seat(&state.slots[0]),
+            "the entry stays its writer's seat"
+        );
+        assert!(
+            !written.names_seat(&state.slots[1]),
+            "renumbering onto the writer's old id must not hand the entry to the other survivor"
+        );
+        drop_reviewer_seats(&mut state, &paths, &[1]).unwrap();
+
+        let ids: Vec<&str> = state.slots.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["review-0-cli-codex"]);
+        assert_eq!(state.slots[0].former_ids, ["review-1-cli-codex"]);
+        assert_eq!(state.review_history.len(), 1, "{:?}", state.review_history);
+        let open = review_result::open_findings(&state, tmp.path());
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert!(
+            open[0].finding.text.contains("codex one finding"),
+            "{open:?}"
+        );
+    }
 }
 
 /// Blank the same-ordinal backup entries a surviving reviewer seat already serves:
@@ -5423,7 +5524,7 @@ fn blockers_from_disk(
         let scoped = state
             .review_history
             .iter()
-            .filter(|e| e.slot_id == rev.id || rev.former_ids.contains(&e.slot_id))
+            .filter(|e| e.names_seat(rev))
             .max_by_key(|e| e.round)
             .is_some_and(|e| e.review.scoped);
         let res = review_result::ReviewResult {
@@ -5696,7 +5797,7 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
             dry_run: state.dry_run,
             ..CommonOpts::default()
         };
-        return run_from_approved(run_id, None, opts, paths, cfg, BoundAmendInputs::default());
+        return run_from_approved(run_id, None, opts, paths, BoundAmendInputs::default());
     }
     if state.workflow == crate::cli::WorkflowKind::Plan {
         return crate::workflow::plan::continue_run(paths, cfg, run_id);
@@ -6606,6 +6707,7 @@ mod carry_forward_tests {
             state.review_history.push(crate::state::ReviewHistoryEntry {
                 round: round - 1,
                 slot_id: slot.to_string(),
+                seat_key: None,
                 review: review_result::parse_review(body),
             });
         }
@@ -6707,5 +6809,75 @@ mod carry_forward_tests {
         state.round = 5;
         assert!(escalate_round_ceiling(&mut state, &paths).unwrap());
         assert_eq!(state.phase, Phase::AwaitingRoundExtension);
+    }
+}
+
+#[cfg(test)]
+mod frozen_reread_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn git_fixture(root: &std::path::Path) {
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("README.md"), "test\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+    }
+
+    /// #234 follow-up (item 5): a bound dispatch builds its amend preview from
+    /// the frozen snapshot as of lock time. Whatever the launcher read before
+    /// the lock for its pre-checks must not leak into the dispatch: a concurrent
+    /// amend that froze in between would otherwise be silently overwritten by
+    /// this dispatch's snapshot.
+    #[test]
+    fn bound_dispatch_builds_from_the_snapshot_on_disk() {
+        let tmp = tempdir().unwrap();
+        git_fixture(tmp.path());
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let run_id = "r-frozen-reread";
+        let mut frozen = Config::default();
+        frozen.roles.implementer = Some("cli:claude".to_string());
+        frozen.roles.reviewer = vec!["cli:grok".to_string(), "cli:claude".to_string()];
+        frozen.suite.enabled = false;
+        frozen.autonomy = crate::config::AutonomyLevel::Full;
+        frozen.save_snapshot(&paths, run_id).unwrap();
+        let mut st = RunState::new(
+            run_id,
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        st.gates.plan_approved = true;
+        st.task = Some("add a hello function".to_string());
+        st.save(&paths).unwrap();
+        let opts = CommonOpts {
+            providers: vec!["cli:claude".to_string(), "cli:grok".to_string()],
+            dry_run: true,
+            json: true,
+            ..CommonOpts::default()
+        };
+        let _ = run_from_approved(run_id, None, opts, &paths, BoundAmendInputs::default()).unwrap();
+        let after = RunState::load(&paths, run_id).unwrap();
+        assert_eq!(
+            after.autonomy,
+            crate::config::AutonomyLevel::Full,
+            "the dispatch carries the frozen snapshot, not a stale pre-lock read"
+        );
+        let implementers: Vec<&str> = after
+            .slots
+            .iter()
+            .filter(|s| s.role == SlotRole::Implementer)
+            .map(|s| s.provider.as_str())
+            .collect();
+        assert_eq!(implementers, vec!["cli:claude"]);
     }
 }

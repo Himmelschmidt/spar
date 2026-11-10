@@ -1166,6 +1166,7 @@ mod tests {
             state.review_history.push(crate::state::ReviewHistoryEntry {
                 round,
                 slot_id: slot.into(),
+                seat_key: None,
                 review: parse(body),
             });
         }
@@ -1650,11 +1651,13 @@ mod tests {
             crate::state::ReviewHistoryEntry {
                 round: 1,
                 slot_id: "review-0".into(),
+                seat_key: None,
                 review: review_with("aaaa", vec![finding(Severity::Critical, None, None, "old")]),
             },
             crate::state::ReviewHistoryEntry {
                 round: 2,
                 slot_id: "review-0".into(),
+                seat_key: None,
                 review: review_with(
                     "0123456789abcdef",
                     vec![finding(
@@ -1668,6 +1671,7 @@ mod tests {
             crate::state::ReviewHistoryEntry {
                 round: 2,
                 slot_id: "review-1".into(),
+                seat_key: None,
                 review: review_with(
                     "0123456789abcdef",
                     vec![finding(Severity::Minor, None, None, "nit")],
@@ -1676,6 +1680,7 @@ mod tests {
             crate::state::ReviewHistoryEntry {
                 round: 2,
                 slot_id: "review-9-dropped".into(),
+                seat_key: None,
                 review: review_with(
                     "0123456789abcdef",
                     vec![finding(Severity::Critical, None, None, "gone seat")],

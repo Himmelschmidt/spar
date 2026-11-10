@@ -259,7 +259,7 @@ fn run() -> Result<ExitCode> {
                 let dropped = cfg.apply_without(&pool, origin, dry_run, &without)?;
                 cfg.apply_role_overrides(&role)?;
                 cfg.refuse_emptied_reviewer_panel(&dropped)?;
-                config::warn_if_role_discards_reviewer_drop(&role, &dropped);
+                config::warn_if_role_replaces_dropped_panel(&role, &dropped);
                 cfg.apply_backup_overrides(&backup)?;
                 cfg.apply_effort_overrides(&effort)?;
                 cfg.apply_suite_command(&suite_command, &without)?;
@@ -694,7 +694,7 @@ fn run() -> Result<ExitCode> {
                 let dropped = cfg.apply_without(&pool, origin, dry_run, &without)?;
                 cfg.apply_role_overrides(&role)?;
                 cfg.refuse_emptied_reviewer_panel(&dropped)?;
-                config::warn_if_role_discards_reviewer_drop(&role, &dropped);
+                config::warn_if_role_replaces_dropped_panel(&role, &dropped);
                 cfg.apply_backup_overrides(&backup)?;
                 cfg.apply_effort_overrides(&effort)?;
                 let opts = CommonOpts {
@@ -1393,8 +1393,9 @@ fn bus_deliver(
 /// its own run cannot change the fleet, timeouts or ship gate of one already in flight.
 /// `--reload-config` is the deliberate way out: it re-reads the file and re-freezes the
 /// run against it. A bound run amends under the dispatch's own lock, after every
-/// launch precondition passes — never here, before them — so a refused launch
-/// changes nothing (O154); this context returns the frozen config untouched.
+/// launch precondition passes. Nothing here amends anything before those checks,
+/// so a refused launch changes nothing (O154); this context returns the frozen
+/// config untouched.
 #[allow(clippy::too_many_arguments)]
 fn implement_ctx(
     run_id: Option<&str>,
@@ -1428,7 +1429,7 @@ fn implement_ctx(
         let dropped = cfg.apply_without(&pool, origin, dry_run, without)?;
         cfg.apply_role_overrides(role)?;
         cfg.refuse_emptied_reviewer_panel(&dropped)?;
-        config::warn_if_role_discards_reviewer_drop(role, &dropped);
+        config::warn_if_role_replaces_dropped_panel(role, &dropped);
         cfg.apply_backup_overrides(backup)?;
         cfg.apply_effort_overrides(effort)?;
         cfg.apply_suite_command(suite_command, without)?;
@@ -1450,7 +1451,7 @@ fn implement_ctx(
     let frozen = Config::for_run(&paths, run_id)?;
     // Seat-id `--without` items name slots of this run; they are resolved to panel
     // ordinals under the dispatch's own lock, against the state the surgery will
-    // apply to — resolving here, before the launch preconditions run, is the
+    // apply to. Resolving here, before the launch preconditions run, is the
     // TOCTOU the amend restructure removes. Nothing below this point may
     // persist: the frozen config goes back untouched. The only errors raised here
     // are usage errors that touch no state. (`--fleet` needs no parse here: the

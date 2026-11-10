@@ -1714,9 +1714,10 @@ fn fresh_launch_seat_id_without_names_the_valid_forms() {
 }
 
 /// #234: an explicit `--role reviewer=...` replaces the panel, so when it lands
-/// after a `--without reviewer[N]` drop the operator is warned the drop is lost.
+/// after a `--without reviewer[N]` drop the operator is warned the pin replaces
+/// the panel while the drop still removes its seat.
 #[test]
-fn role_reviewer_pin_warns_when_it_discards_a_without_drop() {
+fn role_reviewer_pin_warns_when_it_replaces_a_dropped_panel() {
     let tmp = project("[suite]\nenabled = false\n");
     let a = spar_cmd()
         .current_dir(tmp.path())
@@ -1736,7 +1737,7 @@ fn role_reviewer_pin_warns_when_it_discards_a_without_drop() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains(
-            "discarding the --without reviewer seat drop",
+            "still removes its seat but does not narrow the frozen panel",
         ));
     let v: Value = serde_json::from_slice(&a.get_output().stdout).unwrap();
     let run_id = v["run_id"].as_str().unwrap();
@@ -2668,7 +2669,8 @@ fn amend_after_a_reassign_freezes_the_moved_panel() {
 
 /// #234 follow-up: on a bound run, `--role reviewer=...` replaces the panel
 /// outright, so a reassign that runs after the preview must not refresh the
-/// live-slot pin back over it. The frozen config keeps the role panel.
+/// live-slot pin back over it. The frozen config keeps the role panel, the
+/// dropped seat still leaves the run, and the warning says exactly that.
 #[test]
 fn bound_drop_with_role_pin_freezes_the_role_panel() {
     let tmp = project("[suite]\nenabled = false\n");
@@ -2698,9 +2700,10 @@ fn bound_drop_with_role_pin_freezes_the_role_panel() {
         .map(str::to_string)
         .find(|p| *p != current)
         .expect("a provider to move the seat to");
-    run_json(
-        tmp.path(),
-        &[
+    let survivor_provider = providers_for(&state, "reviewer")[1].clone();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args([
             "implement",
             "--run",
             &run_id,
@@ -2712,9 +2715,12 @@ fn bound_drop_with_role_pin_freezes_the_role_panel() {
             "reviewer=cli:codex",
             "--dry-run",
             "--json",
-        ],
-        2,
-    );
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "still removes its seat but does not narrow the frozen panel",
+        ));
     let cfg = read_run_config(tmp.path(), &run_id);
     let panel: Vec<&str> = cfg["roles"]["reviewer"]
         .as_array()
@@ -2726,5 +2732,66 @@ fn bound_drop_with_role_pin_freezes_the_role_panel() {
         panel,
         vec!["cli:codex"],
         "the frozen config keeps the role panel, not the refreshed pin: {panel:?}"
+    );
+    let state = read_state(tmp.path(), &run_id);
+    assert_eq!(
+        slot_ids_for(&state, "reviewer"),
+        vec![format!("review-0-{}", survivor_provider.replace(':', "-"))],
+        "the drop still removes its seat while the role pin wins the panel: {:?}",
+        state["slots"]
+    );
+}
+
+/// #234 follow-up (item 2): `--role` on a bound run without `--reload-config` amends
+/// the frozen config, and the existing seats track it. Before this, the amend wrote
+/// `config.json` and stopped: the live seat kept whatever model it was minted with.
+#[test]
+fn role_amend_repoints_existing_seats_without_reload_config() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(tmp.path(), &["--providers", "cli:claude,cli:grok"]);
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        2,
+    );
+    run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--role",
+            "implementer=cli:claude@repoint-model",
+            "--dry-run",
+            "--json",
+        ],
+        2,
+    );
+    let cfg = read_run_config(tmp.path(), &run_id);
+    assert_eq!(
+        cfg["roles"]["implementer"],
+        serde_json::json!("cli:claude@repoint-model"),
+        "the amend freezes the role pin: {:?}",
+        cfg["roles"]["implementer"]
+    );
+    let state = read_state(tmp.path(), &run_id);
+    let models: Vec<&str> = state["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["role"] == "implementer")
+        .map(|s| s["model"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        models,
+        vec!["repoint-model"],
+        "the live seat tracks the amended pin: {:?}",
+        state["slots"]
     );
 }
