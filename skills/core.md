@@ -613,9 +613,10 @@ on — never a restatement of the plan or contract, which the next round is hand
   Orchestrator-known blockers (which review requested changes on which commit, the
   reviewer's findings, which `AC-n` failed, whether the suite went red) come
   **first**, so a slot that writes an essay cannot squeeze them out. Each blocking
-  review is one bullet — anchor, findings, and its failing criteria together —
-  clamped to its own share of the budget, and the current-verdict sentence renders
-  once per section rather than once per bullet.
+  review is one bullet (anchor, its failing criteria, then findings, with the
+  criteria leading so truncation cannot cut them), clamped to its own share of
+  the budget, and the current-verdict sentence renders once per section rather
+  than once per bullet.
 - **Rebuilt from disk each time the loop starts**, not carried in memory, so the round an
   operator buys at the ceiling gate — a fresh process — still knows which `AC-n` failed.
 - **Consumed on read.** A round whose implementer died without writing one inherits
@@ -2228,6 +2229,6 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
   - **Agent tester.** With `[suite].command` empty, a cheap `tester` slot discovers how the repo runs its tests and reports. Its provider comes from `[roles].tester` (falls through to model-select/fleet if unset/unusable). This is the fallback for a repo that has not declared its commands, and the one path where the gate depends on a model reporting its own result honestly.
 
   Independent `review` workflow does not spawn a tester by default.
-- **Round ceiling:** `state.round` is bounded by `[rounds] max` (default 8). Hitting it is a **gate** (exit 2, phase `awaiting_round_extension`), lifted with `implement --run <id> --max-rounds <N|+N>` (above the current round; sticky; clears `error`; queued while an orchestrator is live). The rotate/widen/`stuck` ladder resolves **first**, so exit 3 always beats the gate, and a lift preserves the ladder's progress rather than re-buying it. **No-progress (O153):** a round that leaves HEAD and the tree unchanged while a `request_changes` review against that same commit is open re-dispatches the implementer once with a warning naming the unaddressed findings instead of a new panel; a second consecutive one parks at this same gate, with the reason in `error` and the warning in `escalation.md`.
+- **Round ceiling:** `state.round` is bounded by `[rounds] max` (default 8). Hitting it is a **gate** (exit 2, phase `awaiting_round_extension`), lifted with `implement --run <id> --max-rounds <N|+N>` (above the current round; sticky; clears `error`; queued while an orchestrator is live). The rotate/widen/`stuck` ladder resolves **first**, so exit 3 always beats the gate, and a no-progress stall parks before the panel runs; a lift preserves the ladder's progress rather than re-buying it. **No-progress (O168):** a round that leaves HEAD and the tree unchanged while a `request_changes` review against that same commit is open re-dispatches the implementer once with a warning naming the unaddressed findings instead of a new panel; a second consecutive one parks at this same gate, with the reason in `error` and the warning in `escalation.md`.
 - **Contract re-freeze is guarded:** a re-entry that would adopt a `test-contract.md` spar saw drift mid-round refuses with exit `1` unless `--accept-contract` is passed. Re-freezes are announced on stderr, not just in `events.jsonl`.
 - **Carry-forward:** the implementer writes `artifacts/carry-forward-<slot>.md`, which seeds the next round's implementer prompt (blockers first, capped at `[rounds] carry_forward_chars`, consumed on read). It never reaches a reviewer or the acceptance gate. The seeded blockers name, per blocking review, the round that wrote it and its `Reviewed-Commit` as the current verdict on the implementer's HEAD, plus the open findings (severity plus one line each).

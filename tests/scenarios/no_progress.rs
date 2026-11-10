@@ -1,4 +1,4 @@
-//! No-progress rounds (#236, DECISIONS O153): an implementer that finishes a round
+//! No-progress rounds (DECISIONS O168): an implementer that finishes a round
 //! with HEAD and the tree unchanged while a `request_changes` review against that
 //! same commit is open must not be answered with another full review of the same
 //! commit. The next dispatch carries a warning instead, and the second consecutive
@@ -197,7 +197,7 @@ fn two_empty_rounds_park_at_the_human_gate() {
     );
 }
 
-/// #236, and not the warning: the carry-forward section itself names the round
+/// The carry-forward section itself, and not the warning, names the round
 /// that wrote each blocking review, the commit it judged, and its open
 /// findings, so a round that never stalls still learns what blocked the ship.
 /// A generous budget keeps clamping out of what this asserts.

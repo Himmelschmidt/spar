@@ -224,12 +224,12 @@ fn reassign_moves_seats_in_place_and_keeps_worktree_carry_forward_and_history() 
     .unwrap();
     fs::write(
         artifacts.join(format!("review-{reviewer}.md")),
-        "## Verdict\nrequest_changes\n\n## Acceptance\nAC-1: fail — OLD-REVIEW-MARKER\n\n## Findings\n- severity: major — the feature is missing\n",
+        "## Verdict\nrequest_changes\n\n## Acceptance\nAC-1: fail - OLD-REVIEW-MARKER\n\n## Findings\n- severity: major - the feature is missing\n",
     )
     .unwrap();
     fs::write(
         artifacts.join("test-contract.md"),
-        "## Scenarios\n- [ ] AC-1: the feature exists — verify: `cargo test`\n",
+        "## Scenarios\n- [ ] AC-1: the feature exists - verify: `cargo test`\n",
     )
     .unwrap();
     let markers = fx.run_dir().join("markers");
@@ -294,7 +294,7 @@ fn reassign_moves_seats_in_place_and_keeps_worktree_carry_forward_and_history() 
         "the retired reviewer's verdict follows the renamed seat: {prompt}"
     );
     assert!(
-        prompt.contains("AC-1: fail — OLD-REVIEW-MARKER"),
+        prompt.contains("AC-1:") && prompt.contains("OLD-REVIEW-MARKER"),
         "the retired reviewer's blockers follow the renamed seat: {prompt}"
     );
     let events = fs::read_to_string(fx.run_dir().join("events.jsonl")).unwrap();

@@ -219,19 +219,34 @@ impl Fixture {
     }
 }
 
-/// The implementer prompt asks for a summary file; write it and exit clean.
+/// The implementer prompt asks for a summary file; write it and exit clean. The
+/// tree is touched on the first two rounds so they count as progress and the
+/// panel genuinely re-dispatches. Once two progress lines exist the tree is
+/// left alone, so a later round stalls and parks instead of judging an
+/// unchanged head again.
 const FAKE_CLAUDE_IMPLEMENTER: &str = r#"set -- "$@" "$(cat)"
 DEST=""
+ICWD=""
 for a in "$@"; do
   case "$a" in
     *"Write a summary to"*)
       DEST=$(printf '%s' "$a" | sed -n 's/.*Write a summary to `\([^`]*\)`.*/\1/p' | head -n 1)
       ;;
   esac
+  case "$a" in
+    *"Cwd (your worktree):"*)
+      ICWD=$(printf '%s' "$a" | sed -n 's/.*Cwd (your worktree): \([^ ]*\).*/\1/p' | head -n 1)
+      ;;
+  esac
 done
 case "$DEST" in
   "") exit 0 ;;
-  *) printf '# Summary\nDid the stub thing.\n' > "$DEST"; exit 0 ;;
+  *) printf '# Summary\nDid the stub thing.\n' > "$DEST"
+     if [ -n "$ICWD" ]; then
+       N=$(grep -c '^progress$' "$ICWD/README.md" 2>/dev/null || true)
+       if [ "${N:-0}" -lt 2 ]; then printf 'progress\n' >> "$ICWD/README.md"; fi
+     fi
+     exit 0 ;;
 esac"#;
 
 /// `FAKE_RC=1` requests changes, otherwise approves. Anchored on the checkout
