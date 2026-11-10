@@ -96,6 +96,7 @@ pub fn run_slots_parallel(
                     s.auth_fault = false;
                     s.timeout_cause = None;
                     s.dispatch_head = None;
+                    s.dispatch_tree = None;
                     s.classifier = None;
                 }
                 let _ =
@@ -1211,8 +1212,6 @@ fn execute_prepared(
             timeout,
             dry_run: false,
             model_override: model.clone(),
-            api_key: None,
-            base_url: None,
         })?;
         let (ok, err, usage, timeout_cause) = (
             outcome.ok,
@@ -1893,12 +1892,25 @@ fn snapshot_combo(cwd: &Path) -> Option<Vec<u8>> {
         }
     }
     if !files.is_empty() {
-        let out = std::process::Command::new("git")
-            .arg("hash-object")
-            .arg("--")
-            .args(files.iter().map(|r| std::ffi::OsStr::from_bytes(r)))
+        // Paths ride stdin (`--stdin-paths` reads one per line), never the
+        // command line, so a large set cannot fail to spawn and silently read
+        // as no work.
+        use std::io::Write;
+        let mut input = Vec::new();
+        for rel in &files {
+            input.extend_from_slice(rel);
+            input.push(b'\n');
+        }
+        let mut child = std::process::Command::new("git")
+            .args(["hash-object", "--stdin-paths"])
             .current_dir(cwd)
-            .output()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        child.stdin.take()?.write_all(&input).ok()?;
+        let out = child
+            .wait_with_output()
             .ok()
             .filter(|o| o.status.success())?;
         for (rel, sha) in files.iter().zip(out.stdout.split(|b| *b == b'\n')) {
@@ -1939,9 +1951,6 @@ pub(crate) fn worktree_snapshot(cwd: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Work the slot left behind since the round started: uncommitted changes past
-/// `since_tree`, or commits past `since_head`.
-///
 /// Whether the tree changed since the round-start snapshot. `None` for the live
 /// digest falls back to the legacy read: any dirty tree.
 fn tree_differs_since(cwd: &Path, since_tree: Option<&str>) -> bool {
@@ -1973,6 +1982,9 @@ fn tree_differs_from_head(cwd: &Path) -> bool {
     }
 }
 
+/// Work the slot left behind since the round started: uncommitted changes past
+/// `since_tree`, or commits past `since_head`.
+///
 /// Pass the stamps taken when the slot joined the round: from round 2 on the
 /// run base predates earlier rounds' commits, so the base always reads as
 /// work, and the tree can already be dirty at round start (the test-author
@@ -2959,8 +2971,6 @@ pub fn run_slot(
             &prompt_path,
             &prompt,
             timeout,
-            None,
-            None,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -4314,8 +4324,6 @@ fn run_api(
     prompt_path: &Path,
     prompt: &str,
     timeout: Duration,
-    api_key: Option<&str>,
-    base_url: Option<&str>,
 ) -> Result<SlotOutcome> {
     let expected = job
         .expected_artifact
@@ -4334,8 +4342,6 @@ fn run_api(
         timeout,
         dry_run: false,
         model_override: model.clone(),
-        api_key: api_key.map(str::to_owned),
-        base_url: base_url.map(str::to_owned),
     })?;
     let (ok, err, usage, timeout_cause) = (
         outcome.ok,
@@ -9632,7 +9638,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
                 std::thread::sleep(std::time::Duration::from_secs(5));
             }
         });
-        let base_url = format!("http://127.0.0.1:{port}/v1");
+        std::env::set_var("OPENAI_API_KEY", "test-key");
+        std::env::set_var("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
         let mut st = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
         st.worktrees.push(crate::state::WorktreeRecord {
             slot_id: "impl".into(),
@@ -9665,12 +9672,10 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &prompt,
             "do it",
             std::time::Duration::from_secs(2),
-            Some("test-key"),
-            Some(base_url.as_str()),
         );
-        // The hang itself is what the test measures: `chat_completion` already
-        // remakes an EINTR-interrupted read at the source (`retry_interrupted`),
-        // so a transport failure here is a real finding, never retried.
+        // The hang itself is what the test measures: the masked call waits out
+        // the ceiling instead of failing on an EINTR from the test runner's own
+        // child churn, so a transport failure here is a real finding.
         let outcome = outcome.unwrap();
         assert!(
             outcome.ok,

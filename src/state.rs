@@ -249,11 +249,9 @@ pub struct CeilingPartialRound {
     pub round: u32,
     pub kind: CeilingPartialKind,
     /// The commit the round's work was banked as (`Wip`'s WIP commit, or the
-    /// HEAD a `Clean` round died on). `None` for `Refused` (nothing was banked)
-    /// and for records written before this field existed. A same-round resume
-    /// compares the tree against this so the round's own banked commit does not
-    /// read as new work a second time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// HEAD a `Clean` round died on). `None` for `Refused` (nothing was banked).
+    /// A same-round resume compares the tree against this so the round's own
+    /// banked commit does not read as new work a second time.
     pub commit: Option<String>,
 }
 
