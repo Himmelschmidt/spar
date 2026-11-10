@@ -1,0 +1,524 @@
+//! Per-bucket quota pauses (O153): one seat's rate limit pauses only that seat's
+//! bucket. A run keeps running its unaffected seats and parks on quota only when
+//! the seat that must run next has no usable provider.
+
+mod common;
+use assert_cmd::Command as AssertCommand;
+use std::fs;
+use std::path::{Path, PathBuf};
+use tempfile::tempdir;
+
+const ANTHROPIC_MODEL: &str = "direct:anthropic/claude-sonnet-4-5";
+const OPENAI_MODEL: &str = "direct:openai/gpt-5-nano";
+
+fn init_repo(dir: &Path) {
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    fs::write(dir.join("README.md"), "test\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+}
+
+struct Fixture {
+    _tmp: tempfile::TempDir,
+    proj: PathBuf,
+    bin: PathBuf,
+    home: PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let tmp = tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let bin = tmp.path().join("bin");
+        let home = tmp.path().join("spar-home");
+        fs::create_dir_all(&proj).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        init_repo(&proj);
+        let fx = Self {
+            _tmp: tmp,
+            proj,
+            bin,
+            home,
+        };
+        for name in ["claude", "grok", "agy", "codex", "pi", "muse"] {
+            fx.cli(name, "exit 1");
+        }
+        fx.cli("claude", FAKE_CLAUDE_IMPLEMENTER);
+        fx.cli("pi", FAKE_PI_REVIEWER);
+        fx
+    }
+
+    fn cli(&self, name: &str, body: &str) {
+        let p = self.bin.join(name);
+        fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fake-{name} 0; exit 0; fi\n{body}\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    fn spar(&self) -> AssertCommand {
+        let mut cmd = common::spar();
+        cmd.env_remove("SPAR_PROJECT_ROOT");
+        cmd.env_remove("SPAR_RUN_ID");
+        cmd.env_remove("SPAR_AGENT_ID");
+        cmd.env_remove("SPAR_DRY_RUN");
+        cmd.env("SPAR_HOME", &self.home);
+        cmd.env("SPAR_AUTH_RETRY_WAIT_SECS", "0");
+        cmd.current_dir(&self.proj)
+            .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
+            .env("FAKE_PROJECT_ROOT", &self.proj);
+        cmd
+    }
+
+    fn pause(&self, seat: &str) {
+        self.spar()
+            .args(["provider", "pause", seat])
+            .assert()
+            .success();
+    }
+
+    fn run_id(&self) -> String {
+        fs::read_dir(self.proj.join(".spar/runs"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().join("state.json").is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .expect("a run")
+    }
+
+    fn state(&self) -> serde_json::Value {
+        let p = self
+            .proj
+            .join(".spar/runs")
+            .join(self.run_id())
+            .join("state.json");
+        serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap()
+    }
+
+    fn quota(&self) -> serde_json::Value {
+        fs::read_to_string(self.proj.join(".spar/quota.json"))
+            .map(|s| serde_json::from_str(&s).unwrap())
+            .unwrap_or(serde_json::json!({"providers": {}}))
+    }
+
+    fn events(&self) -> String {
+        let p = self
+            .proj
+            .join(".spar/runs")
+            .join(self.run_id())
+            .join("events.jsonl");
+        fs::read_to_string(p).unwrap_or_default()
+    }
+
+    fn reviewer_slot(&self, model: &str) -> serde_json::Value {
+        self.state()["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["role"] == "reviewer" && s["model"] == model)
+            .cloned()
+            .unwrap_or_else(|| panic!("no reviewer slot for model {model}"))
+    }
+
+    fn review_artifact(&self, slot_id: &str) -> PathBuf {
+        self.proj
+            .join(".spar/runs")
+            .join(self.run_id())
+            .join("artifacts")
+            .join(format!("review-{slot_id}.md"))
+    }
+
+    /// HEAD of the implementer worktree: the head a panel would judge next.
+    fn worktree_head(&self) -> String {
+        let state = self.state();
+        let slot_id = state["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["role"] == "implementer")
+            .unwrap()["id"]
+            .as_str()
+            .unwrap();
+        let path = state["worktrees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["slot_id"].as_str() == Some(slot_id))
+            .unwrap()["path"]
+            .as_str()
+            .unwrap();
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "rev-parse HEAD failed");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn implement(&self) -> assert_cmd::assert::Assert {
+        self.spar()
+            .args([
+                "implement",
+                "-t",
+                "add a feature",
+                "--role",
+                "implementer=cli:claude",
+                "--role",
+                &format!("reviewer=cli:pi@{ANTHROPIC_MODEL}"),
+                "--role",
+                &format!("reviewer=cli:pi@{OPENAI_MODEL}"),
+                "--without",
+                "suite",
+            ])
+            .assert()
+    }
+
+    /// Mixed panel: claude implements, grok and pi review. `FAKE_RC=1` makes the
+    /// grok seat request changes; otherwise it approves like its sibling.
+    fn implement_mixed(&self, rc: bool, extra: &[&str]) -> assert_cmd::assert::Assert {
+        let mut cmd = self.spar();
+        if rc {
+            cmd.env("FAKE_RC", "1");
+        }
+        cmd.args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--role",
+            "implementer=cli:claude",
+            "--role",
+            "reviewer=cli:grok",
+            "--role",
+            &format!("reviewer=cli:pi@{ANTHROPIC_MODEL}"),
+            "--without",
+            "suite",
+        ])
+        .args(extra)
+        .assert()
+    }
+
+    /// Re-enter a bound run: no `--role` (O27 pins the run to its creation
+    /// config), only the raised ceiling.
+    fn implement_round(
+        &self,
+        run_id: &str,
+        rc: bool,
+        extra: &[&str],
+    ) -> assert_cmd::assert::Assert {
+        let mut cmd = self.spar();
+        if rc {
+            cmd.env("FAKE_RC", "1");
+        }
+        cmd.args(["implement", "--run", run_id])
+            .args(extra)
+            .assert()
+    }
+
+    fn grok_slot(&self) -> serde_json::Value {
+        self.state()["slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["role"] == "reviewer" && s["provider"] == "cli:grok")
+            .cloned()
+            .expect("a grok reviewer seat")
+    }
+}
+
+/// The implementer prompt asks for a summary file; write it and exit clean. The
+/// tree is touched on the first two rounds so they count as progress and the
+/// panel genuinely re-dispatches. Once two progress lines exist the tree is
+/// left alone, so a later round stalls and parks instead of judging an
+/// unchanged head again.
+const FAKE_CLAUDE_IMPLEMENTER: &str = r#"set -- "$@" "$(cat)"
+DEST=""
+ICWD=""
+for a in "$@"; do
+  case "$a" in
+    *"Write a summary to"*)
+      DEST=$(printf '%s' "$a" | sed -n 's/.*Write a summary to `\([^`]*\)`.*/\1/p' | head -n 1)
+      ;;
+  esac
+  case "$a" in
+    *"Cwd (your worktree):"*)
+      ICWD=$(printf '%s' "$a" | sed -n 's/.*Cwd (your worktree): \([^ ]*\).*/\1/p' | head -n 1)
+      ;;
+  esac
+done
+case "$DEST" in
+  "") exit 0 ;;
+  *) printf '# Summary\nDid the stub thing.\n' > "$DEST"
+     if [ -n "$ICWD" ]; then
+       N=$(grep -c '^progress$' "$ICWD/README.md" 2>/dev/null || true)
+       if [ "${N:-0}" -lt 2 ]; then printf 'progress\n' >> "$ICWD/README.md"; fi
+     fi
+     exit 0 ;;
+esac"#;
+
+/// `FAKE_RC=1` requests changes, otherwise approves. Anchored on the checkout
+/// HEAD the prompt names so the commit gate counts the verdict. Grok arrives
+/// via `--prompt-file`, so the prompt is read from there as well as argv.
+const FAKE_GROK_REVIEWER: &str = r#"TEXT="$*"
+PREV=""
+for a in "$@"; do
+  if [ "$PREV" = "--prompt-file" ] && [ -f "$a" ]; then TEXT="$TEXT $(cat "$a")"; fi
+  PREV="$a"
+done
+TEXT="$TEXT $(cat)"
+DEST=$(printf '%s' "$TEXT" | sed -n 's/.*Write review to: \([^ ]*\).*/\1/p' | head -n 1)
+CWD=$(printf '%s' "$TEXT" | sed -n 's/.*Code under review (worktree): \([^ ]*\).*/\1/p' | head -n 1)
+case "$DEST" in
+  "") exit 0 ;;
+  *)
+    SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null || true)
+    if [ "$FAKE_RC" = "1" ]; then V=request_changes; else V=approve; fi
+    { printf '## Verdict\n%s\n' "$V"; [ -n "$SHA" ] && printf 'Reviewed-Commit: %s\n' "$SHA"; } > "$DEST"
+    exit 0
+    ;;
+esac"#;
+
+/// Honest approve for whichever reviewer slot dispatches, anchored on the
+/// checkout HEAD the prompt names so the commit gate counts it.
+const FAKE_PI_REVIEWER: &str = r#"set -- "$@" "$(cat)"
+DEST=""
+CWD=""
+for a in "$@"; do
+  case "$a" in
+    *"Write review to:"*)
+      DEST=$(printf '%s' "$a" | sed -n 's/.*Write review to: \([^ ]*\).*/\1/p' | head -n 1)
+      ;;
+    *"Code under review (worktree):"*)
+      CWD=$(printf '%s' "$a" | sed -n 's/.*Code under review (worktree): \([^ ]*\).*/\1/p' | head -n 1)
+      ;;
+  esac
+done
+case "$DEST" in
+  "") exit 0 ;;
+  *)
+    SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null || true)
+    { printf '## Verdict\napprove\n'; [ -n "$SHA" ] && printf 'Reviewed-Commit: %s\n' "$SHA"; } > "$DEST"
+    exit 0
+    ;;
+esac"#;
+
+#[test]
+fn a_paused_bucket_stands_down_while_the_sibling_bucket_reviews() {
+    let fx = Fixture::new();
+    fx.pause(&format!("cli:pi@{ANTHROPIC_MODEL}"));
+    assert_eq!(
+        fx.quota()["providers"]["cli:pi@direct:anthropic"]["status"],
+        "paused_manual",
+        "the anthropic bucket is paused: {}",
+        fx.quota()
+    );
+
+    fx.implement().code(2);
+    let state = fx.state();
+    assert_eq!(state["phase"], "awaiting_ship_confirm", "{state}");
+
+    let stood_down = fx.reviewer_slot(ANTHROPIC_MODEL);
+    let stood_id = stood_down["id"].as_str().unwrap();
+    assert!(
+        !fx.review_artifact(stood_id).is_file(),
+        "the paused seat never dispatches: {}",
+        stood_down
+    );
+
+    let healthy = fx.reviewer_slot(OPENAI_MODEL);
+    let healthy_id = healthy["id"].as_str().unwrap();
+    let text = fs::read_to_string(fx.review_artifact(healthy_id)).unwrap();
+    assert!(text.contains("approve"), "the sibling seat reviews: {text}");
+
+    assert!(
+        fx.events().contains("stood down"),
+        "the stand-down is said out loud"
+    );
+    assert_eq!(
+        fx.quota()["providers"]["cli:pi@direct:anthropic"]["status"],
+        "paused_manual",
+        "the pause survives the run: {}",
+        fx.quota()
+    );
+    assert!(
+        fx.quota()["providers"]
+            .get("cli:pi@direct:openai")
+            .is_none(),
+        "the sibling bucket is untouched: {}",
+        fx.quota()
+    );
+}
+
+#[test]
+fn a_healthy_probe_clears_the_paused_bucket_it_reads() {
+    let fx = Fixture::new();
+    fx.cli("codex", "echo OK");
+    // Seed the quota pause a rejection would record: `provider pause` writes a
+    // manual pause, which a healthy probe must keep, so write the store row.
+    let seed = serde_json::json!({
+        "providers": {
+            "cli:codex@openrouter": {
+                "name": "cli:codex@openrouter",
+                "status": "paused_quota",
+                "hint": "simulated rejection",
+                "strong": true,
+            }
+        }
+    });
+    fs::create_dir_all(fx.proj.join(".spar")).unwrap();
+    fs::write(
+        fx.proj.join(".spar/quota.json"),
+        serde_json::to_string_pretty(&seed).unwrap(),
+    )
+    .unwrap();
+    fx.spar()
+        .args(["provider", "probe", "cli:codex@openrouter"])
+        .assert()
+        .success();
+    assert_eq!(
+        fx.quota()["providers"]["cli:codex@openrouter"]["status"],
+        "available",
+        "the healthy probe retires the bucket the eligibility check reads: {}",
+        fx.quota()
+    );
+    assert!(
+        fx.quota()["providers"].get("cli:codex").is_none(),
+        "nothing was ever written to the login: {}",
+        fx.quota()
+    );
+}
+
+/// O153. A `request_changes` recorded on the shipping head still blocks ship after
+/// its seat stands down on quota. Round 3 changes nothing, so the stall detector
+/// parks before a panel that would only re-count the same veto; the park preserves
+/// the veto on its head instead of judging an unchanged head again. `spar ship`
+/// refuses the parked run, so the veto still blocks ship through the gate that
+/// matters. Dry runs cannot cover this: they skip pause gating, so rounds 1-2
+/// run their panels on fake CLIs.
+#[test]
+fn a_stood_down_request_changes_on_this_head_still_blocks_ship() {
+    let fx = Fixture::new();
+    fx.cli("grok", FAKE_GROK_REVIEWER);
+    fs::write(fx.proj.join("spar.toml"), "[rounds]\nmax = 2\n").unwrap();
+
+    // Rounds 1-2: grok requests changes on this head while pi approves, then the
+    // ceiling stops the run.
+    fx.implement_mixed(true, &[]).code(2);
+    let run_id = fx.run_id();
+    let st = fx.state();
+    assert_eq!(st["phase"], "awaiting_round_extension", "{st}");
+    assert_eq!(st["round"].as_u64(), Some(2), "{st}");
+
+    // Pause grok's login: the combined bucket-plus-parent read holds its seat,
+    // while claude (implementer) and pi (sibling reviewer) stay usable.
+    fx.pause("cli:grok");
+
+    // Past a raised ceiling: round 3 changes nothing, so the run stall-parks with
+    // grok's round-2 veto preserved on this unchanged head. No panel runs, so pi's
+    // artifact below is round 2's approve, not a round-3 review.
+    fx.implement_round(&run_id, false, &["--max-rounds", "3"])
+        .code(2);
+    let st = fx.state();
+    assert_eq!(st["phase"], "awaiting_round_extension", "{st}");
+    assert_eq!(st["round"].as_u64(), Some(3), "{st}");
+
+    let grok = fx.grok_slot();
+    let grok_id = grok["id"].as_str().unwrap();
+    assert!(
+        grok.get("stood_down").is_some_and(|v| v.is_string()),
+        "the seat is marked stood down: {grok}"
+    );
+    assert_eq!(
+        grok["round"].as_u64(),
+        Some(2),
+        "the stood-down seat never re-dispatched: {grok}"
+    );
+    assert_eq!(
+        grok["review"]["verdict"].as_str(),
+        Some("request_changes"),
+        "its recorded verdict is untouched: {grok}"
+    );
+    let head = fx.worktree_head();
+    assert_eq!(
+        grok["review"]["reviewed_commit"].as_str(),
+        Some(head.as_str()),
+        "the preserved veto names the current head, so the next panel on this head counts it: {grok}"
+    );
+
+    let pi = fx.reviewer_slot(ANTHROPIC_MODEL);
+    let pi_id = pi["id"].as_str().unwrap();
+    let text = fs::read_to_string(fx.review_artifact(pi_id)).unwrap();
+    assert!(
+        text.contains("approve"),
+        "the sibling seat's last review stands: {text}"
+    );
+    let text = fs::read_to_string(fx.review_artifact(grok_id)).unwrap();
+    assert!(
+        text.contains("request_changes"),
+        "the carried artifact is round 2's verdict: {text}"
+    );
+
+    // No round-3 panel ran to count the veto, but the run is still not
+    // shippable while it stands: the ship gate refuses the parked run.
+    let ship = fx.spar().args(["ship", &run_id]).assert().failure();
+    let err = String::from_utf8_lossy(&ship.get_output().stderr);
+    assert!(
+        err.contains("not ready to ship"),
+        "the parked run stays unshippable: {err}"
+    );
+    assert_eq!(
+        fx.state()["phase"],
+        "awaiting_round_extension",
+        "the refused ship leaves the park in place"
+    );
+}
+
+#[test]
+fn paused_buckets_on_every_reviewer_park_the_run() {
+    let fx = Fixture::new();
+    fx.pause(&format!("cli:pi@{ANTHROPIC_MODEL}"));
+    fx.pause(&format!("cli:pi@{OPENAI_MODEL}"));
+
+    fx.implement().code(4);
+    let state = fx.state();
+    assert_eq!(state["phase"], "quota", "{state}");
+    assert!(
+        state["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no eligible"),
+        "the park names the empty panel: {}",
+        state["error"]
+    );
+    for model in [ANTHROPIC_MODEL, OPENAI_MODEL] {
+        let slot = fx.reviewer_slot(model);
+        let id = slot["id"].as_str().unwrap();
+        assert!(
+            !fx.review_artifact(id).is_file(),
+            "no paused seat dispatches: {slot}"
+        );
+    }
+}

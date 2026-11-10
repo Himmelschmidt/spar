@@ -67,8 +67,8 @@ fn only_run_id(proj: &std::path::Path) -> String {
 /// so the full prompt text arrives as `$2`; the expected artifact path is read
 /// off its `Write ... to:` line, never hardcoded. Behavior per artifact:
 /// - `summary-*.md` (implementer): always written, every round, and the tree
-///   is touched too, so the round counts as progress under #236 and the panel
-///   is genuinely re-dispatched instead of skipped as a stall.
+///   is touched too, so the round counts as progress and the panel is genuinely
+///   re-dispatched instead of skipped as a stall.
 /// - `review-*-review-0-*.md`: approved on every dispatch, proving a fresh
 ///   write satisfies the gate (the non-vacuity guard). Carries an honest
 ///   `Reviewed-Commit` so the sha layer never fires inside this O89 test.
@@ -135,9 +135,9 @@ case "$DEST" in
     ;;
   *)
     printf '# Summary\nDid the stub thing.\n' > "$DEST"
-    # Touch the tree every round (#236): an implementer that changes nothing
-    # while a request_changes review is open stalls, the panel is skipped, and
-    # this O89 exercise never happens. Appending keeps every round progress.
+    # Touch the tree every round: an implementer that changes nothing while a
+    # request_changes review is open stalls, the panel is skipped, and this O89
+    # exercise never happens. Appending keeps every round progress.
     if [ -n "$ICWD" ]; then printf 'progress\n' >> "$ICWD/README.md"; fi
     exit 0
     ;;

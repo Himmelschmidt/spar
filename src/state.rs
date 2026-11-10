@@ -89,24 +89,16 @@ pub struct RunState {
     #[serde(default = "crate::config::default_max_rounds")]
     pub max_rounds: u32,
     /// Consecutive implementer rounds that ended with HEAD and the tree unchanged
-    /// while a `request_changes` review against that same HEAD stayed open (#236).
+    /// while a `request_changes` review against that same HEAD stayed open.
     /// Reset the moment a round moves HEAD or dirties the tree; the second in a row
     /// parks the run at the round-extension gate instead of buying another review.
     #[serde(default)]
     pub no_progress_rounds: u32,
     /// The warning a no-progress round put at the top of the next implementer
-    /// prompt (#236). Persisted so a re-entry after the park renders it again
-    /// instead of parking silently; cleared the moment a round makes progress.
+    /// prompt. Persisted so a re-entry after the park renders it again instead
+    /// of parking silently; cleared the moment a round makes progress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_progress_warning: Option<String>,
-    /// Dry-run implementer dispatches consumed so far (#236). Only moves while
-    /// the `SPAR_DRY_IMPL_NOOP` hook is armed, so real dry runs keep it at zero.
-    /// The hook budgets no-ops in dispatches, not rounds: the warning
-    /// re-dispatch is a second dispatch inside the same round, so a
-    /// round-based budget could never stall the first dispatch and let the
-    /// re-dispatch count as progress.
-    #[serde(default)]
-    pub dry_impl_dispatches: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_session: Option<String>,
     #[serde(default)]
@@ -185,6 +177,26 @@ pub struct RunState {
     /// earlier rounds' verdicts and findings for `.spar/history.jsonl`.
     #[serde(default)]
     pub review_history: Vec<ReviewHistoryEntry>,
+    /// When the current dispatch began: the instant the implement entry point
+    /// stamped this round's seats. A weak pause written before it is pre-existing
+    /// (steer the seat); at or after it belongs to this dispatch (park). `None`
+    /// only for runs stamped before this field existed, which compare against
+    /// `created_at` as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_started_at: Option<DateTime<Utc>>,
+    /// The codex profile (`SPAR_CODEX_PROFILE`) this run's seats dispatch under,
+    /// recorded when the entry point stamped the dispatch: `""` records a
+    /// set-but-empty value (codex's own default, the native login). Quota keying
+    /// for model-less codex seats derives from this, not from whatever the ambient
+    /// environment holds when a later process re-reads the seat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_profile: Option<String>,
+    /// The codex model override (`SPAR_CODEX_MODEL`) in force when the entry point
+    /// stamped the dispatch, same encoding as `codex_profile`. A model-less seat
+    /// spawns with this model, so its quota key must derive from it too; without
+    /// the record the key and the spawn disagree for the life of the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_model: Option<String>,
     /// URL of the PR `ship` opened or adopted, or `sync-prs` found for the branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
@@ -550,6 +562,12 @@ pub struct SlotState {
     /// Reset at dispatch alongside the other per-dispatch fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_commit: Option<String>,
+    /// Why a reviewer slot never dispatched this round: the quota pause that stood
+    /// it down. Recorded at stand-down so the ship gate can mark the seat as
+    /// unjudged instead of presenting its stale artifact as current, and cleared
+    /// at dispatch alongside the other per-dispatch fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stood_down: Option<String>,
     /// What the gate parsed from this reviewer's artifact: verdict, the commit it
     /// names (whether or not it matched), per-AC status and findings. `null` until the
     /// gate reads a review; reset at dispatch.
@@ -861,7 +879,6 @@ impl RunState {
             max_rounds: crate::config::default_max_rounds(),
             no_progress_rounds: 0,
             no_progress_warning: None,
-            dry_impl_dispatches: 0,
             tmux_session: None,
             providers: Vec::new(),
             rotated_implementer: false,
@@ -880,6 +897,9 @@ impl RunState {
             pool_origin: PoolOrigin::default(),
             pool_intent: Vec::new(),
             review_history: Vec::new(),
+            round_started_at: None,
+            codex_profile: None,
+            codex_model: None,
             pr_url: None,
             merged_at: None,
             merge_commit: None,
@@ -918,6 +938,33 @@ impl RunState {
         self.ship_override = None;
         self.touch();
         self.round
+    }
+
+    /// Mark the start of the current dispatch: the instant quota pauses are read
+    /// against, and the codex route this dispatch's seats run under. Called by
+    /// every entry point that starts a dispatch (plan and review `run`,
+    /// `replan` and `continue`, `amend`, the implement entries and
+    /// resumptions, the arena/roles/peer `run` fns, `reconcile`), never by an
+    /// in-process fix pass: a fix pass is a continuation of the same dispatch,
+    /// and re-stamping it would turn this run's own pauses into pre-existing
+    /// ones and park the run on its own fumes. The executor never stamps:
+    /// every entry stamps before seats resolve, in the same process the spawn
+    /// inherits, so the record and the ambient route the spawn reads agree.
+    pub fn stamp_dispatch(&mut self) {
+        self.round_started_at = Some(chrono::Utc::now());
+        let route = crate::providers::codex::dispatch_route();
+        self.codex_profile = route.profile;
+        self.codex_model = route.model;
+    }
+
+    /// The dispatch route this run recorded at stamp time, for quota keying and
+    /// rejection writes. Both fields are stamped together, so both `None` means
+    /// an old run with no record: key from this process's environment.
+    pub fn recorded_route(&self) -> crate::providers::RecordedRoute<'_> {
+        crate::providers::RecordedRoute {
+            profile: self.codex_profile.as_deref(),
+            model: self.codex_model.as_deref(),
+        }
     }
 
     /// Whether opening another round would take this run past its ceiling (O52).

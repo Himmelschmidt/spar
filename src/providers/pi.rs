@@ -1,7 +1,9 @@
 use super::{
-    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, SpawnOpts, TrustPolicy,
+    Capabilities, DeliveryStrategy, PresenceSource, ProviderAdapter, QuotaSignal, SpawnOpts,
+    TrustPolicy,
 };
 use crate::effort::EffortLevel;
+use std::borrow::Cow;
 use std::path::Path;
 use std::process::Command;
 
@@ -94,6 +96,35 @@ impl PiAdapter {
 impl ProviderAdapter for PiAdapter {
     fn name(&self) -> &'static str {
         "pi"
+    }
+
+    /// Billing follows the resolved upstream: OpenRouter slugs share the
+    /// `openrouter` bucket, each `direct:<provider>` bills to that provider,
+    /// and any other bare word keys the login (pi's own resolution). Buckets
+    /// keep the `direct:` form, so a stored bucket key re-resolves instead of
+    /// collapsing: `direct:anthropic` strips to a bare provider that still
+    /// bills that provider. `openrouter` alone names the bucket (pi's provider
+    /// of that name bills the same OpenRouter account as the slugs).
+    fn quota_bucket<'m>(&self, model: &'m str) -> Option<Cow<'m, str>> {
+        if let Some(native) = model.strip_prefix(DIRECT_PREFIX).filter(|s| !s.is_empty()) {
+            let provider = native.split('/').next().unwrap_or(native);
+            return Some(Cow::Owned(format!("{DIRECT_PREFIX}{provider}")));
+        }
+        if model.contains('/') || model == "openrouter" {
+            return Some(Cow::Borrowed("openrouter"));
+        }
+        None
+    }
+
+    /// Rejections carry no upstream of their own, so every rejection lands in
+    /// the dispatched seat's own bucket: the seat's upstream, or the login
+    /// for a bare-model seat.
+    fn rejection_scope<'s>(
+        &self,
+        seat: Option<&'s str>,
+        _signal: QuotaSignal<'_>,
+    ) -> Option<Cow<'s, str>> {
+        seat.and_then(|model| self.quota_bucket(model))
     }
 
     // No push channel into a running `pi --mode json` and no presence stream yet:
