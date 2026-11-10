@@ -552,14 +552,12 @@ fn a_ceiling_kill_with_no_work_still_fails() {
     );
 }
 
-/// Round-start dirt is not round work. A commit-msg hook
-/// refuses every commit, so round 1 dies at the ceiling with an edit that stays
-/// uncommitted (a Refused round whose leftovers remain in the tree); the first
-/// review requests changes and the round-2 implementer hangs with no edits at
-/// all. A dirty tree alone would record a second partial round, but nothing
-/// changed since the round-2 dispatch, so the run must fail there instead.
+/// Dirt no commit will take is not work to review. A commit-msg hook refuses every
+/// commit, so round 1 dies at the ceiling with an edit that stays uncommitted;
+/// the round fails with exit 1 instead of sending a HEAD without the round's
+/// work to review, and no second round runs.
 #[test]
-fn a_second_round_ceiling_kill_over_refused_leftovers_fails_the_run() {
+fn a_ceiling_kill_with_a_refused_wip_commit_fails_the_round() {
     let tmp = tempdir().unwrap();
     let proj = tmp.path().join("proj");
     init_repo(&proj);
@@ -589,7 +587,7 @@ fn a_second_round_ceiling_kill_over_refused_leftovers_fails_the_run() {
     let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "failed", "{st}");
-    assert_eq!(st["round"], 2, "{st}");
+    assert_eq!(st["round"], 1, "the refused round fails the run: {st}");
     let partials = st["ceiling_partial_rounds"]
         .as_array()
         .unwrap_or_else(|| panic!("no partial rounds recorded: {st}"));
@@ -598,19 +596,14 @@ fn a_second_round_ceiling_kill_over_refused_leftovers_fails_the_run() {
     assert_eq!(partials[0]["kind"], "refused", "{st}");
     let calls = std::fs::read_to_string(calls_dir.join("calls")).unwrap();
     assert_eq!(
-        calls.lines().filter(|l| *l == "ceiling").count(),
-        2,
-        "both rounds died at the ceiling: {calls}"
+        calls.lines().collect::<Vec<_>>(),
+        ["ceiling"],
+        "no review and no second round ran: {calls}"
     );
+    let err = st["error"].as_str().expect("a failure reason: {st}");
     assert!(
-        !calls.lines().any(|l| l == "artifact-impl-artifact"),
-        "a refused commit is no commit: without HEAD movement neither kill earns \
-         the artifact-recovery turn: {calls}"
-    );
-    assert_eq!(
-        calls.lines().filter(|l| l.starts_with("review-")).count(),
-        1,
-        "the empty round-2 kill never reached review: {calls}"
+        err.contains("failing the round"),
+        "the failure says what it does instead: {err}"
     );
 }
 
@@ -806,11 +799,11 @@ fn ceiling_cut_notice_survives_the_round_ceiling_gate() {
     );
 }
 
-/// A fake `muse` for the dispatch-HEAD test. The first
+/// A fake `muse` for the dispatch-HEAD tests. The first
 /// implementer dispatch leaves an edit uncommitted and hangs past the hard
-/// ceiling, so round 1 becomes a WIP round; every later implementer dispatch
-/// hangs with no edits at all. The first review requests changes, the rest
-/// approve whatever HEAD they are shown.
+/// ceiling; every later implementer dispatch hangs with no edits at all. The
+/// first review requests changes, the rest approve whatever HEAD they are
+/// shown.
 fn install_ceiling_idle_fix_round_muse(bin: &Path) {
     std::fs::create_dir_all(bin).unwrap();
     let p = bin.join("muse");

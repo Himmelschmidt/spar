@@ -3402,8 +3402,8 @@ fn ceiling_partial_refused_notice(round: u32, detail: Option<&str>) -> String {
     };
     format!(
         "NOTE: the implementer pass for round {round} was cut short at its hard time \
-         ceiling and its partial work could not be committed{cause}; judge the HEAD commit \
-         as partial work and continue the task from there."
+         ceiling and its partial work could not be committed{cause}; failing the round \
+         instead of asking review to judge the HEAD commit without the round's work."
     )
 }
 
@@ -3422,7 +3422,7 @@ fn ceiling_partial_refused_notice(round: u32, detail: Option<&str>) -> String {
 ///
 /// The message names the ceiling kill, so the WIP commit reads as an interrupted
 /// round on the branch rather than a normal one. Like `commit_before_review`, a
-/// commit the hooks refuse is said out loud — but unlike that path the round
+/// commit the hooks refuse is said out loud. Unlike that path the round
 /// cannot go on: without the WIP commit there is nothing for review to judge,
 /// so the record site banks the Refused mark and fails the round instead.
 fn try_commit_ceiling_partial(
@@ -3579,14 +3579,20 @@ fn record_ceiling_partial_unless_quota(
     }
     if let Some((note, kind, commit)) = try_commit_ceiling_partial(state, paths, slot_id) {
         let refused = kind == CeilingPartialKind::Refused;
-        record_ceiling_partial(state, paths, slot_id, note, kind, commit, note_out)?;
+        record_ceiling_partial(
+            state,
+            paths,
+            slot_id,
+            CeilingPartialRecord {
+                note: note.clone(),
+                kind,
+                commit,
+                announce: !refused,
+            },
+            note_out,
+        )?;
         if refused {
-            return Ok(CeilingPartialOutcome::Refused(format!(
-                "round {} implementer left work at its hard ceiling but the commit hook \
-                 refused the WIP commit; failing the round instead of sending a HEAD \
-                 without the round's work to review",
-                state.round
-            )));
+            return Ok(CeilingPartialOutcome::Refused(note));
         }
         Ok(CeilingPartialOutcome::Banked)
     } else {
@@ -3637,6 +3643,16 @@ fn clear_finished_round_partial_mark(state: &mut RunState, paths: &SparPaths) ->
     Ok(())
 }
 
+/// What a ceiling kill banks for the round: the notice, how the work was left,
+/// and whether the bank announces itself. A refused WIP fails the round instead
+/// of going on, so it banks silently: no done verdict, no panel broadcast.
+struct CeilingPartialRecord {
+    note: String,
+    kind: CeilingPartialKind,
+    commit: Option<String>,
+    announce: bool,
+}
+
 /// Record a ceiling-cut partial round: the killed slot reads done (the kill stays
 /// in the event log, not as a failure string on a done slot) and the round is
 /// remembered on the run so a fresh process rebuilds the cut-short notice from
@@ -3646,37 +3662,47 @@ fn record_ceiling_partial(
     state: &mut RunState,
     paths: &SparPaths,
     slot_id: &str,
-    note: String,
-    kind: CeilingPartialKind,
-    commit: Option<String>,
+    record: CeilingPartialRecord,
     out: &mut Option<String>,
 ) -> Result<()> {
+    let CeilingPartialRecord {
+        note,
+        kind,
+        commit,
+        announce,
+    } = record;
     eprintln!("note: {note}");
     // The slot reads done now, so the executor's failed dispatch verdict for it is
     // stale: verdict markers only steer running slots, and anything else reading
-    // them must not see a failed implementer for a round that went on.
+    // them must not see a failed implementer for a round that went on. A refused
+    // WIP fails the round instead of going on, so it banks the mark silently:
+    // no done verdict, no panel broadcast; the failure message says it out loud.
     crate::markers::clear_slot(paths, &state.id, slot_id);
-    if let Some(s) = state.slot_mut(slot_id) {
-        s.status = SlotStatus::Done;
-        s.error = None;
+    if announce {
+        if let Some(s) = state.slot_mut(slot_id) {
+            s.status = SlotStatus::Done;
+            s.error = None;
+        }
+        let _ = crate::events::append(
+            paths,
+            &state.id,
+            &crate::events::Event::slot(slot_id, SlotStatus::Done),
+        );
     }
-    let _ = crate::events::append(
-        paths,
-        &state.id,
-        &crate::events::Event::slot(slot_id, SlotStatus::Done),
-    );
     let _ = crate::events::append(
         paths,
         &state.id,
         &crate::events::Event::slot_note(slot_id, note.clone()),
     );
-    let _ = crate::bus::broadcast(
-        paths,
-        Some(&state.id),
-        "orchestrator",
-        note.clone(),
-        state.message_budget,
-    );
+    if announce {
+        let _ = crate::bus::broadcast(
+            paths,
+            Some(&state.id),
+            "orchestrator",
+            note.clone(),
+            state.message_budget,
+        );
+    }
     if let Some(entry) = state
         .ceiling_partial_rounds
         .iter_mut()
@@ -6966,8 +6992,8 @@ mod ceiling_partial_notice_tests {
     use super::{
         blockers_from_disk, ceiling_partial_clean_notice, ceiling_partial_notice,
         ceiling_partial_refused_notice, clear_finished_round_partial_mark, commit_before_review,
-        fail, handle_retry_err, record_ceiling_partial_unless_quota, try_commit_ceiling_partial,
-        CeilingPartialOutcome,
+        fail, handle_retry_err, record_ceiling_partial, record_ceiling_partial_unless_quota,
+        try_commit_ceiling_partial, CeilingPartialOutcome, CeilingPartialRecord,
     };
     use crate::config::Config;
     use crate::executor::{self, TimeoutCause};
@@ -7154,6 +7180,49 @@ mod ceiling_partial_notice_tests {
         assert!(
             subject.starts_with("chore(spar):"),
             "wip subject must pass conventional-commit hooks: {subject}"
+        );
+    }
+
+    #[test]
+    fn banked_ceiling_partial_keeps_ceiling_kill_true_in_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, branch) = fresh_repo(&tmp);
+        let head = git(&wt, &["rev-parse", "HEAD"]);
+        let tree = executor::worktree_snapshot(&wt);
+        std::fs::write(wt.join("work.txt"), "slot work\n").unwrap();
+        let (paths, mut state) = ceiling_state(&tmp, &wt, &branch, Some(head), tree);
+        let (notice, kind, commit) = try_commit_ceiling_partial(&mut state, &paths, "impl")
+            .expect("new work at the ceiling is a partial round");
+        let mut out = None;
+        record_ceiling_partial(
+            &mut state,
+            &paths,
+            "impl",
+            CeilingPartialRecord {
+                note: notice,
+                kind,
+                commit,
+                announce: true,
+            },
+            &mut out,
+        )
+        .unwrap();
+        let slot = state
+            .slots
+            .iter()
+            .find(|s| s.id == "impl")
+            .expect("implementer seat");
+        assert_eq!(
+            slot.timeout_cause,
+            Some(TimeoutCause::HardCeiling),
+            "the bank keeps the kill fact on the slot"
+        );
+        let mut v = serde_json::json!({"slots": [{"id": "impl"}]});
+        crate::liveness::enrich_status_json(&mut v, &state.slots, &Config::default(), &paths, "r1");
+        assert_eq!(
+            v["slots"][0]["ceiling_kill"],
+            serde_json::Value::Bool(true),
+            "status still reports the ceiling kill after the bank: {v}"
         );
     }
 
@@ -7364,7 +7433,7 @@ mod ceiling_partial_notice_tests {
         let hooks = wt.join(".git").join("hooks");
         std::fs::create_dir_all(&hooks).unwrap();
         let hook = hooks.join("commit-msg");
-        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::write(&hook, "#!/bin/sh\necho hook-said-no >&2\nexit 1\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         let (paths, mut state) = ceiling_state(&tmp, &wt, &branch, Some(head), tree);
@@ -7375,8 +7444,21 @@ mod ceiling_partial_notice_tests {
             panic!("a refused WIP commit is not bankable: {outcome:?}");
         };
         assert!(
-            msg.contains("failing the round instead of sending a HEAD without the round's work"),
+            msg.contains("failing the round instead of asking review to judge the HEAD commit"),
             "the failure says what it does instead: {msg}"
+        );
+        assert!(
+            msg.contains("hook-said-no"),
+            "the failure carries the hook reason: {msg}"
+        );
+        let slot = state
+            .slots
+            .iter()
+            .find(|s| s.id == "impl")
+            .expect("implementer seat");
+        assert!(
+            !matches!(slot.status, crate::state::SlotStatus::Done),
+            "a refused partial keeps the failed dispatch verdict instead of reading done"
         );
         let mark = state
             .ceiling_partial_rounds
