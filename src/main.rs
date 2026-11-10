@@ -3589,7 +3589,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
         }
         cli::ProviderAction::Pause { name, until, json } => {
             let (paths, _) = project_ctx()?;
-            let key = quota::quota_key(&name);
+            let key = quota::operator_key(&name);
             let mut store = quota::QuotaStore::load(&paths)?;
             let until_dt = if let Some(u) = until {
                 if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&u) {
@@ -3612,7 +3612,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
         }
         cli::ProviderAction::Resume { name, json } => {
             let (paths, _) = project_ctx()?;
-            let key = quota::quota_key(&name);
+            let key = quota::operator_key(&name);
             let mut store = quota::QuotaStore::load(&paths)?;
             store.resume(&key);
             store.save(&paths)?;
@@ -3651,7 +3651,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
             };
             let reports: Vec<probe::ProbeReport> = targets
                 .iter()
-                .map(|t| probe::probe(&paths, t, dry))
+                .map(|t| probe::probe(&paths, t, dry, None))
                 .collect();
             if json {
                 println!("{}", serde_json::to_string_pretty(&reports)?);

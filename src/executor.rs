@@ -166,6 +166,10 @@ struct PreparedSlot {
     /// sizes its budgets and nudge cadence off the same document every other phase reads.
     cfg: Config,
     dry_run: bool,
+    /// The dispatch profile recorded in run state (`RunState::codex_profile`),
+    /// carried across the thread boundary so the spawn keys the seat this run
+    /// actually dispatched instead of this worker's ambient environment.
+    codex_profile: Option<String>,
     /// Held for the dispatch's lifetime; dropped (and the directory removed) once the
     /// outcome has been applied.
     _tmp: SlotTmp,
@@ -384,6 +388,7 @@ fn prepare_slot_execution(
         s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
+        s.stood_down = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -438,6 +443,7 @@ fn prepare_slot_execution(
         session_provider,
         cfg: cfg.clone(),
         dry_run: state.dry_run,
+        codex_profile: state.codex_profile.clone(),
         _tmp: tmp,
         _fleet_lease: fleet_lease,
         _build_cache: build_cache.and_then(|(lease, _)| lease),
@@ -1177,6 +1183,7 @@ fn execute_prepared(
         effort: prep.job.effort,
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(prep.paths.sessions_dir(&prep.run_id, &prep.job.slot_id)),
+        codex_profile: prep.codex_profile.clone(),
     };
     let (mut cmd, used_resume) = build_dispatch_command(
         adapter.as_ref(),
@@ -1327,6 +1334,7 @@ fn execute_prepared(
                     slot_id: &prep.job.slot_id,
                     round: prep.round,
                     role: prep.job.role,
+                    codex_profile: prep.codex_profile.clone(),
                     owns_cwd: prep.owns_cwd,
                     provider: &prep.job.provider,
                     model: prep.job.model.clone(),
@@ -1501,6 +1509,7 @@ fn execute_prepared(
                 slot_id: &prep.job.slot_id,
                 round: prep.round,
                 role: prep.job.role,
+                codex_profile: prep.codex_profile.clone(),
                 owns_cwd: prep.owns_cwd,
                 provider: &prep.job.provider,
                 model: prep.job.model.clone(),
@@ -1565,6 +1574,7 @@ struct ArtifactRecovery<'a> {
     slot_id: &'a str,
     round: u32,
     role: SlotRole,
+    codex_profile: Option<String>,
     /// `cwd` is this slot's own worktree. See [`owns_cwd`].
     owns_cwd: bool,
     provider: &'a str,
@@ -1745,6 +1755,7 @@ fn recover_artifact(r: &ArtifactRecovery) -> bool {
         effort: r.effort,
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(r.paths.sessions_dir(r.run_id, r.slot_id)),
+        codex_profile: r.codex_profile.clone(),
     };
     let cmd = adapter.build_headless(&bin, &opts);
     let (program, args) = providers::command_to_parts(&cmd);
@@ -2005,7 +2016,7 @@ fn enrich_agy_stats(
     if let (Some(frac), Some(reset)) = (t.quota_remaining_fraction, t.quota_reset_secs) {
         if frac < 0.02 && reset > 0 {
             let until = chrono::Utc::now() + chrono::Duration::seconds(reset);
-            let key = pref.quota_key();
+            let key = pref.quota_key(None);
             let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
             store.pause_quota_until(
                 &key,
@@ -2101,7 +2112,12 @@ fn apply_parallel_outcome(
             // `quota_hit_for_outcome`.
             let pref = seat_ref_for(Some(state), &prep.job);
             let log_text = outcome_log_text(&prep.log_path, &result);
-            let key = quota_write_key(&pref, result.quota_rejected, &log_text);
+            let key = quota_write_key(
+                &pref,
+                result.quota_rejected,
+                &log_text,
+                state.codex_profile.as_deref(),
+            );
             let witness = PauseWitness::before(paths, &state.id, &key);
             let quota_hit = quota_hit_for_outcome(paths, &pref, &key, &log_text, &result);
             let witness = witness.map(|w| w.after_scrape(paths, &key));
@@ -2173,8 +2189,13 @@ fn apply_parallel_outcome(
             // produced a rate_limit_event. The text fallback is what catches an
             // api-sdk 429 here.
             let pref = seat_ref_for(Some(state), &prep.job);
-            let quota_hit =
-                detect_and_pause_quota_with_err(paths, &pref, &log_text, &e.to_string());
+            let quota_hit = detect_and_pause_quota_with_err(
+                paths,
+                &pref,
+                &log_text,
+                &e.to_string(),
+                state.codex_profile.as_deref(),
+            );
             let auth = auth_fault_for(&prep.log_path, &e.to_string(), quota_hit, None, None);
             if let Some(s) = state.slot_mut(slot_id) {
                 s.quota_hit = quota_hit;
@@ -2469,6 +2490,7 @@ pub fn run_slot(
         s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
+        s.stood_down = None;
         // Stamp the round at dispatch: slot ids are stable across re-dispatch (the
         // implementer keeps its worktree through fix rounds), so this is where a slot
         // joins the round that is running now (O45).
@@ -2529,7 +2551,13 @@ pub fn run_slot(
         // No outcome exists on this path either: the backend never produced a
         // stream to have parsed a `rate_limit_event` out of, so there is no typed
         // reset instant to thread through.
-        let quota_hit = detect_and_pause_quota_with_err(paths, pref, &log_text, err_text);
+        let quota_hit = detect_and_pause_quota_with_err(
+            paths,
+            pref,
+            &log_text,
+            err_text,
+            state.codex_profile.as_deref(),
+        );
         let auth = auth_fault_for(log_path, err_text, quota_hit, None, None);
         if let Some(s) = state.slot_mut(slot_id) {
             s.quota_hit = quota_hit;
@@ -2694,7 +2722,12 @@ pub fn run_slot(
         // `quota_hit_for_outcome`.
         let seat = seat_ref_for(Some(state), job);
         let log_text = outcome_log_text(&log_path, &result);
-        let key = quota_write_key(&seat, result.quota_rejected, &log_text);
+        let key = quota_write_key(
+            &seat,
+            result.quota_rejected,
+            &log_text,
+            state.codex_profile.as_deref(),
+        );
         let witness = PauseWitness::before(paths, &state.id, &key);
         let quota_hit = quota_hit_for_outcome(paths, &seat, &key, &log_text, &result);
         let witness = witness.map(|w| w.after_scrape(paths, &key));
@@ -3034,11 +3067,15 @@ fn quota_write_key(
     pref: &ProviderRef,
     structured: Option<RateLimitWindow>,
     log_text: &str,
+    codex_profile: Option<&str>,
 ) -> String {
-    pref.rejection_key(QuotaSignal {
-        window: structured,
-        text: log_text,
-    })
+    pref.rejection_key(
+        QuotaSignal {
+            window: structured,
+            text: log_text,
+        },
+        codex_profile,
+    )
 }
 
 /// The glue between a failed dispatch's tail and [`detect_and_pause_quota`], shared by
@@ -3073,17 +3110,17 @@ fn quota_hit_for_outcome(
 ///
 /// Takes no `structured`/`resets_at`/`quota_recovered`: both call sites are `Err` arms that
 /// by construction never produced a `SlotOutcome`, so a typed verdict cannot exist yet
-/// to thread through. That used to be a parameter every caller passed `None` to — dead
-/// weight a future caller could silently fail to fill in; dropping it from the
-/// signature makes the absence structural instead of a convention callers must uphold.
+/// to thread through. Takes the recorded `codex_profile` for the same reason the
+/// `Ok` arms do: a model-less codex seat writes the bucket it dispatched under.
 fn detect_and_pause_quota_with_err(
     paths: &SparPaths,
     pref: &ProviderRef,
     log_text: &str,
     extra: &str,
+    codex_profile: Option<&str>,
 ) -> bool {
     let text = format!("{log_text}\n{extra}");
-    let key = quota_write_key(pref, None, &text);
+    let key = quota_write_key(pref, None, &text, codex_profile);
     detect_and_pause_quota(paths, pref, &key, &text, None, None, false)
 }
 
@@ -3953,6 +3990,7 @@ fn run_headless(
         effort: slot_effort_for(cfg, Some(state), job),
         timeout_secs: Some(timeout.as_secs()),
         session_dir: Some(paths.sessions_dir(&state.id, &job.slot_id)),
+        codex_profile: state.codex_profile.clone(),
     };
     let prior_session_id =
         prior_session_for_role(paths, &state.id, &job.slot_id, cli_name, job.role);
@@ -4092,6 +4130,7 @@ fn run_headless(
                     slot_id: &job.slot_id,
                     round: state.round,
                     role: job.role,
+                    codex_profile: state.codex_profile.clone(),
                     owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                     provider: &job.provider,
                     model: slot_model_for(Some(state), job),
@@ -4246,6 +4285,7 @@ fn run_headless(
                 slot_id: &job.slot_id,
                 round: state.round,
                 role: job.role,
+                codex_profile: state.codex_profile.clone(),
                 owns_cwd: owns_cwd(state, &job.slot_id, cwd),
                 provider: &job.provider,
                 model: slot_model_for(Some(state), job),
@@ -4466,6 +4506,7 @@ fn run_tmux(
         effort,
         timeout_secs: None,
         session_dir: Some(paths.sessions_dir(&state.id, &job.slot_id)),
+        codex_profile: state.codex_profile.clone(),
     };
     // The pane is teed to a log, never run through `StreamCoalescer`, so no id is
     // ever captured here (O65). An adapter that accepts a caller-supplied id gets
@@ -4741,6 +4782,7 @@ pub fn init_slot_model(
         quota_hit: false,
         reviewed_commit: None,
         review: None,
+        stood_down: None,
         source: None,
         auth_fault: false,
         build_cache: None,
@@ -5033,7 +5075,7 @@ mod tests {
     ) -> (bool, String) {
         let pref = seat_ref(seat);
         let log_text = outcome_log_text(log_path, outcome);
-        let key = quota_write_key(&pref, outcome.quota_rejected, &log_text);
+        let key = quota_write_key(&pref, outcome.quota_rejected, &log_text, None);
         (
             quota_hit_for_outcome(paths, &pref, &key, &log_text, outcome),
             key,
@@ -5056,6 +5098,7 @@ mod tests {
 
     fn dispatch_opts(prompt: &str) -> SpawnOpts {
         SpawnOpts {
+            codex_profile: None,
             prompt: prompt.into(),
             prompt_file: None,
             cwd: PathBuf::from("/tmp"),
@@ -7064,7 +7107,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let until = chrono::Utc::now() + chrono::Duration::hours(2);
         let log = "! rate limit  seven_day_sonnet  rejected\n";
         let seat = seat_ref("cli:claude@opus");
-        let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDaySonnet), log);
+        let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDaySonnet), log, None);
         assert_eq!(key, "cli:claude");
         assert!(detect_and_pause_quota(
             &paths,
@@ -7094,7 +7137,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let until = chrono::Utc::now() + chrono::Duration::hours(2);
         let log = "! rate limit  seven_day_opus  rejected\nYou've hit your limit\n";
         let seat = seat_ref("cli:claude@opus");
-        let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDayOpus), log);
+        let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDayOpus), log, None);
         assert_eq!(key, "cli:claude");
         assert!(detect_and_pause_quota(
             &paths,
@@ -7120,7 +7163,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let paths = SparPaths::new(tmp.path());
         let log = "You've reached your Fable limit\n";
         let seat = seat_ref("cli:claude@fable");
-        let key = quota_write_key(&seat, None, log);
+        let key = quota_write_key(&seat, None, log, None);
         assert_eq!(key, "cli:claude@fable");
         {
             let mut store = crate::quota::QuotaStore::load(&paths).unwrap_or_default();
@@ -7201,10 +7244,20 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn an_overage_included_window_pauses_the_seats_own_bucket() {
         let seat = seat_ref("cli:claude@opus");
-        let key = quota_write_key(&seat, Some(RateLimitWindow::SevenDayOverageIncluded), "");
+        let key = quota_write_key(
+            &seat,
+            Some(RateLimitWindow::SevenDayOverageIncluded),
+            "",
+            None,
+        );
         assert_eq!(key, "cli:claude@opus");
         let haiku = seat_ref("cli:claude@haiku");
-        let key = quota_write_key(&haiku, Some(RateLimitWindow::SevenDayOverageIncluded), "");
+        let key = quota_write_key(
+            &haiku,
+            Some(RateLimitWindow::SevenDayOverageIncluded),
+            "",
+            None,
+        );
         assert_eq!(key, "cli:claude");
     }
 
@@ -7463,11 +7516,13 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(crate::backup::is_provider_eligible(
             "cli:agy@flash",
             &store,
+            None,
             None
         ));
         assert!(crate::backup::is_provider_eligible(
             "cli:agy@pro",
             &store,
+            None,
             None
         ));
     }
@@ -7503,7 +7558,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             effort: None,
         };
         let seat = seat_ref_for(Some(&st), &job);
-        assert_eq!(seat.quota_key(), "cli:agy@gemini-flash");
+        assert_eq!(seat.quota_key(None), "cli:agy@gemini-flash");
         let log = "error: Individual quota reached. Resets in 2h.\n";
         assert!(detect_and_pause_quota(
             &paths,
@@ -7516,17 +7571,21 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         let slot = &st.slots[0];
-        assert_eq!(slot.provider_ref().quota_key(), "cli:agy@gemini-flash");
+        assert_eq!(slot.provider_ref().quota_key(None), "cli:agy@gemini-flash");
         assert!(!crate::backup::is_provider_eligible(
             &slot.provider_ref().display(),
             &store,
+            None,
             None
         ));
         let plan_job = SlotJob {
             model: slot.model.clone(),
             ..job
         };
-        assert_eq!(plan_job.provider_ref().quota_key(), "cli:agy@gemini-flash");
+        assert_eq!(
+            plan_job.provider_ref().quota_key(None),
+            "cli:agy@gemini-flash"
+        );
     }
 
     /// The wiring between a `SlotOutcome` and `detect_and_pause_quota`, not just the
@@ -7810,7 +7869,32 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &seat_ref("api:openai"),
             log,
             err_text,
+            None,
         ));
+    }
+
+    /// The write path and the read path key a model-less codex seat from the same
+    /// recorded profile, not from whatever `SPAR_CODEX_PROFILE` the keying
+    /// process happens to hold: under ambient `muse` (the OpenRouter route) a
+    /// seat dispatched natively writes and reads `cli:codex@native`.
+    #[test]
+    fn recorded_codex_profile_governs_writes_and_reads_under_a_foreign_env() {
+        let _guard = providers::codex::ENV_LOCK.lock().unwrap();
+        std::env::set_var("SPAR_CODEX_PROFILE", "muse");
+        let seat = seat_ref("cli:codex");
+        let write = quota_write_key(&seat, None, "error: 429 rate limit\n", Some(""));
+        assert_eq!(write, "cli:codex@native", "write keys the recorded route");
+        assert_eq!(
+            seat.quota_key(Some("")),
+            "cli:codex@native",
+            "read keys the recorded route"
+        );
+        assert_eq!(
+            seat.quota_key(None),
+            "cli:codex@openrouter",
+            "no record keys this process's route"
+        );
+        std::env::remove_var("SPAR_CODEX_PROFILE");
     }
 
     /// A generic rejection phrase (no Claude-specific shape) must still route, so

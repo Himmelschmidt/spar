@@ -809,6 +809,11 @@ fn run_from_approved(
     } else {
         state.begin_round()
     };
+    // A re-entered round number is not a reused dispatch: this entry is about to
+    // read pauses and spawn, so the pre-existing/this-round line starts now.
+    // A fix pass below opens rounds without re-stamping: it continues this
+    // dispatch, and its seats must not trip over this dispatch's own pauses.
+    state.stamp_dispatch();
     if !opts.json {
         println!("run {run_id} · round {round}");
     }
@@ -825,46 +830,11 @@ fn run_from_approved(
             reload_config: opts.reload_config,
         },
     )?;
+    // Only the implementer must run next at run start, so only it can park the
+    // run here: a paused reviewer or tester seat is reseated onto its backup
+    // or stood down at its own dispatch.
     if !dry {
-        let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-        let has_backup = cfg.backups.implementer.is_some()
-            || !cfg.backups.reviewer.is_empty()
-            || cfg.backups.tester.is_some();
-        let available: Option<std::collections::HashSet<String>> = if !has_backup {
-            None
-        } else {
-            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                .into_iter()
-                .filter(|r| r.available)
-                .map(|r| format!("cli:{}", r.name))
-                .collect();
-            if detected.is_empty() {
-                None
-            } else {
-                Some(detected)
-            }
-        };
-        let mut still_paused: Vec<String> = Vec::new();
-        for slot in &state.slots {
-            if matches!(
-                slot.role,
-                SlotRole::Implementer | SlotRole::Reviewer | SlotRole::Tester
-            ) && !crate::backup::is_provider_eligible(
-                &slot.provider_ref().display(),
-                &store,
-                available.as_ref(),
-            ) {
-                let key = slot.provider_ref().quota_key();
-                if !still_paused.contains(&key) {
-                    still_paused.push(key);
-                }
-            }
-        }
-        if !still_paused.is_empty() {
-            let msg = format!(
-                "provider(s) paused or on cooldown: {}. resume with `spar provider resume <name>` or reassign the role",
-                still_paused.join(", ")
-            );
+        if let Some(msg) = gate_implementer_seat(&mut state, paths, cfg)? {
             state.error = Some(msg.clone());
             state.set_phase(crate::state::Phase::Quota);
             state.save(paths)?;
@@ -991,7 +961,12 @@ fn prepare_implement_slots(
         let mut seat_id = seat.seat.clone();
         let seat_ref =
             crate::provider_ref::ProviderRef::for_seat(&provider, model.as_deref()).display();
-        if !crate::backup::is_provider_eligible(&seat_ref, &store, available.as_ref()) {
+        if !crate::backup::is_provider_eligible(
+            &seat_ref,
+            &store,
+            available.as_ref(),
+            state.codex_profile.as_deref(),
+        ) {
             let ordinal = if seat.role == SlotRole::Reviewer {
                 reviewer_ordinal(&seat.seat).unwrap_or(0)
             } else {
@@ -1004,6 +979,7 @@ fn prepare_implement_slots(
                     available.as_ref(),
                     paths,
                     dry,
+                    state.codex_profile.as_deref(),
                 ) {
                     if let Ok(pin) = crate::provider_ref::Pin::parse(&backup_raw) {
                         provider = pin.display();
@@ -1569,6 +1545,25 @@ enum ReviewedCommitDecision {
     Mismatch,
 }
 
+/// The recorded verdict a stood-down reviewer carries into the gate: only a seat
+/// that never dispatched this round (`stood_down`) and whose last recorded
+/// verdict rejects this head. A veto about an older head was superseded by the
+/// fix round; a seat that never judged has nothing to carry; a failure stub
+/// names no commit, so only a real judgment about this head carries.
+fn carried_rejection<'a>(
+    slot: &'a SlotState,
+    panel_head: Option<&str>,
+) -> Option<&'a ReviewResult> {
+    slot.stood_down.as_ref()?;
+    let head = panel_head?;
+    let res = slot.review.as_ref()?;
+    if res.verdict != Some(review_result::Verdict::RequestChanges) {
+        return None;
+    }
+    let sha = res.reviewed_commit.as_deref()?;
+    review_result::reviewed_commit_matches(head, sha).then_some(res)
+}
+
 fn decide_reviewed_commit(panel_head: Option<&str>, res: &ReviewResult) -> ReviewedCommitDecision {
     let Some(head) = panel_head else {
         return ReviewedCommitDecision::Skipped;
@@ -1879,6 +1874,7 @@ fn run_with_task(
     // just at the plan phase.
     state.pool_origin = pool_origin;
     state.providers = providers::pick_providers(&requested, n, Some(&requested), dry);
+    state.stamp_dispatch();
     // Quota gate is now backup-aware and runs after seat resolution: a paused primary
     // with an eligible backup must not park the run.
     prepare_implement_slots(
@@ -1893,43 +1889,11 @@ fn run_with_task(
             reload_config: opts.reload_config,
         },
     )?;
+    // Only the implementer must run next at run start, so only it can park the
+    // run here: a paused reviewer or tester seat is reseated onto its backup
+    // or stood down at its own dispatch.
     if !dry {
-        let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-        let has_backup = cfg.backups.implementer.is_some()
-            || !cfg.backups.reviewer.is_empty()
-            || cfg.backups.tester.is_some();
-        let available: Option<std::collections::HashSet<String>> = if !has_backup {
-            None
-        } else {
-            let detected: std::collections::HashSet<String> = crate::providers::detect_all()
-                .into_iter()
-                .filter(|r| r.available)
-                .map(|r| format!("cli:{}", r.name))
-                .collect();
-            if detected.is_empty() {
-                None
-            } else {
-                Some(detected)
-            }
-        };
-        let mut still_paused: Vec<String> = Vec::new();
-        for slot in &state.slots {
-            if !crate::backup::is_provider_eligible(
-                &slot.provider_ref().display(),
-                &store,
-                available.as_ref(),
-            ) {
-                let key = slot.provider_ref().quota_key();
-                if !still_paused.contains(&key) {
-                    still_paused.push(key);
-                }
-            }
-        }
-        if !still_paused.is_empty() {
-            let msg = format!(
-                "provider(s) paused or on cooldown: {}. resume with `spar provider resume <name>` or reassign the role",
-                still_paused.join(", ")
-            );
+        if let Some(msg) = gate_implementer_seat(&mut state, paths, cfg)? {
             state.error = Some(msg.clone());
             state.set_phase(Phase::Quota);
             paths.ensure_run_dirs(&state.id)?;
@@ -2220,7 +2184,7 @@ pub fn execute_loop(
             .find(|s| s.role == SlotRole::Implementer)
             .map(|s| s.id.clone())
         {
-            if let SeatCheck::Park(msg) = recheck_seat(state, paths, cfg, &id)? {
+            if let SeatCheck::Park(msg) = recheck_seat(state, paths, cfg, &id, false)? {
                 return fail(state, paths, anyhow::anyhow!(msg), true);
             }
         }
@@ -2309,8 +2273,12 @@ pub fn execute_loop(
                         .find(|s| s.id == impl_job.slot_id)
                         .cloned()
                         .unwrap();
-                    let cause =
-                        crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
+                    let cause = crate::backup::dispatch_stop_cause(
+                        &slot_state,
+                        &store,
+                        available.as_ref(),
+                        state.codex_profile.as_deref(),
+                    );
                     if cause.engages_backup() && slot_state.source != Some(SeatSource::Backup) {
                         let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
                             .map(|r| r.storage_key())
@@ -2325,6 +2293,7 @@ pub fn execute_loop(
                                 available.as_ref(),
                                 paths,
                                 state.dry_run,
+                                state.codex_profile.as_deref(),
                             )
                         {
                             if let Some(s) = state.slot_mut(&impl_job.slot_id) {
@@ -2395,8 +2364,12 @@ pub fn execute_loop(
                     .find(|s| s.id == impl_job.slot_id)
                     .cloned()
                     .unwrap();
-                let cause =
-                    crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
+                let cause = crate::backup::dispatch_stop_cause(
+                    &slot_state,
+                    &store,
+                    available.as_ref(),
+                    state.codex_profile.as_deref(),
+                );
                 if cause.engages_backup() {
                     if let Some(backup_raw) =
                         crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
@@ -2407,6 +2380,7 @@ pub fn execute_loop(
                             available.as_ref(),
                             paths,
                             state.dry_run,
+                            state.codex_profile.as_deref(),
                         ) && slot_state.source != Some(SeatSource::Backup)
                         {
                             let backup_key = crate::provider_ref::ProviderRef::parse(&backup_raw)
@@ -2499,6 +2473,16 @@ pub fn execute_loop(
                 .iter()
                 .find(|s| s.role == SlotRole::Tester)
                 .cloned();
+            // A tester seat with no usable provider parks the run: the suite
+            // is a singular gate. `recheck_seat` moves it onto an eligible
+            // backup when it has one (O153).
+            let tester = match tester {
+                Some(t) => match recheck_seat(state, paths, cfg, &t.id, false)? {
+                    SeatCheck::Ready(id) => state.slots.iter().find(|s| s.id == id).cloned(),
+                    SeatCheck::Park(msg) => return fail(state, paths, anyhow::anyhow!(msg), true),
+                },
+                None => None,
+            };
             if cfg.suite.is_builtin() {
                 state.set_phase(Phase::Suite);
                 state.save(paths)?;
@@ -2792,14 +2776,29 @@ pub fn execute_loop(
             eprintln!("note: {msg}");
             let _ = crate::events::append(paths, &state.id, &crate::events::Event::info(msg));
         }
+        // A reviewer seat with no usable provider is stood down, not parked: the
+        // panel keeps running its other seats. Only a panel with no usable
+        // seat left parks the run (O153).
+        let mut stood_down: Vec<String> = Vec::new();
         for rev in &reviewers {
             // Stop boundary: before each reviewer job.
             if should_stop(paths, &state.id) {
                 return stop_now(state, paths);
             }
-            let rev_id = match recheck_seat(state, paths, cfg, &rev.id)? {
+            let rev_id = match recheck_seat(state, paths, cfg, &rev.id, false)? {
                 SeatCheck::Ready(id) => id,
-                SeatCheck::Park(msg) => return fail(state, paths, anyhow::anyhow!(msg), true),
+                SeatCheck::Park(msg) => {
+                    let note = format!("reviewer seat `{}` stood down: {msg}", rev.id);
+                    eprintln!("warning: {note}");
+                    let _ =
+                        crate::events::append(paths, &state.id, &crate::events::Event::info(note));
+                    if let Some(s) = state.slot_mut(&rev.id) {
+                        s.stood_down = Some(msg.clone());
+                    }
+                    state.save(paths)?;
+                    stood_down.push(msg);
+                    continue;
+                }
             };
             let mut rev = state
                 .slots
@@ -3077,6 +3076,29 @@ pub fn execute_loop(
                 }
             }
         }
+        // Every reviewer stood down: the panel has no usable seat, so the run
+        // parks exactly as a lone reviewer with no backup always has.
+        if !reviewers.is_empty() && stood_down.len() == reviewers.len() {
+            return fail(state, paths, anyhow::anyhow!(stood_down.join("; ")), true);
+        }
+        // A stood-down seat's recorded veto still blocks when it rejects the
+        // head about to ship: judged, unanswered, and unable to re-judge. The
+        // same verdict and acceptance predicates judge it as a fresh artifact.
+        let mut carried: Vec<(String, review_result::ReviewResult)> = Vec::new();
+        for s in state.slots.iter().filter(|s| s.role == SlotRole::Reviewer) {
+            if let Some(res) = carried_rejection(s, panel_head.as_deref()) {
+                carried.push((s.id.clone(), res.clone()));
+            }
+        }
+        for (id, res) in &carried {
+            if res.blocks(cfg.review.block_on) || acceptance_blocks_ship(&criteria, res, cfg) {
+                any_request_changes = true;
+                blockers.push(format!(
+                    "review `{id}` stood down on quota; its recorded request_changes on {} still blocks this head",
+                    res.reviewed_commit.as_deref().unwrap_or("unknown")
+                ));
+            }
+        }
         if !any_request_changes {
             write_impl_summary(state, paths)?;
             if state.big {
@@ -3345,6 +3367,70 @@ enum SeatCheck {
     Park(String),
 }
 
+/// Run-start quota gate: only the implementer must run next at run start, so
+/// only it can park the run here. `recheck_seat` moves it onto an eligible
+/// backup when it has one; a seat with no usable provider parks the run, and
+/// the returned message names it (O153).
+fn gate_implementer_seat(
+    state: &mut RunState,
+    paths: &SparPaths,
+    cfg: &Config,
+) -> Result<Option<String>> {
+    let impl_id: Option<String> = state
+        .slots
+        .iter()
+        .find(|s| s.role == SlotRole::Implementer)
+        .map(|s| s.id.clone());
+    match impl_id {
+        None => Ok(None),
+        Some(id) => match recheck_seat(state, paths, cfg, &id, true)? {
+            SeatCheck::Ready(id) => {
+                // Quota-clean but the CLI may still be missing: the old run-start
+                // gate parked then too, once backups exist to detect against.
+                let has_backup = cfg.backups.implementer.is_some()
+                    || !cfg.backups.reviewer.is_empty()
+                    || cfg.backups.tester.is_some();
+                if !has_backup {
+                    return Ok(None);
+                }
+                let detected: std::collections::HashSet<String> = crate::providers::detect_all()
+                    .into_iter()
+                    .filter(|r| r.available)
+                    .map(|r| format!("cli:{}", r.name))
+                    .collect();
+                let available = if detected.is_empty() {
+                    None
+                } else {
+                    Some(detected)
+                };
+                let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+                let codex_profile = state.codex_profile.clone();
+                let missing = state
+                    .slots
+                    .iter()
+                    .find(|s| s.id == id)
+                    .filter(|s| {
+                        !crate::backup::is_provider_eligible(
+                            &s.provider_ref().display(),
+                            &store,
+                            available.as_ref(),
+                            codex_profile.as_deref(),
+                        )
+                    })
+                    .map(|s| s.provider.clone());
+                match missing {
+                    Some(provider) => Ok(Some(format!(
+                        "provider for `{id}` not available ({provider}). \
+                         install the CLI or set `--select`/`--providers` to a usable one"
+                    ))),
+                    None => Ok(None),
+                }
+            }
+            SeatCheck::Park(msg) => Ok(Some(msg)),
+        },
+    }
+}
+
 /// Re-read pause state right before a dispatch (#175, O106). Pauses used to be read
 /// only when a run started or resumed, so `provider pause grok --until 2027-01-01` did
 /// not stop a live run from dispatching its next grok reviewer. A seat whose provider
@@ -3354,6 +3440,9 @@ fn recheck_seat(
     paths: &SparPaths,
     cfg: &Config,
     slot_id: &str,
+    // A start-of-run gate parks on any pause (O106: a weak pause still steers the
+    // next run's seat choice); a live re-check trusts only manual and strong pauses.
+    strict: bool,
 ) -> Result<SeatCheck> {
     let Some(slot) = state.slots.iter().find(|s| s.id == slot_id).cloned() else {
         return Ok(SeatCheck::Ready(slot_id.to_string()));
@@ -3364,21 +3453,44 @@ fn recheck_seat(
     }
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     let seat = slot.provider_ref();
-    let key = seat.quota_key();
+    let key = seat.quota_key(state.codex_profile.as_deref());
     let sub = seat.storage_key();
-    // Only a pause a live run can trust stops it here: a weak heuristic pause ("429"
-    // in "429 passed") written by this very run must not park it or reseat it (O106).
-    if !store.blocks_live_dispatch(&key) {
+    // A live run trusts only pauses it can trust: manual and strong (O106). A
+    // weak heuristic pause ("429" in "429 passed") written by this very dispatch
+    // must not park it or reseat it — but a weak pause written before this
+    // dispatch started steers the seat onto its backup, so the first dispatch
+    // reads it strict while later dispatches stay trust-only. The line is the
+    // dispatch start, not the run creation: one id threads plan, implement, and
+    // every round (O45), so `created_at` long predates any later round.
+    let horizon = state.round_started_at.unwrap_or(state.created_at);
+    let blocked = if strict {
+        !store.is_usable(&key)
+    } else if store.blocks_live_dispatch(&key) {
+        true
+    } else {
+        !store.is_usable(&key) && store.get(&key).updated_at.is_none_or(|at| at < horizon)
+    };
+    if !blocked {
         return Ok(SeatCheck::Ready(slot_id.to_string()));
     }
     let ordinal = match slot.role {
         SlotRole::Reviewer => reviewer_ordinal(slot_id),
         _ => Some(0),
     };
+    let codex_profile = state.codex_profile.clone();
     let backup = ordinal
         .and_then(|o| crate::backup::backup_for_role(slot.role, o, cfg))
         .filter(|b| crate::quota::sub_key(b) != sub)
-        .filter(|b| crate::backup::backup_eligible(b, &store, None, paths, state.dry_run));
+        .filter(|b| {
+            crate::backup::backup_eligible(
+                b,
+                &store,
+                None,
+                paths,
+                state.dry_run,
+                codex_profile.as_deref(),
+            )
+        });
     let Some(backup_raw) = backup else {
         return Ok(SeatCheck::Park(format!(
             "provider {key} is paused or on cooldown and `{slot_id}` has no eligible backup. \
@@ -3431,7 +3543,12 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                     Some(detected)
                 }
             };
-        let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, available_opt.as_ref());
+        let cause = crate::backup::dispatch_stop_cause(
+            &slot_state,
+            &store,
+            available_opt.as_ref(),
+            state.codex_profile.as_deref(),
+        );
         if has_backup {
             if cause.engages_backup() {
                 if let Some(backup_raw) =
@@ -3453,6 +3570,7 @@ fn try_rotate_implementer(state: &mut RunState, paths: &SparPaths, cfg: &Config)
                             available_opt.as_ref(),
                             paths,
                             state.dry_run,
+                            state.codex_profile.as_deref(),
                         )
                         && slot_state.source != Some(SeatSource::Backup)
                     {
@@ -3660,10 +3778,20 @@ fn try_rotate_reviewer_provider(
     let cur = slot.provider.clone();
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     if infra && slot.source != Some(SeatSource::Backup) {
+        let codex_profile = state.codex_profile.clone();
         let backup = reviewer_ordinal(rev_id)
             .and_then(|o| crate::backup::backup_for_role(SlotRole::Reviewer, o, cfg))
             .filter(|b| crate::quota::sub_key(b) != crate::quota::sub_key(&cur))
-            .filter(|b| crate::backup::backup_eligible(b, &store, None, paths, state.dry_run));
+            .filter(|b| {
+                crate::backup::backup_eligible(
+                    b,
+                    &store,
+                    None,
+                    paths,
+                    state.dry_run,
+                    codex_profile.as_deref(),
+                )
+            });
         if let Some(raw) = backup {
             let id = move_seat_to_backup(state, paths, rev_id, &raw)?;
             if let Some(s) = state.slot_mut(&id) {
@@ -3673,8 +3801,10 @@ fn try_rotate_reviewer_provider(
             return Ok(Some(id));
         }
     }
-    let eligible =
-        |p: &String| -> bool { *p != cur && crate::backup::is_provider_eligible(p, &store, None) };
+    let codex_profile = state.codex_profile.clone();
+    let eligible = |p: &String| -> bool {
+        *p != cur && crate::backup::is_provider_eligible(p, &store, None, codex_profile.as_deref())
+    };
     let reviewer_role_source = if cfg
         .cli_role_keys
         .contains(SlotRole::Reviewer.as_config_key())
@@ -3816,7 +3946,14 @@ mod recheck_seat_tests {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let mut st = state_with("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
-        let got = recheck_seat(&mut st, &paths, &Config::default(), "review-0-cli-grok").unwrap();
+        let got = recheck_seat(
+            &mut st,
+            &paths,
+            &Config::default(),
+            "review-0-cli-grok",
+            false,
+        )
+        .unwrap();
         assert!(matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-grok"));
     }
 
@@ -3830,7 +3967,7 @@ mod recheck_seat_tests {
         let mut st = state_with("review-1-cli-grok", "cli:grok", SlotRole::Reviewer);
         let mut cfg = Config::default();
         cfg.backups.reviewer = vec![String::new(), "cli:codex@gpt-5.6-terra".into()];
-        let got = recheck_seat(&mut st, &paths, &cfg, "review-1-cli-grok").unwrap();
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-1-cli-grok", false).unwrap();
         let SeatCheck::Ready(id) = got else {
             panic!("expected a move to the backup");
         };
@@ -3847,18 +3984,127 @@ mod recheck_seat_tests {
         let paths = SparPaths::new(tmp.path());
         pause(&paths, "cli:claude");
         let mut st = state_with("impl", "cli:claude", SlotRole::Implementer);
-        let got = recheck_seat(&mut st, &paths, &Config::default(), "impl").unwrap();
+        let got = recheck_seat(&mut st, &paths, &Config::default(), "impl", true).unwrap();
         assert!(matches!(got, SeatCheck::Park(ref m) if m.contains("cli:claude")));
 
         pause(&paths, "cli:codex");
         let mut cfg = Config::default();
         cfg.backups.implementer = Some("cli:codex".into());
-        let got = recheck_seat(&mut st, &paths, &cfg, "impl").unwrap();
+        let got = recheck_seat(&mut st, &paths, &cfg, "impl", true).unwrap();
         assert!(
             matches!(got, SeatCheck::Park(_)),
             "a paused backup is no way out"
         );
         assert_eq!(st.slots[0].provider, "cli:claude");
+    }
+
+    /// One id threads plan, implement, and every round (O45), so `created_at`
+    /// long predates any later round: the pre-existing/this-dispatch line is the
+    /// dispatch start. A weak pause written after the run was created but before
+    /// this dispatch steers onto the backup; one written after the dispatch
+    /// started stays trust-only.
+    #[test]
+    fn a_weak_pause_between_creation_and_dispatch_steers_onto_the_backup() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        st.created_at -= chrono::Duration::minutes(10);
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:grok", "possible quota signal: 429");
+        store.providers.get_mut("cli:grok").unwrap().updated_at =
+            Some(st.created_at + chrono::Duration::seconds(60));
+        store.save(&paths).unwrap();
+        st.stamp_dispatch();
+        let mut cfg = Config::default();
+        cfg.backups.reviewer = vec!["cli:codex".into()];
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-grok", false).unwrap();
+        assert!(
+            matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-codex"),
+            "a weak pause predating the dispatch steers onto the backup"
+        );
+    }
+
+    #[test]
+    fn a_weak_pause_written_after_dispatch_start_stays_trust_only() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = state_with("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        st.stamp_dispatch();
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:grok", "possible quota signal: 429");
+        store.save(&paths).unwrap();
+        let mut cfg = Config::default();
+        cfg.backups.reviewer = vec!["cli:codex".into()];
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-grok", false).unwrap();
+        assert!(
+            matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-grok"),
+            "a weak pause from this dispatch must not move the seat"
+        );
+    }
+
+    /// A weak pause written before the run started steers the next run onto its
+    /// backup (O106): only pauses this run wrote stay trust-only.
+    #[test]
+    fn a_weak_pause_older_than_the_run_moves_a_reviewer_to_its_backup() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:grok", "possible quota signal: 429");
+        store.providers.get_mut("cli:grok").unwrap().updated_at =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(10));
+        store.save(&paths).unwrap();
+        let mut st = state_with("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        let mut cfg = Config::default();
+        cfg.backups.reviewer = vec!["cli:codex".into()];
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-grok", false).unwrap();
+        assert!(
+            matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-codex"),
+            "a pre-existing weak pause steers onto the backup"
+        );
+    }
+
+    #[test]
+    fn a_weak_pause_older_than_the_run_parks_a_tester_with_no_backup() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:codex", "possible quota signal: 429");
+        store.providers.get_mut("cli:codex").unwrap().updated_at =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(10));
+        store.save(&paths).unwrap();
+        let mut st = state_with("test", "cli:codex", SlotRole::Tester);
+        let got = recheck_seat(&mut st, &paths, &Config::default(), "test", false).unwrap();
+        assert!(
+            matches!(got, SeatCheck::Park(_)),
+            "a pre-existing weak pause parks a tester with no backup"
+        );
+    }
+
+    /// A pre-existing weak pause benches a reviewer with no backup too: the
+    /// re-check parks, and the review panel loop stands the seat down instead
+    /// of parking the run.
+    #[test]
+    fn a_weak_pause_older_than_the_run_parks_a_reviewer_with_no_backup() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:grok", "possible quota signal: 429");
+        store.providers.get_mut("cli:grok").unwrap().updated_at =
+            Some(chrono::Utc::now() - chrono::Duration::minutes(10));
+        store.save(&paths).unwrap();
+        let mut st = state_with("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        let got = recheck_seat(
+            &mut st,
+            &paths,
+            &Config::default(),
+            "review-0-cli-grok",
+            false,
+        )
+        .unwrap();
+        assert!(
+            matches!(got, SeatCheck::Park(_)),
+            "a pre-existing weak pause parks a reviewer with no backup"
+        );
     }
 
     /// The broad scrape paused codex because a test log said "429 passed". That pause is
@@ -3867,24 +4113,39 @@ mod recheck_seat_tests {
     fn a_weak_heuristic_pause_never_moves_or_parks_a_live_seat() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
+        let mut st = state_with("review-0-cli-codex", "cli:codex", SlotRole::Reviewer);
         let mut store = crate::quota::QuotaStore::default();
         store.pause_quota("cli:codex", "possible quota signal: 429");
         store.save(&paths).unwrap();
-        let mut st = state_with("review-0-cli-codex", "cli:codex", SlotRole::Reviewer);
         let mut cfg = Config::default();
         cfg.backups.reviewer = vec!["cli:grok".into()];
-        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-codex").unwrap();
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-codex", false).unwrap();
         assert!(matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-codex"));
         assert_eq!(st.slots[0].provider, "cli:codex");
 
         let mut store = crate::quota::QuotaStore::load(&paths).unwrap();
         store.mark_strong("cli:codex");
         store.save(&paths).unwrap();
-        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-codex").unwrap();
+        let got = recheck_seat(&mut st, &paths, &cfg, "review-0-cli-codex", false).unwrap();
         assert!(
             matches!(got, SeatCheck::Ready(id) if id == "review-0-cli-grok"),
             "a strong pause still moves the seat"
         );
+    }
+
+    /// The start-of-run gate is strict where a live re-check is lenient (O106): a
+    /// weak pause still steers the next run's seat choice, so with no backup the
+    /// implementer parks instead of dispatching into it.
+    #[test]
+    fn a_weak_pause_parks_the_start_gate_with_no_backup() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut store = crate::quota::QuotaStore::default();
+        store.pause_quota("cli:claude", "possible quota signal: quota");
+        store.save(&paths).unwrap();
+        let mut st = state_with("impl", "cli:claude", SlotRole::Implementer);
+        let got = recheck_seat(&mut st, &paths, &Config::default(), "impl", true).unwrap();
+        assert!(matches!(got, SeatCheck::Park(ref m) if m.contains("cli:claude")));
     }
 
     #[test]
@@ -3893,6 +4154,63 @@ mod recheck_seat_tests {
         assert_eq!(reviewer_ordinal("review-12-cli-codex"), Some(12));
         assert_eq!(reviewer_ordinal("review-cli-grok-wide"), None);
         assert_eq!(reviewer_ordinal("impl"), None);
+    }
+}
+
+#[cfg(test)]
+mod carried_rejection_tests {
+    use super::*;
+
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+    const OTHER: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    fn stood_down(body: &str) -> SlotState {
+        let mut s = executor::init_slot("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        s.stood_down = Some("provider cli:grok is paused".into());
+        s.review = Some(crate::workflow::review_result::parse_review(body));
+        s
+    }
+
+    fn verdict_on(verdict: &str, sha: &str) -> String {
+        format!("## Verdict\n{verdict}\n\nReviewed-Commit: {sha}\n\n## Findings\n- severity: major — x\n")
+    }
+
+    #[test]
+    fn request_changes_on_this_head_carries() {
+        let s = stood_down(&verdict_on("request_changes", HEAD));
+        assert!(carried_rejection(&s, Some(HEAD)).is_some());
+    }
+
+    #[test]
+    fn request_changes_on_an_older_head_does_not_carry() {
+        let s = stood_down(&verdict_on("request_changes", OTHER));
+        assert!(carried_rejection(&s, Some(HEAD)).is_none());
+    }
+
+    #[test]
+    fn approve_on_this_head_does_not_carry() {
+        let s = stood_down(&verdict_on("approve", HEAD));
+        assert!(carried_rejection(&s, Some(HEAD)).is_none());
+    }
+
+    #[test]
+    fn a_dispatched_seat_carries_nothing() {
+        let mut s = stood_down(&verdict_on("request_changes", HEAD));
+        s.stood_down = None;
+        assert!(carried_rejection(&s, Some(HEAD)).is_none());
+    }
+
+    #[test]
+    fn a_seat_that_never_judged_carries_nothing() {
+        let mut s = executor::init_slot("review-0-cli-grok", "cli:grok", SlotRole::Reviewer);
+        s.stood_down = Some("provider cli:grok is paused".into());
+        assert!(carried_rejection(&s, Some(HEAD)).is_none());
+    }
+
+    #[test]
+    fn a_failure_stub_names_no_commit_so_it_carries_nothing() {
+        let s = stood_down("## Verdict\nrequest_changes\n\n## Findings\n- severity: major — x\n");
+        assert!(carried_rejection(&s, Some(HEAD)).is_none());
     }
 }
 
@@ -5120,6 +5438,15 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
         return crate::workflow::plan::continue_run(paths, cfg, run_id);
     }
     let _lock = crate::runlock::RunLock::acquire(paths, run_id)?;
+    // Re-read under the lock: the routing load above can be stale, and the
+    // stamp below writes, so stamping the stale copy would clobber a
+    // concurrent writer's fields.
+    state = RunState::load(paths, run_id)?;
+    // A resume is a new dispatch in this process: re-stamp the horizon and the
+    // profile so a pause written before this resume steers the seat, and reads
+    // key the seats this process actually dispatches. Fix passes inside the
+    // loop below never re-stamp; see `stamp_dispatch`.
+    state.stamp_dispatch();
     match state.workflow {
         crate::cli::WorkflowKind::Loop => {
             // A daemon/`continue` resume is nobody's deliberate amendment, so it never
