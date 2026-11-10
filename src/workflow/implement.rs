@@ -3402,8 +3402,10 @@ fn ceiling_partial_refused_notice(round: u32, detail: Option<&str>) -> String {
 /// A resume that idles into a second ceiling kill returns the carried bank's
 /// notice (a WIP or Clean one) instead of failing: the tree is clean and HEAD
 /// is still the banked commit, so the banked partial is still there and the
-/// run goes on like the first hit, whether the resume stayed in the bank's
-/// round or opened a new one.
+/// run goes on like the first hit. This covers only a round that never reached
+/// a verdict (a quota park before review, a stop): when the bank's round
+/// rendered request_changes, the panel rejected this HEAD, and an idle fix
+/// round fails instead of sending the same commit back for another verdict.
 ///
 /// The message names the ceiling kill, so the WIP commit reads as an interrupted
 /// round on the branch rather than a normal one. Like `commit_before_review`, a
@@ -3435,11 +3437,13 @@ fn try_commit_ceiling_partial(
         .unwrap_or_default();
     let round = state.round;
     // The latest banked partial at or before this round. A same-round resume
-    // carries its own round's bank; a resume that opened a new round (the
-    // previous round parked, e.g. on quota) carries the previous round's bank
-    // when the new round adds nothing before its own ceiling kill. In both
-    // cases HEAD sitting on the bank with a clean tree reads as no new work,
-    // and the run goes on with the banked commit instead of failing.
+    // carries its own round's bank; a round opened by a resume after a park
+    // (the previous round never reached a verdict) carries the previous
+    // round's bank when the new round adds nothing before its own ceiling
+    // kill. A fix round whose banked round rendered request_changes carries
+    // nothing: the branch check below fails it. In the carried cases HEAD
+    // sitting on the bank with a clean tree reads as no new work, and the
+    // run goes on with the banked commit instead of failing.
     let carried = state
         .ceiling_partial_rounds
         .iter()
@@ -3464,6 +3468,22 @@ fn try_commit_ceiling_partial(
             .iter()
             .rev()
             .find(|e| e.round <= round)?;
+        // A fix round answers its round's review verdict: when the bank's
+        // round already rendered request_changes (a real or synthetic one),
+        // the panel rejected this HEAD, so an idle pass that adds nothing
+        // fails instead of sending the same commit back for another verdict.
+        // Only a round that never reached a verdict (a quota park before
+        // review, a stop) carries its bank forward.
+        let verdict_blocks = state.review_history.iter().any(|e| {
+            e.round == banked_entry.round
+                && matches!(
+                    e.review.verdict,
+                    Some(review_result::Verdict::RequestChanges)
+                )
+        });
+        if verdict_blocks {
+            return None;
+        }
         let bank_round = banked_entry.round;
         let commit = banked_entry.commit.clone()?;
         if worktree::git_out(&wt_path, &["rev-parse", "HEAD"]).as_deref() != Some(commit.as_str()) {
@@ -7155,6 +7175,41 @@ mod ceiling_partial_notice_tests {
         assert_eq!(notice, ceiling_partial_notice(1));
         assert!(matches!(kind, CeilingPartialKind::Wip));
         assert_eq!(commit.as_deref(), Some(banked.as_str()));
+    }
+
+    #[test]
+    fn fix_round_idle_ceiling_kill_after_request_changes_is_not_a_partial_round() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, branch) = fresh_repo(&tmp);
+        let head = git(&wt, &["rev-parse", "HEAD"]);
+        let tree = executor::worktree_snapshot(&wt);
+        std::fs::write(wt.join("work.txt"), "slot work\n").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-qm", "banked wip"]);
+        let banked = git(&wt, &["rev-parse", "HEAD"]);
+        let (paths, mut state) = ceiling_state(&tmp, &wt, &branch, Some(head), tree);
+        // The bank's round reached a verdict that rejected this HEAD, so the
+        // fix round that idles into its own ceiling kill fails instead of
+        // sending the same commit back for another verdict.
+        state.round = 2;
+        state.slots[0].dispatch_head = Some(banked.clone());
+        state.slots[0].dispatch_tree = executor::worktree_snapshot(&wt);
+        state.ceiling_partial_rounds = vec![CeilingPartialRound {
+            round: 1,
+            kind: CeilingPartialKind::Wip,
+            commit: Some(banked),
+        }];
+        state.review_history.push(crate::state::ReviewHistoryEntry {
+            round: 1,
+            slot_id: "review-0".into(),
+            review: crate::workflow::review_result::parse_review(
+                "## Verdict\nrequest_changes\n\n## Findings\n- severity: major: unfinished at src/a.rs:1\n",
+            ),
+        });
+        assert!(
+            try_commit_ceiling_partial(&mut state, &paths, "impl").is_none(),
+            "the panel already rejected this HEAD, so the idle fix round fails"
+        );
     }
 
     #[test]
