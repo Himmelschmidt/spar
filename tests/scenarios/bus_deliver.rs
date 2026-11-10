@@ -1049,15 +1049,41 @@ fn poll_file_ages_out_last_round_non_ack(provider: &str) {
     state["round"] = serde_json::Value::from(round + 1);
     std::fs::write(&state_path, state.to_string()).unwrap();
 
+    // The round bumped but the slot has not dispatched since the filing: the
+    // item stays, so the next turn can still read it.
     deliver_json(dir, &run_id, &agent);
     let poll = poll_body(dir, &run_id, &agent);
     assert!(
-        !poll.contains("yesterday's news"),
-        "last round's non-ack message ages out:\n{poll}"
+        poll.contains("yesterday's news"),
+        "a round bump alone never removes what the slot has not had a turn with:\n{poll}"
     );
     assert!(
         poll.contains("still needs eyes"),
         "a requires-ack item survives the round bump until acked:\n{poll}"
+    );
+
+    // Once the slot dispatches past the filing round it had its turn: the
+    // non-ack item leaves on the next render.
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let slot = state["slots"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["id"] == agent)
+        .unwrap();
+    slot["round"] = serde_json::Value::from(round + 1);
+    std::fs::write(&state_path, state.to_string()).unwrap();
+
+    deliver_json(dir, &run_id, &agent);
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        !poll.contains("yesterday's news"),
+        "last round's non-ack message ages out after the slot's turn:\n{poll}"
+    );
+    assert!(
+        poll.contains("still needs eyes"),
+        "a requires-ack item survives the slot's turn until acked:\n{poll}"
     );
     let entries = log_entries(dir, &run_id);
     assert_eq!(

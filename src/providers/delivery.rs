@@ -112,9 +112,9 @@ pub fn deliver(
     // copies stay pending, so `delivered` keeps meaning "posted into the live
     // poll file" instead of "claimed by a file-time drain the slot never reads".
     let msgs = if strategy == DeliveryStrategy::PollFile {
-        bus::inbox_claim_for_poll(paths, agent, via, |m| bus::poll_lists(m, agent))?
+        bus::inbox_claim(paths, agent, via, |m| bus::poll_lists(m, agent))?
     } else {
-        bus::inbox_claim(paths, agent, via)?
+        bus::inbox_claim(paths, agent, via, |_| true)?
     };
     if msgs.is_empty() {
         if strategy == DeliveryStrategy::PollFile
@@ -209,9 +209,11 @@ fn escape_poll_markers(body: &str) -> String {
 /// actually read rather than what was claimed.
 ///
 /// A message leaves the file once the slot acks it, and — unless it asks for an
-/// ack — once the run leaves the round it was filed in (`filed_round`), so the
-/// file cannot grow without bound. `requires-ack` items survive round bumps
-/// until the slot acks them. Acks and system control traffic never list.
+/// ack — once the slot has dispatched in a round past the one it was filed in
+/// (`filed_round` vs the slot's last-dispatched round), so the file cannot grow
+/// without bound yet a round bump alone never removes what the slot has not had
+/// a turn with. `requires-ack` items survive round bumps until the slot acks
+/// them. Acks and system control traffic never list.
 pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str) -> Result<usize> {
     let _lock = lock_poll_file(paths, run, agent)?;
     // The ack scan runs under the poll-file lock: an ack filed between the scan
@@ -239,7 +241,12 @@ pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str
             }
             if !m.requires_ack {
                 if let (Some(filed), Some(r)) = (m.filed_round, m.run.as_deref()) {
-                    if gate.round(paths, r).is_some_and(|now| now > filed) {
+                    // The slot had a turn with the item in its file once it
+                    // dispatched past the filing round; only then may it leave.
+                    if gate
+                        .slot_round(paths, r, agent)
+                        .is_some_and(|last| last > filed)
+                    {
                         return false;
                     }
                 }
@@ -713,7 +720,12 @@ mod tests {
         assert_eq!(d.delivered, 0);
         assert_eq!(d.pending, 2);
         // The agent must still be able to claim them itself.
-        assert_eq!(bus::inbox_claim(&paths, &ub, "test").unwrap().len(), 2);
+        assert_eq!(
+            bus::inbox_claim(&paths, &ub, "test", |_| true)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -768,7 +780,9 @@ mod tests {
         assert_eq!(d.delivered, 2);
         assert!(!poll_file(&paths, Some("r1"), &ub).exists());
         // But the drain is real (exactly-once): nothing remains to claim.
-        assert!(bus::inbox_claim(&paths, &ub, "test").unwrap().is_empty());
+        assert!(bus::inbox_claim(&paths, &ub, "test", |_| true)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -928,5 +942,42 @@ mod tests {
         .unwrap();
         assert_eq!(to_bare.delivered, 1);
         assert!(to_bare.payload.unwrap().contains("hi bare"));
+    }
+
+    #[test]
+    fn refresh_rebuilds_poll_files_for_run_slots() {
+        // The quota early-return and round start share one refresh path: a deleted
+        // poll file comes back with the slot's pending items still listed.
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.slots.push(crate::executor::init_slot(
+            "impl",
+            "cli:agy",
+            crate::state::SlotRole::Implementer,
+        ));
+        state.save(&paths).unwrap();
+
+        let slot = agent_ref(Some("r1"), "impl");
+        chat(
+            &paths,
+            Some("r1"),
+            "human",
+            &slot,
+            "quota note",
+            MessageBudget::Chatty,
+        )
+        .unwrap();
+        let file = poll_file(&paths, Some("r1"), &slot);
+        assert!(file.is_file());
+        std::fs::remove_file(&file).unwrap();
+
+        refresh_run_poll_files(&paths, "r1");
+        let body = std::fs::read_to_string(&file).unwrap();
+        assert!(body.contains("quota note"), "{body}");
     }
 }
