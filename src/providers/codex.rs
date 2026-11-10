@@ -836,6 +836,7 @@ mod tests {
             Some("native"),
             "an emptied profile drops -p, so the seat runs native"
         );
+        std::env::remove_var("SPAR_CODEX_PROFILE");
     }
 
     #[test]
@@ -857,6 +858,7 @@ mod tests {
             Some("openrouter"),
             "an explicit slug forces OpenRouter under any profile"
         );
+        std::env::remove_var("SPAR_CODEX_PROFILE");
     }
 
     #[test]

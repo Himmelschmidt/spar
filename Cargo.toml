@@ -23,6 +23,7 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10.4"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
+libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -109,6 +110,10 @@ path = "tests/scenarios/builtin_suite.rs"
 [[test]]
 name = "quota_routing"
 path = "tests/scenarios/quota_routing.rs"
+
+[[test]]
+name = "ceiling_quota_paths"
+path = "tests/scenarios/ceiling_quota_paths.rs"
 
 [[test]]
 name = "fleet_shaping"

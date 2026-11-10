@@ -266,6 +266,9 @@ fn live_post(
     body: &str,
     timeout: Duration,
 ) -> Result<(u16, String), String> {
+    // One attempt, never re-sent: an interrupted read may already have billed
+    // a completion server-side. The mask keeps child churn from failing it.
+    let _mask = crate::util::block_sigchld();
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
@@ -1323,6 +1326,39 @@ pub mod tests {
             started.elapsed() < Duration::from_secs(10),
             "the per-attempt timeout cuts a slow server off"
         );
+    }
+
+    /// The classifier POST holds the SIGCHLD mask for the whole call: signals
+    /// directed at the reading thread must not fail it with an EINTR read.
+    /// Removing the mask fails this test.
+    #[test]
+    fn live_post_survives_sigchld_churn() {
+        let _serial = crate::util::sigchld_test::serialize();
+        let _handler = crate::util::sigchld_test::InstalledHandler::install();
+        // Directed signals, not a reaping storm: the kernel delivers a child's
+        // SIGCHLD to the thread that forked it, so the reader wins a lottery
+        // and sometimes observes none of the storm. `pthread_kill` at this
+        // thread lands every time while the delayed response holds the read.
+        let tid = unsafe { libc::pthread_self() };
+        let killer = std::thread::spawn(move || {
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(100));
+                let rc = unsafe { libc::pthread_kill(tid, libc::SIGCHLD) };
+                assert_eq!(rc, 0, "directing SIGCHLD at the reading thread");
+            }
+        });
+        // The delayed response keeps the read in flight while the signals land.
+        let server = loopback(200, &answer_body("auth", 0.99), Duration::from_millis(800));
+        let (status, text) = live_post(
+            &format!("{}/systemone", server.base_url),
+            "test-key",
+            "{}",
+            Duration::from_secs(30),
+        )
+        .expect("masked POST survives directed SIGCHLD");
+        assert_eq!(status, 200);
+        assert!(text.contains("\"auth\""), "{text}");
+        killer.join().unwrap();
     }
 
     #[test]

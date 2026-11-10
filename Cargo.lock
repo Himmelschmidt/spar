@@ -1016,6 +1016,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "dirs",
+ "libc",
  "predicates",
  "rustix",
  "serde",

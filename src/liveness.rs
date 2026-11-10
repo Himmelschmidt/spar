@@ -183,14 +183,9 @@ pub fn enrich_status_json(
             obj.insert("pid_alive".into(), serde_json::Value::Bool(pid_alive));
             // A ceiling kill is spar ending the dispatch, not the slot crashing, and an
             // outer agent has to be able to tell those apart without parsing prose.
-            obj.insert(
-                "ceiling_kill".into(),
-                serde_json::Value::Bool(
-                    slot.error
-                        .as_deref()
-                        .is_some_and(crate::nudge::is_ceiling_kill),
-                ),
-            );
+            let ceiling_kill =
+                slot.timeout_cause == Some(crate::executor::TimeoutCause::HardCeiling);
+            obj.insert("ceiling_kill".into(), serde_json::Value::Bool(ceiling_kill));
             if let Some(c) = slot.exit_code {
                 obj.insert("exit_code".into(), serde_json::json!(c));
             }
@@ -241,6 +236,9 @@ mod tests {
             stood_down: None,
             source: None,
             auth_fault: false,
+            timeout_cause: None,
+            dispatch_head: None,
+            dispatch_tree: None,
             build_cache: None,
             classifier: None,
             reviewer_kind: None,

@@ -29,9 +29,10 @@ use std::time::{Duration, Instant};
 /// instant it is crossed, which is nothing against budgets measured in minutes and hours.
 const POLL_SECS: u64 = 30;
 
-/// Prefix on the `error` of a slot the hard ceiling killed. Every writer and every reader
-/// of that distinction goes through [`ceiling_error`] / [`is_ceiling_kill`], so it is one
-/// string in one place rather than a convention.
+/// Prefix on the `error` of a slot the hard ceiling killed, as distinct from a
+/// crash (`exit 143`, `killed by signal 9`) or a soft-budget overrun (which never
+/// ends a dispatch). The prefix is for humans reading the log; readers use the
+/// typed `TimeoutCause` on the slot instead of matching this prose.
 const CEILING_PREFIX: &str = "hard ceiling: ";
 
 /// What a slot killed at the ceiling records, as distinct from a crash (`exit 143`,
@@ -42,10 +43,6 @@ pub fn ceiling_error(ceiling: Duration, soft: Duration, label: &str) -> String {
         ceiling.as_secs(),
         soft.as_secs(),
     )
-}
-
-pub fn is_ceiling_kill(error: &str) -> bool {
-    error.starts_with(CEILING_PREFIX)
 }
 
 /// The artifact shape both nudges ask for. Named once so a token nudge, a time nudge and
@@ -613,15 +610,13 @@ mod tests {
     }
 
     #[test]
-    fn ceiling_kill_is_distinguishable_from_a_crash() {
+    fn ceiling_error_names_the_ceiling_and_not_a_crash() {
         let e = ceiling_error(
             Duration::from_secs(16200),
             Duration::from_secs(5400),
             "timeouts.slot_secs",
         );
-        assert!(is_ceiling_kill(&e), "{e}");
-        assert!(!is_ceiling_kill("killed by signal 9 (SIGKILL)"));
-        assert!(!is_ceiling_kill("exit 143"));
-        assert!(!is_ceiling_kill("missing expected artifact plan.md"));
+        assert!(e.starts_with("hard ceiling: "), "{e}");
+        assert!(e.contains("16200s"), "{e}");
     }
 }

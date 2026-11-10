@@ -1672,3 +1672,93 @@ fn empty_replan_directive_is_refused_and_leaves_the_run_alone() {
         .stderr(predicate::str::contains("replan directive is empty"));
     assert_eq!(std::fs::read_to_string(&state_path).unwrap(), before);
 }
+
+/// Drops a fake CLI named `name` that runs `script` and returns whatever exit
+/// code the script itself chooses, so a slot can genuinely succeed and produce
+/// its own expected artifact.
+fn fake_plan_binary(bin_dir: &std::path::Path, name: &str, script: &str) {
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let fake = bin_dir.join(name);
+    std::fs::write(&fake, format!("#!/bin/sh\n{script}\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// The planner and the critic share `expected_artifact: "plan.md"`, the critic
+/// rewriting the planner's draft in place. Dispatching the critic must not
+/// delete the planner's draft first: the final plan must carry both passes.
+/// Non-dry, so no dry-run artifact rewrite can hide a missing file.
+#[test]
+fn plan_critic_reads_the_planners_plan_md() {
+    let tmp = tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    init_git_repo(&proj);
+    // `[spec]` defaults on, which would ask for a third (test-author) seat.
+    std::fs::write(proj.join("spar.toml"), "[spec]\nenabled = false\n").unwrap();
+    let bin = tmp.path().join("bin");
+    fake_plan_binary(
+        &bin,
+        "claude",
+        r#"run_dir=$(ls -d "$FAKE_PROJECT_ROOT"/.spar/runs/*/ | head -1)
+mkdir -p "$run_dir/artifacts"
+printf '# Plan\n\nPLANNER-PLAN\n' > "$run_dir/artifacts/plan.md"
+exit 0"#,
+    );
+    fake_plan_binary(
+        &bin,
+        "grok",
+        r#"run_dir=$(ls -d "$FAKE_PROJECT_ROOT"/.spar/runs/*/ | head -1)
+mkdir -p "$run_dir/artifacts"
+if [ -f "$run_dir/artifacts/plan.md" ]; then
+  printf '\nCRITIC-SEEN\n' >> "$run_dir/artifacts/plan.md"
+else
+  printf 'critic-only\n' > "$run_dir/artifacts/plan.md"
+fi
+exit 0"#,
+    );
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let out = spar_cmd()
+        .current_dir(&proj)
+        .env("PATH", &path_env)
+        .env("FAKE_PROJECT_ROOT", &proj)
+        .args([
+            "plan",
+            "-t",
+            "add a feature",
+            "--providers",
+            "cli:claude,cli:grok",
+        ])
+        .output()
+        .unwrap();
+    let status = out.status;
+    let runs = proj.join(".spar/runs");
+    let run_id = std::fs::read_dir(&runs)
+        .expect("runs dir")
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().join("state.json").is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .expect("a run");
+    let plan_md = std::fs::read_to_string(runs.join(&run_id).join("artifacts/plan.md")).unwrap();
+    assert!(
+        plan_md.contains("PLANNER-PLAN"),
+        "critic dispatch deleted the planner's draft (status={status}): {plan_md}"
+    );
+    assert!(
+        plan_md.contains("CRITIC-SEEN"),
+        "critic pass missing (status={status}): {plan_md}"
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(runs.join(&run_id).join("state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["phase"], "awaiting_plan_approval", "{state}");
+}
