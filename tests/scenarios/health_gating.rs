@@ -573,3 +573,96 @@ fn unrelated_backups_entry_does_not_park_an_unhealthy_seat_at_quota() {
     assert_eq!(implementer_of(&state)["provider"], "cli:claude", "{state}");
     assert_eq!(calls(&p.bin, "codex"), 0, "sick file seat never dispatches");
 }
+
+/// Continuing a run re-checks auto-selected seats through the same point as
+/// launch: an implementer whose provider went sick between rounds is re-seated
+/// onto the healthy order entry, never redispatched.
+#[test]
+fn continued_run_reseats_an_implementer_whose_provider_went_sick() {
+    let (_tmp, p) = project("[providers]\norder = [\"cli:codex\", \"cli:claude\"]\n[roles]\nimplementer = \"cli:codex\"\nreviewer = [\"cli:claude\"]\n");
+    write_fake(&p.bin, "claude", "auth", "exit 0", "request_changes");
+    write_fake(
+        &p.bin,
+        "codex",
+        "login",
+        "if [ -f \"$FAKE_COUNT_DIR/sick\" ]; then echo \"Error: credentials missing\" >&2; exit 1; fi\nexit 0",
+        "approve",
+    );
+    let out = spar_cmd()
+        .current_dir(&p.proj)
+        .env("SPAR_HOME", &p.home)
+        .env("PATH", &p.path_env)
+        .env("FAKE_PROJECT_ROOT", &p.proj)
+        .env("FAKE_COUNT_DIR", &p.bin)
+        .args([
+            "implement",
+            "-t",
+            "continuation reseats sick",
+            "--without",
+            "suite",
+            "--max-rounds",
+            "1",
+            "--json",
+        ])
+        .assert()
+        .code(predicate::in_iter([2, 3]))
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let run_id: String = serde_json::from_str::<serde_json::Value>(&stdout).expect("run json")
+        ["id"]
+        .as_str()
+        .expect("run id")
+        .to_string();
+    let state = read_state(&p.proj, &run_id);
+    assert_eq!(
+        implementer_of(&state)["provider"],
+        "cli:codex",
+        "round 1 seats the healthy order head: {state}"
+    );
+    let codex_round_1 = calls(&p.bin, "codex");
+    assert!(codex_round_1 >= 1, "round 1 dispatches codex");
+    let claude_round_1 = calls(&p.bin, "claude");
+
+    fs::write(p.bin.join("sick"), "codex went sick between rounds").unwrap();
+
+    let out = spar_cmd()
+        .current_dir(&p.proj)
+        .env("SPAR_HOME", &p.home)
+        .env("PATH", &p.path_env)
+        .env("FAKE_PROJECT_ROOT", &p.proj)
+        .env("FAKE_COUNT_DIR", &p.bin)
+        .args([
+            "implement",
+            "--run",
+            &run_id,
+            "--max-rounds",
+            "+2",
+            "--json",
+        ])
+        .assert()
+        .code(predicate::in_iter([0, 2, 3]))
+        .get_output()
+        .clone();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_no_quota_park(&combined);
+    let state = read_state(&p.proj, &run_id);
+    assert_eq!(
+        implementer_of(&state)["provider"],
+        "cli:claude",
+        "continuation re-seats the sick implementer: {state}"
+    );
+    assert_eq!(
+        calls(&p.bin, "codex"),
+        codex_round_1,
+        "sick codex is never redispatched"
+    );
+    assert!(
+        calls(&p.bin, "claude") > claude_round_1,
+        "the fix round dispatches claude"
+    );
+}
