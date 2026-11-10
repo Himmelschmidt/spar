@@ -439,7 +439,7 @@ fn run() -> Result<ExitCode> {
                     None => task,
                 };
                 // Seat shapers ride along into the dispatch: a bound run amends under
-                // its own lock, after the preconditions below pass (O169). The
+                // its own lock, after the preconditions below pass (O170). The
                 // preset parses here, so a `--fleet` typo fails at the pre-check
                 // instead of after the dispatch acquired its lock.
                 let amend = workflow::implement::BoundAmendInputs {
@@ -486,7 +486,14 @@ fn run() -> Result<ExitCode> {
                     key,
                     reassign,
                 };
-                workflow::implement::parse_reassignments(&opts.reassign, &paths)?;
+                // The pause check keys the route this process's dispatch will
+                // stamp (new or resumed: continuing entries stamp on entry),
+                // not the previous record.
+                workflow::implement::parse_reassignments(
+                    &opts.reassign,
+                    &paths,
+                    providers::codex::dispatch_route().as_recorded(),
+                )?;
                 let mut fleet = None;
                 let mut shown_cfg = None;
                 match &run_id {
@@ -601,7 +608,7 @@ fn run() -> Result<ExitCode> {
             // A round extension refused or found busy after the pre-check is still a
             // refusal: nothing was dispatched, so `--json` gets the same shape. An
             // amend refusal is one too: the frozen config and run state were left
-            // untouched under the dispatch's lock (O169).
+            // untouched under the dispatch's lock (O170).
             workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg, amend)
                 .or_else(|e| {
                     if e.is::<workflow::implement::RoundExtensionRefused>()
@@ -1396,7 +1403,7 @@ fn bus_deliver(
 /// `--reload-config` is the deliberate way out: it re-reads the file and re-freezes the
 /// run against it. A bound run amends under the dispatch's own lock, after every
 /// launch precondition passes. Nothing here amends anything before those checks,
-/// so a refused launch changes nothing (O169); this context returns the frozen
+/// so a refused launch changes nothing (O170); this context returns the frozen
 /// config untouched.
 #[allow(clippy::too_many_arguments)]
 fn implement_ctx(
@@ -3676,9 +3683,19 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
             all,
             json,
             dry_run,
+            run,
         } => {
             let (paths, _) = project_ctx()?;
             let dry = dry_run || util::env_truthy("SPAR_DRY_RUN");
+            let route_state;
+            let route = match run {
+                Some(id) => {
+                    route_state = crate::state::RunState::load(&paths, &id)
+                        .map_err(|e| anyhow::anyhow!("cannot load run {id} for --run: {e}"))?;
+                    route_state.recorded_route()
+                }
+                None => providers::RecordedRoute::ambient(),
+            };
             let targets: Vec<String> = match name {
                 Some(n) => vec![n],
                 None if all => providers::all_adapters()
@@ -3690,7 +3707,7 @@ fn provider_cmd(action: cli::ProviderAction) -> Result<ExitCode> {
             };
             let reports: Vec<probe::ProbeReport> = targets
                 .iter()
-                .map(|t| probe::probe(&paths, t, dry, None))
+                .map(|t| probe::probe(&paths, t, dry, route))
                 .collect();
             if json {
                 println!("{}", serde_json::to_string_pretty(&reports)?);

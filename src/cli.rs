@@ -950,6 +950,12 @@ pub enum ProviderAction {
         /// Show the call each probe would make; spawn nothing, write nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Key the probe from this run's recorded dispatch route instead of the
+        /// ambient environment. A bare `provider probe cli:codex` keys the
+        /// bucket the ambient route resolves (not the `cli:codex` login);
+        /// `--run` keys the bucket that run's seats actually dispatch under.
+        #[arg(long)]
+        run: Option<String>,
     },
     /// Remove spar's agy statusline wrapper and restore the user's original statusline.
     AgyStatuslineUninstall,

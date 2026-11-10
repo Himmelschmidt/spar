@@ -100,7 +100,11 @@ probe <ref>` (or `--all` for every installed CLI) makes one tiny real call throu
 adapter (`Reply with the single word OK`, the ref's `@model` if any, 120s cap) and
 writes the answer: `healthy` clears a quota pause, `quota` pauses (until the stated
 reset when claude states one), `auth` and `failed` leave the store alone. A manual pause
-is never cleared by a probe. `--dry-run` (or `SPAR_DRY_RUN=1`) prints the call each
+is never cleared by a probe. A bare `provider probe cli:codex` keys the ambient route's
+bucket (an ambient model names its own bucket, so `SPAR_CODEX_MODEL=gpt-5` probes
+`cli:codex@native`; only a model-less seat under the default profile probes
+`cli:codex@openrouter`); `provider probe --run <id>` keys that run's recorded dispatch
+route instead, replaying its recorded model (O154, O168). `--dry-run` (or `SPAR_DRY_RUN=1`) prints the call each
 probe would make and spawns nothing. Exit is `0` whatever the verdicts; read them from
 `--json`. A declared `--backup` held on a quota pause gets the same probe before a run
 skips it (O106): a stale pause no longer benches a working backup. A manually paused
@@ -110,7 +114,7 @@ a run is live moves its next seat to the declared backup (a reviewer seat is ren
 the new vendor) or parks the run at `quota` (exit `4`) when there is none. Only a manual
 pause or a trusted quota pause (a typed or clear rejection line) does this; a heuristic
 pause from a stray "429" or "quota" in a failed log steers the next run but never parks
-or reseats a live one. Like the run-start gate, this is skipped under `--dry-run`. Pauses are per quota bucket where billing is separate (O153): codex `openrouter` vs `native`, pi `openrouter` vs each `direct:<provider>`, `api:` per model; grok and muse stay login-wide. A pre-dispatch pause moves the seat to its backup when it has one, else a paused reviewer stands down with a warning and the run carries on (it parks at `quota` only when no reviewer can run), while a paused implementer or tester parks the run. A stood-down reviewer records no new verdict, but a `request_changes` it already recorded on the head being shipped still blocks the ship gate, and the ship body marks stood-down seats instead of printing their verdicts. A bare `provider pause <ref>` holds the whole account; naming a model pauses just that bucket.
+or reseats a live one. Like the run-start gate, this is skipped under `--dry-run`. Pauses are per quota bucket where billing is separate (O153): codex `openrouter` vs `native`, pi `openrouter` vs each `direct:<provider>`, `api:` per model; grok and muse stay login-wide. A pre-dispatch pause moves the seat to its backup when it has one, else a paused reviewer stands down with a warning and the run carries on (it parks at `quota` only when no reviewer can run), while a paused implementer or tester parks the run. A stood-down reviewer records no new verdict, but a `request_changes` it already recorded on the head being shipped still blocks the ship gate, and the ship body marks stood-down seats instead of printing their verdicts. A bare `provider pause <ref>` holds the whole account; naming a model pauses just that bucket, and resuming names the same scope. Probes key what the seat would bill, never the whole login.
 
 **Auth faults (O104).** A dispatch that dies on a refused credential (claude's `401 ...
 OAuth access token has been revoked` or `Please run /login`, codex `Not logged in`, muse
@@ -2013,7 +2017,7 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
   the `--fleet small` reviewer-width override, and any pinned suite command) are recorded in the frozen
   `config.json`, so a later `--reload-config` re-reads `spar.toml` and then re-applies
   them in composition order, so nothing given before is lost unless restated differently
-  (O168). A run's later round with no flags at all still picks the snapshot up unchanged
+  (O169). A run's later round with no flags at all still picks the snapshot up unchanged
   (O27).
 
 **`--suite-command "<cmd>"`** (repeatable, on `plan` and `implement`) sets this run's
@@ -2065,7 +2069,7 @@ spar implement --run <id> --reload-config   # deliberately re-read spar.toml and
 
 `--reload-config` re-reads `spar.toml` into an existing run's snapshot and then re-applies the overrides the run was launched or amended with, so later resumes keep both the file edits and the earlier flags. `--role`, `--backup`, `--effort`, `--without` and `--fleet` amend a `--run <id>` resume's frozen config directly, without `--reload-config`; only `--suite-command` still needs it. Amending and reloading are both refused while the run's orchestrator is alive. Runs created before snapshots existed fall back to the live file.
 
-An amend that changes the implementer pin re-points the live `impl` seat (provider, model, source) instead of only its model: that id names no provider. The re-point is validated read-only in the amend preview, so a refused one persists nothing (O174). Any other amend leaves existing seats alone, and a reviewer seat only ever re-points its model, since its id encodes its provider. To change **who** fills a seat that already exists, reassign it:
+An amend that changes the implementer pin re-points the live `impl` seat (provider, model, source) instead of only its model: that id names no provider. The re-point is validated read-only in the amend preview, so a refused one persists nothing (O175). Any other amend leaves existing seats alone, and a reviewer seat only ever re-points its model, since its id encodes its provider. To change **who** fills a seat that already exists, reassign it:
 
 ```bash
 spar implement --run <id> --reassign implementer=cli:claude@sonnet
