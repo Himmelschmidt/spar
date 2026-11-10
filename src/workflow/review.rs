@@ -151,14 +151,14 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
 
     paths.ensure_run_dirs(&state.id)?;
     bus::ensure_bus(paths)?;
-    bus::join(paths, Some(&state.id), "orchestrator", None, None)?;
+    bus::join(paths, Some(&state.id), bus::ORCHESTRATOR_SEAT, None, None)?;
     for s in &state.slots {
         let _ = bus::join(paths, Some(&state.id), &s.id, Some(&s.provider), None);
     }
     let _ = bus::broadcast(
         paths,
         Some(&state.id),
-        "orchestrator",
+        bus::ORCHESTRATOR_SEAT,
         format!(
             "independent review: {} concurrent reviewers — no coordination, each votes alone",
             state.slots.len()

@@ -179,6 +179,15 @@ spar bus log --run "$RUN_ID"
 spar run --workflow peer --task "$TASK" --providers cli:claude,cli:grok --json
 ```
 
+Poll-file slots (agy, pi) read `logs/nudges-<slot>.md`, a rendering of their inbox;
+a chat line there names the exact `spar bus ack <id>` command to clear it. Inside a
+slot, `bus send`/`ack` (`--from`) and `reserve`/`release` (`--holder`) default to
+`$SPAR_AGENT_ID`, so a bare `spar bus ack <id>` from the slot records the slot.
+From outside, `spar bus ack <id> --run <id>` stops a `requires-ack` redelivery
+without dropping the slot's file copy and without flipping the log word; it is the
+escape hatch for a wedged slot. To take the item back entirely, withdraw the message
+instead.
+
 ## Event feed
 
 `spar events --follow --json` streams every run's lifecycle events in the project as
