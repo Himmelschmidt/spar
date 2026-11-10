@@ -125,8 +125,9 @@ loop on re-entering `implement`, which gates again without dispatching. Exit `3`
 progress, so a lift loop terminates. Two consecutive rounds that change nothing
 while a `request_changes` review against the same commit is open park at the same
 gate (O153): the first re-dispatches the implementer with a warning instead of a
-new panel, the second parks with the reason in `error`. A re-entry that would adopt a `test-contract.md`
-that drifted mid-round exits `1` until you pass `--accept-contract`. Between rounds the implementer's
+new panel, the second parks with the reason in `error`. A re-entry that would
+adopt a `test-contract.md` that drifted mid-round exits `1` until you pass
+`--accept-contract`. Between rounds the implementer's
 `artifacts/carry-forward-<slot>.md` is seeded into the next round's prompt, capped by
 `[rounds] carry_forward_chars`.
 

@@ -608,10 +608,12 @@ on — never a restatement of the plan or contract, which the next round is hand
 
 - **Bounded, not accumulating.** The whole section is hard-capped at
   `[rounds] carry_forward_chars` (default `4000`) and truncated with a visible marker.
-  Orchestrator-known blockers (which `AC-n` failed and the reviewer's evidence, which
-  review requested changes, whether the suite went red) come **first**, so a slot that
-  writes an essay cannot squeeze them out, and each blocker is one bullet per criterion
-  clamped to its own share of the budget.
+  Orchestrator-known blockers (which review requested changes on which commit, the
+  reviewer's findings, which `AC-n` failed, whether the suite went red) come
+  **first**, so a slot that writes an essay cannot squeeze them out. Each blocking
+  review is one bullet — anchor, findings, and its failing criteria together —
+  clamped to its own share of the budget, and the current-verdict sentence renders
+  once per section rather than once per bullet.
 - **Rebuilt from disk each time the loop starts**, not carried in memory, so the round an
   operator buys at the ceiling gate — a fresh process — still knows which `AC-n` failed.
 - **Consumed on read.** A round whose implementer died without writing one inherits

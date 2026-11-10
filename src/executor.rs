@@ -3595,7 +3595,9 @@ fn run_dry(
     };
     process::run_mock(&req, &mock_note)?;
 
-    if job.role == SlotRole::Implementer {
+    if job.role == SlotRole::Implementer
+        && dry_impl_hook_armed(&std::env::var("SPAR_DRY_IMPL_NOOP").unwrap_or_default())
+    {
         state.dry_impl_dispatches = state.dry_impl_dispatches.saturating_add(1);
     }
 
@@ -3626,9 +3628,15 @@ fn run_dry(
 /// every dispatch. `0`, `false`, and unset mean a normal dry-run stamp. Both the
 /// dispatch and the no-progress check read the same `dry_impl_dispatches`
 /// counter, so they agree on whether this dispatch was noop'd.
+/// The hook is armed by any other value, including `all`: only then does the
+/// dispatch counter move, so real dry runs keep `dry_impl_dispatches` at zero.
+fn dry_impl_hook_armed(raw: &str) -> bool {
+    !(raw.is_empty() || raw == "0" || raw == "false")
+}
+
 pub(crate) fn dry_impl_noop(used: u32) -> bool {
     let raw = std::env::var("SPAR_DRY_IMPL_NOOP").unwrap_or_default();
-    if raw.is_empty() || raw == "0" || raw == "false" {
+    if !dry_impl_hook_armed(&raw) {
         return false;
     }
     if let Ok(n) = raw.parse::<u64>() {
