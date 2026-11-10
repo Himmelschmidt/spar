@@ -19,7 +19,7 @@ use std::process::Command;
 
 pub use agy::AgyAdapter;
 pub use claude::{ClaudeAdapter, ClaudeFamily};
-pub use codex::CodexAdapter;
+pub use codex::{default_bucket_for_profile, CodexAdapter};
 pub use grok::GrokAdapter;
 pub use muse::MuseAdapter;
 pub use pi::PiAdapter;

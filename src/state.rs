@@ -166,6 +166,20 @@ pub struct RunState {
     /// earlier rounds' verdicts and findings for `.spar/history.jsonl`.
     #[serde(default)]
     pub review_history: Vec<ReviewHistoryEntry>,
+    /// When the current dispatch began: the instant the implement entry point
+    /// stamped this round's seats. A weak pause written before it is pre-existing
+    /// (steer the seat); at or after it belongs to this dispatch (park). `None`
+    /// only for runs stamped before this field existed, which compare against
+    /// `created_at` as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_started_at: Option<DateTime<Utc>>,
+    /// The codex profile (`SPAR_CODEX_PROFILE`) this run's seats dispatch under,
+    /// recorded when the implement entry point stamped the round: `""` records a
+    /// set-but-empty value (codex's own default, the native login). Quota keying
+    /// for model-less codex seats derives from this, not from whatever the ambient
+    /// environment holds when a later process re-reads the seat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_profile: Option<String>,
     /// URL of the PR `ship` opened or adopted, or `sync-prs` found for the branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
@@ -864,6 +878,8 @@ impl RunState {
             pool_origin: PoolOrigin::default(),
             pool_intent: Vec::new(),
             review_history: Vec::new(),
+            round_started_at: None,
+            codex_profile: None,
             pr_url: None,
             merged_at: None,
             merge_commit: None,
@@ -902,6 +918,16 @@ impl RunState {
         self.ship_override = None;
         self.touch();
         self.round
+    }
+
+    /// Mark the start of the current dispatch: the instant quota pauses are read
+    /// against, and the codex profile this dispatch's seats run under. Called by
+    /// the implement entry points, never by an in-process fix pass: a fix pass is
+    /// a continuation of the same dispatch, and re-stamping it would turn this
+    /// run's own pauses into pre-existing ones and park the run on its own fumes.
+    pub fn stamp_dispatch(&mut self) {
+        self.round_started_at = Some(chrono::Utc::now());
+        self.codex_profile = Some(crate::providers::codex::codex_profile().unwrap_or_default());
     }
 
     /// Whether opening another round would take this run past its ceiling (O52).

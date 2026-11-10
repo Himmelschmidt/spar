@@ -103,6 +103,14 @@ impl ProviderRef {
     /// everything else keys per login, exactly `storage_key()`. The scope is declared
     /// on the adapter type. Idempotent on its own output.
     pub fn quota_key(&self) -> String {
+        self.quota_key_with_codex_profile(None)
+    }
+
+    /// `quota_key` for a codex seat whose dispatch profile was recorded in state.
+    /// A model-less `cli:codex` seat dispatches under that profile, not under
+    /// whatever `SPAR_CODEX_PROFILE` the keying process happens to hold; every
+    /// other ref ignores the profile and keys exactly as `quota_key`.
+    pub fn quota_key_with_codex_profile(&self, codex_profile: Option<&str>) -> String {
         // api providers have no adapter; every model bills separately, so the
         // model is its own bucket and a model-less seat keys at the login.
         if self.backend == ExecBackend::ApiSdk {
@@ -111,9 +119,19 @@ impl ProviderRef {
                 None => self.storage_key(),
             };
         }
-        // A model-less seat dispatches under the adapter's default route
-        // (codex's default profile layers OpenRouter); without one the seat
-        // keys at the login (O151).
+        // A model-less seat dispatches under the adapter's default route; without
+        // one the seat keys at the login (O151). A model-less codex seat with a
+        // recorded profile uses that profile's bucket (`""` records a set-but-empty
+        // `SPAR_CODEX_PROFILE`, the native route).
+        if self.storage_key() == "cli:codex" && self.model.is_none() {
+            if let Some(recorded) = codex_profile {
+                let profile = (!recorded.is_empty()).then_some(recorded);
+                return match crate::providers::default_bucket_for_profile(profile) {
+                    Some(bucket) => format!("{}@{bucket}", self.storage_key()),
+                    None => self.storage_key(),
+                };
+            }
+        }
         let bucket = match self.model.as_deref() {
             Some(model) => crate::providers::adapter_named(&self.storage_key())
                 .and_then(|a| a.quota_bucket(model)),
@@ -132,6 +150,25 @@ impl ProviderRef {
     /// login-wide vote, disagreeing votes, or a vote for another seat's family).
     /// No adapter means the login.
     pub fn rejection_key(&self, signal: crate::providers::QuotaSignal<'_>) -> String {
+        self.rejection_key_with_codex_profile(signal, None)
+    }
+
+    /// `rejection_key` for a codex seat whose dispatch profile was recorded in
+    /// state; see `quota_key_with_codex_profile`.
+    pub fn rejection_key_with_codex_profile(
+        &self,
+        signal: crate::providers::QuotaSignal<'_>,
+        codex_profile: Option<&str>,
+    ) -> String {
+        if self.storage_key() == "cli:codex" && self.model.is_none() {
+            if let Some(recorded) = codex_profile {
+                let profile = (!recorded.is_empty()).then_some(recorded);
+                return match crate::providers::default_bucket_for_profile(profile) {
+                    Some(bucket) => format!("{}@{bucket}", self.storage_key()),
+                    None => self.storage_key(),
+                };
+            }
+        }
         if self.backend != ExecBackend::NativeCli {
             return self.quota_key();
         }
@@ -424,6 +461,57 @@ mod tests {
             via_openrouter.quota_key(),
             "cli:codex@openrouter",
             "an explicit slug forces OpenRouter under any profile"
+        );
+        std::env::remove_var("SPAR_CODEX_PROFILE");
+    }
+
+    #[test]
+    fn recorded_codex_profile_keys_the_seat_not_the_process_env() {
+        use crate::providers::QuotaSignal;
+        // The seat's bucket comes from the profile the run recorded at dispatch,
+        // not from whatever SPAR_CODEX_PROFILE the keying process holds.
+        let _guard = crate::providers::codex::ENV_LOCK.lock().unwrap();
+        std::env::set_var("SPAR_CODEX_PROFILE", "");
+        let bare = ProviderRef::parse("cli:codex").unwrap();
+        assert_eq!(
+            bare.quota_key(),
+            "cli:codex@native",
+            "ambient empty profile runs native"
+        );
+        assert_eq!(
+            bare.quota_key_with_codex_profile(Some("muse")),
+            "cli:codex@openrouter",
+            "the recorded dispatch profile decides, not the keying process's env"
+        );
+        assert_eq!(
+            bare.quota_key_with_codex_profile(Some("")),
+            "cli:codex@native",
+            "a recorded set-but-empty profile is the native route"
+        );
+        assert_eq!(
+            bare.quota_key_with_codex_profile(Some("plain")),
+            "cli:codex",
+            "an unverified profile keys the login"
+        );
+        assert_eq!(
+            bare.quota_key_with_codex_profile(None),
+            "cli:codex@native",
+            "no recorded profile falls back to the ambient env"
+        );
+        let modeled = ProviderRef::parse("cli:codex@gpt-5").unwrap();
+        assert_eq!(
+            modeled.quota_key_with_codex_profile(Some("muse")),
+            "cli:codex@native",
+            "an explicit model runs without -p regardless of profile"
+        );
+        let signal = QuotaSignal {
+            window: None,
+            text: "",
+        };
+        assert_eq!(
+            bare.rejection_key_with_codex_profile(signal, Some("muse")),
+            "cli:codex@openrouter",
+            "rejections land in the recorded bucket too"
         );
         std::env::remove_var("SPAR_CODEX_PROFILE");
     }

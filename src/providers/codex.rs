@@ -13,11 +13,24 @@ const DEFAULT_CODEX_PROFILE: &str = "muse";
 /// Which codex profile (`-p`) to run — a profile is codex's own (backend, model) unit.
 /// `SPAR_CODEX_PROFILE` unset → the `muse` default; set-but-empty → omit `-p` so codex
 /// falls back to its own config default (e.g. plain OpenAI).
-fn codex_profile() -> Option<String> {
+pub(crate) fn codex_profile() -> Option<String> {
     match std::env::var("SPAR_CODEX_PROFILE") {
         Ok(p) if p.trim().is_empty() => None,
         Ok(p) => Some(p.trim().to_string()),
         Err(_) => Some(DEFAULT_CODEX_PROFILE.to_string()),
+    }
+}
+
+/// Bucket for the profile a model-less codex seat dispatches under. `None`
+/// drops `-p`, running codex's own default, the native login; only the `muse`
+/// profile is known to layer OpenRouter. Any other profile's billing route is
+/// unverified, so it keys at the login rather than in a bucket it might not
+/// share.
+pub fn default_bucket_for_profile(profile: Option<&str>) -> Option<&'static str> {
+    match profile {
+        None => Some("native"),
+        Some("muse") => Some("openrouter"),
+        Some(_) => None,
     }
 }
 
@@ -273,16 +286,13 @@ impl ProviderAdapter for CodexAdapter {
         }
     }
 
-    /// The model-less seat's bucket: the profile it dispatches under. Read from
-    /// this process's `SPAR_CODEX_PROFILE`, so every spar process that keys the
-    /// same seat (the run, `provider list`, `provider probe`, stats) must share
-    /// the same value; a dropped `-p` (an emptied `SPAR_CODEX_PROFILE`) runs
-    /// codex's own default, the native login.
+    /// The model-less seat's bucket: the profile it dispatches under. `None`
+    /// (an emptied `SPAR_CODEX_PROFILE`) drops `-p`, running codex's own
+    /// default, the native login; any set profile is treated as its own
+    /// billing route, keyed by name, since only `muse` is verified to layer
+    /// OpenRouter.
     fn default_bucket(&self) -> Option<&'static str> {
-        match std::env::var("SPAR_CODEX_PROFILE") {
-            Ok(p) if p.trim().is_empty() => Some("native"),
-            _ => Some("openrouter"),
-        }
+        default_bucket_for_profile(codex_profile().as_deref())
     }
 
     /// Rejections carry no route of their own, so every rejection lands in the
@@ -652,8 +662,14 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("SPAR_CODEX_PROFILE");
         assert_eq!(CodexAdapter.default_bucket(), Some("openrouter"));
-        std::env::set_var("SPAR_CODEX_PROFILE", "gpt");
+        std::env::set_var("SPAR_CODEX_PROFILE", "muse");
         assert_eq!(CodexAdapter.default_bucket(), Some("openrouter"));
+        std::env::set_var("SPAR_CODEX_PROFILE", "gpt");
+        assert_eq!(
+            CodexAdapter.default_bucket(),
+            None,
+            "only the muse profile is verified to layer OpenRouter; an unverified one keys the login"
+        );
         std::env::set_var("SPAR_CODEX_PROFILE", "");
         assert_eq!(
             CodexAdapter.default_bucket(),

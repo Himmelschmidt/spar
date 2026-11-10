@@ -89,12 +89,36 @@ pub fn scrape_auth_signal(text: &str) -> Option<String> {
         .map(|l| l.trim().chars().take(300).collect())
 }
 
+/// Where a seat's pause lives when the run recorded its dispatch profile: a
+/// model-less `cli:codex` seat keys under the recorded profile's bucket, not
+/// under whatever `SPAR_CODEX_PROFILE` the keying process happens to hold.
+/// Every other seat keys exactly as `quota::quota_key`.
+pub fn seat_quota_key(provider: &str, codex_profile: Option<&str>) -> String {
+    let candidate = if provider.contains(':') {
+        provider.to_string()
+    } else {
+        format!("cli:{provider}")
+    };
+    crate::provider_ref::ProviderRef::parse(&candidate)
+        .map(|p| p.quota_key_with_codex_profile(codex_profile))
+        .unwrap_or_else(|_| provider.to_string())
+}
+
 pub fn is_provider_eligible(
     provider: &str,
     store: &QuotaStore,
     available: Option<&std::collections::HashSet<String>>,
 ) -> bool {
-    let key = crate::quota::quota_key(provider);
+    is_provider_eligible_with_profile(provider, store, available, None)
+}
+
+pub fn is_provider_eligible_with_profile(
+    provider: &str,
+    store: &QuotaStore,
+    available: Option<&std::collections::HashSet<String>>,
+    codex_profile: Option<&str>,
+) -> bool {
+    let key = seat_quota_key(provider, codex_profile);
     if !store.is_usable(&key) {
         return false;
     }
@@ -126,10 +150,21 @@ pub fn backup_eligible(
     paths: &crate::paths::SparPaths,
     dry: bool,
 ) -> bool {
-    if is_provider_eligible(backup, store, available) {
+    backup_eligible_with_profile(backup, store, available, paths, dry, None)
+}
+
+pub fn backup_eligible_with_profile(
+    backup: &str,
+    store: &QuotaStore,
+    available: Option<&std::collections::HashSet<String>>,
+    paths: &crate::paths::SparPaths,
+    dry: bool,
+    codex_profile: Option<&str>,
+) -> bool {
+    if is_provider_eligible_with_profile(backup, store, available, codex_profile) {
         return true;
     }
-    let key = crate::quota::quota_key(backup);
+    let key = seat_quota_key(backup, codex_profile);
     if dry || !store.is_quota_paused(&key) {
         return false;
     }
@@ -141,7 +176,7 @@ pub fn backup_eligible(
         );
     }
     let fresh = QuotaStore::load(paths).unwrap_or_default();
-    is_provider_eligible(backup, &fresh, available)
+    is_provider_eligible_with_profile(backup, &fresh, available, codex_profile)
 }
 
 static PROBED_BACKUPS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
@@ -219,6 +254,22 @@ pub fn dispatch_stop_cause(
     store: &QuotaStore,
     available: Option<&std::collections::HashSet<String>>,
 ) -> StopCause {
+    dispatch_stop_cause_with_profile(slot, store, available, None)
+}
+
+pub fn dispatch_stop_cause_with_profile(
+    slot: &SlotState,
+    store: &QuotaStore,
+    available: Option<&std::collections::HashSet<String>>,
+    codex_profile: Option<&str>,
+) -> StopCause {
+    let seat_key = || {
+        let seat = slot.provider_ref();
+        (
+            seat.quota_key_with_codex_profile(codex_profile),
+            seat.storage_key(),
+        )
+    };
     if slot.status != crate::state::SlotStatus::Failed {
         return StopCause::Work;
     }
@@ -253,9 +304,7 @@ pub fn dispatch_stop_cause(
             || lower.contains("capacity")
             || lower.contains("billing"))
             && {
-                let seat = slot.provider_ref();
-                let key = seat.quota_key();
-                let sub = seat.storage_key();
+                let (key, sub) = seat_key();
                 store.effective_status(&key) != crate::quota::ProviderStatus::Available
                     || !store.is_usable(&key)
                     || available.is_some_and(|s| !s.contains(&sub))
@@ -269,9 +318,7 @@ pub fn dispatch_stop_cause(
             || lower.contains("os error")
             || lower.contains("executable not found"))
             && {
-                let seat = slot.provider_ref();
-                let key = seat.quota_key();
-                let sub = seat.storage_key();
+                let (key, sub) = seat_key();
                 store.effective_status(&key) != crate::quota::ProviderStatus::Available
                     || !store.is_usable(&key)
                     || available.is_some_and(|s| !s.contains(&sub))
