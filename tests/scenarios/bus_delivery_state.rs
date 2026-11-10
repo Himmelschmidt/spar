@@ -1,8 +1,8 @@
 //! Per-message delivery state in `bus log` (issue #231, part (a)): every entry
-//! carries `delivery` — `queued` while a copy still waits in an inbox,
+//! carries `delivery`, `queued` while a copy still waits in an inbox,
 //! `delivered` once it has landed in the recipient's channel, `acknowledged`
 //! once a recipient's ack answers it, `withdrawn` when no copy waits anywhere
-//! and nothing ever landed — in both `--json` and human output. Derived at read
+//! and nothing ever landed, in both `--json` and human output. Derived at read
 //! time from the inbox directories, the delivery receipts and the ack events;
 //! nothing new is stored.
 
@@ -148,7 +148,7 @@ fn line_for(text: &str, id: &str) -> String {
 
 /// A plain message reads `queued` until claimed, `delivered` after; a
 /// `requires_ack` message reads `delivered` while it waits for its ack and
-/// `acknowledged` once the ack lands — identically in `--json` and human output.
+/// `acknowledged` once the ack lands, identically in `--json` and human output.
 #[test]
 fn bus_log_reports_queued_delivered_acknowledged() {
     let env = env();
@@ -281,8 +281,8 @@ fn bus_log_counts_a_default_from_ack_for_human() {
     assert!(line_for(&text, &id).contains("[acknowledged"), "{text}");
 }
 
-/// A message superseded before claim reads `withdrawn` — no copy waits anywhere
-/// and nothing ever landed — while the superseding message itself reads `queued`.
+/// A message superseded before claim reads `withdrawn`, no copy waits anywhere
+/// and nothing ever landed, while the superseding message itself reads `queued`.
 #[test]
 fn bus_log_reports_withdrawn_for_superseded_before_claim() {
     let env = env();

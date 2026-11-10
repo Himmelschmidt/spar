@@ -187,7 +187,7 @@ const POLL_SECTION_START: &str = "<!-- spar:poll:start -->";
 const POLL_SECTION_END: &str = "<!-- spar:poll:end -->";
 
 /// Rewrite the slot's poll file from its inbox: one line per pending message,
-/// oldest first. The inbox is the only source — a message withdrawn, expired or
+/// oldest first. The inbox is the only source, a message withdrawn, expired or
 /// acked stops being listed, wherever its copies were.
 ///
 /// Only action items render: messages addressed to the slot, plus chat
@@ -451,7 +451,7 @@ pub fn strategy_for_slot(state: &RunState, slot: &str) -> DeliveryStrategy {
 
 /// File-time fan-out for PollFile slots: [`crate::bus`] calls this on every inbox
 /// filing, so every producer (CLI sends, broadcasts, acks, ack redeliveries)
-/// lands in a PollFile slot's poll file — not just the producers that remember
+/// lands in a PollFile slot's poll file, not just the producers that remember
 /// to drain. Each recipient's whole inbox drains through [`deliver`], which also
 /// picks up copies filed while the run state was unreadable. Other strategies
 /// keep their own pulse; bare ids resolve to no slot and stay inbox-queued.

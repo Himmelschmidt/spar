@@ -131,7 +131,7 @@ pub struct BusMessage {
     /// The run round the message was filed in, stamped by [`send`] for run-tagged
     /// messages. The poll-file render drops a non-`requires_ack` message once its
     /// slot has finished a dispatch that started after that round, so the file
-    /// cannot grow without bound yet nothing leaves mid-turn, unread (O161).
+    /// cannot grow without bound yet nothing leaves mid-turn, unread (O163).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filed_round: Option<u32>,
     #[serde(default)]
@@ -686,7 +686,7 @@ fn deliver_inbox(paths: &SparPaths, msg: &BusMessage) -> Result<()> {
     // producer's PollFile copies reach the poll file at file time. A superseding
     // send skips this drain: its withdrawal renders holders of the old message
     // and the send path drains this message's own targets right after, so a
-    // retargeted slot still sees the replacement — and a failed send, which never
+    // retargeted slot still sees the replacement, and a failed send, which never
     // reaches the drain, leaves the old instruction untouched.
     if msg.refs.supersedes.is_none() {
         crate::providers::delivery::drain_poll_files(paths, &targets);
@@ -1261,7 +1261,7 @@ pub struct RecipientReceipt {
 /// Where one message stands for the operator: still waiting to be picked up,
 /// landed in the recipient's channel, confirmed, or gone with no trace of ever
 /// landing. Read off the inbox directories, the delivery receipts and the ack
-/// events every time a listing is built — never stored, so there is no second
+/// events every time a listing is built, never stored, so there is no second
 /// copy of the state to keep in step. The disk scan is the primary signal; a
 /// `Delivered`/`Read` receipt only ever upgrades toward delivered (prompt
 /// inclusion leaves the inbox copy behind), never downgrades, so a dropped
@@ -1289,7 +1289,7 @@ impl std::fmt::Display for DeliveryState {
 /// Where every message copy sits on disk right now: ids with an unclaimed copy
 /// in some inbox, and ids with a claimed copy. Inbox files are named
 /// `{millis}-{id}.json`, so the listing maps filenames without opening any
-/// file. Built once per listing and shared by every entry — the one source the
+/// file. Built once per listing and shared by every entry, the one source the
 /// delivery word comes from.
 #[derive(Debug, Default)]
 pub struct DiskPositions {
@@ -1342,7 +1342,7 @@ pub fn disk_positions(paths: &SparPaths) -> DiskPositions {
 /// copy still on disk wins: it sits in the slot's next prompt, so a withdrawal
 /// that arrived after the claim reads `Delivered` (a message cannot be unread).
 /// With no copy on disk a withdrawal that postdates every landing of an unread
-/// message takes the word back to `Withdrawn` — the poll-file case, whose
+/// message takes the word back to `Withdrawn`, the poll-file case, whose
 /// claimed copies are deleted on withdrawal while a claim records no `Read`.
 /// A landing the model already saw (any `Read` receipt) stays `Delivered`, as
 /// does a landing with no later withdrawal:
@@ -1372,7 +1372,7 @@ pub fn delivery_state(
 
 /// Whether some recipient's withdrawal postdates every landing: the message was
 /// taken back everywhere it had reached. Only an unread message can be taken
-/// back — a `Read` means a model already saw it (prompt inclusion, Stop-hook
+/// back, a `Read` means a model already saw it (prompt inclusion, Stop-hook
 /// injection, inbox claim or ack all record one), so the word stays
 /// `delivered` no matter how late the withdrawal arrives. The receipts fold
 /// backfills `delivered_at` from `read_at`, so a read landing still counts as

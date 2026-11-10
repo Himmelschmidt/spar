@@ -110,7 +110,7 @@ a run is live moves its next seat to the declared backup (a reviewer seat is ren
 the new vendor) or parks the run at `quota` (exit `4`) when there is none. Only a manual
 pause or a trusted quota pause (a typed or clear rejection line) does this; a heuristic
 pause from a stray "429" or "quota" in a failed log steers the next run but never parks
-or reseats a live one. Like the run-start gate, this is skipped under `--dry-run`.
+or reseats a live one. Like the run-start gate, this is skipped under `--dry-run`. Pauses are per quota bucket where billing is separate (O153): codex `openrouter` vs `native`, pi `openrouter` vs each `direct:<provider>`, `api:` per model; grok and muse stay login-wide. A pre-dispatch pause moves the seat to its backup when it has one, else a paused reviewer stands down with a warning and the run carries on (it parks at `quota` only when no reviewer can run), while a paused implementer or tester parks the run. A stood-down reviewer records no new verdict, but a `request_changes` it already recorded on the head being shipped still blocks the ship gate, and the ship body marks stood-down seats instead of printing their verdicts. A bare `provider pause <ref>` holds the whole account; naming a model pauses just that bucket.
 
 **Auth faults (O104).** A dispatch that dies on a refused credential (claude's `401 ...
 OAuth access token has been revoked` or `Please run /login`, codex `Not logged in`, muse
@@ -204,7 +204,9 @@ exceptions are agy, whose Gemini models are metered separately (`cli:agy@flash` 
 model, still holds every model), and claude, whose weekly windows are metered per
 model family (`cli:claude@opus`, `cli:claude@sonnet` and `cli:claude@fable` pause
 independently of each other and of the login; a haiku seat and login-wide windows
-bucket as `cli:claude`). An explicit `@model` beats a
+bucket as `cli:claude`), codex, whose route decides (`/` slugs bucket as `openrouter`,
+explicit bare models as `native`), pi, whose upstream decides (`openrouter` vs each
+`direct:<provider>`), and `api:`, which bills per model. An explicit `@model` beats a
 model chosen by `--select`.
 
 `cli:codex` (codex, `codex exec --json`) drives whatever backend + model a codex **profile**
@@ -1280,10 +1282,10 @@ recipient acked it), `withdrawn` (superseded or expired). A poll file or codex q
 ```
 
 Each time is the earliest of its kind. `delivery` reads one word off disk per message
-(O156, O157): `acknowledged` once a recipient's ack answers it (terminal, even with
+(O158, O159): `acknowledged` once a recipient's ack answers it (terminal, even with
 copies still waiting; a broadcast's send-time recipients are unknowable, so any acker
-counts there), else `delivered` while a claimed copy sits on disk — a withdrawal that
-arrives after the claim cannot unread a message already in the model's input — or a
+counts there), else `delivered` while a claimed copy sits on disk, a withdrawal that
+arrives after the claim cannot unread a message already in the model's input, or a
 `Delivered`/`Read` receipt from a prompt inclusion that left the inbox copy behind,
 else `withdrawn` once a withdrawal postdates every landing, no copy remains, and the
 message was never read (the poll-file case: a claim records no `Read`, and the
@@ -1291,25 +1293,25 @@ claimed copy is deleted on withdrawal), else `queued` while a copy still waits i
 an inbox, else `withdrawn` when no copy waits anywhere and nothing ever landed.
 For poll-file slots `withdrawn` means taken back out of the file, not never seen:
 reading the file leaves no receipt, so the slot may have read it before the withdrawal.
-A landing the model already saw — any `Read` receipt, from a prompt inclusion,
-a Stop-hook injection, an inbox claim or an ack — stays `delivered` under a
+A landing the model already saw, any `Read` receipt, from a prompt inclusion,
+a Stop-hook injection, an inbox claim or an ack, stays `delivered` under a
 later withdrawal. It is derived at read time from the inbox directories, the receipts and the
-ack events — never stored, so there is no second copy of the state to drift. A slot's
-poll file (agy, pi) renders its inbox, not an append-only log (O156–O161): every filing,
+ack events, never stored, so there is no second copy of the state to drift. A slot's
+poll file (agy, pi) renders its inbox, not an append-only log (O158–O163): every filing,
 withdrawal and round start rewrites it from the pending messages, so a withdrawn or
 expired message disappears from the file. A superseding send skips its own filing
 render; the withdrawal renders holders of the old message and the send path then
 renders the new message's own targets (even if the withdrawal fails), so a
 replacement addressed to a slot that never held the old one still reaches its file. Messages addressed to the slot render (never acks or system prompts), plus
-`Chat` broadcasts from humans, peer slots and the orchestrator — the default
-`--to broadcast` reaches every poll-file slot — while acks and system prompts stay in the
+`Chat` broadcasts from humans, peer slots and the orchestrator, the default
+`--to broadcast` reaches every poll-file slot, while acks and system prompts stay in the
 inbox and the bus log but never become action items. Posting into the live poll file
 counts as `delivered`, and the drain claims only what renders, so `delivered` never
 describes a message the slot cannot see. Dry-run runs skip the fan-out (nothing live polls their
 files); the messages stay in the inbox for inspection and no poll file is
-written. A message leaves the file once the slot acks it — the ack filing re-renders
+written. A message leaves the file once the slot acks it, the ack filing re-renders
 the acker's own file at once, and the heading names the exact ack command for the
-slot — and a message that asks for no ack also leaves once the slot has finished
+slot, and a message that asks for no ack also leaves once the slot has finished
 a dispatch that started after the round it was filed in; a render mid-turn never
 drops what the slot may not have opened. `requires-ack` items survive until the
 slot acks them, so the file cannot grow without bound. Claiming alone never clears

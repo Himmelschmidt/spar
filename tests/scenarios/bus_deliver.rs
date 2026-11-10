@@ -317,7 +317,7 @@ fn muse_stop_hook_inject_claims_and_builds_block_payload() {
 }
 
 /// agy: no push channel into the running process, so a send fans the slot's inbox
-/// straight into its poll file — the file every role prompt (agy's included)
+/// straight into its poll file, the file every role prompt (agy's included)
 /// tells the agent to read before starting any new major step. No explicit `bus
 /// deliver`: the body is in the file, the log reads delivered, and a later
 /// deliver drains nothing (exactly-once).
@@ -389,7 +389,7 @@ fn agy_send_fans_out_to_the_poll_file() {
 
 /// A `requires_ack` redelivery reaches the agy poll file too: the tick re-files
 /// the message into the inbox, and file-time fan-out drains it like any other
-/// producer's filing — no explicit `bus deliver` needed for the copy to land.
+/// producer's filing, no explicit `bus deliver` needed for the copy to land.
 #[test]
 fn agy_redelivery_reaches_the_poll_file() {
     let tmp = tempdir().unwrap();
@@ -448,7 +448,7 @@ fn agy_redelivery_reaches_the_poll_file() {
 
     // `bus deliver` ticks acks before draining: the due redelivery re-files and
     // fans straight out to the poll file. The poll file renders the inbox, so the
-    // same message still lists once — redelivery refreshes, never duplicates.
+    // same message still lists once, redelivery refreshes, never duplicates.
     deliver_json(tmp.path(), &run_id, &agent);
     assert_eq!(
         poll().matches("confirm the migration plan").count(),
