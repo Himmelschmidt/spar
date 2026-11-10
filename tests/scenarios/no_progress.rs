@@ -13,22 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
 
-/// Per-test-process SPAR_HOME so the suite never writes the developer's real
-/// `~/.spar/registry.json`. Shared across spawns in this binary.
-fn spar_home_dir() -> PathBuf {
-    use std::sync::OnceLock;
-    static HOME: OnceLock<PathBuf> = OnceLock::new();
-    HOME.get_or_init(|| {
-        let d = std::env::temp_dir().join(format!("spar-test-home-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    })
-    .clone()
-}
-
 fn spar_cmd() -> assert_cmd::Command {
     let mut c = common::spar();
-    c.env("SPAR_HOME", spar_home_dir());
     // spar exports these into every slot, so when the suite runs inside a spar
     // worktree the child would resolve the primary checkout instead of this
     // test's temp project and write real runs into it.
@@ -216,8 +202,8 @@ fn warning_round_then_progress_reaches_the_panel_again() {
     project_with_clean_tree(tmp.path(), 8);
     let run_id = planned_run(tmp.path());
 
-    // Only the first two implementer dispatches stall; the warning re-dispatch
-    // writes its stamp, so the round counts as progress again.
+    // Only rounds 1-2 stall; round 3 runs the normal dry-run stamp, so the
+    // warned re-dispatch counts as progress and the panel runs again.
     implement_noop(tmp.path(), &run_id, "2", &[]).code(2);
 
     let st = state_json(tmp.path(), &run_id);
@@ -231,7 +217,11 @@ fn warning_round_then_progress_reaches_the_panel_again() {
     let rounds = review_rounds(tmp.path(), &run_id);
     assert!(
         rounds.contains(&2),
-        "the panel must run again once the tree moves: {rounds:?}"
+        "the first panel judges the first implementer round: {rounds:?}"
+    );
+    assert!(
+        rounds.iter().any(|&r| r > 2),
+        "the panel must run again once the warned re-dispatch makes progress: {rounds:?}"
     );
     assert_eq!(st["no_progress_rounds"].as_u64(), Some(0), "{st}");
 

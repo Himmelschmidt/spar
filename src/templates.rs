@@ -135,6 +135,18 @@ mod tests {
     }
 
     #[test]
+    fn implementer_template_renders_warning_first() {
+        let mut v = HashMap::new();
+        v.insert("task".into(), "add login".into());
+        v.insert(
+            "no_progress_warning".into(),
+            "## No-progress warning\nBody\n".into(),
+        );
+        let s = render("implementer", &v).unwrap();
+        assert!(s.starts_with("## No-progress warning\nBody\n"), "{s}");
+    }
+
+    #[test]
     fn tester_template_renders() {
         let mut v = HashMap::new();
         v.insert("task".into(), "ship auth".into());

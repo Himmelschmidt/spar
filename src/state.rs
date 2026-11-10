@@ -94,6 +94,18 @@ pub struct RunState {
     /// parks the run at the round-extension gate instead of buying another review.
     #[serde(default)]
     pub no_progress_rounds: u32,
+    /// The warning a no-progress round put at the top of the next implementer
+    /// prompt (#236). Persisted so a re-entry after the park renders it again
+    /// instead of parking silently; cleared the moment a round makes progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_progress_warning: Option<String>,
+    /// Dry-run implementer dispatches consumed so far (#236). The
+    /// `SPAR_DRY_IMPL_NOOP` hook budgets no-ops in dispatches, not rounds: the
+    /// warning re-dispatch is a second dispatch inside the same round, so a
+    /// round-based budget could never stall the first dispatch and let the
+    /// re-dispatch count as progress.
+    #[serde(default)]
+    pub dry_impl_dispatches: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_session: Option<String>,
     #[serde(default)]
@@ -847,6 +859,8 @@ impl RunState {
             max_fix_rounds: 3,
             max_rounds: crate::config::default_max_rounds(),
             no_progress_rounds: 0,
+            no_progress_warning: None,
+            dry_impl_dispatches: 0,
             tmux_session: None,
             providers: Vec::new(),
             rotated_implementer: false,
