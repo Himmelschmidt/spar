@@ -799,6 +799,7 @@ fn name_cold_retry(
 /// so tests never sleep the real schedule.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_with_resume_recovery(
+    classifier: &crate::classifier::Classifier,
     adapter: &dyn providers::ProviderAdapter,
     bin: &Path,
     opts: &mut SpawnOpts,
@@ -886,7 +887,7 @@ fn dispatch_with_resume_recovery(
     let backoff = transient_backoff_secs();
     let mut retries = 0usize;
     let advise = |res: &process::SpawnResult| {
-        classifier_dispatch_advice(adapter, paths, run_id, slot_id, res, &log_path)
+        classifier_dispatch_advice(classifier, adapter, paths, run_id, slot_id, res, &log_path)
     };
     let mut advice = advise(&res);
     while retries < backoff.len()
@@ -1336,6 +1337,7 @@ fn execute_prepared(
         .then(|| git_output(&prep.cwd, &["rev-parse", "HEAD"]))
         .flatten();
     let mut res = dispatch_with_resume_recovery(
+        crate::classifier::Classifier::live(),
         adapter.as_ref(),
         &bin,
         &mut opts,
@@ -2191,6 +2193,7 @@ fn apply_parallel_outcome(
                 result.signal,
             );
             let (quota_hit, auth, classified) = classifier_verdict(
+                crate::classifier::Classifier::live(),
                 paths,
                 &state.id,
                 &prep.job,
@@ -2798,6 +2801,7 @@ pub fn run_slot(
         let err = result.error.as_deref().unwrap_or("failed");
         auth_rejection = auth_fault_for(&log_path, err, quota_hit, result.exit_code, result.signal);
         let (quota_hit, auth, classified) = classifier_verdict(
+            crate::classifier::Classifier::live(),
             paths,
             &state.id,
             job,
@@ -3221,6 +3225,7 @@ fn auth_fault_for(
 /// work into a transient retry or the O104 auth retry. Asked only about a non-zero exit
 /// that no rule already explains; `None` whenever it is off, silent or below threshold.
 fn classifier_dispatch_advice(
+    classifier: &crate::classifier::Classifier,
     adapter: &dyn providers::ProviderAdapter,
     paths: &SparPaths,
     run_id: &str,
@@ -3270,7 +3275,7 @@ fn classifier_dispatch_advice(
         )),
         log_path,
     );
-    let rec = crate::classifier::consult(
+    let rec = classifier.consult(
         &cfg,
         paths,
         run_id,
@@ -3294,6 +3299,7 @@ fn classifier_dispatch_advice(
 /// scrape ([`PauseWitness`]): a veto only weakens a pause that scrape made.
 #[allow(clippy::too_many_arguments)]
 fn classifier_verdict(
+    classifier: &crate::classifier::Classifier,
     paths: &SparPaths,
     run_id: &str,
     job: &SlotJob,
@@ -3351,7 +3357,7 @@ fn classifier_verdict(
         Some(err),
         log_path,
     );
-    let Some(rec) = crate::classifier::consult(
+    let Some(rec) = classifier.consult(
         &cfg,
         paths,
         run_id,
@@ -4141,6 +4147,7 @@ fn run_headless(
         .then(|| git_output(cwd, &["rev-parse", "HEAD"]))
         .flatten();
     let mut res = dispatch_with_resume_recovery(
+        crate::classifier::Classifier::live(),
         adapter.as_ref(),
         &bin,
         &mut opts,
@@ -5522,6 +5529,7 @@ mod tests {
         opts.session_id = Some("abc".into());
         let req = shell_req(&adapter.script, &log_path);
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -5595,6 +5603,7 @@ mod tests {
         opts.session_id = Some(cold);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -5662,6 +5671,7 @@ mod tests {
         opts.session_id = Some(cold);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -5716,6 +5726,7 @@ mod tests {
         opts.session_id = Some("derived-1".into());
         let req = shell_req(&adapter.cold_script, &log_path);
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6111,6 +6122,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let adapter = crate::providers::PiAdapter;
         let mut opts = dispatch_opts("go");
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6149,6 +6161,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let script = r#"echo "agent quoted: No project session found with id 'other'; creating a new session" >&2
 echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut dispatch_opts("go"),
@@ -6184,6 +6197,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let mut opts = dispatch_opts("go");
         let req = shell_req(&adapter.script, &log_path);
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6225,6 +6239,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &log_path,
         );
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6269,6 +6284,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &log_path,
         );
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6322,6 +6338,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         // the real 60s/150s/300s schedule.
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6399,6 +6416,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let req = shell_req(&adapter.script, &log_path);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6441,6 +6459,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     ) -> process::SpawnResult {
         let mut opts = dispatch_opts("go");
         dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6621,6 +6640,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let bad_req = shell_req("exit 2", &log_path);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6670,6 +6690,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let req = shell_req(&adapter.script, &log_path);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6722,6 +6743,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &log_path,
         );
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6757,6 +6779,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let log_path = tmp.path().join("slot.log");
         let mut opts = dispatch_opts("go");
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -6814,6 +6837,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let req = shell_req(&adapter.script, &log_path);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &crate::classifier::Classifier::inert(),
             &adapter,
             Path::new("/bin/sh"),
             &mut opts,
@@ -9067,10 +9091,14 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     fn classifier_run(
         tmp: &Path,
         answer: (&str, f64),
-    ) -> (SparPaths, crate::classifier::tests::FakeSystemOne) {
+    ) -> (
+        SparPaths,
+        crate::classifier::Classifier,
+        crate::classifier::tests::StubSystemOne,
+    ) {
         let paths = SparPaths::new(tmp);
         paths.ensure_run_dirs("run1").unwrap();
-        let fake = crate::classifier::tests::fake_system_one(
+        let (cls, fake) = crate::classifier::tests::stub_system_one(
             200,
             crate::classifier::tests::answer_body(answer.0, answer.1),
             Duration::ZERO,
@@ -9088,7 +9116,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             .slots
             .push(init_slot("impl", "cli:muse", SlotRole::Implementer));
         state.save(&paths).unwrap();
-        (paths, fake)
+        (paths, cls, fake)
     }
 
     fn failed_with(exit_code: Option<i32>, signal: Option<i32>, err: &str) -> SlotOutcome {
@@ -9104,7 +9132,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_fills_a_quota_gap_with_a_strong_pause() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.86));
+        let (paths, cls, fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.86));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(
             &log_path,
@@ -9114,7 +9142,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let job = impl_job("impl");
         let outcome = failed_with(Some(1), None, "exit 1");
         let (quota, auth, rec) = classifier_verdict(
-            &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None, None,
+            &cls, &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None,
+            None,
         );
         assert!(quota && auth.is_none());
         assert_eq!(rec.unwrap().action, crate::classifier::Action::PauseQuota);
@@ -9123,7 +9152,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert_eq!(fake.bodies.lock().unwrap().len(), 1);
 
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.6));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.6));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(
             &log_path,
@@ -9131,7 +9160,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         )
         .unwrap();
         let (quota, auth, rec) = classifier_verdict(
-            &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None, None,
+            &cls, &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None,
+            None,
         );
         assert!(!quota && auth.is_none(), "below threshold: today's verdict");
         assert!(!rec.unwrap().acted);
@@ -9145,7 +9175,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_veto_downgrades_a_text_quota_verdict_to_a_weak_pause() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.95));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.95));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, WEEKLY_LIMIT_LOG).unwrap();
         let job = impl_job("impl");
@@ -9157,6 +9187,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             .unwrap()
             .blocks_live_dispatch("cli:muse"));
         let (quota, auth, rec) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9177,6 +9208,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(!store.blocks_live_dispatch("cli:muse"), "but weak");
 
         let (quota, auth, _) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9199,7 +9231,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_veto_weakens_only_the_family_bucket_it_vetoes() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.95));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.95));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, "You've reached your Fable limit\n").unwrap();
         let job = impl_job("impl");
@@ -9210,6 +9242,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert_eq!(key, "cli:claude@fable");
         let witness = witness.after_scrape(&paths, "cli:claude@fable");
         let (quota, auth, rec) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9238,7 +9271,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_veto_leaves_a_prior_strong_pause_and_never_pauses_on_auth() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
         let mut store = crate::quota::QuotaStore::load(&paths).unwrap();
         store.pause_quota("cli:muse", "typed five_hour rejection");
         store.mark_strong("cli:muse");
@@ -9250,6 +9283,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let job = impl_job("impl");
         let outcome = failed_with(Some(1), None, "exit 1");
         let (quota, _, rec) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9271,7 +9305,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         );
 
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, WEEKLY_LIMIT_LOG).unwrap();
         let witness = PauseWitness::before(&paths, "run1", "cli:muse").unwrap();
@@ -9286,6 +9320,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         store.mark_strong("cli:muse");
         store.save(&paths).unwrap();
         let (quota, _, _) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9306,10 +9341,11 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         );
 
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("genuine_failure", 0.97));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, "! not logged in: run `muse login` first\n").unwrap();
         let (quota, auth, _) = classifier_verdict(
+            &cls,
             &paths,
             "run1",
             &job,
@@ -9335,7 +9371,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_is_never_asked_about_state_decided_failures() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.99));
+        let (paths, cls, fake) = classifier_run(tmp.path(), ("quota_or_rate_limit", 0.99));
         let log_path = tmp.path().join("impl.log");
         std::fs::write(&log_path, "something odd\n").unwrap();
         let job = impl_job("impl");
@@ -9375,14 +9411,16 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         ];
         for (outcome, err, quota_hit) in cases {
             let (quota, auth, rec) = classifier_verdict(
-                &paths, "run1", &job, "cli:muse", &log_path, &outcome, &err, quota_hit, None, None,
+                &cls, &paths, "run1", &job, "cli:muse", &log_path, &outcome, &err, quota_hit, None,
+                None,
             );
             assert_eq!((quota, auth, rec), (quota_hit, None, None), "{err}");
         }
         std::fs::write(&log_path, "! model `m` does not exist or you lack access\n").unwrap();
         let outcome = failed_with(Some(1), None, "exit 1");
         let (_, _, rec) = classifier_verdict(
-            &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None, None,
+            &cls, &paths, "run1", &job, "cli:muse", &log_path, &outcome, "exit 1", false, None,
+            None,
         );
         assert!(
             rec.is_none(),
@@ -9396,7 +9434,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     #[test]
     fn classifier_transient_answer_takes_the_retry_loop_after_tool_calls() {
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, fake) = classifier_run(tmp.path(), ("transient_infra", 0.9));
+        let (paths, cls, fake) = classifier_run(tmp.path(), ("transient_infra", 0.9));
         let log_path = tmp.path().join("slot.log");
         let ctr = tmp.path().join("attempts");
         let script = format!(
@@ -9406,6 +9444,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         let adapter = ShellAdapter::cold(&script);
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &cls,
             &adapter,
             Path::new("/bin/sh"),
             &mut dispatch_opts("go"),
@@ -9429,11 +9468,12 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(events.contains("\"type\":\"classifier\"") && events.contains("\"retry\""));
 
         let tmp = tempfile::tempdir().unwrap();
-        let (paths, _fake) = classifier_run(tmp.path(), ("transient_infra", 0.9));
+        let (paths, cls, _fake) = classifier_run(tmp.path(), ("transient_infra", 0.9));
         let log_path = tmp.path().join("slot.log");
         let script = "echo 'upstream wobble, please hold' >&2; exit 1";
         let waits = std::cell::RefCell::new(Vec::new());
         let res = dispatch_with_resume_recovery(
+            &cls,
             &ShellAdapter::cold(script),
             Path::new("/bin/sh"),
             &mut dispatch_opts("go"),
