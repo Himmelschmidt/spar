@@ -274,8 +274,10 @@ pub enum BaseMerge {
     /// Nothing merged; carries why.
     Skipped(BaseMergeSkip),
     /// The merge conflicted and is left in progress in the worktree, for the
-    /// caller to hand to the implementer or abort. Carries the conflicting files.
-    Conflict { files: Vec<String> },
+    /// caller to hand to the implementer or abort. Carries the conflicting
+    /// files and the upstream tip the merge attempted, so the caller can later
+    /// verify a resolution commit contains it.
+    Conflict { files: Vec<String>, tip: String },
 }
 
 /// Why no forward merge happened. Only branch bases with a remote merge
@@ -314,12 +316,30 @@ impl std::fmt::Display for BaseMergeSkip {
 
 /// Whether `dir` has a merge in progress (`MERGE_HEAD` present).
 pub fn merge_in_progress(dir: &Path) -> bool {
-    git_out(dir, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).is_some()
+    merge_head(dir).is_some()
+}
+
+/// The tip a merge in progress is merging in, `None` when no merge is open.
+fn merge_head(dir: &Path) -> Option<String> {
+    git_out(dir, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"])
 }
 
 /// Paths with unresolved conflicts in `dir`, empty when the tree is clean.
 pub fn conflicted_files(dir: &Path) -> Vec<String> {
     git_out(dir, &["diff", "--name-only", "--diff-filter=U"])
+        .map(|s| {
+            s.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The repo's configured remotes, in `git remote` order.
+fn remotes(dir: &Path) -> Vec<String> {
+    git_out(dir, &["remote"])
         .map(|s| {
             s.lines()
                 .map(str::trim)
@@ -338,14 +358,25 @@ fn base_remote(dir: &Path, branch: &str) -> Option<String> {
     {
         return Some(remote);
     }
-    let remotes = git_out(dir, &["remote"])?;
+    let remotes = remotes(dir);
     remotes
-        .lines()
-        .map(str::trim)
-        .filter(|r| !r.is_empty())
+        .iter()
         .find(|r| *r == "origin")
-        .or_else(|| remotes.lines().map(str::trim).find(|r| !r.is_empty()))
-        .map(str::to_string)
+        .or_else(|| remotes.first())
+        .cloned()
+}
+
+/// Split a recorded base ref into the remote to fetch from and the branch to
+/// merge. A `remote/branch` prefix names the remote outright, but only when
+/// that remote is configured here; otherwise the whole ref is the branch name
+/// and the branch's own remote (then `origin`, then the first remote) answers.
+fn split_base_remote(dir: &Path, base: &str) -> (Option<String>, String) {
+    if let Some((head, tail)) = base.split_once('/') {
+        if remotes(dir).iter().any(|r| r == head) {
+            return (Some(head.to_string()), tail.to_string());
+        }
+    }
+    (base_remote(dir, base), base.to_string())
 }
 
 /// Fetch the run's base branch from its remote and merge it into the branch
@@ -358,47 +389,77 @@ pub fn merge_base_forward(dir: &Path, base_ref: Option<&str>) -> Result<BaseMerg
         Some(b) => b.to_string(),
         None => return Ok(BaseMerge::Skipped(BaseMergeSkip::NoBranchBase)),
     };
-    if merge_in_progress(dir) {
+    // A merge an earlier round left in progress is re-handed, not re-fetched:
+    // the pending tip is the open merge's other parent.
+    if let Some(tip) = merge_head(dir) {
         return Ok(BaseMerge::Conflict {
             files: conflicted_files(dir),
+            tip,
         });
     }
-    let branch = base.strip_prefix("origin/").unwrap_or(&base).to_string();
-    let Some(remote) = base_remote(dir, &branch) else {
+    if git_out(dir, &["rev-parse", "--git-dir"]).is_some()
+        && git_out(dir, &["symbolic-ref", "--quiet", "HEAD"]).is_none()
+    {
+        bail!(
+            "cannot merge the base forward in {}: the worktree is not on a branch (detached HEAD)",
+            dir.display()
+        );
+    }
+    let (remote, branch) = split_base_remote(dir, &base);
+    let Some(remote) = remote else {
         return Ok(BaseMerge::Skipped(BaseMergeSkip::NoRemote));
     };
     let remote_ref = format!("refs/remotes/{remote}/{branch}");
+    // Reachability first: a quiet `ls-remote` tells a branch the remote never
+    // had (skip) from a fetch the network refused (the round goes on stale).
+    match git_out(
+        dir,
+        &[
+            "ls-remote",
+            "--heads",
+            &remote,
+            &format!("refs/heads/{branch}"),
+        ],
+    ) {
+        None => return Ok(BaseMerge::Skipped(BaseMergeSkip::FetchFailed)),
+        Some(out) if out.is_empty() => {
+            // The remote never had this branch. A name that is a local branch
+            // (or plain unknown) is a branch the remote does not know; a name
+            // that resolves to a commit without being a branch is the detached
+            // sha a sha-pinned run carries as its base.
+            if git_quiet(
+                dir,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ],
+            )? {
+                return Ok(BaseMerge::Skipped(BaseMergeSkip::NoUpstreamBranch));
+            }
+            if git_out(
+                dir,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{base}^{{commit}}"),
+                ],
+            )
+            .is_some()
+            {
+                return Ok(BaseMerge::Skipped(BaseMergeSkip::NoBranchBase));
+            }
+            return Ok(BaseMerge::Skipped(BaseMergeSkip::NoUpstreamBranch));
+        }
+        Some(_) => {}
+    }
     if !git_quiet(
         dir,
         &["fetch", "--quiet", &remote, &format!("refs/heads/{branch}")],
     )? {
-        if git_out(dir, &["rev-parse", "--verify", "--quiet", &remote_ref]).is_some() {
-            return Ok(BaseMerge::Skipped(BaseMergeSkip::FetchFailed));
-        }
-        let is_local_branch = git_quiet(
-            dir,
-            &[
-                "show-ref",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ],
-        )?;
-        let is_commit = git_out(
-            dir,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("{base}^{{commit}}"),
-            ],
-        )
-        .is_some();
-        return Ok(BaseMerge::Skipped(if is_local_branch || !is_commit {
-            BaseMergeSkip::NoUpstreamBranch
-        } else {
-            BaseMergeSkip::NoBranchBase
-        }));
+        return Ok(BaseMerge::Skipped(BaseMergeSkip::FetchFailed));
     }
     let Some(tip) = git_out(dir, &["rev-parse", "--verify", "--quiet", &remote_ref]) else {
         return Ok(BaseMerge::Skipped(BaseMergeSkip::NoUpstreamBranch));
@@ -406,24 +467,32 @@ pub fn merge_base_forward(dir: &Path, base_ref: Option<&str>) -> Result<BaseMerg
     if git_quiet(dir, &["merge-base", "--is-ancestor", &tip, "HEAD"])? {
         return Ok(BaseMerge::AlreadyCurrent { tip });
     }
-    if git_quiet(
-        dir,
-        &[
+    let merge = Command::new("git")
+        .args([
             "merge",
             "--no-edit",
             "-m",
             &format!("spar: merge base {branch} forward"),
             &tip,
-        ],
-    )? {
+        ])
+        .current_dir(dir)
+        .output()?;
+    if merge.status.success() {
         // `merged` is the upstream tip that went in, not the new HEAD: `merged_base`
         // is what the run's diff is relative to (`tip..HEAD`), so recording the
         // merge commit would hide the run's own commits (#229).
         return Ok(BaseMerge::Clean { merged: tip });
     }
-    Ok(BaseMerge::Conflict {
-        files: conflicted_files(dir),
-    })
+    if merge_head(dir).is_some() {
+        return Ok(BaseMerge::Conflict {
+            files: conflicted_files(dir),
+            tip,
+        });
+    }
+    bail!(
+        "could not merge base {branch} forward: {}",
+        String::from_utf8_lossy(&merge.stderr).trim()
+    );
 }
 
 /// Undo a conflicted forward merge, leaving the branch and tree as before.
@@ -590,6 +659,15 @@ pub fn commit_leftovers(
     let status = git_out(dir, &["status", "--porcelain"]).ok_or("git status failed")?;
     if status.is_empty() {
         return Ok(None);
+    }
+    // Committing over unmerged paths concludes the open merge with the conflict
+    // markers as its content. Refuse instead: every caller banks the refusal
+    // and the round fails at the merge check, never at review (#229).
+    if git_out(dir, &["ls-files", "--unmerged"]).is_some_and(|s| !s.trim().is_empty()) {
+        return Err(
+            "cannot commit leftovers while a merge has unresolved conflicts; resolve them and commit the resolution first"
+                .into(),
+        );
     }
     if git_out(dir, &["add", "-A"]).is_none() {
         return Err("git add -A failed".into());
@@ -2176,10 +2254,13 @@ mod tests {
         std::fs::write(run.join("file.txt"), "run side\n").unwrap();
         fixture_git(&run, &["add", "."]);
         fixture_git(&run, &["commit", "-q", "-m", "run work"]);
-        advance_origin_main(&repo, "base side\n");
+        let tip = advance_origin_main(&repo, "base side\n");
 
         match merge_base_forward(&run, Some("main")).unwrap() {
-            BaseMerge::Conflict { files } => assert_eq!(files, vec!["file.txt".to_string()]),
+            BaseMerge::Conflict { files, tip: t } => {
+                assert_eq!(files, vec!["file.txt".to_string()]);
+                assert_eq!(t, tip);
+            }
             other => panic!("expected a conflict, got {other:?}"),
         }
         assert!(merge_in_progress(&run));
@@ -2188,6 +2269,109 @@ mod tests {
         abort_base_merge(&run);
         assert!(!merge_in_progress(&run));
         assert!(conflicted_files(&run).is_empty());
+    }
+
+    /// #229: a merge an earlier round left open is re-handed with the open
+    /// merge's tip, not re-fetched: the pending tip is `MERGE_HEAD`.
+    #[test]
+    fn base_forward_merge_rehands_an_open_merge_with_its_tip() {
+        let (_tmp, repo, run) = merge_fixture();
+        std::fs::write(run.join("file.txt"), "run side\n").unwrap();
+        fixture_git(&run, &["add", "."]);
+        fixture_git(&run, &["commit", "-q", "-m", "run work"]);
+        advance_origin_main(&repo, "base side\n");
+        let first = merge_base_forward(&run, Some("main")).unwrap();
+        let BaseMerge::Conflict { tip, .. } = first else {
+            panic!("expected a conflict, got {first:?}");
+        };
+
+        match merge_base_forward(&run, Some("main")).unwrap() {
+            BaseMerge::Conflict { files, tip: t } => {
+                assert_eq!(files, vec!["file.txt".to_string()]);
+                assert_eq!(t, tip);
+                assert_eq!(t, fixture_git(&run, &["rev-parse", "MERGE_HEAD"]));
+            }
+            other => panic!("expected the open merge re-handed, got {other:?}"),
+        }
+    }
+
+    /// #229: merging with a worktree that is not on a branch fails loudly
+    /// instead of stranding a merge on a detached HEAD.
+    #[test]
+    fn base_forward_merge_fails_loudly_on_a_detached_head() {
+        let (_tmp, repo, run) = merge_fixture();
+        advance_origin_main(&repo, "base\nmore\n");
+        fixture_git(&run, &["checkout", "-q", "--detach", "HEAD"]);
+        let err = merge_base_forward(&run, Some("main"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("detached"), "{err}");
+    }
+
+    /// #229: a `remote/branch` base fetches from the remote it names when that
+    /// remote is configured, not from wherever `origin` happens to point.
+    #[test]
+    fn base_forward_merge_prefers_the_remote_a_prefixed_base_names() {
+        let (tmp, repo, run) = merge_fixture();
+        fixture_git(
+            &run,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                tmp.path().join("origin.git").to_str().unwrap(),
+            ],
+        );
+        std::fs::write(run.join("run.txt"), "run work\n").unwrap();
+        fixture_git(&run, &["add", "."]);
+        fixture_git(&run, &["commit", "-q", "-m", "run work"]);
+        let tip = advance_origin_main(&repo, "base\nmore\n");
+
+        match merge_base_forward(&run, Some("upstream/main")).unwrap() {
+            BaseMerge::Clean { merged } => assert_eq!(merged, tip),
+            other => panic!("expected a clean merge, got {other:?}"),
+        }
+    }
+
+    /// #229: a merge the tree refuses to start (here the worktree holds
+    /// uncommitted edits the merge would overwrite) is an error naming the
+    /// cause, never a conflict with no files.
+    #[test]
+    fn base_forward_merge_errors_when_no_merge_starts() {
+        let (_tmp, repo, run) = merge_fixture();
+        std::fs::write(run.join("file.txt"), "run side\n").unwrap();
+        fixture_git(&run, &["add", "."]);
+        fixture_git(&run, &["commit", "-q", "-m", "run work"]);
+        advance_origin_main(&repo, "base side\n");
+        std::fs::write(run.join("file.txt"), "uncommitted\n").unwrap();
+
+        let err = merge_base_forward(&run, Some("main"))
+            .unwrap_err()
+            .to_string();
+        assert!(!merge_in_progress(&run));
+        assert!(err.contains("would be overwritten"), "{err}");
+    }
+
+    /// #229: committing over unmerged paths would conclude the open merge with
+    /// the conflict markers as its content. Every leftover commit refuses.
+    #[test]
+    fn commit_leftovers_refuses_unmerged_paths() {
+        let (_tmp, repo, run) = merge_fixture();
+        std::fs::write(run.join("file.txt"), "run side\n").unwrap();
+        fixture_git(&run, &["add", "."]);
+        fixture_git(&run, &["commit", "-q", "-m", "run work"]);
+        advance_origin_main(&repo, "base side\n");
+        assert!(matches!(
+            merge_base_forward(&run, Some("main")).unwrap(),
+            BaseMerge::Conflict { .. }
+        ));
+
+        let err = commit_leftovers(&run, "s", "b").unwrap_err();
+        assert!(err.contains("unresolved conflicts"), "{err}");
+        assert!(
+            merge_in_progress(&run),
+            "the merge stays open for the implementer"
+        );
     }
 
     /// #229: only branch bases with a remote merge forward; a detached sha, a
