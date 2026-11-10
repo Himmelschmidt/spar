@@ -258,6 +258,7 @@ fn run() -> Result<ExitCode> {
                 };
                 let dropped = cfg.apply_without(&pool, origin, dry_run, &without)?;
                 cfg.apply_role_overrides(&role)?;
+                cfg.refuse_emptied_reviewer_panel(&dropped)?;
                 config::warn_if_role_discards_reviewer_drop(&role, &dropped);
                 cfg.apply_backup_overrides(&backup)?;
                 cfg.apply_effort_overrides(&effort)?;
@@ -692,6 +693,7 @@ fn run() -> Result<ExitCode> {
                 };
                 let dropped = cfg.apply_without(&pool, origin, dry_run, &without)?;
                 cfg.apply_role_overrides(&role)?;
+                cfg.refuse_emptied_reviewer_panel(&dropped)?;
                 config::warn_if_role_discards_reviewer_drop(&role, &dropped);
                 cfg.apply_backup_overrides(&backup)?;
                 cfg.apply_effort_overrides(&effort)?;
@@ -1425,6 +1427,7 @@ fn implement_ctx(
         };
         let dropped = cfg.apply_without(&pool, origin, dry_run, without)?;
         cfg.apply_role_overrides(role)?;
+        cfg.refuse_emptied_reviewer_panel(&dropped)?;
         config::warn_if_role_discards_reviewer_drop(role, &dropped);
         cfg.apply_backup_overrides(backup)?;
         cfg.apply_effort_overrides(effort)?;
@@ -1445,30 +1448,13 @@ fn implement_ctx(
         anyhow::bail!("--recapture-env needs --reload-config");
     }
     let frozen = Config::for_run(&paths, run_id)?;
-    // `--fleet standard` is a documented no-op (never re-enables a channel the
-    // file disabled), so spelling it out neither amends nor needs the
-    // orchestrator check. An unknown preset name stays a hard error here, not
-    // something a later refusal swallows.
-    let fleet_amends = match fleet {
-        Some(preset) => config::FleetPreset::parse(preset)? != config::FleetPreset::Standard,
-        None => false,
-    };
-    if !reload_config
-        && role.is_empty()
-        && backup.is_empty()
-        && effort.is_empty()
-        && without.is_empty()
-        && !fleet_amends
-    {
-        return Ok((paths, frozen));
-    }
     // Seat-id `--without` items name slots of this run; they are resolved to panel
     // ordinals under the dispatch's own lock, against the state the surgery will
     // apply to — resolving here, before the launch preconditions run, is the
-    // TOCTOU the amend restructure (O154) removes. Nothing below this point may
+    // TOCTOU the amend restructure removes. Nothing below this point may
     // persist: the frozen config goes back untouched. The only errors raised here
-    // are usage errors that touch no state, plus an early parse of the fleet
-    // preset so an unknown name fails fast.
+    // are usage errors that touch no state. (`--fleet` needs no parse here: the
+    // amend inputs parsed it up front, so an unknown preset already failed.)
     Ok((paths, frozen))
 }
 

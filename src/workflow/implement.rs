@@ -70,6 +70,23 @@ impl std::error::Error for AmendRefused {}
 pub struct BoundAmend {
     pub cfg: Config,
     pub dropped: Vec<usize>,
+    /// The pin came from the run's own slots: a reassign that moves reviewer
+    /// seats afterwards must refresh it before the freeze.
+    pub panel_pinned: bool,
+}
+
+/// The run's own reviewer panel in ordinal order, never slot order and never a
+/// widened extra (their ids carry no ordinal): a reassign may have moved seats
+/// around, and widening appends `-wide` seats past the panel.
+fn reviewer_panel_by_ordinal(state: &RunState) -> Vec<String> {
+    let mut panel: Vec<(usize, String)> = state
+        .slots
+        .iter()
+        .filter(|s| s.role == SlotRole::Reviewer)
+        .filter_map(|s| reviewer_ordinal(&s.id).map(|o| (o, s.provider_ref().display())))
+        .collect();
+    panel.sort_by_key(|(o, _)| *o);
+    panel.into_iter().map(|(_, p)| p).collect()
 }
 
 pub fn preview_bound_amend(
@@ -100,23 +117,16 @@ pub fn preview_bound_amend(
         cfg.apply_fleet_preset(preset);
     }
     let without = resolve_without_seat_ids(state, &inputs.without)?;
+    let mut panel_pinned = false;
     if without
         .iter()
         .any(|w| crate::config::parse_reviewer_without(w).is_ok())
     {
-        // The pin is the run's own panel in ordinal order, never slot order and
-        // never a widened extra (their ids carry no ordinal): a reassign may
-        // have moved seats around, and widening appends `-wide` seats past it.
-        let mut panel: Vec<(usize, String)> = state
-            .slots
-            .iter()
-            .filter(|s| s.role == SlotRole::Reviewer)
-            .filter_map(|s| reviewer_ordinal(&s.id).map(|o| (o, s.provider_ref().display())))
-            .collect();
-        panel.sort_by_key(|(o, _)| *o);
+        let panel = reviewer_panel_by_ordinal(state);
         if !panel.is_empty() {
-            cfg.roles.reviewer = panel.into_iter().map(|(_, p)| p).collect();
+            cfg.roles.reviewer = panel;
             cfg.cli_role_keys.insert(SlotRole::Reviewer);
+            panel_pinned = true;
         }
     }
     let (pool, pool_origin, dry) = if !state.providers.is_empty() {
@@ -130,11 +140,16 @@ pub fn preview_bound_amend(
     };
     let dropped = cfg.apply_without(&pool, pool_origin, dry, &without)?;
     cfg.apply_role_overrides(&inputs.role)?;
+    cfg.refuse_emptied_reviewer_panel(&dropped)?;
     crate::config::warn_if_role_discards_reviewer_drop(&inputs.role, &dropped);
     cfg.apply_backup_overrides(&inputs.backup)?;
     cfg.apply_effort_overrides(&inputs.effort)?;
     cfg.apply_suite_command(&inputs.suite_command, &without)?;
-    Ok(BoundAmend { cfg, dropped })
+    Ok(BoundAmend {
+        cfg,
+        dropped,
+        panel_pinned,
+    })
 }
 
 /// Seat ids in `--without` resolved to `reviewer[N]` ordinals against one run
@@ -228,6 +243,37 @@ mod preview_amend_tests {
         let amend = preview_bound_amend(&Config::default(), None, &st, &inputs).unwrap();
         assert_eq!(amend.dropped, vec![1]);
         assert_eq!(amend.cfg.roles.reviewer, vec!["cli:claude".to_string()]);
+    }
+
+    /// The last-seat refusal judges the final panel: `--role reviewer=` re-seats
+    /// it, so a drop plus a re-seat is allowed, while a drop alone is refused.
+    #[test]
+    fn drop_plus_role_reseat_is_allowed() {
+        let mut st = dry_stateless_run();
+        st.slots.push(executor::init_slot(
+            "review-0-cli-claude",
+            "cli:claude",
+            SlotRole::Reviewer,
+        ));
+        let inputs = BoundAmendInputs {
+            without: vec!["reviewer[0]".to_string()],
+            role: vec!["reviewer=cli:codex".to_string()],
+            ..BoundAmendInputs::default()
+        };
+        let amend = preview_bound_amend(&Config::default(), None, &st, &inputs).unwrap();
+        assert_eq!(amend.dropped, vec![0]);
+        assert_eq!(amend.cfg.roles.reviewer, vec!["cli:codex".to_string()]);
+        let bare = BoundAmendInputs {
+            without: vec!["reviewer[0]".to_string()],
+            ..BoundAmendInputs::default()
+        };
+        match preview_bound_amend(&Config::default(), None, &st, &bare) {
+            Ok(_) => panic!("a drop with no re-seat must be refused"),
+            Err(e) => assert!(
+                format!("{e:#}").contains("cannot drop the last reviewer seat"),
+                "{e:#}"
+            ),
+        }
     }
 
     /// O130: a reload re-reads the file, not the shell. Names still captured keep
@@ -901,7 +947,7 @@ fn run_from_approved(
     // The live file config loads before the run's captured env is re-applied:
     // `Config::load` fills `captured` from this process, and the re-apply below
     // overwrites the process env with the creation values (O130), so loading
-    // after it would freeze the creation values as this shell's (O157 round 2).
+    // after it would freeze the creation values as this shell's (O154).
     let live = if opts.reload_config {
         Some(Config::load(&paths.project_root)?)
     } else {
@@ -1027,6 +1073,16 @@ fn run_from_approved(
     // refusal here means the surgery itself failed mid-apply.
     let amended;
     let cfg: &Config = if let Some(mut preview) = preview {
+        if preview.panel_pinned {
+            // The reassigns above moved seats after the preview pinned them, and
+            // the pin records providers by panel ordinal: refresh it from the
+            // moved seats, then re-apply the recorded drops.
+            let mut panel = reviewer_panel_by_ordinal(&state);
+            for d in preview.dropped.iter() {
+                panel.remove(*d);
+            }
+            preview.cfg.roles.reviewer = panel;
+        }
         if !preview.dropped.is_empty() {
             let removed = drop_reviewer_seats(&mut state, paths, &preview.dropped)
                 .map_err(|e| AmendRefused(format!("{e:#}")))?;

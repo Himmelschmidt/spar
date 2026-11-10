@@ -1973,11 +1973,6 @@ impl Config {
                     );
                 }
             }
-            if ordinals.len() >= self.roles.reviewer.len() {
-                anyhow::bail!(
-                    "--without reviewer[N]: cannot drop the last reviewer seat; the run would reach the ship gate unreviewed"
-                );
-            }
             // Descending, so each removal names a seat of the panel the operator saw.
             let mut shifted_backups = false;
             for (_, ordinal) in ordinals.iter().rev() {
@@ -1996,6 +1991,18 @@ impl Config {
             self.cli_role_keys.insert(crate::state::SlotRole::Reviewer);
         }
         Ok(ordinals.into_iter().map(|(_, n)| n).rev().collect())
+    }
+
+    /// A drop that emptied the reviewer panel is refused once the role overrides
+    /// have run: `--role reviewer=` re-seats the panel, so the check judges the
+    /// final panel, not the intermediate one a `--without` alone leaves behind.
+    pub fn refuse_emptied_reviewer_panel(&self, dropped: &[usize]) -> Result<()> {
+        if !dropped.is_empty() && self.roles.reviewer.is_empty() {
+            anyhow::bail!(
+                "--without reviewer[N]: cannot drop the last reviewer seat; the run would reach the ship gate unreviewed (--role reviewer=<provider> re-seats the panel)"
+            );
+        }
+        Ok(())
     }
 
     /// Pin the operator-visible reviewer panel onto `roles.reviewer`, so an ordinal

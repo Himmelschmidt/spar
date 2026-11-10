@@ -712,10 +712,17 @@ pub fn panel_before(
 pub fn panel_findings<'a>(
     panel: &[&'a crate::state::ReviewHistoryEntry],
 ) -> Vec<(&'a str, &'a Finding)> {
+    review_findings(panel.iter().map(|e| (e.slot_id.as_str(), &e.review)))
+}
+
+/// The same fold over judged reviews rather than raw history entries.
+pub fn review_findings<'a>(
+    items: impl IntoIterator<Item = (&'a str, &'a ReviewResult)>,
+) -> Vec<(&'a str, &'a Finding)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for e in panel {
-        for f in e.review.findings.iter().filter(|f| !f.synthetic) {
+    for (slot_id, review) in items {
+        for f in review.findings.iter().filter(|f| !f.synthetic) {
             let text = f
                 .text
                 .split_whitespace()
@@ -723,11 +730,67 @@ pub fn panel_findings<'a>(
                 .join(" ")
                 .to_lowercase();
             if seen.insert((f.severity, f.file.clone(), f.line, f.follow_up, text)) {
-                out.push((e.slot_id.as_str(), f));
+                out.push((slot_id, f));
             }
         }
     }
     out
+}
+
+/// Slot ids the gate still counts: live reviewer seats, present or renamed.
+pub fn live_reviewer_seats(state: &RunState) -> std::collections::BTreeSet<&str> {
+    state
+        .slots
+        .iter()
+        .filter(|s| s.role == crate::state::SlotRole::Reviewer)
+        .flat_map(|s| std::iter::once(s.id.as_str()).chain(s.former_ids.iter().map(|f| f.as_str())))
+        .collect()
+}
+
+/// One review the gate judges: the slot it counts for, the round judged, the review.
+pub struct JudgedReview<'a> {
+    pub slot_id: &'a str,
+    pub round: u32,
+    pub review: &'a ReviewResult,
+}
+
+/// The reviews the gate judges: the latest round any surviving reviewer seat
+/// judged, restricted to entries naming those seats. The slots' own records when
+/// no history entry names one: a run with no history, or one whose reviewed
+/// seats are all gone. Never `state.round`: a round begun but not yet reviewed
+/// has no reviews to judge.
+pub fn judged_panel(state: &RunState) -> Vec<JudgedReview<'_>> {
+    let live = live_reviewer_seats(state);
+    let latest = state
+        .review_history
+        .iter()
+        .filter(|e| live.contains(e.slot_id.as_str()))
+        .map(|e| e.round)
+        .max();
+    match latest {
+        Some(round) => state
+            .review_history
+            .iter()
+            .filter(|e| e.round == round && live.contains(e.slot_id.as_str()))
+            .map(|e| JudgedReview {
+                slot_id: e.slot_id.as_str(),
+                round: e.round,
+                review: &e.review,
+            })
+            .collect(),
+        None => state
+            .slots
+            .iter()
+            .filter(|s| s.role == crate::state::SlotRole::Reviewer)
+            .filter_map(|s| {
+                s.review.as_ref().map(|review| JudgedReview {
+                    slot_id: s.id.as_str(),
+                    round: s.round,
+                    review,
+                })
+            })
+            .collect(),
+    }
 }
 
 /// One finding as a markdown bullet: severity, follow-up mark, location, reviewer, text.
@@ -786,20 +849,20 @@ impl OpenFinding {
     }
 }
 
-/// The last panel's reviewer findings, each checked against the commits since its
+/// The judged panel's reviewer findings, each checked against the commits since its
 /// review that touched its cited file, in `cwd` (the implementer's worktree). No model
 /// call: one `git log` per distinct (commit, file).
 pub fn open_findings(state: &RunState, cwd: &std::path::Path) -> Vec<OpenFinding> {
-    let panel = panel_before(&state.review_history, u32::MAX);
+    let panel = judged_panel(state);
     let mut cache: std::collections::HashMap<(String, String), Option<Vec<String>>> =
         std::collections::HashMap::new();
-    panel_findings(&panel)
+    review_findings(panel.iter().map(|j| (j.slot_id, j.review)))
         .into_iter()
         .map(|(slot, f)| {
             let reviewed_commit = panel
                 .iter()
-                .find(|e| e.slot_id == slot)
-                .and_then(|e| e.review.reviewed_commit.clone());
+                .find(|j| j.slot_id == slot)
+                .and_then(|j| j.review.reviewed_commit.clone());
             let touched_since = match (&reviewed_commit, &f.file) {
                 (Some(sha), Some(file)) => cache
                     .entry((sha.clone(), file.clone()))
@@ -2176,6 +2239,11 @@ The loop at src/resolver.rs:88 never stops.\n\
         git(dir, &["commit", "-q", "-am", "fix a"]);
 
         let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, dir.into());
+        state.slots.push(crate::executor::init_slot(
+            "rev",
+            "cli:codex",
+            crate::state::SlotRole::Reviewer,
+        ));
         state.review_history.push(crate::state::ReviewHistoryEntry {
             round: 2,
             slot_id: "rev".into(),

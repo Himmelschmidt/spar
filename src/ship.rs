@@ -313,41 +313,18 @@ pub struct ShipOverride {
     findings: Vec<OpenFinding>,
 }
 
-/// Every finding the current round's surviving seats left: the current round's own
-/// history entries, or the slots' own records on a run with no history. Judging
-/// anything older would resurrect findings the current panel already addressed:
-/// dropping a seat prunes its entries, so the highest round left is not the
-/// round that judged.
+/// Every finding the judged panel left, from the same panel `brief` and the
+/// escalation show (O155): the latest round any surviving seat judged, or the
+/// slots' own records when no history entry names one. Approving reviewers'
+/// findings and synthetic ones count too, the latter tagged `[synthetic]`.
 fn open_findings(state: &RunState) -> Vec<OpenFinding> {
-    let live: std::collections::BTreeSet<&str> = state
-        .slots
-        .iter()
-        .filter(|s| s.role == crate::state::SlotRole::Reviewer)
-        .flat_map(|s| std::iter::once(s.id.as_str()).chain(s.former_ids.iter().map(|f| f.as_str())))
-        .collect();
-    let reviews: Vec<(String, u32, &crate::workflow::review_result::ReviewResult)> =
-        if state.review_history.is_empty() {
-            state
-                .slots
-                .iter()
-                .filter(|s| s.role == crate::state::SlotRole::Reviewer)
-                .filter_map(|s| s.review.as_ref().map(|r| (s.id.clone(), s.round, r)))
-                .collect()
-        } else {
-            state
-                .review_history
-                .iter()
-                .filter(|e| e.round == state.round && live.contains(e.slot_id.as_str()))
-                .map(|e| (e.slot_id.clone(), e.round, &e.review))
-                .collect()
-        };
-    reviews
+    crate::workflow::review_result::judged_panel(state)
         .into_iter()
-        .flat_map(|(slot_id, round, review)| {
-            review.findings.iter().map(move |f| OpenFinding {
-                slot_id: slot_id.clone(),
-                round,
-                reviewed_commit: review.reviewed_commit.clone(),
+        .flat_map(|judged| {
+            judged.review.findings.iter().map(move |f| OpenFinding {
+                slot_id: judged.slot_id.to_string(),
+                round: judged.round,
+                reviewed_commit: judged.review.reviewed_commit.clone(),
                 finding: f.clone(),
             })
         })
@@ -1645,12 +1622,11 @@ mod tests {
         }
     }
 
-    /// O154: the gate judges the current round's surviving seats, never the highest
-    /// round left in history. A dropped seat's entries are pruned, so the highest
-    /// round left would otherwise fall back to an older round whose findings the
-    /// current panel already addressed.
+    /// O155: the gate judges the latest round any surviving seat judged, filtered
+    /// to live seats, never `state.round`: a round begun but not yet reviewed has
+    /// no reviews to judge.
     #[test]
-    fn open_findings_judge_the_current_rounds_surviving_seats() {
+    fn open_findings_judge_the_latest_reviewed_rounds_live_seats() {
         use crate::workflow::review_result::Severity;
         let mut state = RunState::new("r1", WorkflowKind::Loop, PathBuf::from("/x"));
         for id in ["review-0", "review-1"] {
@@ -1708,12 +1684,32 @@ mod tests {
             "- **minor**: nit (review-1, round 2, Reviewed-Commit `0123456789ab`)"
         );
 
-        // The dropped seat was the only one with entries in the latest round: its
-        // pruning leaves an older round behind, and the gate reports nothing rather
-        // than resurrecting that round's addressed findings.
+        // The dropped seat took round 2 with it: the survivors' latest judged
+        // round is 1, so the gate judges that round.
+        let round_two: Vec<_> = state
+            .review_history
+            .iter()
+            .filter(|e| e.round == 2)
+            .cloned()
+            .collect();
         state.review_history.retain(|e| e.round < 2);
-        state.round = 2;
-        assert!(open_findings(&state).is_empty());
+        let found = open_findings(&state);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            finding_line(&found[0]),
+            "- **critical**: old (review-0, round 1, Reviewed-Commit `aaaa`)"
+        );
+
+        // A round begun but not yet reviewed has no reviews to judge: the gate
+        // still judges the latest reviewed round, never `state.round`.
+        state.review_history.extend(round_two);
+        state.round = 3;
+        let found = open_findings(&state);
+        assert_eq!(found.len(), 2);
+        assert_eq!(
+            finding_line(&found[0]),
+            "- **major** `src/a.rs:12`: off by one (review-0, round 2, Reviewed-Commit `0123456789ab`)"
+        );
     }
 
     #[test]
