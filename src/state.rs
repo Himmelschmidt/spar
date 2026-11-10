@@ -202,17 +202,13 @@ pub struct RunState {
     #[serde(default)]
     pub contract_amendments: Vec<ContractAmendment>,
     /// Rounds whose implementer was cut short at its hard ceiling with work left
-    /// behind, oldest first. The leftovers were committed as a partial WIP round,
-    /// so a fresh process entering the next round — past the round-ceiling gate,
-    /// a stop, a quota park, a crashed orchestrator — still tells its implementer
-    /// the previous pass never finished (`blockers_from_disk` rebuilds the note).
+    /// behind, oldest first, and how each left its work. The leftovers were
+    /// committed as a partial round, so a fresh process entering the next round —
+    /// past the round-ceiling gate, a stop, a quota park, a crashed orchestrator —
+    /// still tells its implementer the previous pass never finished
+    /// (`blockers_from_disk` rebuilds the note).
     #[serde(default)]
-    pub ceiling_partial_rounds: Vec<u32>,
-    /// How each recorded ceiling-cut round left its work. Empty for runs recorded
-    /// before the distinction existed; those rebuild with the WIP wording they
-    /// were recorded with.
-    #[serde(default)]
-    pub ceiling_partial_kinds: Vec<CeilingPartialRound>,
+    pub ceiling_partial_rounds: Vec<CeilingPartialRound>,
     /// Set while `spar amend` has the test author out, cleared when it settles. Found
     /// set by a later `amend`, `resume` or `approve`, it means the amend was killed: the
     /// run is put back exactly as this records (O137).
@@ -431,6 +427,18 @@ impl RunState {
             .rev()
             .find(|s| s.role == SlotRole::TestAuthor)
     }
+
+    /// Cut-short rounds, oldest first, as displayable numbers.
+    pub fn partial_round_list(&self) -> Vec<u32> {
+        let mut rounds: Vec<u32> = self
+            .ceiling_partial_rounds
+            .iter()
+            .map(|e| e.round)
+            .collect();
+        rounds.sort_unstable();
+        rounds.dedup();
+        rounds
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -621,7 +629,9 @@ impl SlotState {
     ///
     /// Every outcome field of the last dispatch is dropped with the old provider (O149):
     /// a seat that names one provider while carrying another's `quota_hit`, `auth_fault`
-    /// or usage reports that failure against a provider that never ran.
+    /// or usage reports that failure against a provider that never ran. `dispatch_head`
+    /// is not an outcome: rotation keeps the round and the worktree, so the round's
+    /// start HEAD still measures this round's work and survives the rotation.
     /// The ref this seat dispatches as: its stored provider plus its recorded
     /// model. Quota gates resolve through this so a seat whose model came from
     /// config or model-select keys identically to the writer's backfilled job.
@@ -648,7 +658,6 @@ impl SlotState {
         self.quota_hit = false;
         self.auth_fault = false;
         self.timeout_cause = None;
-        self.dispatch_head = None;
         self.classifier = None;
     }
 }
@@ -915,7 +924,6 @@ impl RunState {
             seat_reassignments: Vec::new(),
             contract_amendments: Vec::new(),
             ceiling_partial_rounds: Vec::new(),
-            ceiling_partial_kinds: Vec::new(),
             amend_in_progress: None,
             pr_state: None,
         }

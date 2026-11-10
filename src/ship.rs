@@ -176,26 +176,34 @@ fn pr_body(paths: &SparPaths, state: &RunState, branch: &str, cwd: &Path) -> Str
             body.push('\n');
         }
     }
-    if !state.ceiling_partial_rounds.is_empty() {
-        let mut rounds = state.ceiling_partial_rounds.clone();
-        rounds.sort_unstable();
-        rounds.dedup();
+    let rounds = state.partial_round_list();
+    if !rounds.is_empty() {
         let list = rounds
             .iter()
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(", ");
         body.push_str("\n## Partial work\n\n");
-        body.push_str(&format!(
-            "Rounds {list} were cut short at their hard ceiling; the branch carries \
-             their partial work. Judge the diff as unfinished work continued by later rounds.\n"
-        ));
+        if rounds.len() == 1 {
+            body.push_str(&format!(
+                "Round {list} was cut short at its hard ceiling; the branch carries \
+                 its partial work. Judge the diff as unfinished work continued by later rounds.\n"
+            ));
+        } else {
+            body.push_str(&format!(
+                "Rounds {list} were cut short at their hard ceiling; the branch carries \
+                 their partial work. Judge the diff as unfinished work continued by later rounds.\n"
+            ));
+        }
     }
     // A round cut short at its own hard ceiling never finishes its summary: the
     // file on disk is the previous round's, salvaged from the log, or missing,
     // and presenting it as this round's would ship someone else's words (or the
     // orchestrator's) under the implementer's name. Say so instead.
-    let final_partial = state.ceiling_partial_rounds.contains(&state.round);
+    let final_partial = state
+        .ceiling_partial_rounds
+        .iter()
+        .any(|e| e.round == state.round);
     body.push_str("\n## Implementer summary\n\n");
     match &summary {
         Some((_, text)) if !final_partial => body.push_str(text.trim()),
@@ -981,6 +989,7 @@ fn shell_single_quote(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::cli::WorkflowKind;
+    use crate::state::{CeilingPartialKind, CeilingPartialRound};
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
@@ -1237,7 +1246,10 @@ mod tests {
         let tmp = tempdir().unwrap();
         let (paths, mut state) = body_state(tmp.path());
         state.round = 2;
-        state.ceiling_partial_rounds = vec![1];
+        state.ceiling_partial_rounds = vec![CeilingPartialRound {
+            round: 1,
+            kind: CeilingPartialKind::Wip,
+        }];
         std::fs::write(
             paths.artifact("rb1", "summary-impl.md"),
             "Did the follow-up.\n",
@@ -1245,7 +1257,7 @@ mod tests {
         .unwrap();
         let body = pr_body(&paths, &state, "spar/rb1/impl", tmp.path());
         assert!(
-            body.contains("## Partial work\n\nRounds 1 were cut short"),
+            body.contains("## Partial work\n\nRound 1 was cut short"),
             "{body}"
         );
         assert!(
@@ -1259,7 +1271,16 @@ mod tests {
         let tmp = tempdir().unwrap();
         let (paths, mut state) = body_state(tmp.path());
         state.round = 2;
-        state.ceiling_partial_rounds = vec![1, 2];
+        state.ceiling_partial_rounds = vec![
+            CeilingPartialRound {
+                round: 1,
+                kind: CeilingPartialKind::Wip,
+            },
+            CeilingPartialRound {
+                round: 2,
+                kind: CeilingPartialKind::Wip,
+            },
+        ];
         std::fs::write(
             paths.artifact("rb1", "summary-impl.md"),
             "The previous round's words.\n",

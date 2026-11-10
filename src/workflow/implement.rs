@@ -3329,16 +3329,14 @@ fn try_commit_ceiling_partial(
         .iter()
         .find(|w| w.slot_id == impl_id)
         .map(|w| w.path.clone())?;
-    // This dispatch's start HEAD, never the run base: from round 2 on the base
-    // predates earlier rounds' commits, so the base always reads as work and a
-    // fix round that hangs without edits would pass as having work. Falls back
-    // to the base for dispatches recorded before the field existed.
+    // The round's start HEAD, never the run base: from round 2 on the base predates
+    // earlier rounds' commits, so the base always reads as work. Without a recorded
+    // HEAD only a dirty tree counts.
     let since = state
         .slots
         .iter()
         .find(|s| s.id == impl_id)
-        .and_then(|s| s.dispatch_head.clone())
-        .or_else(|| state.base_commit.clone());
+        .and_then(|s| s.dispatch_head.clone());
     if !executor::slot_has_work(&wt_path, since.as_deref()) {
         return None;
     }
@@ -3451,17 +3449,14 @@ fn record_ceiling_partial(
         note.clone(),
         state.message_budget,
     );
-    if state.ceiling_partial_rounds.last() != Some(&state.round) {
-        state.ceiling_partial_rounds.push(state.round);
-    }
     if let Some(entry) = state
-        .ceiling_partial_kinds
+        .ceiling_partial_rounds
         .iter_mut()
         .find(|e| e.round == state.round)
     {
         entry.kind = kind;
     } else {
-        state.ceiling_partial_kinds.push(CeilingPartialRound {
+        state.ceiling_partial_rounds.push(CeilingPartialRound {
             round: state.round,
             kind,
         });
@@ -4790,18 +4785,22 @@ fn write_impl_summary(state: &RunState, paths: &SparPaths) -> Result<()> {
     for s in &state.slots {
         body.push_str(&format!("- {} ({}) {:?}\n", s.id, s.provider, s.status));
     }
-    if !state.ceiling_partial_rounds.is_empty() {
-        let mut rounds = state.ceiling_partial_rounds.clone();
-        rounds.sort_unstable();
-        rounds.dedup();
+    let rounds = state.partial_round_list();
+    if !rounds.is_empty() {
         let list = rounds
             .iter()
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(", ");
-        body.push_str(&format!(
-            "\nPartial work: rounds {list} were cut short at the hard ceiling; the branch carries partial work.\n"
-        ));
+        if rounds.len() == 1 {
+            body.push_str(&format!(
+                "\nPartial work: round {list} was cut short at the hard ceiling; the branch carries partial work.\n"
+            ));
+        } else {
+            body.push_str(&format!(
+                "\nPartial work: rounds {list} were cut short at the hard ceiling; the branch carries partial work.\n"
+            ));
+        }
     }
     body.push_str("\nShip when ready: `spar ship ");
     body.push_str(&state.id);
@@ -5158,18 +5157,15 @@ fn blockers_from_disk(
     // either consumed by the round after it or approved as-is. The recorded kind
     // picks the wording: only a saved WIP commit may be claimed as one.
     if let Some(prev) = state.round.checked_sub(1) {
-        if state.ceiling_partial_rounds.contains(&prev) {
-            let kind = state
-                .ceiling_partial_kinds
-                .iter()
-                .find(|e| e.round == prev)
-                .map(|e| e.kind);
-            // Rounds recorded before the kind existed used the WIP wording, so
-            // the default rebuilds that rather than inventing a cleaner past.
-            out.push(match kind {
-                Some(CeilingPartialKind::Clean) => ceiling_partial_clean_notice(prev),
-                Some(CeilingPartialKind::Refused) => ceiling_partial_refused_notice(prev),
-                Some(CeilingPartialKind::Wip) | None => ceiling_partial_notice(prev),
+        if let Some(entry) = state
+            .ceiling_partial_rounds
+            .iter()
+            .find(|e| e.round == prev)
+        {
+            out.push(match entry.kind {
+                CeilingPartialKind::Clean => ceiling_partial_clean_notice(prev),
+                CeilingPartialKind::Refused => ceiling_partial_refused_notice(prev),
+                CeilingPartialKind::Wip => ceiling_partial_notice(prev),
             });
         }
     }
