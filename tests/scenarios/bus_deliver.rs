@@ -332,6 +332,7 @@ fn agy_send_fans_out_to_the_poll_file() {
     // real fan-out path. Nothing else in this test dispatches, so nothing else
     // can observe the flip.
     set_dry_run(tmp.path(), &run_id, false);
+    set_all_slots_running(tmp.path(), &run_id);
 
     send(tmp.path(), &run_id, &agent, "write the acceptance test");
 
@@ -397,6 +398,7 @@ fn agy_redelivery_reaches_the_poll_file() {
     let run_id = plan_and_approve(tmp.path());
     let agent = slot_for_provider(tmp.path(), &run_id, "cli:agy");
     set_dry_run(tmp.path(), &run_id, false);
+    set_all_slots_running(tmp.path(), &run_id);
 
     let out = spar_cmd()
         .current_dir(tmp.path())
@@ -486,11 +488,24 @@ fn set_dry_run(dir: &std::path::Path, run_id: &str, dry_run: bool) {
 }
 
 /// A live run with one PollFile slot for `provider` (`cli:agy` or `cli:pi`).
+/// The slots read `running`: file-time fan-out only delivers to a slot with a
+/// turn that can read the poll file, so the helper starts every slot.
 fn live_poll_run(dir: &std::path::Path, provider: &str) -> (String, String) {
     let run_id = plan_and_approve_with_providers(dir, &format!("cli:claude,cli:grok,{provider}"));
     let agent = slot_for_provider(dir, &run_id, provider);
     set_dry_run(dir, &run_id, false);
+    set_all_slots_running(dir, &run_id);
     (run_id, agent)
+}
+
+fn set_all_slots_running(dir: &std::path::Path, run_id: &str) {
+    let path = dir.join(".spar/runs").join(run_id).join("state.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut state: Value = serde_json::from_str(&text).unwrap();
+    for slot in state["slots"].as_array_mut().unwrap() {
+        slot["status"] = Value::String("running".into());
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 }
 
 fn poll_body(dir: &std::path::Path, run_id: &str, agent: &str) -> String {
@@ -1264,4 +1279,188 @@ fn poll_file_round_start_refresh_drops_expired_for_agy() {
 #[test]
 fn poll_file_round_start_refresh_drops_expired_for_pi() {
     poll_file_round_start_refresh_drops_expired("cli:pi");
+}
+
+/// A `--supersedes` landing while a redelivery is due never lists both bodies:
+/// the withdrawal clears the pending record, so the tick has nothing to
+/// re-file, and the render skips superseded ids even for a re-filed copy.
+#[test]
+fn supersede_during_redelivery_tick_lists_only_the_replacement() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), "cli:agy");
+    let dir = tmp.path();
+
+    let old = send_json(
+        dir,
+        &run_id,
+        &["--to", &agent, "--requires-ack", "-m", "old instruction"],
+    );
+    let old_id = old["id"].as_str().unwrap().to_string();
+    assert!(
+        poll_body(dir, &run_id, &agent).contains("old instruction"),
+        "the first send fans out"
+    );
+
+    // Redelivery comes due now.
+    let pending = dir
+        .join(".spar/bus/pending_ack")
+        .join(format!("{old_id}.json"));
+    let record = serde_json::json!({
+        "msg": old,
+        "attempts": 0,
+        "next_at": "2000-01-01T00:00:00Z",
+    });
+    std::fs::write(&pending, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+
+    // The supersede lands inside the tick window: it clears the pending record
+    // and deletes the copies, then renders only the replacement.
+    let new = send_json(
+        dir,
+        &run_id,
+        &[
+            "--to",
+            &agent,
+            "--supersedes",
+            &old_id,
+            "-m",
+            "new instruction",
+        ],
+    );
+    let new_id = new["id"].as_str().unwrap().to_string();
+    assert!(!pending.exists(), "the supersede clears the pending record");
+
+    // The tick that would have redelivered the old message finds nothing due.
+    deliver_json(dir, &run_id, &agent);
+
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        !poll.contains("old instruction"),
+        "both bodies never list together:\n{poll}"
+    );
+    assert!(poll.contains("new instruction"), "{poll}");
+
+    let entries = log_entries(dir, &run_id);
+    assert_eq!(log_entry(&entries, &old_id)["delivery"], "withdrawn");
+    assert_eq!(log_entry(&entries, &new_id)["delivery"], "delivered");
+    assert!(
+        !entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["body"].as_str().unwrap_or("").contains("No ack after")),
+        "no false escalation for the withdrawn message: {entries}"
+    );
+}
+
+/// `human` and `@human` are one seat: a message sent `--from @human` is
+/// superseded by a send with the default `--from human`, and both spellings
+/// file into the one `@human` inbox. (Pair grouping across the spellings is
+/// covered at unit level: the guard exempts human-bound traffic by design, so
+/// no CLI refusal can observe it.)
+#[test]
+fn human_spelling_supersede_and_single_budget_pair() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), "cli:agy");
+    let dir = tmp.path();
+
+    let old = send_json(
+        dir,
+        &run_id,
+        &["--from", "@human", "--to", &agent, "-m", "old human note"],
+    );
+    let old_id = old["id"].as_str().unwrap().to_string();
+
+    let new = send_json(
+        dir,
+        &run_id,
+        &[
+            "--to",
+            &agent,
+            "--supersedes",
+            &old_id,
+            "-m",
+            "new human note",
+        ],
+    );
+    let new_id = new["id"].as_str().unwrap().to_string();
+
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(
+        !poll.contains("old human note"),
+        "the human-spelled supersede takes the @human message back:\n{poll}"
+    );
+    assert!(poll.contains("new human note"), "{poll}");
+    let entries = log_entries(dir, &run_id);
+    assert_eq!(
+        log_entry(&entries, &old_id)["superseded_by"],
+        new_id,
+        "{entries}"
+    );
+
+    // Both spellings land in the same inbox: `--to human` and `--to @human`
+    // file into the one `@human` directory.
+    send(dir, &run_id, "human", "bare human note");
+    let inboxes: Vec<String> = std::fs::read_dir(dir.join(".spar/bus/inbox"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !inboxes.contains(&"human".to_string()),
+        "no bare-human inbox beside @human: {inboxes:?}"
+    );
+}
+
+/// A PollFile slot with no running turn gets no file-time fan-out: the copy
+/// stays pending and the log reads `queued` until a filing lands once the
+/// slot's turn starts.
+#[test]
+fn send_to_idle_poll_slot_stays_queued_until_its_turn() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let run_id = plan_and_approve_with_providers(tmp.path(), "cli:claude,cli:grok,cli:agy");
+    let agent = slot_for_provider(tmp.path(), &run_id, "cli:agy");
+    set_dry_run(tmp.path(), &run_id, false);
+    // Slots stay pending: no turn can read the poll file yet.
+    let dir = tmp.path();
+    let poll_path = dir
+        .join(".spar/runs")
+        .join(&run_id)
+        .join("logs")
+        .join(format!("nudges-{agent}.md"));
+
+    send(dir, &run_id, &agent, "early ruling");
+    assert!(!poll_path.is_file(), "no fan-out to a slot that never ran");
+    let entries = log_entries(dir, &run_id);
+    assert!(
+        entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["body"] == "early ruling" && e["delivery"] == "queued"),
+        "{entries}"
+    );
+
+    // The slot's turn starts: the next filing drains the backlog too.
+    set_all_slots_running(dir, &run_id);
+    send(dir, &run_id, &agent, "later ruling");
+
+    let poll = std::fs::read_to_string(&poll_path).unwrap();
+    assert!(
+        poll.contains("early ruling") && poll.contains("later ruling"),
+        "{poll}"
+    );
+    let entries = log_entries(dir, &run_id);
+    for body in ["early ruling", "later ruling"] {
+        assert!(
+            entries
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["body"] == body && e["delivery"] == "delivered"),
+            "{entries}"
+        );
+    }
 }

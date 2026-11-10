@@ -1273,7 +1273,7 @@ recipient acked it), `withdrawn` (superseded or expired). A poll file or codex q
 `delivered`, not `read`, until an ack. `bus log --json` returns each message with:
 
 ```json
-{"schema_version": 1, "id": "...", "from": "human", "to": "impl", "...": "message fields",
+{"schema_version": 1, "id": "...", "from": "@human", "to": "impl", "...": "message fields",
  "persist": true, "expires_after_round": 3, "refs": {"supersedes": "..."},
  "receipts": [{"recipient": "ab12cd34:impl", "queued_at": "...", "delivered_at": "..." | null,
                "read_at": "..." | null, "withdrawn_at": "..." | null}],
@@ -1297,7 +1297,7 @@ A landing the model already saw, any `Read` receipt, from a prompt inclusion,
 a Stop-hook injection, an inbox claim or an ack, stays `delivered` under a
 later withdrawal. It is derived at read time from the inbox directories, the receipts and the
 ack events, never stored, so there is no second copy of the state to drift. A slot's
-poll file (agy, pi) renders its inbox, not an append-only log (O158–O163): every filing,
+poll file (agy, pi) renders its inbox, not an append-only log (O158–O164): every filing,
 withdrawal and round start rewrites it from the pending messages, so a withdrawn or
 expired message disappears from the file. A superseding send skips its own filing
 render; the withdrawal renders holders of the old message and the send path then
@@ -1307,7 +1307,8 @@ replacement addressed to a slot that never held the old one still reaches its fi
 `--to broadcast` reaches every poll-file slot, while acks and system prompts stay in the
 inbox and the bus log but never become action items. Posting into the live poll file
 counts as `delivered`, and the drain claims only what renders, so `delivered` never
-describes a message the slot cannot see. Dry-run runs skip the fan-out (nothing live polls their
+describes a message the slot cannot see. A send to a poll slot with no running turn
+stays `queued` until the slot runs and its file renders. Dry-run runs skip the fan-out (nothing live polls their
 files); the messages stay in the inbox for inspection and no poll file is
 written. A message leaves the file once the slot acks it, the ack filing re-renders
 the acker's own file at once, and the heading names the exact ack command for the
@@ -1325,8 +1326,8 @@ poll file, which can exceed what that call just claimed.
 `schema_version` (and `withdrawal` under `--supersedes`). The human `bus log` shows the
 message id and `[queued|delivered|acknowledged|withdrawn; landed n/m, read n/m; superseded by …; expired]`.
 
-A message to `@human` (or any `Blocked` agent) lands in the `@human` inbox
-(`spar bus inbox @human`) and,
+A message to `human` or `@human` (one seat: both spellings canonicalise at send)
+lands in the `@human` inbox (`spar bus inbox @human`) and,
 if `[notify]` is configured, also fires an external notifier. A `requires_ack` message
 redelivers until acked, then escalates to `@human`.
 

@@ -187,7 +187,8 @@ const POLL_SECTION_START: &str = "<!-- spar:poll:start -->";
 const POLL_SECTION_END: &str = "<!-- spar:poll:end -->";
 
 /// Rewrite the slot's poll file from its inbox: one line per pending message,
-/// oldest first. The inbox is the only source, a message withdrawn, expired or
+/// oldest first. The inbox is the only source, a message withdrawn (including
+/// superseded, even when a stale redelivery re-files its copy), expired or
 /// acked stops being listed, wherever its copies were.
 ///
 /// Only action items render: messages addressed to the slot, plus chat
@@ -227,10 +228,17 @@ pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str
         fs::create_dir_all(parent)?;
     }
     let mut seen = HashSet::new();
+    let superseded = bus::superseded_on_disk(paths);
     let mut msgs: Vec<bus::BusMessage> = bus::filed_copies(paths, agent)
         .into_iter()
         .filter(|m| {
+            if !seen.insert(m.id.clone()) {
+                return false;
+            }
             if !bus::poll_lists(m, agent) {
+                return false;
+            }
+            if superseded.contains(&m.id) {
                 return false;
             }
             if acked.contains(&m.id) {
@@ -248,7 +256,7 @@ pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str
                     }
                 }
             }
-            seen.insert(m.id.clone())
+            true
         })
         .collect();
     msgs.sort_by_key(|m| m.ts);
@@ -288,6 +296,8 @@ pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str
     };
     fs::write(path.with_extension("tmp"), &next)?;
     fs::rename(path.with_extension("tmp"), &path)?;
+    let listed: HashSet<String> = msgs.iter().map(|m| m.id.clone()).collect();
+    bus::prune_aged_claims(paths, agent, &seen, &listed, &acked);
     Ok(msgs.len())
 }
 
@@ -455,6 +465,9 @@ pub fn strategy_for_slot(state: &RunState, slot: &str) -> DeliveryStrategy {
 /// to drain. Each recipient's whole inbox drains through [`deliver`], which also
 /// picks up copies filed while the run state was unreadable. Other strategies
 /// keep their own pulse; bare ids resolve to no slot and stay inbox-queued.
+/// A PollFile slot with no running turn (finished, or never dispatched) is not
+/// drained: its copies stay pending and the log reads `queued` until a turn
+/// that can read the poll file starts.
 /// Best effort with a stderr line, never an error: the filing already succeeded,
 /// the inbox stays the durable queue, and the next filing retries the drain.
 /// Skipped for dry-run runs: no live slot polls their files, so the messages
@@ -482,6 +495,10 @@ pub fn drain_poll_files(paths: &SparPaths, targets: &[String]) {
             .filter(|agent| {
                 let short = agent.strip_prefix(&format!("{run}:")).unwrap_or(agent);
                 strategy_for_slot(&state, short) == DeliveryStrategy::PollFile
+                    && state
+                        .slots
+                        .iter()
+                        .any(|s| s.id == short && s.status == crate::state::SlotStatus::Running)
             })
             .collect();
         for agent in poll_agents {
@@ -957,6 +974,7 @@ mod tests {
             "cli:agy",
             crate::state::SlotRole::Implementer,
         ));
+        state.slots[0].status = crate::state::SlotStatus::Running;
         state.save(&paths).unwrap();
 
         let slot = agent_ref(Some("r1"), "impl");
