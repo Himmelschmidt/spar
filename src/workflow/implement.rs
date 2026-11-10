@@ -3396,7 +3396,14 @@ fn ceiling_partial_refused_notice(round: u32, detail: Option<&str>) -> String {
 
 /// Commit an implementer's leftovers after a hard-ceiling kill as a WIP round and
 /// report the notice for the reviewers and the next round. `None` when the kill
-/// was not at the ceiling or left no work at all: that round fails as before.
+/// was not at the ceiling, left no work at all, or the round's banked commit no
+/// longer sits at HEAD: those rounds fail as before.
+///
+/// A resume that idles into a second ceiling kill returns the carried bank's
+/// notice (a WIP or Clean one) instead of failing: the tree is clean and HEAD
+/// is still the banked commit, so the banked partial is still there and the
+/// run goes on like the first hit, whether the resume stayed in the bank's
+/// round or opened a new one.
 ///
 /// The message names the ceiling kill, so the WIP commit reads as an interrupted
 /// round on the branch rather than a normal one. Like `commit_before_review`, a
@@ -3427,32 +3434,44 @@ fn try_commit_ceiling_partial(
         .map(|s| (s.dispatch_head.clone(), s.dispatch_tree.clone()))
         .unwrap_or_default();
     let round = state.round;
-    // The round's own banked WIP commit: a same-round resume that idles into a
-    // second ceiling kill leaves HEAD exactly here with a clean tree, which must
-    // read as no new work rather than re-record the round.
-    let banked = state
+    // The latest banked partial at or before this round. A same-round resume
+    // carries its own round's bank; a resume that opened a new round (the
+    // previous round parked, e.g. on quota) carries the previous round's bank
+    // when the new round adds nothing before its own ceiling kill. In both
+    // cases HEAD sitting on the bank with a clean tree reads as no new work,
+    // and the run goes on with the banked commit instead of failing.
+    let carried = state
         .ceiling_partial_rounds
         .iter()
-        .find(|e| e.round == round)
-        .and_then(|e| e.commit.clone());
+        .rev()
+        .find(|e| e.round <= round);
+    let banked = carried.and_then(|e| e.commit.clone());
     if !executor::dispatch_left_work(
         &wt_path,
         since.as_deref(),
         since_tree.as_deref(),
         banked.as_deref(),
     ) {
-        // A same-round resume that idles into a second ceiling kill: the tree is
-        // clean and HEAD is still the round's own banked commit, so there is no
-        // new work, but the banked partial is still there. Go on like the first
-        // hit instead of failing the round.
+        // A resume that idles into a second ceiling kill: the tree is clean and
+        // HEAD is still the carried banked commit, so there is no new work, but
+        // the banked partial is still there. Go on like the first hit instead
+        // of failing the round. The notice names the bank's round, since that
+        // is the round whose work is under review. The HEAD check keeps the
+        // notice honest: an agent that reset HEAD away from the bank before the
+        // second kill no longer carries that commit, so the bank says nothing.
         let banked_entry = state
             .ceiling_partial_rounds
             .iter()
-            .find(|e| e.round == round)?;
+            .rev()
+            .find(|e| e.round <= round)?;
+        let bank_round = banked_entry.round;
         let commit = banked_entry.commit.clone()?;
+        if worktree::git_out(&wt_path, &["rev-parse", "HEAD"]).as_deref() != Some(commit.as_str()) {
+            return None;
+        }
         let notice = match banked_entry.kind {
-            CeilingPartialKind::Wip => ceiling_partial_notice(round),
-            CeilingPartialKind::Clean => ceiling_partial_clean_notice(round),
+            CeilingPartialKind::Wip => ceiling_partial_notice(bank_round),
+            CeilingPartialKind::Clean => ceiling_partial_clean_notice(bank_round),
             CeilingPartialKind::Refused => return None,
         };
         return Some((notice, banked_entry.kind, Some(commit)));
@@ -7108,6 +7127,57 @@ mod ceiling_partial_notice_tests {
         assert_eq!(notice, ceiling_partial_notice(1));
         assert!(matches!(kind, CeilingPartialKind::Wip));
         assert_eq!(commit.as_deref(), Some(banked.as_str()));
+    }
+
+    #[test]
+    fn resumed_round_idle_ceiling_kill_continues_on_the_previous_round_bank() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, branch) = fresh_repo(&tmp);
+        let head = git(&wt, &["rev-parse", "HEAD"]);
+        let tree = executor::worktree_snapshot(&wt);
+        std::fs::write(wt.join("work.txt"), "slot work\n").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-qm", "banked wip"]);
+        let banked = git(&wt, &["rev-parse", "HEAD"]);
+        let (paths, mut state) = ceiling_state(&tmp, &wt, &branch, Some(head), tree);
+        // The resume opened a new round (the previous round parked) and added
+        // nothing before its own ceiling kill.
+        state.round = 2;
+        state.slots[0].dispatch_head = Some(banked.clone());
+        state.slots[0].dispatch_tree = executor::worktree_snapshot(&wt);
+        state.ceiling_partial_rounds = vec![CeilingPartialRound {
+            round: 1,
+            kind: CeilingPartialKind::Wip,
+            commit: Some(banked.clone()),
+        }];
+        let (notice, kind, commit) = try_commit_ceiling_partial(&mut state, &paths, "impl")
+            .expect("the previous round's banked partial is still there, so the round goes on");
+        assert_eq!(notice, ceiling_partial_notice(1));
+        assert!(matches!(kind, CeilingPartialKind::Wip));
+        assert_eq!(commit.as_deref(), Some(banked.as_str()));
+    }
+
+    #[test]
+    fn second_ceiling_kill_after_a_reset_away_from_the_bank_is_not_a_partial_round() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wt, branch) = fresh_repo(&tmp);
+        let head = git(&wt, &["rev-parse", "HEAD"]);
+        let tree = executor::worktree_snapshot(&wt);
+        std::fs::write(wt.join("work.txt"), "slot work\n").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-qm", "banked wip"]);
+        let banked = git(&wt, &["rev-parse", "HEAD"]);
+        git(&wt, &["reset", "--hard", "-q", "HEAD~1"]);
+        let (paths, mut state) = ceiling_state(&tmp, &wt, &branch, Some(head), tree);
+        state.ceiling_partial_rounds = vec![CeilingPartialRound {
+            round: 1,
+            kind: CeilingPartialKind::Wip,
+            commit: Some(banked),
+        }];
+        assert!(
+            try_commit_ceiling_partial(&mut state, &paths, "impl").is_none(),
+            "the banked commit is no longer carried, so the bank says nothing"
+        );
     }
 
     #[test]

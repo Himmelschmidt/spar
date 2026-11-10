@@ -1884,26 +1884,66 @@ fn snapshot_combo(cwd: &Path) -> Option<Vec<u8>> {
     if !files.is_empty() {
         // Paths ride stdin (`--stdin-paths` reads one per line), never the
         // command line, so a large set cannot fail to spawn and silently read
-        // as no work.
-        use std::io::Write;
-        let mut input = Vec::new();
-        for rel in &files {
-            input.extend_from_slice(rel);
-            input.push(b'\n');
+        // as no work. A name with a newline cannot ride the line protocol, so
+        // it hashes alone through argv, which carries it whole.
+        let (lined, odd): (Vec<&[u8]>, Vec<&[u8]>) =
+            files.into_iter().partition(|rel| !rel.contains(&b'\n'));
+        if !lined.is_empty() {
+            use std::io::Write;
+            let mut input = Vec::new();
+            for rel in &lined {
+                input.extend_from_slice(rel);
+                input.push(b'\n');
+            }
+            let mut child = std::process::Command::new("git")
+                .args(["hash-object", "--stdin-paths"])
+                .current_dir(cwd)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .ok()?;
+            // The write overlaps the stdout drain on its own thread: the main
+            // thread's `wait_with_output` drains stdout while the writer
+            // feeds stdin, so a large set never fills both pipes with both
+            // sides blocked.
+            let stdin = child.stdin.take()?;
+            let writer = std::thread::spawn(move || {
+                let mut stdin = stdin;
+                stdin.write_all(&input).is_ok()
+            });
+            let out = child
+                .wait_with_output()
+                .ok()
+                .filter(|o| o.status.success())?;
+            if !writer.join().unwrap_or(false) {
+                return None;
+            }
+            let mut shas = out.stdout.split(|b| *b == b'\n');
+            for rel in &lined {
+                match shas.next() {
+                    Some(sha) if !sha.is_empty() => {
+                        combo.extend_from_slice(rel);
+                        combo.push(0);
+                        combo.extend_from_slice(sha);
+                        combo.push(0);
+                    }
+                    _ => return None,
+                }
+            }
+            if shas.next() != Some([].as_slice()) {
+                return None;
+            }
         }
-        let mut child = std::process::Command::new("git")
-            .args(["hash-object", "--stdin-paths"])
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .ok()?;
-        child.stdin.take()?.write_all(&input).ok()?;
-        let out = child
-            .wait_with_output()
-            .ok()
-            .filter(|o| o.status.success())?;
-        for (rel, sha) in files.iter().zip(out.stdout.split(|b| *b == b'\n')) {
+        for rel in odd {
+            let sha = std::process::Command::new("git")
+                .arg("hash-object")
+                .arg(std::ffi::OsStr::from_bytes(rel))
+                .current_dir(cwd)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| o.stdout)?;
+            let sha = sha.strip_suffix(b"\n").unwrap_or(&sha);
             if sha.is_empty() {
                 return None;
             }
@@ -3445,11 +3485,15 @@ fn mark_pause_strong(paths: &SparPaths, key: &str) {
 }
 
 /// The log tail a failed dispatch is judged on. A dispatch that ended by signal is
-/// judged on its typed verdicts only, never on log text: something killed it, and a
-/// log that happens to mention "quota" or "429" must not pause the provider for every
-/// run in the project (#174).
+/// judged on its typed verdicts only, never on log text, with one exception: a hard
+/// ceiling kill ran its full budget, so its log is the provider's own record and a
+/// quota signal in it parks like any other. Any other kill (a stop, a nudge, the
+/// machine) says nothing about the provider, and a log that happens to mention
+/// "quota" or "429" must not pause the provider for every run in the project (#174).
 fn outcome_log_text(log_path: &Path, outcome: &SlotOutcome) -> String {
-    if process::ended_by_signal(outcome.signal, outcome.exit_code) {
+    if process::ended_by_signal(outcome.signal, outcome.exit_code)
+        && outcome.timeout_cause != Some(TimeoutCause::HardCeiling)
+    {
         String::new()
     } else {
         process::tail_log(log_path, 8000)
@@ -8824,6 +8868,73 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         );
     }
 
+    fn snapshot_repo(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let repo = tmp.path().join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        repo
+    }
+
+    /// Thousands of untracked files overflow both pipes at once (path list in,
+    /// sha list out). Writing everything before reading anything wedges git and
+    /// spar against each other with no timeout, so the write must overlap the
+    /// drain on its own thread. Fails by hanging on the old sequence.
+    #[test]
+    fn snapshot_combo_hashes_thousands_of_untracked_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = snapshot_repo(&tmp);
+        for i in 0..4000 {
+            std::fs::write(
+                repo.join(format!("untracked-{i:05}-with-a-longer-name.txt")),
+                "x\n",
+            )
+            .unwrap();
+        }
+        let before = snapshot_combo(&repo).expect("a large untracked set still snapshots");
+        std::fs::write(repo.join("one-more.txt"), "y\n").unwrap();
+        let after = snapshot_combo(&repo).expect("the set still snapshots after growing");
+        assert_ne!(before, after, "one added file changes the snapshot");
+    }
+
+    /// A newline in an untracked name cannot ride the `--stdin-paths` line
+    /// protocol, so it hashes alone through argv and still pairs with its own
+    /// sha. The pairing is checked byte for byte against an independent hash.
+    #[test]
+    fn snapshot_combo_pairs_a_newline_filename_with_its_own_sha() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = snapshot_repo(&tmp);
+        let odd = "weird\nname.txt";
+        std::fs::write(repo.join(odd), "odd\n").unwrap();
+        std::fs::write(repo.join("plain.txt"), "plain\n").unwrap();
+        let combo = snapshot_combo(&repo).expect("a newline name still snapshots");
+        let expected = std::process::Command::new("git")
+            .args(["hash-object", odd])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(expected.status.success());
+        let sha = String::from_utf8_lossy(&expected.stdout).trim().to_string();
+        let needle = [odd.as_bytes(), &[0], sha.as_bytes(), &[0]].concat();
+        assert!(
+            combo.windows(needle.len()).any(|w| w == needle),
+            "the newline name pairs with its own sha"
+        );
+    }
+
     /// The round's own banked WIP commit is the starting point, not new work:
     /// recovery and the ceiling-commit pre-check share `dispatch_left_work`, so
     /// a resumed round that idles into another ceiling kill with HEAD on the
@@ -9656,8 +9767,9 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
                 std::thread::sleep(std::time::Duration::from_secs(5));
             }
         });
-        std::env::set_var("OPENAI_API_KEY", "test-key");
-        std::env::set_var("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}/v1"));
+        let _key = crate::util::EnvRestore::set("OPENAI_API_KEY", "test-key");
+        let _url =
+            crate::util::EnvRestore::set("OPENAI_BASE_URL", &format!("http://127.0.0.1:{port}/v1"));
         let mut st = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
         st.worktrees.push(crate::state::WorktreeRecord {
             slot_id: "impl".into(),

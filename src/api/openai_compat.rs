@@ -129,7 +129,10 @@ pub fn chat_completion(
         .send_json(&body)
         .with_context(|| format!("POST {url}"))?;
     let status = resp.status();
-    let text = resp.into_body().read_to_string()?;
+    let text = resp
+        .into_body()
+        .read_to_string()
+        .with_context(|| format!("read POST {url} body"))?;
     if !status.is_success() {
         bail!("api {} status {status}: {}", cfg.name, truncate(&text, 400));
     }

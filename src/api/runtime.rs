@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn hard_ceiling_reports_a_typed_cause() {
         let tmp = tempdir().unwrap();
-        std::env::set_var("OPENAI_API_KEY", "test-key");
+        let _key = crate::util::EnvRestore::set("OPENAI_API_KEY", "test-key");
         let outcome = run_api_slot(&ApiSlotRequest {
             provider_name: "openai",
             prompt: "hello",

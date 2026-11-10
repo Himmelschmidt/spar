@@ -69,6 +69,7 @@ pub fn expand_home(raw: &str) -> std::path::PathBuf {
 /// to a thread that leaves it unblocked. The previous mask is restored on drop.
 pub struct SigchldGuard {
     saved: libc::sigset_t,
+    _thread: std::marker::PhantomData<*const ()>,
 }
 
 pub fn block_sigchld() -> SigchldGuard {
@@ -77,8 +78,12 @@ pub fn block_sigchld() -> SigchldGuard {
         libc::sigemptyset(&mut add);
         libc::sigaddset(&mut add, libc::SIGCHLD);
         let mut saved: libc::sigset_t = std::mem::zeroed();
-        libc::pthread_sigmask(libc::SIG_BLOCK, &add, &mut saved);
-        SigchldGuard { saved }
+        let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &add, &mut saved);
+        debug_assert_eq!(rc, 0);
+        SigchldGuard {
+            saved,
+            _thread: std::marker::PhantomData,
+        }
     }
 }
 
@@ -86,6 +91,33 @@ impl Drop for SigchldGuard {
     fn drop(&mut self) {
         unsafe {
             libc::pthread_sigmask(libc::SIG_SETMASK, &self.saved, std::ptr::null_mut());
+        }
+    }
+}
+
+/// A test env var that restores its previous value (or absence) on drop, so a
+/// loopback URL a test installs never leaks into a later test in the binary.
+#[cfg(test)]
+pub struct EnvRestore {
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl EnvRestore {
+    pub fn set(key: &'static str, value: &str) -> Self {
+        let prev = std::env::var_os(key);
+        std::env::set_var(key, value);
+        EnvRestore { key, prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
         }
     }
 }
