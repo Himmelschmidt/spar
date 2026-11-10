@@ -65,6 +65,8 @@ impl Sandbox {
             .env("SPAR_HOME", self.home.join(".spar"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("SPAR_AUTH_RETRY_WAIT_SECS", "0")
+            .env("FAKE_COUNT_DIR", &self.bin)
             .env_remove("SPAR_PROJECT_ROOT")
             .env_remove("SPAR_RUN_ID")
             .env_remove("SPAR_AGENT_ID")
@@ -72,6 +74,58 @@ impl Sandbox {
             .env_remove("SPAR_CODEX_PROFILE")
             .env_remove("SPAR_CODEX_MODEL");
         c
+    }
+
+    /// A fake provider CLI answering `--version` and counting dispatches.
+    fn cli(&self, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = self.bin.join(name);
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fake; exit 0; fi\necho x >> \"$FAKE_COUNT_DIR/{name}.count\"\n{body}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn count(&self, name: &str) -> usize {
+        std::fs::read_to_string(self.bin.join(format!("{name}.count")))
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// A real implement whose claude implementer fails fast, leaving an
+    /// implementer seat on claude to reassign. Creation shell records the
+    /// default profile.
+    fn failed_claude_run(&self) -> String {
+        self.cli("claude", "echo 'boom: the model crashed'\nexit 1");
+        self.cli("codex", "exit 1");
+        let out = self
+            .spar()
+            .args([
+                "implement",
+                "-t",
+                "add a feature",
+                "--providers",
+                "cli:claude",
+                "--fleet",
+                "small",
+                "--without",
+                "suite",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let mut runs: Vec<String> = std::fs::read_dir(self.project.join(".spar/runs"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(self.count("claude"), 1, "implementer dispatched");
+        runs.pop().unwrap()
     }
 
     fn state(&self, id: &str) -> serde_json::Value {
@@ -151,24 +205,44 @@ fn spar_codex_model_seat_probes_the_bucket_it_bills() {
     assert_eq!(bare[0]["provider"], "cli:codex@openrouter", "{bare}");
 }
 
-/// `--reassign` refuses a paused recorded-route bucket: the run recorded the
-/// emptied profile (native), so reassigning onto codex is refused even though
-/// the ambient default profile would key the unpaused openrouter bucket.
+/// A bare probe with a model in the ambient environment keys the bucket the
+/// spawn bills: a bare model runs under codex's native default, not the
+/// default profile's OpenRouter bucket.
 #[test]
-fn reassign_refuses_a_paused_recorded_route_bucket() {
+fn bare_probe_with_a_model_in_env_keys_the_billed_bucket() {
     let sb = Sandbox::new();
-    let id = sb.plan_codex(None, Some(""));
-    assert_eq!(sb.state(&id)["codex_profile"], "");
+    sb.plan_codex(None, None);
+    let out = sb
+        .spar()
+        .env("SPAR_CODEX_MODEL", "gpt-5")
+        .args(["provider", "probe", "cli:codex", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let r: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(r[0]["provider"], "cli:codex@native", "{r}");
+}
+
+/// `--reassign` keys the route the dispatch will stamp, not the run's previous
+/// record: the stamp overwrites the record from this process's environment, so
+/// the check must key that same route. Pausing `native` while the shell records
+/// the emptied profile refuses; a shell on the default profile proceeds even
+/// though the previous record named `native`.
+#[test]
+fn reassign_keys_the_route_the_dispatch_will_stamp() {
+    let sb = Sandbox::new();
     sb.spar()
         .args(["provider", "pause", "cli:codex@native"])
         .assert()
         .success();
-    sb.spar()
-        .args(["approve", &id, "--json"])
-        .assert()
-        .success();
+
+    // Shell native, run recorded the default profile: the stamp overwrites the
+    // record from this shell, so the dispatch would run native-paused.
+    let id = sb.failed_claude_run();
+    assert_eq!(sb.state(&id)["codex_profile"], "muse");
     let out = sb
         .spar()
+        .env("SPAR_CODEX_PROFILE", "")
         .args([
             "implement",
             "--run",
@@ -185,6 +259,57 @@ fn reassign_refuses_a_paused_recorded_route_bucket() {
     let err = v["error"].as_str().unwrap_or_default();
     assert!(err.contains("cli:codex@native"), "{v}");
     assert!(err.contains("paused"), "{v}");
+    assert_eq!(sb.count("codex"), 0, "refused before any dispatch");
+
+    // Shell on the default profile: the dispatch stamps openrouter-unpaused,
+    // so the pause another shell recorded must not refuse.
+    let out = sb
+        .spar()
+        .args([
+            "implement",
+            "--run",
+            &id,
+            "--reassign",
+            "implementer=cli:codex",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("is paused"),
+        "stale record must not refuse: {stdout} {out:?}"
+    );
+    assert!(
+        stdout.contains("reassigned seat impl (cli:claude) to cli:codex"),
+        "reassign proceeds: {stdout} {out:?}"
+    );
+}
+
+/// A review dispatches seats too, so it stamps the codex route like every
+/// other entry: the emptied profile records `native` on a dry review run.
+#[test]
+fn review_stamps_the_codex_route() {
+    let sb = Sandbox::new();
+    let out = sb
+        .spar()
+        .env("SPAR_CODEX_PROFILE", "")
+        .args([
+            "run",
+            "--workflow",
+            "review",
+            "-t",
+            "review this",
+            "--providers",
+            "cli:codex",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v = json(&out);
+    let id = v["run_id"].as_str().expect("review mints a run: {v}");
+    assert_eq!(sb.state(id)["codex_profile"], "", "{v}");
 }
 
 /// A replan is a new dispatch: it re-stamps the codex route instead of
