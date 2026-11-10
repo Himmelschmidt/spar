@@ -38,7 +38,7 @@ pub struct CommonOpts {
     /// round. Without it, a re-entry that would re-freeze a tampered contract refuses.
     pub accept_contract: bool,
     /// `--re-review`: send the unchanged HEAD back to the panel instead of counting
-    /// another no-progress dispatch (O171). One-shot: the stall branch consumes it.
+    /// another no-progress dispatch (O180). One-shot: the stall branch consumes it.
     pub re_review: bool,
     /// `--reload-config`: this re-entry resolved a fresh `Config` rather than reading
     /// the run's frozen one (O27), so seats that already exist are re-resolved from it
@@ -105,6 +105,7 @@ impl CommonOpts {
             roles,
             cfg,
             dry,
+            &crate::providers::LiveHealth::for_dry(dry),
         )?;
         if let Some(art) = &resolved.artifact {
             crate::model_select::write_select_artifact(paths, run_id, art)?;

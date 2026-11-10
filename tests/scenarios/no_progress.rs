@@ -1,4 +1,4 @@
-//! No-progress rounds (DECISIONS O169): an implementer that finishes a round
+//! No-progress rounds (DECISIONS O178): an implementer that finishes a round
 //! with HEAD and the tree unchanged while a `request_changes` review against that
 //! same commit is open must not be answered with another full review of the same
 //! commit. The next dispatch carries a warning instead, and the second consecutive

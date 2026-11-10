@@ -66,14 +66,16 @@ impl Fixture {
     }
 
     /// A fake CLI that answers `--version` and otherwise counts the dispatch in
-    /// `$FAKE_COUNT_DIR/<name>.count` before running `body`.
+    /// `$FAKE_COUNT_DIR/<name>.count` before running `body`. Readiness probes
+    /// (`auth`/`login`) run `body` uncounted: a probe is not a dispatch, and
+    /// counting one breaks dispatch-count assertions.
     fn cli(&self, name: &str, body: &str) {
         let p = self.bin.join(name);
         fs::write(
             &p,
             format!(
                 "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fake; exit 0; fi\n\
-                 echo x >> \"$FAKE_COUNT_DIR/{name}.count\"\n{body}\n"
+                 case \"$1\" in auth|login) {body};; *) echo x >> \"$FAKE_COUNT_DIR/{name}.count\"\n{body};; esac\n"
             ),
         )
         .unwrap();
@@ -896,6 +898,12 @@ fn an_interrupted_amend_is_rolled_back_by_approve_and_by_the_next_amend() {
 #[test]
 fn amend_reuses_the_current_test_author_seat_and_rolls_back_when_it_fails() {
     let fx = Fixture::new();
+    // The backup must pass the readiness probe to be eligible, so codex
+    // answers `login` while still failing the dispatch.
+    fx.cli(
+        "codex",
+        "if [ \"$1\" = \"login\" ]; then exit 0; fi\necho 'boom: backup failed'\nexit 1",
+    );
     let id = planned_run(&fx);
     // A seat the config would no longer resolve to: amend must still use it.
     let mut st = fx.state();

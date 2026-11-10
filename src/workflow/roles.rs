@@ -39,7 +39,15 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     }
     let requested = opts.resolve_pool(2, &["implementer", "implementer"], paths, cfg, &state.id)?;
     state.pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
-    state.providers = providers::pick_providers(&requested, 2, Some(&requested), dry);
+    let health = providers::LiveHealth::for_dry(dry);
+    state.providers = providers::pick_providers(
+        &requested,
+        2,
+        Some(&requested),
+        dry,
+        state.pool_origin,
+        &health,
+    );
     if state.providers.is_empty() {
         state.error = Some("no usable providers".into());
         state.set_phase(Phase::Failed);
@@ -56,14 +64,31 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         state.providers.push(state.providers[0].clone());
     }
 
-    let fe = state.providers[0].clone();
-    let be = state.providers[1].clone();
+    let mut pair = [state.providers[0].clone(), state.providers[1].clone()];
+    for (i, seat) in pair.iter_mut().enumerate() {
+        if let Some((pin_provider, pin_source)) = crate::workflow::roles_resolve::resolve_seat(
+            SlotRole::Implementer,
+            i,
+            i,
+            &state.providers,
+            state.pool_origin,
+            cfg,
+            &health,
+            &[],
+        ) {
+            if pin_source.is_explicit_pin() {
+                *seat = pin_provider;
+            }
+        }
+    }
+    let [fe, be] = pair;
     let sources = crate::workflow::roles_resolve::resolve_seat_sources(
         SlotRole::Implementer,
         2,
         &state.providers,
         state.pool_origin,
         cfg,
+        &health,
     );
     let mut fe_slot = executor::init_slot(format!("role-frontend-{fe}"), &fe, SlotRole::Peer);
     fe_slot.source = sources.first().copied();
@@ -71,6 +96,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     let mut be_slot = executor::init_slot(format!("role-backend-{be}"), &be, SlotRole::Peer);
     be_slot.source = sources.get(1).copied();
     state.slots.push(be_slot);
+    state.record_unhealthy_pin_warnings();
 
     paths.ensure_run_dirs(&state.id)?;
     bus::ensure_bus(paths)?;

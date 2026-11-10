@@ -71,7 +71,9 @@ failed, with the probe's own one-line message, e.g. pi with no OpenRouter key),
 `missing` (not on PATH). `--json` carries the same verdict as `readiness` with values
 `healthy` / `unhealthy` / `unknown`, plus `readiness_message` (ANSI-stripped, capped at
 300 chars) when unhealthy. `doctor` exits failure only when no usable provider remains,
-so one unhealthy provider alongside working ones does not block a run. Probes wired:
+so one unhealthy provider alongside working ones does not block a run. `available`
+(binary resolves) is display-only; auto-selection reads `usable()` (available and not
+`unhealthy`) instead. Probes wired:
 `cli:pi` runs `pi auth check --provider openrouter --json --no-refresh` (or `--model
 <SPAR_PI_MODEL routed>` when that is set; detection is per adapter, so it cannot see a
 slot's own `@model`), which catches a missing key, not a dead one; (O107) `cli:claude` runs `claude auth status` with nonessential traffic off (logged out) and
@@ -79,8 +81,18 @@ reads its `.credentials.json` for an expired refresh token; `cli:codex` runs `co
 login status` (logged out). grok, muse and agy have no local check that fails on a dead
 login, so they report unknown; use `spar provider probe <ref>` for a real call. Limit:
 no local probe sees a token revoked server-side; that surfaces at dispatch as an auth
-fault. An `unhealthy` provider is still eligible for dispatch; doctor warns, it does not
-exclude.
+fault. An `unhealthy` provider is skipped by auto-selection and backup rotation
+(`unknown` stays eligible). An explicit pin (`--providers` or `--backup` naming
+it, or a `--role` seat) still dispatches, with a launch warning carried on the
+run as `warnings` (stderr and `--json`); a dispatched `--backup` records source
+`cli-backup`. A `[backups]`-file entry stays a fallback and is skipped while
+unhealthy. Launch resolves readiness once per seat where its provider is
+settled, so a hung login can delay that launch up to the readiness timeout
+before dispatch. A non-pin seat with no healthy provider fails readiness
+(exit `1`) naming the failed probes; exit `4` is quota pauses only.
+Continuing a run (`implement --run`) re-checks auto-selected seats the same
+way and re-seats one whose provider went unhealthy; singleton order seats
+take the first usable entry no earlier seat holds.
 
 **A reviewer that cannot run is not a verdict (O103).** In the implement loop, a
 reviewer dispatch that fails because the provider could not serve it (rate limit, auth
@@ -565,7 +577,7 @@ spar implement --run <id> --max-rounds 12   # buy more rounds; sticky on the run
 spar implement --run <id> --max-rounds +2   # two rounds past the current one (O127)
 spar implement --run <id> --re-review       # reviewer-is-wrong exit: send the unchanged
                                             # HEAD straight to the panel, skipping the
-                                            # implementer (O171); one-shot
+                                            # implementer (O180); one-shot
 ```
 
 **Extending (O127).** The value must land above the run's current round (a round opened
@@ -1648,7 +1660,7 @@ stderr and the purge or sweep goes on.
   "id": "ab12cd34", "task": "first line of the task", "workflow": "loop",
   "dry_run": false, "phase": "done",
   "roles": [{"slot": "review-0-cli-codex", "role": "reviewer", "provider": "cli:codex",
-             "model": null, "source": "backup" | null, "parked_run": false}],
+             "model": null, "source": "backup" | "cli-backup" | null, "parked_run": false}],
   "rounds": 3, "max_rounds": 5,
   "review_rounds": [{"round": 2,
                      "verdicts": [{"slot": "review-0-cli-codex", "verdict": "request_changes",
@@ -1907,8 +1919,9 @@ provider is not a validation failure: that still creates a run parked in `quota`
 To pre-check without launching, add `--validate-only` (any of the three commands): it runs
 the same checks, writes nothing (no run dir, no brief intake, no `--reload-config`
 snapshot) and exits 0 with `{"ok": true, "run_id": null, "kind": "validation", "fleet": [...],
-"gates": {...}}`. It does not rank `--select` (that needs the bench cache) or probe PATH and
-quota. Usage errors on any command exit 1, not clap's default 2.
+"gates": {...}}`. It does not rank `--select` (that needs the bench cache) or re-probe
+quota pauses; readiness probes run for real, so the fleet below is the panel launch
+would seat. Usage errors on any command exit 1, not clap's default 2.
 
 The `--validate-only` JSON also says what the launch would do (O147), so a front end can show
 it before anyone confirms:
@@ -1916,10 +1929,15 @@ it before anyone confirms:
 - `fleet`: the seats, in the run JSON `fleet` shape (`{seat, role, provider, model, source,
   projected}`), resolved by the same functions the launch uses: plan-phase seats plus the
   projected implement panel for `plan`, the implement panel for `implement -t` and
-  `--workflow loop`, the reviewers for `--workflow review`, and the run's own seats for
-  `implement --run <id>` and `plan --run <id>`. Availability, quota pauses and backups are
-  not applied, so a paused primary shows as itself. `null` with `--select` and for arena,
-  peer and roles.
+  `--workflow loop`, the reviewers for `--workflow review`, and for `implement --run
+  <id>` and `plan --run <id>` the run's stored seats projected through the next
+  dispatch's re-resolution: a paused seat shows its backup, a sick seat its
+  fallback. Quota pauses are not re-probed, so a seat the next dispatch would
+  park on fails the pre-check instead of showing a fleet: a paused seat with no
+  eligible backup exits 4 with the quota message, a seat with nothing healthy
+  exits 1 with the readiness error, each the same error the dispatch would print.
+  Readiness is probed for real: an unhealthy seat shows the fallback launch would
+  take. `null` with `--select` and for arena, peer and roles.
 - `gates`: `autonomy` plus `auto_plan`, `auto_winner`, `auto_ship`, true when the config
   (`autonomy`, `[gates]`, `[ship].auto_confirm`) would pass that gate without the operator.
 - `implement --run <id> --validate-only` also refuses, as data, a run that is not resumable
@@ -2236,6 +2254,6 @@ timeout_secs = 3600    # test_author's SOFT clock; hard_ceiling_multiple applies
   - **Agent tester.** With `[suite].command` empty, a cheap `tester` slot discovers how the repo runs its tests and reports. Its provider comes from `[roles].tester` (falls through to model-select/fleet if unset/unusable). This is the fallback for a repo that has not declared its commands, and the one path where the gate depends on a model reporting its own result honestly.
 
   Independent `review` workflow does not spawn a tester by default.
-- **Round ceiling:** `state.round` is bounded by `[rounds] max` (default 8). Hitting it is a **gate** (exit 2, phase `awaiting_round_extension`), lifted with `implement --run <id> --max-rounds <N|+N>` (above the current round; sticky; clears `error`; queued while an orchestrator is live). The rotate/widen/`stuck` ladder resolves **first**, so exit 3 beats the ceiling gate, but a no-progress stall parks at this same gate before the ladder runs (a stall presents exit 2 where the ladder would otherwise have reached `stuck`); a lift preserves the ladder's progress rather than re-buying it. **No-progress (O169):** a dispatch that leaves HEAD and the tree unchanged while a still-blocking review against that same commit is open re-dispatches the implementer once with a warning naming the unaddressed findings instead of a new panel; a second consecutive one parks at this same gate, with the reason in `error` and the warning in `escalation.md`. A below-ceiling stall re-enters without `--max-rounds`: on every re-entry the flag only ever raises, so resolving under the ceiling keeps it and an uncapped run stays uncapped. If the blocking review is wrong (O171), rule it out with `spar rule add` and re-enter with `implement --run <id> --re-review`: the unchanged HEAD goes straight back to the suite and panel with the ruling in context, without dispatching the implementer.
+- **Round ceiling:** `state.round` is bounded by `[rounds] max` (default 8). Hitting it is a **gate** (exit 2, phase `awaiting_round_extension`), lifted with `implement --run <id> --max-rounds <N|+N>` (above the current round; sticky; clears `error`; queued while an orchestrator is live). The rotate/widen/`stuck` ladder resolves **first**, so exit 3 beats the ceiling gate, but a no-progress stall parks at this same gate before the ladder runs (a stall presents exit 2 where the ladder would otherwise have reached `stuck`); a lift preserves the ladder's progress rather than re-buying it. **No-progress (O178):** a dispatch that leaves HEAD and the tree unchanged while a still-blocking review against that same commit is open re-dispatches the implementer once with a warning naming the unaddressed findings instead of a new panel; a second consecutive one parks at this same gate, with the reason in `error` and the warning in `escalation.md`. A below-ceiling stall re-enters without `--max-rounds`: on every re-entry the flag only ever raises, so resolving under the ceiling keeps it and an uncapped run stays uncapped. If the blocking review is wrong (O180), rule it out with `spar rule add` and re-enter with `implement --run <id> --re-review`: the unchanged HEAD goes straight back to the suite and panel with the ruling in context, without dispatching the implementer.
 - **Contract re-freeze is guarded:** a re-entry that would adopt a `test-contract.md` spar saw drift mid-round refuses with exit `1` unless `--accept-contract` is passed. Re-freezes are announced on stderr, not just in `events.jsonl`.
 - **Carry-forward:** the implementer writes `artifacts/carry-forward-<slot>.md`, which seeds the next round's implementer prompt (blockers first, capped at `[rounds] carry_forward_chars`, consumed on read). It never reaches a reviewer or the acceptance gate. The seeded blockers name, per blocking review, the round that wrote it and its `Reviewed-Commit` as the current verdict on the implementer's HEAD, plus the open findings (severity plus one line each, untagged items included) and a `full review:` line naming the review's artifact file (resolved against the `Artifacts:` dir printed in the same prompt).
