@@ -550,6 +550,13 @@ fn run() -> Result<ExitCode> {
                                         plan.removed.iter().map(|s| s.as_str()).collect();
                                     seats.retain(|s| !doomed.contains(s.seat.as_str()));
                                 }
+                                // A `--role reviewer=` pin re-seats the live panel: show
+                                // the simulated panel, not the stale live seats it
+                                // replaces. Freshly minted seats are `projected`.
+                                if let Some(resynced) = &preview.resynced_panel {
+                                    seats.retain(|s| s.role != crate::state::SlotRole::Reviewer);
+                                    seats.extend(resynced.iter().cloned());
+                                }
                                 shown_cfg = Some(preview.cfg.clone());
                             }
                             fleet = Some(seats);

@@ -2814,7 +2814,7 @@ fn amend_after_a_reassign_freezes_the_moved_panel() {
 /// dropping a seat while pinning `--role reviewer=` still removes the seat,
 /// then re-seats the live panel to match the pin.
 #[test]
-fn bound_drop_with_role_pin_freezes_the_role_panel() {
+fn bound_drop_with_role_pin_reseats_the_live_panel() {
     let tmp = project("[suite]\nenabled = false\n");
     let v = plan_json(
         tmp.path(),

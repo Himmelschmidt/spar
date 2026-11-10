@@ -1090,8 +1090,8 @@ fn split_role_override(raw: &str) -> Result<(crate::state::SlotRole, &str)> {
 
 /// The refusal a drop-all without a re-seat gets, on fresh and bound runs alike:
 /// the run would otherwise reach the ship gate with no reviewer judging it.
-fn emptied_reviewer_panel_message() -> String {
-    "--without reviewer[N]: cannot drop the last reviewer seat; the run would reach the ship gate unreviewed (--role reviewer=<provider> re-seats the panel)".to_string()
+pub(crate) fn emptied_reviewer_panel_message() -> String {
+    "--without reviewer[N]: cannot drop the last reviewer panel seat; the run would reach the ship gate unreviewed (--role reviewer=<provider> re-seats the panel; widened extras sit outside the panel and review on)".to_string()
 }
 
 /// Whether any `--role` assignment pins the reviewer panel outright, replacing
@@ -2046,16 +2046,6 @@ impl Config {
     /// final panel, not the intermediate one a `--without` alone leaves behind.
     pub fn refuse_emptied_reviewer_panel(&self, dropped: &[usize]) -> Result<()> {
         if !dropped.is_empty() && self.roles.reviewer.is_empty() {
-            anyhow::bail!("{}", emptied_reviewer_panel_message());
-        }
-        Ok(())
-    }
-
-    /// The bound-run form of the same refusal: the live panel and the frozen
-    /// config panel are one fact, so the check judges the live seats left after
-    /// retirement, not the config panel a `--role reviewer=` pin just refilled.
-    pub fn refuse_emptied_live_panel(live: usize, removed: usize) -> Result<()> {
-        if removed > 0 && removed >= live {
             anyhow::bail!("{}", emptied_reviewer_panel_message());
         }
         Ok(())
