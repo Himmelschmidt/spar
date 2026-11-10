@@ -326,9 +326,9 @@ pub struct Reassignment {
 
 /// Parse `--reassign` and refuse a provider the run could not dispatch anyway: unknown,
 /// manually paused, or paused on a trusted quota signal (O106, O136). Read before the run
-/// lock, so a typo costs nothing. The pause check keys the run's recorded dispatch
-/// route, not this process's environment: a model-less codex seat reassigned onto a
-/// paused recorded bucket is refused even when the ambient profile would key elsewhere.
+/// lock, so a typo costs nothing. The pause check keys the route the next dispatch will
+/// stamp (this process's environment): a model-less codex seat reassigned onto a paused
+/// ambient bucket is refused even when the run's stale record would key elsewhere.
 pub fn parse_reassignments(
     raw: &[String],
     paths: &SparPaths,
