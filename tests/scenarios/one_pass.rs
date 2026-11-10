@@ -1,7 +1,7 @@
-//! `--one-pass` (O196): one small round, then ship. A passed gate ships; a gate
-//! failed on reviewer findings alone ships anyway, with the findings recorded
-//! as follow-ups (acceptance and suite must be clear). A blocking finding, a
-//! failed acceptance line, or a failed suite parks at exit 2, as without the flag.
+//! `--one-pass` (O196): one small round, then the verdict. A passed gate ships;
+//! a sub-threshold `request_changes` counts as approve-with-notes and ships
+//! clean with the findings as follow-ups in the PR body. Anything that fails
+//! the gate parks at it (exit 2), as without the flag.
 
 mod common;
 
@@ -132,12 +132,14 @@ fn plan_and_approve(dir: &Path) -> String {
 }
 
 /// A passed gate ships: exit 0, done, no override recorded, and the run config
-/// freezes the mode with a one-reviewer panel and a one-round ceiling.
+/// freezes the mode with a one-reviewer panel and a one-round ceiling. The
+/// entry prints exactly one JSON document: the ship reports itself and the
+/// loop does not emit a second one.
 #[test]
 fn one_pass_clean_review_ships() {
     let tmp = tempdir().unwrap();
     init_git_repo(tmp.path());
-    spar_cmd()
+    let out = spar_cmd()
         .current_dir(tmp.path())
         .args([
             "implement",
@@ -150,7 +152,14 @@ fn one_pass_clean_review_ships() {
             "--one-pass",
         ])
         .assert()
-        .code(0);
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    // `from_slice` rejects trailing bytes, so a second document fails here.
+    let v: serde_json::Value =
+        serde_json::from_slice(&out).expect("implement --json prints one JSON document");
+    assert_eq!(v["phase"], "done");
     let run_id = only_run_id(tmp.path());
     assert_eq!(status_json(tmp.path(), &run_id)["phase"], "done");
     let cfg = config_json(tmp.path(), &run_id);
@@ -206,8 +215,16 @@ fn one_pass_minor_notes_ship_clean_on_bound_run() {
     let ship = std::fs::read_to_string(run_dir(tmp.path(), &run_id).join("artifacts/ship.md"))
         .expect("dry-run ship writes ship.md");
     assert!(
-        !ship.contains("Shipped over open findings"),
-        "no follow-ups on a passed gate"
+        ship.contains("## Open findings (non-blocking)"),
+        "the minor findings ride along as follow-ups in the PR body:\n{ship}"
+    );
+    assert!(
+        ship.contains("dry-run forced finding"),
+        "the minor finding text is in the PR body:\n{ship}"
+    );
+    assert!(
+        !ship.contains("## Gate override"),
+        "a passed gate ships clean, never through the override machinery:\n{ship}"
     );
 }
 
@@ -251,8 +268,8 @@ fn one_pass_blocking_finding_parks() {
 }
 
 /// A gate failed on acceptance alone parks: the review approves, but the
-/// omitted criterion trips the fail-closed acceptance check, so this is not a
-/// findings-alone failure. Exit 2, no ship, no override. Needs a planned run:
+/// omitted criterion trips the fail-closed acceptance check. Exit 2, no ship,
+/// no override. Needs a planned run:
 /// the small fleet has no TestAuthor seat, so a fresh run's contract is empty
 /// and there is nothing to omit.
 #[test]

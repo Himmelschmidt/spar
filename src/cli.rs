@@ -206,11 +206,13 @@ pub enum Command {
         #[arg(long, value_name = "PRESET")]
         fleet: Option<String>,
         /// One pass and ship: imply `--fleet small`, cap the run at one round, and
-        /// ship at the end of it — a passed gate ships, and a failed gate ships
-        /// anyway when no open finding reaches `[review] block_on` (the findings
-        /// ride along as follow-ups). A finding at or above `block_on` parks at
-        /// the existing gate (exit 2). Frozen into the run's config; an explicit
-        /// `--fleet` still wins over the implied preset.
+        /// ship at the end of a passed gate. A sub-threshold `request_changes`
+        /// counts as approve-with-notes and ships clean, with the findings
+        /// listed as follow-ups in the PR body; anything that fails the gate
+        /// (a finding at or above `[review] block_on`, a failed acceptance
+        /// line, a failing suite, a dead reviewer seat) parks at the existing
+        /// gate (exit 2). Frozen into the run's config; an explicit `--fleet`
+        /// or `--max-rounds` still wins over the implied preset and ceiling.
         #[arg(long = "one-pass")]
         one_pass: bool,
         /// Drop seats for THIS run only, comma-separated: `critic`, `spec`, `suite`,
@@ -345,11 +347,14 @@ pub enum Command {
         #[arg(long, value_name = "PRESET")]
         fleet: Option<String>,
         /// One pass and ship, for the `loop` workflow: imply `--fleet small`, cap
-        /// the run at one round, and ship at the end of it — a passed gate ships,
-        /// and a failed gate ships anyway when no open finding reaches `[review]
-        /// block_on` (the findings ride along as follow-ups). A finding at or
-        /// above `block_on` parks at the existing gate (exit 2). Frozen into the
-        /// run's config; an explicit `--fleet` still wins over the implied preset.
+        /// the run at one round, and ship at the end of a passed gate. A
+        /// sub-threshold `request_changes` counts as approve-with-notes and
+        /// ships clean, with the findings listed as follow-ups in the PR body;
+        /// anything that fails the gate (a finding at or above `[review]
+        /// block_on`, a failed acceptance line, a failing suite, a dead
+        /// reviewer seat) parks at the existing gate (exit 2). Frozen into the
+        /// run's config; an explicit `--fleet` or `--max-rounds` still wins
+        /// over the implied preset and ceiling.
         /// Refused for other workflows.
         #[arg(long = "one-pass")]
         one_pass: bool,
