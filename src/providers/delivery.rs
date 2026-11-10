@@ -219,16 +219,15 @@ pub(crate) fn render_poll_file(paths: &SparPaths, run: Option<&str>, agent: &str
     let _lock = lock_poll_file(paths, run, agent)?;
     // The ack scan runs under the poll-file lock: an ack filed between the scan
     // and the write would otherwise lose to a stale render.
-    let acked = bus::acked_by_map(paths, run, &HashSet::from([agent.to_string()]))
-        .remove(agent)
-        .unwrap_or_default();
+    let mut scan = bus::scan_for_render(paths, run, &HashSet::from([agent.to_string()]));
+    let acked = scan.acked.remove(agent).unwrap_or_default();
+    let superseded = scan.superseded;
     let mut gate = bus::ExpiryGate::new();
     let path = poll_file(paths, run, agent);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut seen = HashSet::new();
-    let superseded = bus::superseded_on_disk(paths);
     let mut msgs: Vec<bus::BusMessage> = bus::filed_copies(paths, agent)
         .into_iter()
         .filter(|m| {

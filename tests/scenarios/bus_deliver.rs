@@ -1353,6 +1353,112 @@ fn supersede_during_redelivery_tick_lists_only_the_replacement() {
     );
 }
 
+/// The pending-ack clear takes the same lock the redelivery tick holds: with
+/// the lock held elsewhere, a racing `--supersedes` send blocks in its clear
+/// instead of deleting the record out from under a tick that already read it
+/// (which would resurrect the message), so the withdrawal lands wholly before
+/// or after the tick.
+#[test]
+fn supersede_clear_waits_for_the_pending_ack_lock() {
+    let tmp = tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let (run_id, agent) = live_poll_run(tmp.path(), "cli:agy");
+    let dir = tmp.path();
+
+    let old = send_json(
+        dir,
+        &run_id,
+        &["--to", &agent, "--requires-ack", "-m", "old instruction"],
+    );
+    let old_id = old["id"].as_str().unwrap().to_string();
+    let pending = dir
+        .join(".spar/bus/pending_ack")
+        .join(format!("{old_id}.json"));
+    assert!(
+        pending.is_file(),
+        "a requires-ack send records a pending ack"
+    );
+
+    // Hold the tick's lock while the superseding send runs.
+    let lock_path = dir.join(".spar/bus/pending_ack/.lock");
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        rustix::fs::flock(&f, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        release_rx.recv().unwrap();
+    });
+
+    let mut child = {
+        let mut c = common::spar_std();
+        c.env("SPAR_HOME", spar_home_dir());
+        c.current_dir(dir)
+            .args([
+                "bus",
+                "send",
+                "--run",
+                &run_id,
+                "--json",
+                "--to",
+                &agent,
+                "--supersedes",
+                &old_id,
+                "-m",
+                "new instruction",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+
+    // The new message is filed before its withdrawal runs: once the log shows
+    // it, the child is inside the withdrawal and must be stuck at the clear.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let entries = log_entries(dir, &run_id);
+        if entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["body"].as_str().unwrap_or("") == "new instruction")
+        {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the superseding send never filed its message");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the send is blocked clearing the pending record while the lock is held"
+    );
+    assert!(
+        pending.is_file(),
+        "the clear waits for the lock: the record survives"
+    );
+
+    release_tx.send(()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    holder.join().unwrap();
+    assert!(
+        out.status.success(),
+        "the supersede succeeds after release: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!pending.exists(), "release lets the clear through");
+    let poll = poll_body(dir, &run_id, &agent);
+    assert!(!poll.contains("old instruction"), "{poll}");
+    assert!(poll.contains("new instruction"), "{poll}");
+}
+
 /// `human` and `@human` are one seat: a message sent `--from @human` is
 /// superseded by a send with the default `--from human`, and both spellings
 /// file into the one `@human` inbox. (Pair grouping across the spellings is

@@ -63,9 +63,10 @@ pub fn agent_ref(run: Option<&str>, slot: &str) -> String {
 /// bare agent — pass that agent's already-unique id (bare ids are colon-less, so send it
 /// with `run = None`) or its fully-qualified `run:slot`. `send_mention` does exactly this.
 /// One spelling for the human seat: `human` (the CLI `--from` default) and
-/// `@human` (prompts, docs, the notifier) are one role. Every address is
-/// canonicalised at the `send` choke point, so all later comparisons see
-/// `@human`; `resolve_addr` canonicalises too, so reads route to one inbox.
+/// `@human` (prompts, docs, the notifier) are one role. `send` canonicalises,
+/// so everything built from here on sees `@human`; `resolve_addr`
+/// canonicalises again for reads, because events logged before this rule still
+/// carry bare `human` and must route to the one inbox.
 pub(crate) fn canonical_addr(id: &str) -> &str {
     if id == "human" {
         HUMAN
@@ -1663,92 +1664,93 @@ pub(crate) fn filed_copies(paths: &SparPaths, agent: &str) -> Vec<BusMessage> {
     out
 }
 
-/// The cheapest slice of an event line: the scan below probes every line of the
-/// workspace log, and most lines are not acks.
-#[derive(serde::Deserialize)]
-struct AckProbe {
-    kind: Option<MsgKind>,
-}
-
-/// Message ids each listed slot acked, in one streaming pass over the run's event
-/// mirror (`Some(run)`) or the workspace log (`None`). A slot that acked a
-/// message is done with it, so its poll file stops listing it. Slot acks carry
-/// the run tag (the CLI defaults `--from`/`--run` to the slot env), so the
-/// run-scoped render scans only its own run's mirror instead of the whole
-/// workspace log on every filing; `None` keeps the complete workspace scan for
-/// run-less readers.
-pub(crate) fn acked_by_map(
-    paths: &SparPaths,
-    run: Option<&str>,
-    agents: &HashSet<String>,
-) -> HashMap<String, HashSet<String>> {
-    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
-    let log = match run {
-        Some(r) => run_events_path(paths, r),
-        None => events_path(paths),
-    };
-    let Ok(f) = File::open(log) else {
-        return out;
-    };
-    for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(probe) = serde_json::from_str::<AckProbe>(&line) else {
-            continue;
-        };
-        if probe.kind != Some(MsgKind::Ack) {
-            continue;
-        }
-        let Ok(m) = serde_json::from_str::<BusMessage>(&line) else {
-            continue;
-        };
-        let from = resolve_addr(m.run.as_deref(), &m.from);
-        if !agents.contains(&from) {
-            continue;
-        }
-        if let Some(t) = m.refs.reply_to {
-            out.entry(from).or_default().insert(t);
-        }
-    }
-    out
-}
-
-/// The cheapest slice of an event line for the supersede scan: the render probes
-/// every line of the workspace log, and most lines supersede nothing.
+/// The cheapest slice of an event line for the render scan: most lines are
+/// neither acks nor supersedes, and the full message parse on every line cost
+/// the render a second whole-log pass.
 #[derive(serde::Deserialize, Default)]
-struct SupersedeProbe {
+struct RenderProbe {
     #[serde(default)]
-    refs: SupersedeRefs,
+    kind: Option<MsgKind>,
+    #[serde(default)]
+    from: String,
+    #[serde(default)]
+    run: Option<String>,
+    #[serde(default)]
+    refs: RenderRefs,
 }
 
 #[derive(serde::Deserialize, Default)]
-struct SupersedeRefs {
+struct RenderRefs {
+    #[serde(default)]
+    reply_to: Option<String>,
     #[serde(default)]
     supersedes: Option<String>,
 }
 
-/// Ids a later logged message supersedes, in one streaming pass over the same
-/// workspace log `list_events` reads (run-tagged and untagged alike). The
-/// poll-file render filters on this, so it shares `persisted_for`'s derivation
-/// without parsing the whole log on every filing.
-pub(crate) fn superseded_on_disk(paths: &SparPaths) -> HashSet<String> {
-    let mut out = HashSet::new();
-    let Ok(f) = File::open(events_path(paths)) else {
-        return out;
+/// What one poll-file render needs from the logs: the message ids each listed
+/// slot acked (a slot that acked is done with it) and the ids a later logged
+/// message supersedes (sharing `persisted_for`'s derivation). One streaming
+/// pass per file: the run's event mirror (`Some(run)`) for acks — slot acks
+/// carry the run tag — and the workspace log for supersedes, which are
+/// workspace-wide (a `--supersedes` without `--run` is stored untagged yet
+/// still withdraws). `None` reads the workspace log once for both.
+pub(crate) struct RenderScan {
+    pub acked: HashMap<String, HashSet<String>>,
+    pub superseded: HashSet<String>,
+}
+
+pub(crate) fn scan_for_render(
+    paths: &SparPaths,
+    run: Option<&str>,
+    agents: &HashSet<String>,
+) -> RenderScan {
+    match run {
+        Some(r) => {
+            let ack = scan_render_log(&run_events_path(paths, r), agents).0;
+            let superseded = scan_render_log(&events_path(paths), agents).1;
+            RenderScan {
+                acked: ack,
+                superseded,
+            }
+        }
+        None => {
+            let (acked, superseded) = scan_render_log(&events_path(paths), agents);
+            RenderScan { acked, superseded }
+        }
+    }
+}
+
+fn scan_render_log(
+    log: &std::path::Path,
+    agents: &HashSet<String>,
+) -> (HashMap<String, HashSet<String>>, HashSet<String>) {
+    let mut acked: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut superseded = HashSet::new();
+    let Ok(f) = File::open(log) else {
+        return (acked, superseded);
     };
     for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(probe) = serde_json::from_str::<SupersedeProbe>(&line) else {
+        let Ok(probe) = serde_json::from_str::<RenderProbe>(&line) else {
             continue;
         };
         if let Some(old) = probe.refs.supersedes {
-            out.insert(old);
+            superseded.insert(old);
+        }
+        if probe.kind != Some(MsgKind::Ack) {
+            continue;
+        }
+        let from = resolve_addr(probe.run.as_deref(), &probe.from);
+        if !agents.contains(&from) {
+            continue;
+        }
+        if let Some(t) = probe.refs.reply_to {
+            acked.entry(from).or_default().insert(t);
         }
     }
-    out
+    (acked, superseded)
 }
 
 /// Delete `claimed/` copies the render filtered out of every future render:
