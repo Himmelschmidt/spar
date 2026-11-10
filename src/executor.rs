@@ -1846,14 +1846,10 @@ fn banked_partial_commit(state: &RunState, round: u32) -> Option<String> {
         .and_then(|e| e.commit.clone())
 }
 
-/// Content digest of everything `HEAD` does not carry: the tracked diff plus
-/// every untracked file's hash, folded through git itself. `None` when `cwd`
-/// is not a readable worktree. Two snapshots compare equal only for identical
-/// trees, so dirt that predates the snapshot (the test-author overlay, a
-/// refused round's leftovers) does not read as new work, while any edit —
-/// even to an already-dirty file — does. `--binary` keeps an edited tracked
-/// binary distinct from its identical `Binary files ... differ` line.
-pub(crate) fn worktree_snapshot(cwd: &Path) -> Option<String> {
+/// Raw snapshot input: the tracked diff plus a separator plus every untracked
+/// file's hash. A tree with nothing past HEAD always builds `[0]`: the diff is
+/// empty and there is nothing to hash.
+fn snapshot_combo(cwd: &Path) -> Option<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
     let bytes = |args: &[&str]| {
         std::process::Command::new("git")
@@ -1915,6 +1911,18 @@ pub(crate) fn worktree_snapshot(cwd: &Path) -> Option<String> {
             combo.push(0);
         }
     }
+    Some(combo)
+}
+
+/// Content digest of everything `HEAD` does not carry: the tracked diff plus
+/// every untracked file's hash, folded through git itself. `None` when `cwd`
+/// is not a readable worktree. Two snapshots compare equal only for identical
+/// trees, so dirt that predates the snapshot (the test-author overlay, a
+/// refused round's leftovers) does not read as new work, while any edit —
+/// even to an already-dirty file — does. `--binary` keeps an edited tracked
+/// binary distinct from its identical `Binary files ... differ` line.
+pub(crate) fn worktree_snapshot(cwd: &Path) -> Option<String> {
+    let combo = snapshot_combo(cwd)?;
     let mut hash = std::process::Command::new("git");
     hash.args(["hash-object", "--stdin"]).current_dir(cwd);
     let mut child = hash
@@ -1939,13 +1947,29 @@ pub(crate) fn worktree_snapshot(cwd: &Path) -> Option<String> {
 fn tree_differs_since(cwd: &Path, since_tree: Option<&str>) -> bool {
     match (worktree_snapshot(cwd), since_tree) {
         (Some(now), Some(before)) => now != before,
-        _ => std::process::Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(cwd)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .is_some_and(|o| !o.stdout.iter().all(|b| b.is_ascii_whitespace())),
+        _ => tree_is_dirty(cwd),
+    }
+}
+
+/// The legacy read, shared by both tree halves: any dirty tree counts when a
+/// stamp is missing or git cannot build a snapshot.
+fn tree_is_dirty(cwd: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| !o.stdout.iter().all(|b| b.is_ascii_whitespace()))
+}
+
+/// Whether the tree holds anything past HEAD: a non-empty diff or new
+/// untracked files. The banked-round case reads this instead of the
+/// round-start snapshot.
+fn tree_differs_from_head(cwd: &Path) -> bool {
+    match snapshot_combo(cwd) {
+        Some(combo) => combo != [0],
+        _ => tree_is_dirty(cwd),
     }
 }
 
@@ -1955,15 +1979,31 @@ fn tree_differs_since(cwd: &Path, since_tree: Option<&str>) -> bool {
 /// overlay lands before round 1, a refused round leaves leftovers), so any
 /// dirty tree always reads as work. `None` for either stamp falls back to the
 /// legacy read for that half: any dirty tree, or only HEAD movement. The
-/// banked partial commit counts as the starting point rather than new work.
-/// The one predicate behind both recovery and the ceiling-commit pre-check.
+/// banked partial commit counts as the starting point rather than new work:
+/// with HEAD on the bank the tree measures against HEAD itself, because the
+/// bank swept the round-start dirt into the commit. The one predicate behind
+/// both recovery and the ceiling-commit pre-check.
 pub fn dispatch_left_work(
     cwd: &Path,
     since_head: Option<&str>,
     since_tree: Option<&str>,
     banked_head: Option<&str>,
 ) -> bool {
+    if head_is_banked(cwd, banked_head) {
+        // The bank committed everything (`git add -A`), so the round-start
+        // dirt is in HEAD now: only post-bank changes count, measured against
+        // HEAD itself rather than the round-start snapshot.
+        return tree_differs_from_head(cwd);
+    }
     tree_differs_since(cwd, since_tree) || head_moved_since_dispatch(cwd, since_head, banked_head)
+}
+
+/// Whether HEAD is the round's own banked WIP commit.
+fn head_is_banked(cwd: &Path, banked_head: Option<&str>) -> bool {
+    match (banked_head, git_output(cwd, &["rev-parse", "HEAD"])) {
+        (Some(banked), Some(head)) => head == banked,
+        _ => false,
+    }
 }
 
 /// Re-prompt a clean-exiting slot for its artifact alone.
@@ -8810,6 +8850,64 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(
             dispatch_left_work(&repo, Some(&base), tree.as_deref(), Some(&banked)),
             "a commit past the bank is new work"
+        );
+    }
+
+    /// A round that starts dirty and banks its WIP reads no work on resume: the
+    /// bank's `git add -A` sweeps the round-start dirt into HEAD, so HEAD on the
+    /// bank with a clean tree must measure against the bank, not the dirty
+    /// round-start snapshot. Fails on the round-start comparison, which reads
+    /// the cleaned tree as changed.
+    #[test]
+    fn banked_wip_with_a_dirty_round_start_is_not_new_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        };
+        if std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("overlay.txt"), "test author files\n").unwrap();
+        let tree = worktree_snapshot(&repo);
+
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "banked wip"]);
+        let banked = git(&["rev-parse", "HEAD"]);
+
+        assert!(
+            !dispatch_left_work(&repo, Some(&base), tree.as_deref(), Some(&banked)),
+            "HEAD on the bank with a clean tree is no new work, even over a dirty start"
+        );
+
+        std::fs::write(
+            repo.join("overlay.txt"),
+            "test author files plus a slot edit\n",
+        )
+        .unwrap();
+        assert!(
+            dispatch_left_work(&repo, Some(&base), tree.as_deref(), Some(&banked)),
+            "a post-bank edit counts, even in a dirty-started file"
         );
     }
 
