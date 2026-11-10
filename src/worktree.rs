@@ -386,6 +386,29 @@ pub fn reviewer_checkout(
     Ok(path)
 }
 
+/// Remove a reviewer seat's detached checkout, if it has one. Gone seats leave no
+/// directory behind for the next dispatch to trip over; renamed survivors recreate
+/// theirs on demand (`reviewer_checkout` prunes stale admin entries first).
+/// Cleanup never fails a drop: a leftover directory is cosmetic next to a seat.
+pub fn remove_reviewer_checkout(state: &RunState, seat: &str) {
+    let Ok(area) = reviewer_area(&state.project_root, &state.id) else {
+        return;
+    };
+    let path = area.join(sanitize_slot(seat));
+    if !path.exists() {
+        return;
+    }
+    if let Some(path_s) = path.to_str() {
+        let _ = git_quiet(
+            &state.project_root,
+            &["worktree", "remove", "--force", path_s],
+        );
+    }
+    if path.exists() {
+        let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
 /// Commit whatever the implementer left uncommitted in `dir` (tracked changes and
 /// untracked files git does not ignore) on the branch checked out there, so the review
 /// panel, the suite and `ship` all see one commit (O138). `Ok(None)` when the tree was

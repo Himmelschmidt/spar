@@ -45,7 +45,7 @@ pub struct Config {
     /// and — because it lives on `Config`, which every run snapshots — the precedence
     /// survives a later round with no `--reload-config` (O27).
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
-    pub cli_role_keys: std::collections::BTreeSet<String>,
+    pub cli_role_keys: std::collections::BTreeSet<crate::state::SlotRole>,
     /// Per-role backup assignment (feature 009). Mirrors `[roles]` shape.
     #[serde(default)]
     pub backups: BackupsConfig,
@@ -57,7 +57,18 @@ pub struct Config {
     pub effort: EffortConfig,
     /// Role config keys assigned via CLI `--backup` for this run. Parallel to `cli_role_keys`.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
-    pub cli_backup_keys: std::collections::BTreeSet<String>,
+    pub cli_backup_keys: std::collections::BTreeSet<crate::state::SlotRole>,
+    /// CLI `--effort` keys by role name, mirroring `cli_role_keys`, so a later
+    /// `--reload-config` keeps launch levels instead of re-reading `[effort]`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub cli_effort_keys: std::collections::BTreeSet<crate::state::SlotRole>,
+    /// Channels dropped by an explicit CLI `--without critic|spec|suite`, so a later
+    /// `--reload-config` re-applies the drops instead of resurrecting the seats from
+    /// the file. The `--fleet small` preset's own shutdowns are not recorded here;
+    /// they are re-derived from the recorded preset on reload, so a newly configured
+    /// deterministic suite stays on per the preset's own rule.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub cli_without: std::collections::BTreeSet<DroppedChannel>,
     /// `--fleet small`'s reviewer panel width override (feature 011). `None` leaves
     /// panel sizing to `[roles].reviewer` / `DEFAULT_REVIEWERS` as usual. A CLI `--role
     /// reviewer=…` panel always outranks this — see `roles_resolve::panel_size`.
@@ -1004,6 +1015,113 @@ impl FleetPreset {
     }
 }
 
+/// Whole channels an explicit `--without` can drop. Recorded on the frozen config so
+/// a later `--reload-config` re-applies the operator's drops; serialized as the same
+/// lowercase names the flag spells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DroppedChannel {
+    Critic,
+    Spec,
+    Suite,
+}
+
+impl DroppedChannel {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "critic" => Some(Self::Critic),
+            "spec" => Some(Self::Spec),
+            "suite" => Some(Self::Suite),
+            _ => None,
+        }
+    }
+}
+
+/// Parse a reviewer-seat `--without` item into its panel ordinal: `reviewer[N]`
+/// (0-based). Anything else starting with `review-` is an existing run's seat id,
+/// which the caller resolves first; anything else is not a seat at all.
+pub fn parse_reviewer_without(item: &str) -> Result<usize> {
+    const VALID: &str = "critic, spec, suite, reviewer[N]";
+    if let Some(inner) = item
+        .strip_prefix("reviewer[")
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        return inner.parse::<usize>().map_err(|_| {
+            anyhow::anyhow!("--without {item:?}: bad reviewer ordinal (valid: {VALID})")
+        });
+    }
+    if item.starts_with("review-") {
+        anyhow::bail!(
+            "--without {item:?}: seat ids name slots of an existing run; pass --run <id> (or drop the seat by ordinal as reviewer[N])"
+        );
+    }
+    anyhow::bail!("--without {item:?}: unknown seat (valid: {VALID})")
+}
+
+/// Whether `--without` holds a reviewer seat ordinal (`reviewer[N]`), the only
+/// item that indexes a panel. Channels resolve without one, and seat ids refuse
+/// on a fresh run before any pool is drawn, so callers use this to skip the
+/// provider resolution (including any `--select` benchmark) when no panel
+/// lookup can happen.
+pub fn without_has_reviewer_item(without: &[String]) -> bool {
+    without
+        .iter()
+        .any(|w| parse_reviewer_without(w.trim()).is_ok())
+}
+
+/// Split one `--role <role>=<provider>` assignment into its typed role and raw
+/// provider, the single parse `apply_role_overrides` and the panel helpers share.
+fn split_role_override(raw: &str) -> Result<(crate::state::SlotRole, &str)> {
+    let (role, provider) = raw
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("--role expects <role>=<provider>, got {raw:?}"))?;
+    let (role, provider) = (role.trim(), provider.trim());
+    if provider.is_empty() {
+        anyhow::bail!("--role {role}= has no provider");
+    }
+    let slot = crate::state::SlotRole::from_config_key(role).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--role {role}: unknown role (planner, plan_critic, implementer, \
+             reviewer, tester, test_author)"
+        )
+    })?;
+    Ok((slot, provider))
+}
+
+/// The refusal a drop-all without a re-seat gets, on fresh and bound runs alike:
+/// the run would otherwise reach the ship gate with no reviewer judging it.
+pub(crate) fn emptied_reviewer_panel_message() -> String {
+    "--without reviewer[N]: cannot drop the last reviewer panel seat; the run would reach the ship gate unreviewed (--role reviewer=<provider> re-seats the panel; widened extras sit outside the panel and review on)".to_string()
+}
+
+/// Whether any `--role` assignment pins the reviewer panel outright, replacing
+/// whatever the file or a `--without` drop built.
+pub fn role_pins_reviewer(role: &[String]) -> bool {
+    role.iter().any(|r| {
+        split_role_override(r).is_ok_and(|(slot, _)| slot == crate::state::SlotRole::Reviewer)
+    })
+}
+
+/// Warn when an explicit `--role reviewer=...` replaces a panel a `--without
+/// reviewer[N]` just cut: the pin wins outright and the live panel is re-seated
+/// to match it. On a fresh launch no slots exist yet, so the drop is discarded;
+/// on a bound run the drop still retires its seat's history. Callers apply
+/// `--without` before `--role`, so this runs after both.
+pub fn warn_if_role_supersedes_reviewer_drop(role: &[String], dropped: &[usize], bound: bool) {
+    if dropped.is_empty() || !role_pins_reviewer(role) {
+        return;
+    }
+    if bound {
+        eprintln!(
+            "warning: --role reviewer=... replaces the reviewer panel, so the live panel is re-seated to match it; the --without reviewer seat drop still retires its seat's history"
+        );
+    } else {
+        eprintln!(
+            "warning: --role reviewer=... replaces the reviewer panel, discarding the --without reviewer seat drop"
+        );
+    }
+}
+
 /// Acceptance gate policy. Review *timeouts* stay at `[timeouts].review_secs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewConfig {
@@ -1188,6 +1306,8 @@ impl Default for Config {
             backups: BackupsConfig::default(),
             effort: EffortConfig::default(),
             cli_backup_keys: std::collections::BTreeSet::new(),
+            cli_effort_keys: std::collections::BTreeSet::new(),
+            cli_without: std::collections::BTreeSet::new(),
             review: ReviewConfig::default(),
             spec: SpecConfig::default(),
             critic: CriticConfig::default(),
@@ -1472,11 +1592,21 @@ impl Config {
     }
 
     pub fn save_snapshot(&self, paths: &SparPaths, run_id: &str) -> Result<()> {
+        let staged = self.stage_snapshot(paths, run_id)?;
+        Self::commit_snapshot(paths, run_id, &staged)
+    }
+
+    /// Write the snapshot to a temp file and hand back its path without
+    /// publishing it: the caller renames it into place only after the paired
+    /// state write succeeds, so a failed `RunState::save` can never leave the
+    /// frozen config narrowed while the slots it narrowed are still live.
+    /// Captured `[env]` values can carry proxy credentials: owner-only, set at
+    /// creation of a temp file and renamed in, so the file is never readable
+    /// wider in between.
+    pub fn stage_snapshot(&self, paths: &SparPaths, run_id: &str) -> Result<PathBuf> {
         paths.ensure_run_dirs(run_id)?;
         let path = paths.run_config_file(run_id);
         let text = serde_json::to_string_pretty(self)?;
-        // Captured `[env]` values can carry proxy credentials: owner-only, set at creation
-        // of a temp file and renamed in, so the file is never readable wider in between.
         let mode = if self.env.captured.is_empty() {
             0o644
         } else {
@@ -1497,7 +1627,14 @@ impl Config {
             f.write_all(text.as_bytes())
                 .with_context(|| format!("write run config {}", tmp.display()))?;
         }
-        std::fs::rename(&tmp, &path).with_context(|| format!("write run config {}", path.display()))
+        Ok(tmp)
+    }
+
+    /// Publish a staged snapshot written by [`Self::stage_snapshot`].
+    pub fn commit_snapshot(paths: &SparPaths, run_id: &str, staged: &Path) -> Result<()> {
+        let path = paths.run_config_file(run_id);
+        std::fs::rename(staged, &path)
+            .with_context(|| format!("write run config {}", path.display()))
     }
 
     /// Overlay `--role <role>=<provider>` onto `[roles]`, so a run's fleet can be chosen
@@ -1510,19 +1647,8 @@ impl Config {
         }
         let mut reviewers = Vec::new();
         for raw in assignments {
-            let (role, provider) = raw
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("--role expects <role>=<provider>, got {raw:?}"))?;
-            let (role, provider) = (role.trim(), provider.trim());
-            if provider.is_empty() {
-                anyhow::bail!("--role {role}= has no provider");
-            }
-            let slot = crate::state::SlotRole::from_config_key(role).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--role {role}: unknown role (planner, plan_critic, implementer, \
-                     reviewer, tester, test_author)"
-                )
-            })?;
+            let (slot, provider) = split_role_override(raw)?;
+            let role = slot.as_config_key();
             let pin = crate::provider_ref::Pin::parse(provider)
                 .with_context(|| format!("invalid provider in --role {role}: {provider:?}"))?;
             let canonical = pin.display();
@@ -1538,7 +1664,7 @@ impl Config {
                     other.as_config_key()
                 ),
             }
-            self.cli_role_keys.insert(slot.as_config_key().to_string());
+            self.cli_role_keys.insert(slot);
         }
         if !reviewers.is_empty() {
             self.roles.reviewer = reviewers;
@@ -1603,6 +1729,7 @@ impl Config {
                 .parse()
                 .with_context(|| format!("invalid effort in --effort {role}: {level:?}"))?;
             let canonical = parsed.as_str().to_string();
+            self.cli_effort_keys.insert(slot);
             match slot {
                 crate::state::SlotRole::Planner => self.effort.planner = Some(canonical),
                 crate::state::SlotRole::PlanCritic => self.effort.plan_critic = Some(canonical),
@@ -1703,8 +1830,7 @@ impl Config {
                     other.as_config_key()
                 ),
             }
-            self.cli_backup_keys
-                .insert(slot.as_config_key().to_string());
+            self.cli_backup_keys.insert(slot);
         }
         if has_backup_reviewers {
             self.backups.reviewer = backup_reviewers;
@@ -1808,24 +1934,233 @@ impl Config {
         Ok(())
     }
 
-    /// `--without <critic,spec,suite>`: drop seats for this run only, without touching
-    /// `spar.toml`. Unlike `[roles]` overrides, dropping the plan critic has no config
-    /// knob before feature 011 (an absent `[roles].plan_critic` still falls back to
-    /// `[providers].order`), which is why `[critic].enabled` exists at all.
-    pub fn apply_without(&mut self, names: &[String]) -> Result<()> {
-        const VALID: [&str; 3] = ["critic", "spec", "suite"];
+    /// The pool a fresh run's reviewer panel is drawn from: explicit `--providers`
+    /// as-is, a `--select` ranking resolved read-only (no artifact write; the
+    /// dispatch re-resolves and writes its own), else the file order as a
+    /// synthesized pool. Mirrors what the launch resolves, so an ordinal drop
+    /// indexes the panel the dispatch builds rather than a fresh order draw.
+    pub fn fresh_reviewer_pool(
+        &self,
+        providers: &[String],
+        select: &[String],
+        urgency: &str,
+        dry: bool,
+    ) -> Result<(
+        crate::model_select::ResolvedProviders,
+        crate::state::PoolOrigin,
+    )> {
+        use crate::state::PoolOrigin;
+        if !providers.is_empty() {
+            return Ok((
+                crate::model_select::ResolvedProviders {
+                    providers: providers.to_vec(),
+                    artifact: None,
+                },
+                PoolOrigin::CliProviders,
+            ));
+        }
+        if !select.is_empty() {
+            let (n, roles) = crate::workflow::roles_resolve::reviewer_select_question(self);
+            let resolved = crate::model_select::resolve_providers(
+                &[],
+                Some(select),
+                crate::model_select::Urgency::parse(urgency)?,
+                n,
+                &roles,
+                self,
+                dry,
+                &crate::providers::LiveHealth::for_dry(dry),
+            )?;
+            return Ok((resolved, PoolOrigin::Selected));
+        }
+        Ok((
+            crate::model_select::ResolvedProviders {
+                providers: self.providers.order.clone(),
+                artifact: None,
+            },
+            PoolOrigin::Synth,
+        ))
+    }
+
+    /// `--without` drops seats from the fleet. `critic`, `spec` and `suite` drop whole
+    /// channels; `reviewer[N]` drops the Nth seat (0-based) of the reviewer panel, and
+    /// any other `review-*` id is an existing run's seat, resolved to its ordinal by
+    /// the caller (seat ids name slots of a run, so a fresh run cannot take them).
+    /// Returns the dropped reviewer ordinals, descending, so the caller can reap the
+    /// matching state slots.
+    pub fn apply_without(
+        &mut self,
+        pool: &[String],
+        pool_origin: crate::state::PoolOrigin,
+        dry: bool,
+        names: &[String],
+    ) -> Result<Vec<usize>> {
+        let mut ordinals: Vec<(String, usize)> = Vec::new();
         for raw in names {
-            match raw.trim() {
-                "critic" => self.critic.enabled = false,
-                "spec" => self.spec.enabled = false,
-                "suite" => self.suite.enabled = false,
-                other => anyhow::bail!(
-                    "--without {other:?}: unknown seat (valid: {})",
-                    VALID.join(", ")
-                ),
+            let item = raw.trim();
+            if let Some(channel) = DroppedChannel::parse(item) {
+                match channel {
+                    DroppedChannel::Critic => self.critic.enabled = false,
+                    DroppedChannel::Spec => self.spec.enabled = false,
+                    DroppedChannel::Suite => self.suite.enabled = false,
+                }
+                self.cli_without.insert(channel);
+            } else {
+                ordinals.push((raw.trim().to_string(), parse_reviewer_without(item)?));
             }
         }
+        ordinals.sort_by_key(|(_, n)| *n);
+        ordinals.dedup_by_key(|(_, n)| *n);
+        if !ordinals.is_empty() {
+            self.materialize_reviewer_panel(pool, pool_origin, dry)?;
+            for (item, ordinal) in &ordinals {
+                if *ordinal >= self.roles.reviewer.len() {
+                    anyhow::bail!(
+                        "--without {item}: only {} reviewer seat(s) on the panel (0-based, so the last is reviewer[{}])",
+                        self.roles.reviewer.len(),
+                        self.roles.reviewer.len().saturating_sub(1)
+                    );
+                }
+            }
+            // Descending, so each removal names a seat of the panel the operator saw.
+            let mut shifted_backups = false;
+            for (_, ordinal) in ordinals.iter().rev() {
+                self.roles.reviewer.remove(*ordinal);
+                if *ordinal < self.backups.reviewer.len() {
+                    self.backups.reviewer.remove(*ordinal);
+                    shifted_backups = true;
+                }
+            }
+            // The survivor ordinals changed, so a reload must carry this run's
+            // shifted backups rather than re-read the file's full-length list.
+            if shifted_backups {
+                self.cli_backup_keys
+                    .insert(crate::state::SlotRole::Reviewer);
+            }
+            self.cli_role_keys.insert(crate::state::SlotRole::Reviewer);
+        }
+        Ok(ordinals.into_iter().map(|(_, n)| n).rev().collect())
+    }
+
+    /// A drop that emptied the reviewer panel is refused once the role overrides
+    /// have run: `--role reviewer=` re-seats the panel, so the check judges the
+    /// final panel, not the intermediate one a `--without` alone leaves behind.
+    pub fn refuse_emptied_reviewer_panel(&self, dropped: &[usize]) -> Result<()> {
+        if !dropped.is_empty() && self.roles.reviewer.is_empty() {
+            anyhow::bail!("{}", emptied_reviewer_panel_message());
+        }
         Ok(())
+    }
+
+    /// Pin the operator-visible reviewer panel onto `roles.reviewer`, so an ordinal
+    /// drop has a list to index. Only a panel pinned by an explicit operator choice
+    /// (a CLI `--role`, or an amend that pinned the run's own live seats) is taken
+    /// as-is: a `[roles].reviewer` file pin never beats the explicit pool the
+    /// dispatch itself would resolve. Every other case replays the dispatch's own
+    /// resolution (`build_implement_seats` over the run's pool), from that one
+    /// source rather than a second copy of the precedence rules.
+    fn materialize_reviewer_panel(
+        &mut self,
+        pool: &[String],
+        pool_origin: crate::state::PoolOrigin,
+        dry: bool,
+    ) -> Result<()> {
+        use crate::state::SlotRole;
+        use crate::workflow::roles_resolve;
+        if self.cli_role_keys.contains(&SlotRole::Reviewer) {
+            return Ok(());
+        }
+        let health = crate::providers::LiveHealth::for_dry(dry);
+        let expanded = crate::providers::pick_providers(
+            pool,
+            roles_resolve::pool_width(self),
+            Some(pool),
+            dry,
+            pool_origin,
+            &health,
+        );
+        let pool = if expanded.is_empty() { pool } else { &expanded };
+        let panel: Vec<String> = (0..roles_resolve::panel_size(self))
+            .filter_map(|r| {
+                roles_resolve::resolve_seat(
+                    SlotRole::Reviewer,
+                    r + 1,
+                    r,
+                    pool,
+                    pool_origin,
+                    self,
+                    &health,
+                    &[],
+                )
+            })
+            .map(|(raw, _)| roles_resolve::split_model(&raw, None).0)
+            .collect();
+        self.roles.reviewer = panel;
+        if self.roles.reviewer.is_empty() {
+            anyhow::bail!(
+                "--without reviewer[N]: the run has no reviewer panel to index (pin one with --role reviewer=... first)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Re-apply the overrides the run was launched or amended with onto a freshly
+    /// loaded file config, so `--reload-config` picks up file edits without losing
+    /// anything given on the command line. Composition mirrors launch order
+    /// (preset, without, role): role pins land first, the suite pin next, and the
+    /// recorded channel drops last. A `--suite-command` restated at a later amend
+    /// already cleared its recorded Suite drop (one source), so the drops here only
+    /// silence channels the operator never re-enabled.
+    pub fn reapply_cli_overrides(&mut self, frozen: &Config) {
+        use crate::state::SlotRole;
+        // The three sub-configs carry the same six assignable role fields
+        // (`reviewer` is a list on roles and backups, a single value on effort;
+        // `clone_from` covers both), so one copy rule serves all three.
+        macro_rules! copy_assignable_role {
+            ($dst:expr, $src:expr, $role:expr) => {
+                match $role {
+                    SlotRole::Planner => $dst.planner = $src.planner.clone(),
+                    SlotRole::PlanCritic => $dst.plan_critic = $src.plan_critic.clone(),
+                    SlotRole::Implementer => $dst.implementer = $src.implementer.clone(),
+                    SlotRole::Reviewer => $dst.reviewer.clone_from(&$src.reviewer),
+                    SlotRole::Tester => $dst.tester = $src.tester.clone(),
+                    SlotRole::TestAuthor => $dst.test_author = $src.test_author.clone(),
+                    // Only assignable roles are ever recorded; the derived workflows
+                    // (ranker, peer, reconciler) have no field to carry.
+                    SlotRole::Ranker | SlotRole::Peer | SlotRole::Reconciler => {}
+                }
+            };
+        }
+        for key in &frozen.cli_role_keys {
+            copy_assignable_role!(self.roles, frozen.roles, key);
+        }
+        self.cli_role_keys
+            .extend(frozen.cli_role_keys.iter().cloned());
+        for key in &frozen.cli_backup_keys {
+            copy_assignable_role!(self.backups, frozen.backups, key);
+        }
+        self.cli_backup_keys
+            .extend(frozen.cli_backup_keys.iter().cloned());
+        for key in &frozen.cli_effort_keys {
+            copy_assignable_role!(self.effort, frozen.effort, key);
+        }
+        self.cli_effort_keys
+            .extend(frozen.cli_effort_keys.iter().cloned());
+        self.fleet_reviewer_override = frozen.fleet_reviewer_override;
+        // The preset's own shutdowns are re-derived rather than recorded, so a file
+        // that gained a `[suite].command` since launch keeps its suite on.
+        if self.fleet_reviewer_override.is_some() {
+            self.apply_small_preset_channels();
+        }
+        self.carry_cli_suite_command(frozen);
+        for channel in &frozen.cli_without {
+            match channel {
+                DroppedChannel::Critic => self.critic.enabled = false,
+                DroppedChannel::Spec => self.spec.enabled = false,
+                DroppedChannel::Suite => self.suite.enabled = false,
+            }
+        }
+        self.cli_without.extend(frozen.cli_without.iter().cloned());
     }
 
     /// `--suite-command <cmd>` (repeatable): this run's deterministic suite, replacing
@@ -1849,6 +2184,10 @@ impl Config {
         self.suite.command = commands.to_vec();
         self.suite.command_from_cli = true;
         self.suite.enabled = true;
+        // A later amend restating the opposite replaces the recorded override: one
+        // source, so a `--without suite` recorded earlier cannot switch the suite
+        // back off on the next reload.
+        self.cli_without.retain(|c| *c != DroppedChannel::Suite);
         Ok(())
     }
 
@@ -1873,16 +2212,22 @@ impl Config {
             // deliberately disabled.
             FleetPreset::Standard => {}
             FleetPreset::Small => {
-                self.critic.enabled = false;
-                self.spec.enabled = false;
                 self.fleet_reviewer_override = Some(1);
-                // A configured deterministic `[suite].command` is free and stays on —
-                // `SuiteConfig::is_builtin` already never spawns a tester slot for it.
-                // Only the agent tester (no command configured) is worth dropping.
-                if self.suite.command.is_empty() {
-                    self.suite.enabled = false;
-                }
+                self.apply_small_preset_channels();
             }
+        }
+    }
+
+    /// The `--fleet small` channel shutdowns, evaluated against the current file:
+    /// critic and spec always go, the agent tester only when no deterministic
+    /// `[suite].command` is configured (a configured suite is free and stays on).
+    /// Re-run on `--reload-config` (never recorded), so the file's current suite
+    /// state decides each time.
+    fn apply_small_preset_channels(&mut self) {
+        self.critic.enabled = false;
+        self.spec.enabled = false;
+        if self.suite.command.is_empty() {
+            self.suite.enabled = false;
         }
     }
 
@@ -3127,6 +3472,30 @@ planner = "best"
     }
 
     #[test]
+    fn suite_command_replaces_a_recorded_without_suite() {
+        // Round N: `--without suite` records the drop and switches the suite off.
+        let mut frozen = Config::default();
+        frozen.cli_without.insert(DroppedChannel::Suite);
+        frozen.suite.enabled = false;
+        // Round N+1: `--suite-command ... --reload-config` names a suite again.
+        frozen
+            .apply_suite_command(&["make test".into()], &[])
+            .unwrap();
+        assert!(frozen.suite.enabled);
+        assert!(
+            !frozen.cli_without.contains(&DroppedChannel::Suite),
+            "the restated opposite replaces the recorded override: {:?}",
+            frozen.cli_without
+        );
+        // Round N+2: a later reload replays the recording, which must no longer
+        // silence the suite the operator just named.
+        let mut reloaded = Config::default();
+        reloaded.reapply_cli_overrides(&frozen);
+        assert!(reloaded.suite.enabled, "the suite survives the next reload");
+        assert_eq!(reloaded.suite.command, vec!["make test"]);
+    }
+
+    #[test]
     fn classifier_comes_from_user_config_only_and_is_frozen_with_the_run() {
         let file: ConfigFile =
             toml::from_str("[classifier]\nenabled = true\nkey_file = \"~/k\"\nthreshold = 0.8\n")
@@ -3262,5 +3631,27 @@ planner = "best"
         assert_eq!(std::env::var(name).unwrap(), "http://proxy.invalid:3128");
         assert!(std::env::var(unset).is_err());
         std::env::remove_var(name);
+    }
+
+    #[test]
+    fn a_reviewer_drop_records_the_survivor_panel_as_the_rotation_scope() {
+        let mut cfg = Config::default();
+        let pool = ["cli:claude", "cli:grok", "cli:codex"].map(String::from);
+        let dropped = cfg
+            .apply_without(
+                &pool,
+                crate::state::PoolOrigin::CliProviders,
+                true,
+                &["reviewer[0]".to_string()],
+            )
+            .unwrap();
+        assert_eq!(dropped, vec![0]);
+        assert_eq!(cfg.roles.reviewer, vec!["cli:codex".to_string()]);
+        assert!(cfg
+            .cli_role_keys
+            .contains(&crate::state::SlotRole::Reviewer));
+        assert!(crate::workflow::roles_resolve::reviewer_panel_has_pins(
+            &cfg
+        ));
     }
 }

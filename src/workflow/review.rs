@@ -154,6 +154,7 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
         };
         let mut slot = executor::init_slot_model(&id, &provider, SlotRole::Reviewer, model);
         slot.source = source;
+        slot.reviewer_kind = Some(crate::state::ReviewerSeatKind::Panel);
         state.slots.push(slot);
     }
     state.record_unhealthy_pin_warnings();

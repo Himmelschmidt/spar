@@ -5,17 +5,508 @@ use crate::exit_codes::ExitCode;
 use crate::paths::SparPaths;
 use crate::providers::{self, HealthSource};
 use crate::state::{
-    FleetSeat, Phase, PoolOrigin, RunState, SeatSource, SlotRole, SlotState, SlotStatus,
-    SuiteOutcome,
+    FleetSeat, Phase, PoolOrigin, ReviewerSeatKind, RunState, SeatSource, SlotRole, SlotState,
+    SlotStatus, SuiteOutcome,
 };
 use crate::util::{self, sanitize_slot};
 use crate::workflow::review_result::{self, AcStatus, ReviewResult};
 use crate::worktree;
 use anyhow::{bail, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+/// Amend flags a bound `implement --run <id>` carries into the dispatch. The run's
+/// frozen config is amended under the dispatch's own lock, after the launch
+/// preconditions pass, so a refused launch changes nothing.
+#[derive(Debug, Clone, Default)]
+pub struct BoundAmendInputs {
+    pub role: Vec<String>,
+    pub backup: Vec<String>,
+    pub effort: Vec<String>,
+    pub without: Vec<String>,
+    pub fleet: Option<crate::config::FleetPreset>,
+    pub suite_command: Vec<String>,
+    pub recapture_env: bool,
+}
+
+impl BoundAmendInputs {
+    /// No seat shaper was passed. Whether the dispatch reloads the file config
+    /// is not part of this: callers pair it with the live config's presence
+    /// (`live.is_none() && amend.is_noop()`), so a reload alone still replays
+    /// the recorded pool.
+    pub fn is_noop(&self) -> bool {
+        self.role.is_empty()
+            && self.backup.is_empty()
+            && self.effort.is_empty()
+            && self.without.is_empty()
+            && self.suite_command.is_empty()
+            && matches!(
+                self.fleet,
+                None | Some(crate::config::FleetPreset::Standard)
+            )
+    }
+}
+
+/// An amend-phase refusal: the frozen config and run state were left untouched,
+/// so the caller reports it as a launch refusal (exit 1), never an internal error.
+#[derive(Debug)]
+pub struct AmendRefused(pub String);
+
+impl std::fmt::Display for AmendRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for AmendRefused {}
+
+/// The amended config plus the reviewer ordinals the amend dropped, computed
+/// read-only from the frozen config, the run state the surgery will apply to,
+/// and the live file config when that is present (its presence means reload).
+/// Both the `--validate-only` preview and the under-lock dispatch path use it;
+/// the dispatch path calls it after acquiring the run lock so seat-id
+/// resolution and the panel pin see the state the surgery is about to change.
+pub struct BoundAmend {
+    pub cfg: Config,
+    pub dropped: Vec<usize>,
+    /// The pin came from the run's own slots: a reassign that moves reviewer
+    /// seats afterwards must refresh it before the freeze.
+    pub panel_pinned: bool,
+    /// The reviewer panel the amend will leave, simulated read-only: `--validate-only`
+    /// shows these seats instead of the stale live ones. `None` when the amend
+    /// touches no reviewer seat. Freshly minted seats are `projected`.
+    pub resynced_panel: Option<Vec<FleetSeat>>,
+    /// Live seats the re-seat retired beyond the explicit drops (a replaced
+    /// provider, a panel position past the pin): `--validate-only` hides
+    /// exactly these, so widened extras sitting outside the panel survive the
+    /// splice.
+    pub resync_removed: Vec<String>,
+}
+
+/// Which reviewer seat a slot holds. A panel seat owns a backup-list position
+/// and a `roles.reviewer` config entry; a widened extra sits past the panel
+/// and owns neither. The kind is recorded on the slot when the seat is minted;
+/// ids written before that field existed still parse, so they fall back to the
+/// `-wide` suffix here, the one place that read remains.
+fn reviewer_seat_kind(slot: &SlotState) -> Option<ReviewerSeatKind> {
+    if slot.role != SlotRole::Reviewer {
+        return None;
+    }
+    if let Some(kind) = slot.reviewer_kind {
+        return Some(kind);
+    }
+    if slot.id.ends_with("-wide") {
+        Some(ReviewerSeatKind::Wide)
+    } else {
+        Some(ReviewerSeatKind::Panel)
+    }
+}
+
+/// The one panel-membership predicate. A widened extra is a reviewer slot but
+/// never a panel seat: it holds no backup-list position and no config entry.
+fn is_panel_reviewer(slot: &SlotState) -> bool {
+    reviewer_seat_kind(slot) == Some(ReviewerSeatKind::Panel)
+}
+
+/// The run's own reviewer panel in live panel order, never a widened extra: the
+/// same slot order `panel_position` and `panel_seat_with_ordinal` index, so an
+/// ordinal into this list is a live panel position.
+fn reviewer_panel_by_ordinal(state: &RunState) -> Vec<String> {
+    state
+        .slots
+        .iter()
+        .filter(|s| is_panel_reviewer(s))
+        .map(|s| s.provider_ref().display())
+        .collect()
+}
+
+pub fn preview_bound_amend(
+    frozen: &Config,
+    live: Option<&Config>,
+    state: &RunState,
+    inputs: &BoundAmendInputs,
+) -> Result<BoundAmend> {
+    let mut cfg = if let Some(live) = live {
+        let mut cfg = live.clone();
+        cfg.reapply_cli_overrides(frozen);
+        // A reload re-reads the file, not the shell: names still captured keep
+        // the creation values, a name removed from `capture` is dropped, and
+        // only a name newly added to `capture` takes this process's value (O130).
+        // `--recapture-env` is the deliberate exception: everything is retaken.
+        if !inputs.recapture_env {
+            for (k, v) in &frozen.env.captured {
+                if cfg.env.capture.contains(k) {
+                    cfg.env.captured.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        cfg
+    } else {
+        frozen.clone()
+    };
+    if let Some(preset) = inputs.fleet {
+        cfg.apply_fleet_preset(preset);
+    }
+    let without = resolve_without_seat_ids(state, &inputs.without)?;
+    let mut panel_pinned = false;
+    if without
+        .iter()
+        .any(|w| crate::config::parse_reviewer_without(w).is_ok())
+    {
+        let panel = reviewer_panel_by_ordinal(state);
+        if !panel.is_empty() {
+            cfg.roles.reviewer = panel;
+            cfg.cli_role_keys.insert(SlotRole::Reviewer);
+            panel_pinned = true;
+        }
+    }
+    let (pool, pool_origin, dry) = if !state.providers.is_empty() {
+        (state.providers.clone(), state.pool_origin, state.dry_run)
+    } else {
+        (
+            cfg.providers.order.clone(),
+            PoolOrigin::Synth,
+            state.dry_run,
+        )
+    };
+    let dropped = cfg.apply_without(&pool, pool_origin, dry, &without)?;
+    cfg.apply_role_overrides(&inputs.role)?;
+    if crate::config::role_pins_reviewer(&inputs.role) {
+        // The role replaces the panel outright: the live-slot pin is no longer
+        // the panel's source, so a later reassign must not refresh it back.
+        panel_pinned = false;
+    }
+    // The refusal judges the panel the amend will leave: the live panel after
+    // the planned retirements, re-seated to the pin when one applies. The
+    // simulation runs on a throwaway clone, so both this refusal and
+    // `--validate-only` read the same outcome the dispatch will apply.
+    let resync_applies = bound_panel_resync_applies(state, &inputs.role, cfg.roles.reviewer.len());
+    let mut resync_removed = Vec::new();
+    let resynced_panel: Option<Vec<FleetSeat>> = if !dropped.is_empty() || resync_applies {
+        let mut sim = state.clone();
+        retire_reviewer_seats(&mut sim, &dropped)?;
+        let mut sim_backups = cfg.backups.reviewer.clone();
+        if resync_applies {
+            let pin = parse_reviewer_pin(&cfg.roles.reviewer)?;
+            resync_removed = resync_reviewer_panel_to_pin(&mut sim, &mut sim_backups, &pin)?;
+        }
+        Some(
+            sim.slots
+                .iter()
+                .filter(|s| is_panel_reviewer(s))
+                .map(|s| FleetSeat {
+                    seat: s.id.clone(),
+                    role: SlotRole::Reviewer,
+                    provider: s.provider.clone(),
+                    model: s.model.clone(),
+                    source: s.source.unwrap_or(SeatSource::Unknown),
+                    projected: !state.slots.iter().any(|live| live.id == s.id),
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
+    // The refusal judges the panel the dispatch will actually seat: the
+    // simulated live panel where seats already exist, the amended config
+    // panel on a first dispatch that mints it once from the config.
+    let sim_empty = resynced_panel
+        .as_ref()
+        .is_some_and(|panel| panel.is_empty());
+    let emptied = if state.slots.iter().any(is_panel_reviewer) {
+        sim_empty
+    } else {
+        cfg.roles.reviewer.is_empty()
+    };
+    if !dropped.is_empty() && emptied {
+        anyhow::bail!("{}", crate::config::emptied_reviewer_panel_message());
+    }
+    crate::config::warn_if_role_supersedes_reviewer_drop(&inputs.role, &dropped, true);
+    cfg.apply_backup_overrides(&inputs.backup)?;
+    cfg.apply_effort_overrides(&inputs.effort)?;
+    cfg.apply_suite_command(&inputs.suite_command, &without)?;
+    Ok(BoundAmend {
+        cfg,
+        dropped,
+        panel_pinned,
+        resynced_panel,
+        resync_removed,
+    })
+}
+
+/// Seat ids in `--without` resolved to `reviewer[N]` ordinals against one run
+/// state. Channels and ordinals pass through; anything else is refused naming
+/// the run's own seats.
+pub fn resolve_without_seat_ids(state: &RunState, without: &[String]) -> Result<Vec<String>> {
+    without
+        .iter()
+        .map(|w| {
+            let item = w.trim();
+            if crate::config::DroppedChannel::parse(item).is_some()
+                || crate::config::parse_reviewer_without(item).is_ok()
+            {
+                return Ok(w.clone());
+            }
+            let slot = state.slots.iter().find(|s| s.id == item).ok_or_else(|| {
+                let mut seats: Vec<&str> = state
+                    .slots
+                    .iter()
+                    .filter(|s| s.role == SlotRole::Reviewer)
+                    .map(|s| s.id.as_str())
+                    .collect();
+                seats.sort();
+                anyhow::anyhow!(
+                    "--without {item:?}: no such seat on run {} (valid: critic, spec, suite, reviewer[N], or one of: {})",
+                    state.id,
+                    seats.join(", ")
+                )
+            })?;
+            if slot.role != SlotRole::Reviewer {
+                anyhow::bail!("--without {item:?}: only reviewer seats can be dropped by seat id");
+            }
+            if reviewer_seat_kind(slot) == Some(ReviewerSeatKind::Wide) {
+                anyhow::bail!("--without {item:?}: extra seats from widening cannot be dropped; drop a panel seat as reviewer[N]");
+            }
+            // The id names a live panel seat; the ordinal is its position in the
+            // current panel, not the one baked into the id.
+            let position = panel_position(state, item).ok_or_else(|| {
+                anyhow::anyhow!("--without {item:?}: seat {item} vanished from the panel")
+            })?;
+            Ok(format!("reviewer[{position}]"))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod preview_amend_tests {
+    use super::*;
+
+    fn dry_stateless_run() -> RunState {
+        let mut st = RunState::new(
+            "r1",
+            crate::cli::WorkflowKind::Loop,
+            std::path::PathBuf::from("/x"),
+        );
+        st.dry_run = true;
+        st
+    }
+
+    /// A seat id names a live panel seat by position, not by the ordinal baked
+    /// into the id: after a drop retires review-1, review-2-cli-codex sits at
+    /// panel position 1.
+    #[test]
+    fn seat_id_without_resolves_to_the_live_panel_position() {
+        let mut st = dry_stateless_run();
+        st.slots.push(executor::init_slot(
+            "review-0-cli-claude",
+            "cli:claude",
+            SlotRole::Reviewer,
+        ));
+        st.slots.push(executor::init_slot(
+            "review-2-cli-codex",
+            "cli:codex",
+            SlotRole::Reviewer,
+        ));
+        let out = resolve_without_seat_ids(&st, &["review-2-cli-codex".to_string()]).unwrap();
+        assert_eq!(out, vec!["reviewer[1]".to_string()]);
+    }
+
+    /// A dry-run run with no recorded pool resolves the reviewer
+    /// panel with the run's own dry-run state, never a hard `false`, so the
+    /// order-derived panel survives availability filtering.
+    #[test]
+    fn pool_less_dry_run_amend_indexes_the_order_panel() {
+        let inputs = BoundAmendInputs {
+            without: vec!["reviewer[0]".to_string()],
+            ..BoundAmendInputs::default()
+        };
+        let amend =
+            preview_bound_amend(&Config::default(), None, &dry_stateless_run(), &inputs).unwrap();
+        assert_eq!(amend.dropped, vec![0]);
+        assert_eq!(amend.cfg.roles.reviewer, vec!["cli:grok".to_string()]);
+    }
+
+    /// The bound pin is the run's panel in live slot order, the
+    /// same order `panel_position` and `panel_seat_with_ordinal` index, never a
+    /// second id-ordinal sort; widened extras are not panel seats. Slots stored
+    /// codex-first pin codex-first, and the `-wide` extra is neither pinned nor
+    /// counted.
+    #[test]
+    fn bound_pin_follows_slot_order_and_ignores_wide_extras() {
+        let mut st = dry_stateless_run();
+        for (id, provider) in [
+            ("review-1-cli-codex", "cli:codex"),
+            ("review-0-cli-claude", "cli:claude"),
+            ("review-cli-grok-wide", "cli:grok"),
+        ] {
+            st.slots
+                .push(executor::init_slot(id, provider, SlotRole::Reviewer));
+        }
+        let inputs = BoundAmendInputs {
+            without: vec!["reviewer[1]".to_string()],
+            ..BoundAmendInputs::default()
+        };
+        let amend = preview_bound_amend(&Config::default(), None, &st, &inputs).unwrap();
+        assert_eq!(amend.dropped, vec![1]);
+        assert_eq!(amend.cfg.roles.reviewer, vec!["cli:codex".to_string()]);
+    }
+
+    /// The last-seat refusal judges the final panel: `--role reviewer=` re-seats
+    /// it, so a drop plus a re-seat is allowed, while a drop alone is refused.
+    #[test]
+    fn drop_plus_role_reseat_is_allowed() {
+        let mut st = dry_stateless_run();
+        st.slots.push(executor::init_slot(
+            "review-0-cli-claude",
+            "cli:claude",
+            SlotRole::Reviewer,
+        ));
+        let inputs = BoundAmendInputs {
+            without: vec!["reviewer[0]".to_string()],
+            role: vec!["reviewer=cli:codex".to_string()],
+            ..BoundAmendInputs::default()
+        };
+        let amend = preview_bound_amend(&Config::default(), None, &st, &inputs).unwrap();
+        assert_eq!(amend.dropped, vec![0]);
+        assert_eq!(amend.cfg.roles.reviewer, vec!["cli:codex".to_string()]);
+        let panel = amend.resynced_panel.unwrap();
+        assert_eq!(panel.len(), 1);
+        assert_eq!(panel[0].seat, "review-0-cli-codex");
+        assert!(panel[0].projected);
+        let bare = BoundAmendInputs {
+            without: vec!["reviewer[0]".to_string()],
+            ..BoundAmendInputs::default()
+        };
+        match preview_bound_amend(&Config::default(), None, &st, &bare) {
+            Ok(_) => panic!("a drop with no re-seat must be refused"),
+            Err(e) => assert!(
+                format!("{e:#}").contains("cannot drop the last reviewer panel seat"),
+                "{e:#}"
+            ),
+        }
+    }
+
+    /// A drop-all on a run with no live panel seats refuses in the preview,
+    /// before anything persists: with no seats to retire and no pin to re-seat
+    /// from, the amend would leave a config no reviewer can review under.
+    #[test]
+    fn drop_all_with_no_live_panel_refuses() {
+        let inputs = BoundAmendInputs {
+            without: vec!["reviewer[0]".to_string(), "reviewer[1]".to_string()],
+            ..BoundAmendInputs::default()
+        };
+        match preview_bound_amend(&Config::default(), None, &dry_stateless_run(), &inputs) {
+            Ok(_) => panic!("a drop-all with no live panel and no pin must be refused"),
+            Err(e) => assert!(
+                format!("{e:#}").contains("cannot drop the last reviewer panel seat"),
+                "{e:#}"
+            ),
+        }
+    }
+
+    /// A pin on a first dispatch simulates nothing: no seats exist yet, so the
+    /// fresh dispatch mints the panel once from the amended config.
+    #[test]
+    fn role_pin_on_a_first_dispatch_simulates_nothing() {
+        let inputs = BoundAmendInputs {
+            role: vec!["reviewer=cli:codex".to_string()],
+            ..BoundAmendInputs::default()
+        };
+        let amend =
+            preview_bound_amend(&Config::default(), None, &dry_stateless_run(), &inputs).unwrap();
+        assert_eq!(amend.cfg.roles.reviewer, vec!["cli:codex".to_string()]);
+        assert!(amend.resynced_panel.is_none());
+    }
+
+    /// A pin over a live two-seat panel simulates the single re-seated seat the
+    /// dispatch will leave: the retired id is never reminted.
+    #[test]
+    fn role_pin_simulates_the_reseated_panel() {
+        let mut st = dry_stateless_run();
+        for (id, provider) in [
+            ("review-0-cli-claude", "cli:claude"),
+            ("review-1-cli-grok", "cli:grok"),
+        ] {
+            st.slots
+                .push(executor::init_slot(id, provider, SlotRole::Reviewer));
+        }
+        let inputs = BoundAmendInputs {
+            role: vec!["reviewer=cli:codex".to_string()],
+            ..BoundAmendInputs::default()
+        };
+        let amend = preview_bound_amend(&Config::default(), None, &st, &inputs).unwrap();
+        let panel = amend.resynced_panel.unwrap();
+        assert_eq!(panel.len(), 1);
+        assert_eq!(panel[0].seat, "review-0-cli-codex");
+        assert_eq!(panel[0].provider, "cli:codex");
+        assert!(panel[0].projected);
+    }
+
+    /// O130: a reload re-reads the file, not the shell. Names still captured keep
+    /// the creation values, a name removed from `capture` is dropped, and only a
+    /// name newly added to `capture` takes this process's value; `--recapture-env`
+    /// retakes everything.
+    #[test]
+    fn reload_merges_env_per_name() {
+        fn env(capture: &[&str], captured: &[(&str, &str)]) -> crate::config::EnvConfig {
+            crate::config::EnvConfig {
+                capture: capture.iter().map(|s| s.to_string()).collect(),
+                captured: captured
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }
+        }
+        let frozen = Config {
+            env: env(
+                &["KEEP", "GONE"],
+                &[("KEEP", "frozen"), ("GONE", "frozen-gone")],
+            ),
+            ..Config::default()
+        };
+        let live = Config {
+            env: env(&["KEEP", "NEW"], &[("KEEP", "shell"), ("NEW", "shell-new")]),
+            ..Config::default()
+        };
+        let kept = preview_bound_amend(
+            &frozen,
+            Some(&live),
+            &dry_stateless_run(),
+            &BoundAmendInputs::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            kept.cfg.env.captured.get("KEEP").map(String::as_str),
+            Some("frozen")
+        );
+        assert_eq!(
+            kept.cfg.env.captured.get("NEW").map(String::as_str),
+            Some("shell-new")
+        );
+        assert!(!kept.cfg.env.captured.contains_key("GONE"));
+        let retaken = preview_bound_amend(
+            &frozen,
+            Some(&live),
+            &dry_stateless_run(),
+            &BoundAmendInputs {
+                recapture_env: true,
+                ..BoundAmendInputs::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            retaken.cfg.env.captured.get("KEEP").map(String::as_str),
+            Some("shell")
+        );
+        assert_eq!(
+            retaken.cfg.env.captured.get("NEW").map(String::as_str),
+            Some("shell-new")
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_from_cli(
     run_id: Option<String>,
     plan: Option<PathBuf>,
@@ -24,12 +515,13 @@ pub fn run_from_cli(
     opts: CommonOpts,
     paths: &SparPaths,
     cfg: &Config,
+    amend: BoundAmendInputs,
 ) -> Result<ExitCode> {
     if let Some(t) = &task {
         crate::workflow::validate_task(t).map_err(anyhow::Error::msg)?;
     }
     if let Some(id) = run_id {
-        return run_from_approved(&id, task, opts, paths, cfg);
+        return run_from_approved(&id, task, opts, paths, amend);
     }
     if let Some(plan_path) = plan {
         // A plan belongs to the run that produced it. Implementing it is that run
@@ -45,7 +537,7 @@ pub fn run_from_cli(
             if !opts.json {
                 eprintln!("continuing run {id} (it wrote this plan)");
             }
-            return run_from_approved(&id, task, opts, paths, cfg);
+            return run_from_approved(&id, task, opts, paths, amend);
         }
         if !new {
             bail!("{}", unlinked_plan_error(&plan_path, paths));
@@ -203,7 +695,7 @@ pub fn resume(
         dry_run: state.dry_run,
         ..CommonOpts::default()
     };
-    run_from_approved(run_id, None, opts, paths, cfg)
+    run_from_approved(run_id, None, opts, paths, BoundAmendInputs::default())
 }
 
 /// The run that wrote this plan, if spar wrote it: plan artifacts live at
@@ -238,49 +730,143 @@ struct Reentry {
     /// Lifted off the round ceiling (O52): the same escalation continuing, so the
     /// stuck ladder's rotate/widen budget is not reset.
     from_round_gate: bool,
-    /// `--reload-config`: seats that already exist are re-resolved from the fresh
-    /// config rather than keeping the provider they were minted with.
-    reload_config: bool,
+    /// An amend was applied, so seats that already exist are re-resolved from
+    /// the amended config rather than keeping what they were minted with.
+    repoint: bool,
+    /// The amend moved the implementer pin, so the existing implementer seat
+    /// moves too. Any other amend leaves it alone.
+    repoint_implementer: bool,
 }
 
-/// Re-resolve the provider and model of seats that already exist, from a config the
-/// caller reloaded (`--reload-config`).
+/// The implementer seat a config resolves under the pool it dispatches from:
+/// the two sides of the pin-change comparison.
+fn resolved_implementer(
+    cfg: &Config,
+    pool: &[String],
+    pool_origin: PoolOrigin,
+    health: &dyn crate::providers::HealthSource,
+) -> Option<(String, Option<String>)> {
+    crate::workflow::roles_resolve::resolve_seat(
+        SlotRole::Implementer,
+        0,
+        0,
+        pool,
+        pool_origin,
+        cfg,
+        health,
+        &[],
+    )
+    .map(|(raw, _)| crate::workflow::roles_resolve::split_model(&raw, None))
+}
+
+/// The re-point gate: an amend was applied *and* it moved the implementer pin.
+/// The pin is compared resolved, not raw: `--role implementer=grok` restated
+/// with the seat already there resolves the same and re-points nothing, while
+/// a genuinely new pin resolves differently and moves the seat. Any other
+/// amend (reviewer restatements, drops, suite) resolves the same pin and leaves
+/// the seat, and any stuck-ladder rotation off it, alone.
+#[allow(clippy::too_many_arguments)]
+fn should_repoint_implementer(
+    amend_applied: bool,
+    frozen: &Config,
+    prev_pool: &[String],
+    prev_origin: PoolOrigin,
+    amended: &Config,
+    pool: &[String],
+    pool_origin: PoolOrigin,
+    health: &dyn crate::providers::HealthSource,
+) -> bool {
+    amend_applied
+        && implementer_pin_changed(
+            frozen,
+            prev_pool,
+            prev_origin,
+            amended,
+            pool,
+            pool_origin,
+            health,
+        )
+}
+
+/// Whether the amend moved the implementer pin: the frozen and amended configs
+/// resolving it differently under their own pools.
+fn implementer_pin_changed(
+    frozen: &Config,
+    prev_pool: &[String],
+    prev_origin: PoolOrigin,
+    amended: &Config,
+    pool: &[String],
+    pool_origin: PoolOrigin,
+    health: &dyn crate::providers::HealthSource,
+) -> bool {
+    resolved_implementer(frozen, prev_pool, prev_origin, health)
+        != resolved_implementer(amended, pool, pool_origin, health)
+}
+
+/// Re-resolve the provider and model of seats that already exist, from the amended
+/// config (an amend was applied, or `--reload-config` reloaded the file).
 ///
-/// Matched by seat id, so a seat the new config no longer produces is left alone
-/// rather than guessed at: dropping it is `--without`'s job, and this must not become
-/// a second path that reaps slots.
+/// A reviewer config entry pairs with the live seat at its own panel position,
+/// never with the id the formula stamps on it: a drop shifts later entries
+/// down while slot ids stay stable, so the entry now at config position
+/// `r` governs the survivor at live panel position `r`. The provider must agree
+/// for the pairing to hold; on a mismatch the entry is skipped, since a
+/// replaced panel re-seats rather than re-points. Skipping also keeps one slot
+/// from being claimed by two entries: the stamped id of a shifted entry can
+/// name a survivor another entry already governs. A seat the new config no
+/// longer produces is left alone rather than guessed at: dropping it is
+/// `--without`'s job, and this must not become a second path that reaps slots.
+///
+/// The implementer moves only when the amend changed its pin
+/// (`repoint_implementer`): any other amend leaves the seat alone, so a
+/// stuck-ladder rotation off the pin survives it. A reviewer seat's id encodes
+/// its provider, so the implementer is the only seat this can move.
 ///
 /// **A `Running` seat is never re-pointed.** Its provider is the one that is mid-flight;
 /// rewriting it would make the run's own record disagree with the process it is
 /// waiting on, and the slot's pid marker is filed against what actually spawned.
 fn repoint_existing_seats(
     state: &mut RunState,
+    paths: &SparPaths,
     cfg: &Config,
     health: &dyn crate::providers::HealthSource,
+    repoint_implementer: bool,
 ) -> Result<()> {
     let pool = state.providers.clone();
-    for slot in state
+    let positions: HashMap<String, usize> = state
         .slots
-        .iter_mut()
-        .filter(|s| s.status != SlotStatus::Running && s.source != Some(SeatSource::Reassigned))
-    {
-        // Never touch the seat that is mid-flight (filtered above): its provider is
-        // the one that spawned, and its pid marker is filed against exactly that.
-        // A hand-moved seat (O136, filtered above) is likewise left alone: the
-        // config never named its provider, so it has nothing to say about its
-        // model either.
-        //
-        // Resolve the seat this slot fills raw and unsettled: re-pointing is
-        // model-only, so the provider must come out exactly as the slot carries
-        // it. Settling here (a backup or order substitution) would resolve a
-        // different provider and trip the mismatch refusal below on every
-        // continue whose primary went unhealthy, without changing anything the
-        // seat machinery owns. Canonical seats only: a rotated or widened seat
-        // is not the config's seat and stays with the seat machinery.
+        .iter()
+        .filter(|s| is_panel_reviewer(s))
+        .enumerate()
+        .map(|(r, s)| (s.id.clone(), r))
+        .collect();
+    let run_id = state.id.clone();
+    // Never touch the seat that is mid-flight: its provider is the one that
+    // spawned, and its pid marker is filed against exactly that. A hand-moved
+    // seat (O136) is not governed by the config: it never named its provider.
+    // Neither is a seat serving its engaged backup: the failover picked the
+    // provider deliberately, and the resolved seat names the primary, so
+    // re-pointing would undo the failover.
+    for slot in state.slots.iter_mut().filter(|s| {
+        s.status != SlotStatus::Running
+            && s.source != Some(SeatSource::Reassigned)
+            && s.source != Some(SeatSource::Backup)
+    }) {
+        // Resolve the seat this slot fills raw and unsettled: settling here (a
+        // backup or order substitution) would resolve a different provider on
+        // every continue whose primary went unhealthy, without changing
+        // anything the seat machinery owns. Reviewer entries pair positionally;
+        // see above. A widened extra holds no panel position and stays with the
+        // seat machinery.
         let (role, pool_index, role_index) = match slot.role {
-            SlotRole::Implementer if slot.id == "impl" => (SlotRole::Implementer, 0, 0),
-            SlotRole::Reviewer => match reviewer_ordinal(&slot.id) {
-                Some(r) => (SlotRole::Reviewer, r + 1, r),
+            SlotRole::Implementer if slot.id == "impl" => {
+                if !repoint_implementer {
+                    continue;
+                }
+                (SlotRole::Implementer, 0, 0)
+            }
+            SlotRole::Reviewer => match positions.get(&slot.id) {
+                Some(&r) => (SlotRole::Reviewer, r + 1, r),
                 None => continue,
             },
             _ => continue,
@@ -298,45 +884,36 @@ fn repoint_existing_seats(
             continue;
         };
         let (provider, model) = crate::workflow::roles_resolve::split_model(&raw, None);
-        if role == SlotRole::Reviewer
-            && slot.id
-                != format!(
-                    "review-{role_index}-{}",
-                    crate::util::sanitize_slot(&provider)
-                )
-        {
-            continue;
-        }
-        // **Model only.** A reviewer seat's id is `review-{r}-{sanitized provider}`
-        // (`roles_resolve::build_implement_seats`), so the id *encodes* the provider:
-        // a matching id already means a matching provider, and writing
-        // `seat.provider` over it can only ever make the id contradict its own
-        // contents. The first cut of this did write it, and on a run whose reviewer
-        // pins were re-stated it put `cli:claude` behind the seat named
-        // `review-1-cli-codex` — silently collapsing a deliberate two-vendor panel to
-        // one vendor (the exact thing feature 011 exists to keep exact) and then
-        // blaming codex in the rate-limit error when claude's limit was the one hit.
-        //
-        // A genuinely *different* provider therefore fails the canonical-id check
-        // above and is left to the seat machinery rather than smuggled in here.
-        // Changing who fills a seat is a different operation from changing which
-        // model they use, and only the second one is safe to do to a slot that
-        // already carries a worktree, a branch and a round history.
-        // Enforced, not asserted: a seat id that names one provider while the slot
-        // carries another is how a two-vendor panel becomes one vendor without
-        // anybody being told, and how a rate-limit error ends up blaming the wrong
-        // provider. If this ever does not hold, the seat machinery and the id
-        // formula have diverged, and refusing is the only safe answer: writing
-        // either field would bake the disagreement in.
         if slot.provider != provider {
-            bail!(
-                "seat `{}` resolves to {} but the run carries {}; the seat id encodes \
-                 its provider, so these cannot both be right. Refusing to re-point it \
-                 rather than leave a seat whose id contradicts what fills it.",
-                slot.id,
-                provider,
-                slot.provider
-            );
+            // A reviewer seat's id encodes its provider: writing a new one over
+            // it would make the id contradict its own contents, collapsing a
+            // deliberate two-vendor panel to one vendor without anybody being
+            // told. A different reviewer provider is the re-seat's job, so the
+            // pairing is skipped. Only the implementer's id names no provider.
+            if role == SlotRole::Reviewer {
+                continue;
+            }
+            // A provider change goes through the same primitive as every
+            // other one: the old provider's outcome stays off the seat, a
+            // level the new CLI refuses is dropped, and a stale session
+            // marker for the new provider is cleared.
+            let pin = crate::provider_ref::Pin {
+                provider: provider.clone(),
+                model,
+            };
+            let display = pin.display();
+            slot.point_at(&display);
+            if executor::check_slot_effort(&display, slot.effort).is_err() {
+                slot.effort = None;
+            }
+            slot.source = Some(source);
+            if let Some(cli) = crate::provider_ref::ProviderRef::parse(&provider)
+                .ok()
+                .and_then(|p| p.cli_name().map(str::to_string))
+            {
+                crate::markers::clear_session_id(paths, &run_id, &slot.id, &cli);
+            }
+            continue;
         }
         if slot.model == model {
             continue;
@@ -457,7 +1034,7 @@ fn reassign_target(state: &RunState, target: &str) -> Result<String> {
 
 /// Resolve every `--reassign` against the run before anything moves, so one bad
 /// target leaves every seat as it was.
-fn resolve_reassignments(
+pub(crate) fn resolve_reassignments(
     state: &RunState,
     wanted: &[Reassignment],
 ) -> Result<Vec<(String, crate::provider_ref::Pin)>> {
@@ -479,7 +1056,7 @@ fn resolve_reassignments(
                 r.pin.display()
             );
         }
-        let new_id = moved_seat_id(slot.role, &seat, &r.pin.provider);
+        let new_id = moved_seat_id(slot.role, reviewer_seat_kind(slot), &seat, &r.pin.provider);
         if new_id != seat && state.slots.iter().any(|s| s.id == new_id) {
             bail!(
                 "--reassign {}: seat {seat} would become {new_id}, which this run already has",
@@ -617,7 +1194,7 @@ fn run_from_approved(
     amendment: Option<String>,
     mut opts: CommonOpts,
     paths: &SparPaths,
-    cfg: &Config,
+    amend: BoundAmendInputs,
 ) -> Result<ExitCode> {
     // Loaded once before the lock only so a mistyped id fails without the lock minting
     // a run directory for it. Everything below mutates the run, so it all happens under
@@ -642,7 +1219,8 @@ fn run_from_approved(
             && !opts.reload_config
             && !opts.accept_contract
             && !opts.re_review
-            && opts.reassign.is_empty();
+            && opts.reassign.is_empty()
+            && amend.is_noop();
         let live = crate::runlock::RunLock::owner(paths, run_id).filter(|o| o.alive());
         if let (true, Some(owner)) = (extension_only, live) {
             if let Some(code) =
@@ -662,9 +1240,24 @@ fn run_from_approved(
             }
         }
     };
+    // The live file config loads before the run's captured env is re-applied:
+    // `Config::load` fills `captured` from this process, and the re-apply below
+    // overwrites the process env with the creation values (O130), so loading
+    // after it would freeze the creation values as this shell's.
+    let live = if opts.reload_config {
+        Some(Config::load(&paths.project_root)?)
+    } else {
+        None
+    };
     // Every way back into a run (`--run`, `resume`, a `--plan` the run wrote) dispatches
     // under the environment the run was created in (O130), from its own snapshot.
-    Config::for_run(paths, run_id)?.reapply_captured_env();
+    // `cfg` was read before the lock for the cheap pre-checks in `implement_ctx`;
+    // re-read the frozen snapshot under the lock: another dispatch may have amended
+    // it since, and the preview below builds from the frozen base (O27), so the
+    // stale read would silently overwrite the newer snapshot.
+    let frozen = Config::for_run(paths, run_id)?;
+    frozen.reapply_captured_env();
+    let cfg = &frozen;
     let mut state = RunState::load(paths, run_id)?;
     // Read before anything below resets slot statuses for re-dispatch.
     let round_dispatched = current_round_dispatched(&state);
@@ -686,6 +1279,25 @@ fn run_from_approved(
     }
     let moves = resolve_reassignments(&state, &reassignments)
         .map_err(|e| ReassignRefused(format!("{e:#}")))?;
+    // The amend previews against the post-move state: the reassigns below apply
+    // after the preconditions, and the amend applies after them, so ordinals,
+    // pins and the re-seat simulation must read the seats the dispatch will
+    // actually amend. Simulating on a clone keeps the preview read-only; a bad
+    // move fails here, before any side effect below.
+    let moved = simulate_moves(&state, &moves).map_err(|e| ReassignRefused(format!("{e:#}")))?;
+    // The amend previews here, read-only, before any side effect below (the
+    // stopped-marker removal, the terminal-slot clearing, the base worktrees,
+    // the reassigns). A refused amend (a bad seat id, a malformed override, the
+    // last-seat drop) changes nothing on disk or in the saved state. It is
+    // applied after the preconditions, further down.
+    let preview = if live.is_none() && amend.is_noop() {
+        None
+    } else {
+        Some(
+            preview_bound_amend(cfg, live.as_ref(), &moved, &amend)
+                .map_err(|e| AmendRefused(format!("{e:#}")))?,
+        )
+    };
     // Resuming a stopped run: drop the marker so execute_loop dispatches instead
     // of halting again at its first boundary.
     if state.phase == Phase::Stopped {
@@ -760,6 +1372,89 @@ fn run_from_approved(
             );
         }
     }
+    // Bound amend, applied under this same lock and after every launch
+    // precondition passed (resumable, round extension, reassign resolution,
+    // base): the frozen config is amended, reviewer seats are dropped with
+    // their slots, a `--role reviewer=` pin re-seats the live panel to match
+    // it, and the snapshot is re-frozen, so a refused launch changes nothing.
+    // The amended config shadows the frozen one for the rest of this dispatch.
+    // The `preview` above already passed every check, so a refusal here means
+    // the surgery itself failed mid-apply.
+    let amend_applied = preview.is_some();
+    let amended;
+    let cfg: &Config = if let Some(mut preview) = preview {
+        if preview.panel_pinned {
+            // The preview already pinned post-move seats, but the pin is rebuilt
+            // here from the live state anyway: the re-seat and the config it
+            // freezes must read the same panel, never a stale copy.
+            let doomed: BTreeSet<String> = plan_reviewer_drop(&state, &preview.dropped)
+                .map_err(|e| AmendRefused(format!("{e:#}")))?
+                .map(|plan| plan.removed)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            preview.cfg.roles.reviewer = state
+                .slots
+                .iter()
+                .filter(|s| is_panel_reviewer(s) && !doomed.contains(&s.id))
+                .map(|s| s.provider_ref().display())
+                .collect();
+        }
+        // The seats retire in state first; their files go only after both
+        // saves below land, so neither a failed save nor a failed deletion
+        // leaves the config naming seats whose checkouts are gone.
+        let mut removed = if !preview.dropped.is_empty() {
+            let removed = retire_reviewer_seats(&mut state, &preview.dropped)
+                .map_err(|e| AmendRefused(format!("{e:#}")))?;
+            disengage_spent_reviewer_backups(&state, &mut preview.cfg.backups.reviewer);
+            removed
+        } else {
+            Vec::new()
+        };
+        // A `--role reviewer=` pin replaces the panel outright: the live seats
+        // are moved or minted to match it, so the live panel and the frozen
+        // config panel stay one fact. A drop-all plus pin re-seats the panel
+        // instead of reaching the ship gate with no reviewer. The same
+        // predicate the preview simulated with, so a first dispatch mints the
+        // panel once from the amended config instead of twice.
+        if bound_panel_resync_applies(&state, &amend.role, preview.cfg.roles.reviewer.len()) {
+            let pin = parse_reviewer_pin(&preview.cfg.roles.reviewer)
+                .map_err(|e| AmendRefused(format!("{e:#}")))?;
+            let resynced =
+                resync_reviewer_panel_to_pin(&mut state, &mut preview.cfg.backups.reviewer, &pin)
+                    .map_err(|e| AmendRefused(format!("{e:#}")))?;
+            removed.extend(resynced);
+        }
+        if !removed.is_empty() {
+            let _ = crate::events::append(
+                paths,
+                run_id,
+                &crate::events::Event::info(format!(
+                    "operator dropped reviewer seat(s) {} on re-entry",
+                    removed.join(", ")
+                )),
+            );
+            eprintln!(
+                "run {run_id}: dropped reviewer seat(s) {} (the amended config re-freezes this dispatch)",
+                removed.join(", ")
+            );
+        }
+        save_amended_pair(paths, run_id, &preview.cfg, &state)
+            .map_err(|e| AmendRefused(format!("{e:#}")))?;
+        if !removed.is_empty() {
+            if let Err(e) = delete_dropped_reviewer_files(&state, paths, &removed) {
+                eprintln!("run {run_id}: dropped seats retired but their files could not be deleted: {e:#}");
+            }
+        }
+        preview.cfg.reapply_captured_env();
+        amended = preview;
+        state.isolation = amended.cfg.isolation;
+        state.autonomy = amended.cfg.autonomy;
+        state.message_budget = amended.cfg.message_budget;
+        &amended.cfg
+    } else {
+        cfg
+    };
     if state.dry_run {
         std::env::set_var("SPAR_DRY_RUN", "1");
     }
@@ -786,7 +1481,7 @@ fn run_from_approved(
         && opts.select.is_empty()
         && is_explicit_frozen_pool
         && !frozen_pool.is_empty();
-    let n = crate::workflow::roles_resolve::pool_width(cfg);
+    let (n, roles) = crate::workflow::roles_resolve::reviewer_select_question(cfg);
     if reuses_frozen_pool {
         // The frozen pool may be narrower than this round's panel — e.g. a plan phase
         // that ran with `--without critic,spec` only ever needed one provider. Refusing
@@ -796,10 +1491,6 @@ fn run_from_approved(
         // same fallback an unpinned panel already relies on, so let it.
         opts.providers = frozen_pool.clone();
     }
-    let roles: Vec<&str> = std::iter::once(SlotRole::Implementer.as_config_key())
-        .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
-        .take(n)
-        .collect();
     let requested = opts.resolve_pool(n, &roles, paths, cfg, &state.id)?;
     // `opts.providers` was just filled from the frozen pool above when reusing a
     // continuation's pool — that is not a fresh CLI `--providers`, so the source it
@@ -810,6 +1501,8 @@ fn run_from_approved(
     } else {
         crate::workflow::roles_resolve::pool_origin_for(&opts)
     };
+    let prev_pool = state.providers.clone();
+    let prev_origin = state.pool_origin;
     state.pool_origin = pool_origin;
     // A replacement pool this round (an explicit `--providers`/`--select` on the
     // continuation) becomes the new frozen intent for any later round; a reused one
@@ -828,6 +1521,20 @@ fn run_from_approved(
         n,
         Some(&requested),
         state.dry_run,
+        state.pool_origin,
+        &health,
+    );
+    // The implementer re-points only when the amend moved its pin: the frozen
+    // and amended configs resolving it differently under their own pools. Any
+    // other amend leaves the seat alone, so a stuck-ladder rotation off the pin
+    // survives it.
+    let repoint_implementer = should_repoint_implementer(
+        amend_applied,
+        &frozen,
+        &prev_pool,
+        prev_origin,
+        cfg,
+        &state.providers,
         state.pool_origin,
         &health,
     );
@@ -902,7 +1609,8 @@ fn run_from_approved(
         paths,
         Reentry {
             from_round_gate,
-            reload_config: opts.reload_config,
+            repoint: amend_applied,
+            repoint_implementer,
         },
     )?;
     // Only the implementer must run next at run start, so only it can park the
@@ -926,6 +1634,24 @@ fn run_from_approved(
     }
     if state.slots.iter().all(|s| s.role != SlotRole::Implementer) {
         bail!("no implementer slot after provider pick");
+    }
+    // Readiness: a run with no live reviewer seats must never reach the ship
+    // confirm through the loop below, so it fails here, before any dispatch,
+    // instead of shipping unreviewed.
+    if !state.slots.iter().any(is_panel_reviewer) {
+        // `fail` returns before any `--json` output for a refused launch; a
+        // run that reaches this gate is already failed, so record that first
+        // and let the emitted run JSON say so, like the quota gate above.
+        let err = anyhow::anyhow!(
+            "run {run_id} has no reviewer seats; the run would reach the ship gate unreviewed"
+        );
+        state.set_phase(crate::state::Phase::Failed);
+        state.error = Some(err.to_string());
+        state.save(paths)?;
+        if opts.json {
+            crate::executor::emit_run_json(&state)?;
+        }
+        return Err(err);
     }
     state.record_unhealthy_pin_warnings();
     // `--re-review` arms the reviewer-is-wrong exit (O180) here, at loop entry:
@@ -959,7 +1685,8 @@ fn prepare_implement_slots(
 ) -> Result<()> {
     let Reentry {
         from_round_gate: resuming_from_round_gate,
-        reload_config,
+        repoint,
+        repoint_implementer,
     } = reentry;
     state.workflow = crate::cli::WorkflowKind::Loop;
     state.max_fix_rounds = 3;
@@ -977,14 +1704,18 @@ fn prepare_implement_slots(
     // Keep planner slots as historical; add impl/review if missing.
     let has_impl = state.slots.iter().any(|s| s.role == SlotRole::Implementer);
     if has_impl {
-        // `--reload-config` resolved a fresh `Config` (O27's one sanctioned escape),
-        // and until now that reached `config.json` and stopped there: seats minted by
-        // an earlier round kept whatever provider they were created with, so
-        // `--role implementer=…` on a run whose slots exist changed the frozen config
-        // and nothing that runs. `skills/core.md` documents `--reload-config` as the
-        // way to change a running run's fleet, so the contract was real and unhonoured.
-        if reload_config {
-            repoint_existing_seats(state, cfg, &crate::providers::LiveHealth::for_dry(dry))?;
+        // Seats minted by an earlier round are re-resolved from the amended
+        // config whenever an amend was applied; only an amend that moved the
+        // implementer pin moves the implementer seat, so a stuck-ladder
+        // rotation off the pin survives any other amend.
+        if repoint {
+            repoint_existing_seats(
+                state,
+                paths,
+                cfg,
+                &crate::providers::LiveHealth::for_dry(dry),
+                repoint_implementer,
+            )?;
         }
         ensure_suite_slot(state, dry, cfg, paths)?;
         return Ok(());
@@ -1044,6 +1775,9 @@ fn prepare_implement_slots(
     for seat in seats {
         let mut slot = executor::init_slot_model(&seat.seat, &seat.provider, seat.role, seat.model);
         slot.source = Some(seat.source);
+        if seat.role == SlotRole::Reviewer {
+            slot.reviewer_kind = Some(ReviewerSeatKind::Panel);
+        }
         state.slots.push(slot);
     }
     // The projected panel has graduated into real slots; a stale projection would only
@@ -1195,7 +1929,7 @@ fn resolve_suite_provider(
     if let Some(p) = &cfg.roles.tester {
         crate::provider_ref::ProviderRef::parse(p)
             .map_err(|e| anyhow::anyhow!("invalid [roles].tester {p:?}: {e}"))?;
-        let pinned = cfg.cli_role_keys.contains(SlotRole::Tester.as_config_key());
+        let pinned = cfg.cli_role_keys.contains(&SlotRole::Tester);
         if dry
             || (if pinned {
                 providers::is_provider_present(p, false)
@@ -1367,27 +2101,273 @@ mod suite_reap_tests {
     /// editing `state.json` by hand.
     #[test]
     fn reload_config_repoints_a_seat_that_already_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
         let mut st = run_with_impl("cli:muse", "muse-spark-1.3", SlotStatus::Failed);
         let cfg = cfg_with_implementer("cli:muse@muse-spark-1.2");
 
-        repoint_existing_seats(&mut st, &cfg, &crate::providers::StubHealth::allow_all()).unwrap();
+        repoint_existing_seats(
+            &mut st,
+            &paths,
+            &cfg,
+            &crate::providers::StubHealth::allow_all(),
+            true,
+        )
+        .unwrap();
 
         let impl_slot = st.slots.iter().find(|s| s.id == "impl").unwrap();
         assert_eq!(impl_slot.model.as_deref(), Some("muse-spark-1.2"));
     }
 
-    /// The invariant a re-point must preserve: every reviewer seat's provider still
-    /// matches the provider its id names (`review-{r}-{provider}`).
-    ///
-    /// This pins the invariant, **not** the incident. In a live session a
-    /// `--reload-config` left `cli:claude` behind the seat named `review-1-cli-codex`
-    /// on two runs — collapsing a deliberate two-vendor panel to one vendor, which is
-    /// the exact thing feature 011 exists to keep exact, and then naming codex in the
-    /// rate-limit error when claude's limit was the one hit. The config that produced
-    /// it could not be reconstructed from the run state afterwards, so this test does
-    /// not fail against the old code. What catches that case now is the `bail!` in
-    /// `repoint_existing_seats`: a seat whose id and provider disagree is refused
-    /// instead of written.
+    /// A reviewer-model-only amend must still re-point reviewer seats: the flag
+    /// that decides whether the implementer moves must not also decide whether
+    /// `repoint_existing_seats` runs at all. This passes exactly what the dispatch
+    /// passes when the amend did not move the pin, and failed while the call was
+    /// gated on the pin flag: the reviewer kept its stale model.
+    #[test]
+    fn an_amend_without_an_implementer_pin_move_still_repoints_reviewer_models() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = run_with_impl("cli:muse", "muse-spark-1.3", SlotStatus::Failed);
+        let mut review_slot = executor::init_slot_model(
+            "review-0-cli-claude",
+            "cli:claude",
+            SlotRole::Reviewer,
+            Some("opus".into()),
+        );
+        review_slot.status = SlotStatus::Failed;
+        st.slots.push(review_slot);
+        st.providers = vec!["cli:muse".into(), "cli:claude".into()];
+
+        let mut cfg = cfg_with_implementer("cli:muse@muse-spark-1.3");
+        cfg.roles.reviewer = vec!["cli:claude@sonnet".into()];
+
+        prepare_implement_slots(
+            &mut st,
+            None,
+            PoolOrigin::Synth,
+            true,
+            &cfg,
+            &paths,
+            Reentry {
+                from_round_gate: false,
+                repoint: true,
+                repoint_implementer: false,
+            },
+        )
+        .unwrap();
+
+        let review = st
+            .slots
+            .iter()
+            .find(|s| s.id == "review-0-cli-claude")
+            .unwrap();
+        assert_eq!(
+            review.model.as_deref(),
+            Some("sonnet"),
+            "reviewer model follows the amend even when the implementer pin did not move"
+        );
+    }
+
+    /// A drop shifts later config entries down while slot ids stay stable,
+    /// so after `--without reviewer[0]` the entry now at config position 0 governs
+    /// the survivor at live panel position 0. Id-only pairing re-points the
+    /// survivor from its neighbour's entry instead: with
+    /// `[claude@opus, codex@gpt-5, codex@gpt-5.6-terra]` the `gpt-5` seat silently
+    /// becomes `gpt-5.6-terra` on a no-op amend. Failed before position pairing:
+    /// `review-1-cli-codex` came back `gpt-5.6-terra`.
+    #[test]
+    fn a_drop_then_amend_repoints_each_survivor_from_its_own_position() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = run_with_impl("cli:muse", "muse-spark-1.3", SlotStatus::Failed);
+        for (id, provider, model) in [
+            ("review-0-cli-claude", "cli:claude", "opus"),
+            ("review-1-cli-codex", "cli:codex", "gpt-5"),
+            ("review-2-cli-codex", "cli:codex", "gpt-5.6-terra"),
+        ] {
+            let mut slot =
+                executor::init_slot_model(id, provider, SlotRole::Reviewer, Some(model.into()));
+            slot.status = SlotStatus::Failed;
+            st.slots.push(slot);
+        }
+        st.providers = vec!["cli:muse".into(), "cli:claude".into(), "cli:codex".into()];
+
+        let mut cfg = cfg_with_implementer("cli:muse@muse-spark-1.3");
+        cfg.roles.reviewer = vec![
+            "cli:claude@opus".into(),
+            "cli:codex@gpt-5".into(),
+            "cli:codex@gpt-5.6-terra".into(),
+        ];
+        cfg.cli_role_keys.insert(SlotRole::Reviewer);
+        let dropped = cfg
+            .apply_without(
+                &st.providers.clone(),
+                PoolOrigin::Synth,
+                true,
+                &["reviewer[0]".to_string()],
+            )
+            .unwrap();
+        let retired = retire_reviewer_seats(&mut st, &dropped).unwrap();
+        delete_dropped_reviewer_files(&st, &paths, &retired).unwrap();
+
+        prepare_implement_slots(
+            &mut st,
+            None,
+            PoolOrigin::Synth,
+            true,
+            &cfg,
+            &paths,
+            Reentry {
+                from_round_gate: false,
+                repoint: true,
+                repoint_implementer: false,
+            },
+        )
+        .unwrap();
+
+        let model_of = |id: &str| {
+            st.slots
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("survivor {id} still seated"))
+                .model
+                .clone()
+        };
+        assert_eq!(
+            model_of("review-1-cli-codex").as_deref(),
+            Some("gpt-5"),
+            "the first survivor keeps the entry at its live panel position"
+        );
+        assert_eq!(
+            model_of("review-2-cli-codex").as_deref(),
+            Some("gpt-5.6-terra"),
+            "the second survivor keeps the entry at its live panel position"
+        );
+    }
+
+    /// A drop plus a backup failover must not hand a survivor its neighbour's
+    /// entry: with `[codex@gpt-b, codex@gpt-c]` left by the drop, the entry at
+    /// config position 1 governs the seat at live panel position 1, which now
+    /// serves its backup. Falling back to the stamped id `review-1-cli-codex`
+    /// instead re-points the `gpt-b` survivor sitting at position 0, and the
+    /// later entry wins: the survivor silently becomes `gpt-c` on a no-op
+    /// amend. Failed before the fallback was removed.
+    #[test]
+    fn a_drop_then_backup_never_repoints_a_survivor_from_its_neighbours_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = run_with_impl("cli:muse", "muse-spark-1.3", SlotStatus::Failed);
+        for (id, provider, model) in [
+            ("review-0-cli-codex", "cli:codex", "gpt-a"),
+            ("review-1-cli-codex", "cli:codex", "gpt-b"),
+            ("review-2-cli-codex", "cli:codex", "gpt-c"),
+        ] {
+            let mut slot =
+                executor::init_slot_model(id, provider, SlotRole::Reviewer, Some(model.into()));
+            slot.status = SlotStatus::Failed;
+            st.slots.push(slot);
+        }
+        st.providers = vec!["cli:muse".into(), "cli:codex".into()];
+
+        let mut cfg = cfg_with_implementer("cli:muse@muse-spark-1.3");
+        cfg.roles.reviewer = vec![
+            "cli:codex@gpt-a".into(),
+            "cli:codex@gpt-b".into(),
+            "cli:codex@gpt-c".into(),
+        ];
+        cfg.cli_role_keys.insert(SlotRole::Reviewer);
+        let dropped = cfg
+            .apply_without(
+                &st.providers.clone(),
+                PoolOrigin::Synth,
+                true,
+                &["reviewer[0]".to_string()],
+            )
+            .unwrap();
+        let retired = retire_reviewer_seats(&mut st, &dropped).unwrap();
+        delete_dropped_reviewer_files(&st, &paths, &retired).unwrap();
+        let pin = crate::provider_ref::Pin::parse("cli:claude@opus").unwrap();
+        let moved = move_seat(
+            &mut st,
+            &paths,
+            "review-2-cli-codex",
+            &pin,
+            SeatSource::Backup,
+        )
+        .unwrap();
+        assert_eq!(moved, "review-2-cli-claude");
+
+        prepare_implement_slots(
+            &mut st,
+            None,
+            PoolOrigin::Synth,
+            true,
+            &cfg,
+            &paths,
+            Reentry {
+                from_round_gate: false,
+                repoint: true,
+                repoint_implementer: false,
+            },
+        )
+        .unwrap();
+
+        let slot_of = |id: &str| {
+            st.slots
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("{id} still seated"))
+        };
+        assert_eq!(
+            slot_of("review-1-cli-codex").model.as_deref(),
+            Some("gpt-b"),
+            "the first survivor keeps its own entry, not its neighbour's"
+        );
+        assert_eq!(
+            slot_of("review-2-cli-claude").model.as_deref(),
+            Some("opus"),
+            "the backup-serving seat keeps the backup model"
+        );
+    }
+
+    /// A work-failure rotation re-points a pinned seat's provider but keeps its
+    /// id (`point_at` stamps the provider, not the id), so the preview must pair
+    /// the way the apply does: by live panel position with a provider-agrees
+    /// skip. Id pairing refuses the amend (`review-1-cli-codex` resolves
+    /// `cli:codex` while the slot carries `cli:grok`) even though the apply
+    /// would skip that seat and carry on. Failed before the preview paired
+    /// positionally: the amend was refused.
+    #[test]
+    fn preview_allows_what_a_rotation_left_the_apply_to_skip() {
+        let mut st = run_with_impl("cli:muse", "muse-spark-1.3", SlotStatus::Failed);
+        for (id, provider) in [
+            ("review-0-cli-claude", "cli:claude"),
+            ("review-1-cli-codex", "cli:grok"),
+        ] {
+            let mut slot = executor::init_slot(id, provider, SlotRole::Reviewer);
+            slot.status = SlotStatus::Failed;
+            slot.source = Some(SeatSource::CliRole);
+            st.slots.push(slot);
+        }
+        st.providers = vec!["cli:muse".into(), "cli:claude".into(), "cli:codex".into()];
+        st.pool_origin = PoolOrigin::CliProviders;
+
+        let mut cfg = cfg_with_implementer("cli:muse@muse-spark-1.3");
+        cfg.roles.reviewer = vec!["cli:claude".into(), "cli:codex".into()];
+        cfg.cli_role_keys.insert(SlotRole::Reviewer);
+
+        let inputs = BoundAmendInputs {
+            effort: vec!["reviewer=high".into()],
+            ..BoundAmendInputs::default()
+        };
+        preview_bound_amend(&cfg, None, &st, &inputs).unwrap();
+    }
+
+    /// A re-point never writes a provider over a seat whose id names another one:
+    /// a reviewer seat's id encodes its provider, so a genuinely different provider
+    /// resolves to a seat id that does not exist yet and the entry is skipped.
+    /// Every reviewer seat's provider still matches the provider its id names.
     #[test]
     fn a_repoint_keeps_every_seat_matching_the_provider_its_id_names() {
         let mut st = RunState::new(
@@ -1408,8 +2388,17 @@ mod suite_reap_tests {
 
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:claude@opus".into(), "cli:codex@gpt-5.6-terra".into()];
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
 
-        repoint_existing_seats(&mut st, &cfg, &crate::providers::StubHealth::allow_all()).unwrap();
+        repoint_existing_seats(
+            &mut st,
+            &paths,
+            &cfg,
+            &crate::providers::StubHealth::allow_all(),
+            false,
+        )
+        .unwrap();
 
         let panel: Vec<(&str, &str)> = st
             .slots
@@ -1440,10 +2429,19 @@ mod suite_reap_tests {
     /// make the run disagree with the process it is waiting on.
     #[test]
     fn a_running_seat_is_never_repointed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
         let mut st = run_with_impl("cli:muse", "muse-spark-1.3", SlotStatus::Running);
         let cfg = cfg_with_implementer("cli:muse@muse-spark-1.2");
 
-        repoint_existing_seats(&mut st, &cfg, &crate::providers::StubHealth::allow_all()).unwrap();
+        repoint_existing_seats(
+            &mut st,
+            &paths,
+            &cfg,
+            &crate::providers::StubHealth::allow_all(),
+            true,
+        )
+        .unwrap();
 
         let impl_slot = st.slots.iter().find(|s| s.id == "impl").unwrap();
         assert_eq!(
@@ -1451,6 +2449,193 @@ mod suite_reap_tests {
             Some("muse-spark-1.3"),
             "a live dispatch keeps the provider that spawned it"
         );
+    }
+
+    /// The implementer's seat id names no provider, so a provider change on amend
+    /// re-points the seat instead of refusing after the amend is already saved.
+    #[test]
+    fn an_implementer_provider_change_repoints_instead_of_refusing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = run_with_impl("cli:claude", "opus", SlotStatus::Pending);
+        let cfg = cfg_with_implementer("cli:grok");
+
+        repoint_existing_seats(
+            &mut st,
+            &paths,
+            &cfg,
+            &crate::providers::StubHealth::allow_all(),
+            true,
+        )
+        .unwrap();
+
+        let impl_slot = st.slots.iter().find(|s| s.id == "impl").unwrap();
+        assert_eq!(impl_slot.provider.as_str(), "cli:grok");
+    }
+
+    /// The stuck ladder rotates the implementer off the pin and stamps the rung
+    /// it drew from, never Backup: an amend that does not touch the implementer
+    /// pin must leave that seat alone instead of silently moving it back.
+    #[test]
+    fn an_unrelated_amend_leaves_a_ladder_rotated_implementer_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = run_with_impl("cli:codex", "gpt-5", SlotStatus::Pending);
+        st.slots[0].source = Some(SeatSource::CliRole);
+        let cfg = cfg_with_implementer("cli:claude");
+
+        repoint_existing_seats(
+            &mut st,
+            &paths,
+            &cfg,
+            &crate::providers::StubHealth::allow_all(),
+            false,
+        )
+        .unwrap();
+
+        let impl_slot = st.slots.iter().find(|s| s.id == "impl").unwrap();
+        assert_eq!(
+            impl_slot.provider.as_str(),
+            "cli:codex",
+            "only an amend that changes the implementer pin moves the seat"
+        );
+    }
+
+    /// The implementer-branch gate is the resolved pin, not the amend: restating
+    /// the same pin resolves identically and moves nothing, while a new pin
+    /// resolves differently. No amend means no re-point either way.
+    #[test]
+    fn only_a_moved_implementer_pin_repoints() {
+        let pool = vec!["cli:claude".to_string(), "cli:codex".to_string()];
+        let frozen = cfg_with_implementer("cli:claude");
+        let restated = cfg_with_implementer("cli:claude");
+        assert!(
+            !should_repoint_implementer(
+                true,
+                &frozen,
+                &pool,
+                PoolOrigin::Synth,
+                &restated,
+                &pool,
+                PoolOrigin::Synth,
+                &crate::providers::StubHealth::allow_all(),
+            ),
+            "restating the pin resolves the same seat"
+        );
+        let moved = cfg_with_implementer("cli:codex");
+        assert!(
+            should_repoint_implementer(
+                true,
+                &frozen,
+                &pool,
+                PoolOrigin::Synth,
+                &moved,
+                &pool,
+                PoolOrigin::Synth,
+                &crate::providers::StubHealth::allow_all(),
+            ),
+            "a new pin resolves a different seat"
+        );
+        assert!(
+            !should_repoint_implementer(
+                false,
+                &frozen,
+                &pool,
+                PoolOrigin::Synth,
+                &moved,
+                &pool,
+                PoolOrigin::Synth,
+                &crate::providers::StubHealth::allow_all(),
+            ),
+            "no amend means no re-point even when the configs disagree"
+        );
+    }
+
+    /// The re-point is a provider change, so it goes through the same primitive
+    /// as every other one: the old provider's outcome stays off the seat, a
+    /// level the new CLI refuses is dropped, and a stale session marker for the
+    /// new provider is cleared.
+    #[test]
+    fn an_implementer_repoint_resets_the_old_providers_outcome() {
+        use crate::effort::EffortLevel;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = run_with_impl("cli:claude", "opus", SlotStatus::Failed);
+        {
+            let s = &mut st.slots[0];
+            s.quota_hit = true;
+            s.error = Some("rate limited".into());
+            s.usage = Some(crate::state::SlotUsage {
+                slot_id: "impl".into(),
+                provider: "cli:claude".into(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                context_tokens: 0,
+                context_semantics: crate::state::ContextSemantics::Unknown,
+                billed_tokens: 2,
+                tools: 0,
+                model: None,
+                cost_usd: None,
+                subagent_stats: None,
+                model_usage: Default::default(),
+            });
+            s.effort = Some(EffortLevel::Max);
+        }
+        let marker = paths.marker("repoint1", "impl.grok.session_id");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "stale-session").unwrap();
+        let cfg = cfg_with_implementer("cli:grok");
+
+        repoint_existing_seats(
+            &mut st,
+            &paths,
+            &cfg,
+            &crate::providers::StubHealth::allow_all(),
+            true,
+        )
+        .unwrap();
+
+        let s = st.slots.iter().find(|s| s.id == "impl").unwrap();
+        assert_eq!(s.provider.as_str(), "cli:grok");
+        assert!(!s.quota_hit, "claude's quota hit must not ride along");
+        assert_eq!(s.error, None);
+        assert!(s.usage.is_none(), "claude's usage must not ride along");
+        assert_eq!(s.status, SlotStatus::Pending);
+        assert_eq!(
+            s.effort, None,
+            "grok takes no max, and a recorded level beats config"
+        );
+        assert_eq!(
+            crate::markers::read_session_id(&paths, "repoint1", "impl", "grok"),
+            None,
+            "a marker from an earlier grok rotation belongs to a conversation this seat never had"
+        );
+    }
+
+    /// A seat on its engaged backup keeps the failover provider: the config names
+    /// the primary, so re-pointing would undo the failover and then refuse, since
+    /// the backup provider disagrees with the resolved seat.
+    #[test]
+    fn a_backup_served_seat_is_never_repointed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = run_with_impl("cli:grok", "grok-model", SlotStatus::Pending);
+        st.slots[0].source = Some(SeatSource::Backup);
+        st.providers = vec!["cli:claude".into(), "cli:grok".into()];
+        let cfg = cfg_with_implementer("cli:claude");
+
+        repoint_existing_seats(
+            &mut st,
+            &paths,
+            &cfg,
+            &crate::providers::StubHealth::allow_all(),
+            true,
+        )
+        .unwrap();
+
+        let impl_slot = st.slots.iter().find(|s| s.id == "impl").unwrap();
+        assert_eq!(impl_slot.provider.as_str(), "cli:grok");
     }
 
     /// The cap must reserve what is about to run.
@@ -2039,11 +3224,7 @@ fn run_with_task(
     state.max_rounds = opts
         .max_rounds
         .map_or(cfg.rounds.max, |mr| mr.resolve(state.round));
-    let n = crate::workflow::roles_resolve::pool_width(cfg);
-    let roles: Vec<&str> = std::iter::once(SlotRole::Implementer.as_config_key())
-        .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
-        .take(n)
-        .collect();
+    let (n, roles) = crate::workflow::roles_resolve::reviewer_select_question(cfg);
     let requested = opts.resolve_pool(n, &roles, paths, cfg, &state.id)?;
     let pool_origin = crate::workflow::roles_resolve::pool_origin_for(&opts);
     // A later round resuming this run without `--reload-config` (O27) reads this back
@@ -2065,7 +3246,8 @@ fn run_with_task(
         paths,
         Reentry {
             from_round_gate: false,
-            reload_config: opts.reload_config,
+            repoint: false,
+            repoint_implementer: false,
         },
     )?;
     // Only the implementer must run next at run start, so only it can park the
@@ -3364,6 +4546,20 @@ pub fn execute_loop(
         if let Some((cause, messages)) = panel_stop(reviewers.len(), &stood_down) {
             return fail(state, paths, anyhow::anyhow!(messages), cause.quota_hit());
         }
+        // No reviewer seats at all: the stood-down check above only fires on a
+        // non-empty panel, so an emptied panel would fall through to the ship
+        // confirm below. Fail closed: the run can never ship unreviewed.
+        if reviewers.is_empty() {
+            return fail(
+                state,
+                paths,
+                anyhow::anyhow!(
+                    "run {} has no reviewer seats; the run would reach the ship gate unreviewed",
+                    state.id
+                ),
+                false,
+            );
+        }
         let carried =
             carried_veto_blocker_lines(&state.slots, panel_head.as_deref(), &criteria, cfg);
         if !carried.is_empty() {
@@ -3808,15 +5004,761 @@ fn reviewer_cwd(
     }
 }
 
-/// The panel position a reviewer seat id encodes (`review-1-cli-codex` is 1), which is
-/// the index into `[backups].reviewer`. `None` for ids that carry none (`review-cli-grok-wide`).
-fn reviewer_ordinal(slot_id: &str) -> Option<usize> {
+/// The panel position a reviewer seat id encodes (`review-1-cli-codex` is 1).
+/// `None` for ids that spell none (`review-cli-grok-wide`). This parses what
+/// the id spells, not membership: a pinned widen id (`review-3-wide`) still
+/// parses to its number, so gate panel paths on [`is_panel_reviewer`] (and
+/// index the config with live positions, not this number) first.
+pub(crate) fn reviewer_ordinal(slot_id: &str) -> Option<usize> {
     slot_id
         .strip_prefix("review-")?
         .split('-')
         .next()?
         .parse()
         .ok()
+}
+
+/// A reviewer seat's position in the live panel in slot order: the index its
+/// backup holds in `backups.reviewer`. Id-encoded ordinals go stale when a drop
+/// retires a lower seat, so only the live position counts. Widened extras sit
+/// past the panel and hold no backup-list position, so they report none.
+fn panel_position(state: &RunState, slot_id: &str) -> Option<usize> {
+    state
+        .slots
+        .iter()
+        .filter(|s| is_panel_reviewer(s))
+        .position(|s| s.id == slot_id)
+}
+
+/// The Nth live reviewer panel seat in slot order (never a widened extra).
+/// Panel positions shift when a drop removes a lower seat: seats keep their ids
+/// for the life of the run, so the ordinal baked into an id goes stale and only
+/// the live position counts.
+fn panel_seat_with_ordinal(state: &RunState, ordinal: usize) -> Option<String> {
+    state
+        .slots
+        .iter()
+        .filter(|s| is_panel_reviewer(s))
+        .nth(ordinal)
+        .map(|s| s.id.clone())
+}
+
+/// What a reviewer drop removes, computed without touching anything. Both the
+/// dispatch (which applies it under the run lock) and `--validate-only` (which
+/// folds it into the displayed fleet) plan from it. Survivors keep their ids:
+/// nothing renumbers, and dropped ids retire so they are never reminted.
+pub struct ReviewerDropPlan {
+    pub removed: Vec<String>,
+}
+
+pub(crate) fn plan_reviewer_drop(
+    state: &RunState,
+    ordinals: &[usize],
+) -> Result<Option<ReviewerDropPlan>> {
+    let mut gone: Vec<usize> = ordinals.to_vec();
+    gone.sort_unstable();
+    gone.dedup();
+    if gone.is_empty() {
+        return Ok(None);
+    }
+    // Resolve each ordinal against the current panel. A missing ordinal means no
+    // slot was ever seated for it (e.g. a plan continuation), so there is
+    // nothing to reap.
+    let mut removed: Vec<String> = Vec::new();
+    for ordinal in &gone {
+        if let Some(slot_id) = panel_seat_with_ordinal(state, *ordinal) {
+            removed.push(slot_id);
+        }
+    }
+    if removed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ReviewerDropPlan { removed }))
+}
+
+/// Retire reviewer seats by panel position (`--without reviewer[N]`) in state
+/// only: prune their review history so the ship gate and review history stop
+/// counting that seat's open findings, drop their slots, and retire their ids
+/// so no later seat ever reuses them. Survivors keep their ids. Returns the
+/// removed slot ids. File deletion is separate (`delete_dropped_reviewer_files`)
+/// so a dispatch can save before deleting: a failed save must never leave
+/// slots dropped with the config still naming them, and a failed deletion must
+/// never leave the config naming seats whose checkouts are gone.
+pub(crate) fn retire_reviewer_seats(
+    state: &mut RunState,
+    ordinals: &[usize],
+) -> Result<Vec<String>> {
+    let Some(plan) = plan_reviewer_drop(state, ordinals)? else {
+        return Ok(Vec::new());
+    };
+    let ReviewerDropPlan { removed } = plan;
+    for id in &removed {
+        retire_panel_seat(state, id);
+    }
+    Ok(removed)
+}
+
+/// Delete the checkouts, pid markers and verdict artifacts of retired reviewer
+/// seats. Runs after the state saves, so a deletion failure leaves orphaned
+/// files behind dropped seats, never seats behind a config that names them.
+pub(crate) fn delete_dropped_reviewer_files(
+    state: &RunState,
+    paths: &SparPaths,
+    removed: &[String],
+) -> Result<()> {
+    for id in removed {
+        crate::worktree::remove_reviewer_checkout(state, id);
+        crate::markers::clear_pid(paths, &state.id, id);
+        for ext in ["md", "json"] {
+            let path = paths.artifact(&state.id, &format!("review-{id}.{ext}"));
+            if path.is_file() {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Persist an amended snapshot and its state fail-safe: the snapshot stages to
+/// a temp file first and renames into place only after the state save lands,
+/// so a failed state save never leaves the frozen config narrowed while the
+/// slots it narrowed are still live. Either failure removes the staged temp.
+fn save_amended_pair(
+    paths: &SparPaths,
+    run_id: &str,
+    cfg: &Config,
+    state: &RunState,
+) -> Result<()> {
+    let staged = cfg.stage_snapshot(paths, run_id)?;
+    state.save(paths).inspect_err(|_| {
+        let _ = std::fs::remove_file(&staged);
+    })?;
+    crate::config::Config::commit_snapshot(paths, run_id, &staged).inspect_err(|_| {
+        let _ = std::fs::remove_file(&staged);
+    })?;
+    Ok(())
+}
+
+/// Retire one live panel seat like a drop: its history is pruned now, its id
+/// retires so it is never reminted, its files go after the save. Returns the id.
+fn retire_panel_seat(state: &mut RunState, id: &str) -> String {
+    state.review_history.retain(|e| e.slot_id != id);
+    state.retired_seat_ids.insert(id.to_string());
+    state.slots.retain(|s| s.id != id);
+    id.to_string()
+}
+
+/// Whether a `--role reviewer=` pin reconciles live seats on a bound run. The
+/// re-seat only runs where seats already exist to reconcile: a first dispatch
+/// mints the panel once from the amended config, so running the re-seat there
+/// too would mint every pinned seat twice under the same id.
+fn bound_panel_resync_applies(state: &RunState, role: &[String], pin_len: usize) -> bool {
+    crate::config::role_pins_reviewer(role)
+        && pin_len > 0
+        && state
+            .slots
+            .iter()
+            .any(|s| s.role == SlotRole::Implementer || is_panel_reviewer(s))
+}
+
+/// Parse the frozen reviewer panel into pins. A malformed entry refuses the
+/// amend rather than seating half a panel.
+fn parse_reviewer_pin(panel: &[String]) -> Result<Vec<crate::provider_ref::Pin>> {
+    panel
+        .iter()
+        .map(|raw| crate::provider_ref::Pin::parse(raw.as_str()))
+        .collect()
+}
+
+/// Re-seat the live reviewer panel to a `--role reviewer=` pin, so the live
+/// panel and the frozen config panel stay one fact. A seat already carrying
+/// the pinned provider keeps its seat (and its history); a pinned provider
+/// seated elsewhere in the panel swaps into position; anything else retires
+/// like a drop and mints fresh at an id neither live nor retired. Live seats
+/// past the pin's length retire the same way. Returns the retired ids, whose
+/// files the caller deletes after its save lands.
+fn resync_reviewer_panel_to_pin(
+    state: &mut RunState,
+    backups: &mut Vec<String>,
+    pin: &[crate::provider_ref::Pin],
+) -> Result<Vec<String>> {
+    let mut removed = Vec::new();
+    // Seats already placed by an earlier pin entry: a repeated provider in
+    // the pin mints a second seat instead of seating one seat twice.
+    let mut placed: BTreeSet<String> = BTreeSet::new();
+    for (position, want) in pin.iter().enumerate() {
+        let panel: Vec<String> = state
+            .slots
+            .iter()
+            .filter(|s| is_panel_reviewer(s))
+            .map(|s| s.id.clone())
+            .collect();
+        let provider_of = |id: &str| {
+            state
+                .slots
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.provider.clone())
+        };
+        if let Some(id) = panel.get(position) {
+            if provider_of(id).as_deref() == Some(want.provider.as_str())
+                && placed.insert(id.clone())
+            {
+                if let Some(s) = state.slot_mut(id) {
+                    s.reviewer_kind = Some(ReviewerSeatKind::Panel);
+                }
+                blank_spent_backup_entry(backups, position, &want.provider);
+                continue;
+            }
+        }
+        if let Some(other) = panel
+            .iter()
+            .find(|id| {
+                provider_of(id).as_deref() == Some(want.provider.as_str()) && !placed.contains(*id)
+            })
+            .cloned()
+        {
+            let here = panel
+                .get(position)
+                .and_then(|id| state.slots.iter().position(|s| &s.id == id));
+            let there = state.slots.iter().position(|s| s.id == other);
+            if let (Some(a), Some(b)) = (here, there) {
+                state.slots.swap(a, b);
+                if let Some(s) = state.slot_mut(&other) {
+                    s.reviewer_kind = Some(ReviewerSeatKind::Panel);
+                }
+                placed.insert(other);
+                blank_spent_backup_entry(backups, position, &want.provider);
+                continue;
+            }
+        }
+        // The pinned provider is nowhere in the panel, or the only seat
+        // carrying it is already placed: the seat here retires like a drop
+        // and a fresh seat mints at an id neither live nor retired, so a
+        // move can never land on a live or retired id.
+        let at = panel
+            .get(position)
+            .and_then(|id| state.slots.iter().position(|s| &s.id == id));
+        if let Some(id) = panel.get(position).cloned() {
+            removed.push(retire_panel_seat(state, &id));
+        }
+        let mut ordinal = position;
+        while {
+            let id = format!(
+                "review-{ordinal}-{}",
+                crate::util::sanitize_slot(&want.provider)
+            );
+            state.slots.iter().any(|s| s.id == id) || state.retired_seat_ids.contains(&id)
+        } {
+            ordinal += 1;
+        }
+        let seat_id = format!(
+            "review-{ordinal}-{}",
+            crate::util::sanitize_slot(&want.provider)
+        );
+        let mut slot = executor::init_slot_model(
+            &seat_id,
+            want.display(),
+            SlotRole::Reviewer,
+            want.model.clone(),
+        );
+        slot.source = Some(SeatSource::CliRole);
+        slot.reviewer_kind = Some(ReviewerSeatKind::Panel);
+        match at {
+            Some(i) if i <= state.slots.len() => state.slots.insert(i, slot),
+            _ => state.slots.push(slot),
+        }
+        placed.insert(seat_id);
+        blank_spent_backup_entry(backups, position, &want.provider);
+    }
+    while backups.last().is_some_and(|s| s.is_empty()) {
+        backups.pop();
+    }
+    // Entries past the pin length sit under positions no seat can hold: the
+    // live panel is exactly the pin's length after this function, so they
+    // can never be read back.
+    backups.truncate(pin.len());
+    // Live seats past the pin's length retire like drops: their history is
+    // pruned now, their ids retire, their files go after the save.
+    let live_ids: Vec<String> = state
+        .slots
+        .iter()
+        .filter(|s| is_panel_reviewer(s))
+        .map(|s| s.id.clone())
+        .collect();
+    for id in live_ids.into_iter().skip(pin.len()) {
+        removed.push(retire_panel_seat(state, &id));
+    }
+    Ok(removed)
+}
+
+/// Blank a same-position backup entry that now names the seat's own provider:
+/// a seat serving its engaged backup is not governed by the config, the same
+/// spent-backup rule drops apply.
+fn blank_spent_backup_entry(backups: &mut [String], position: usize, provider: &str) {
+    if let Some(entry) = backups.get_mut(position) {
+        if !entry.is_empty() && backup_key(entry) == provider {
+            entry.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod amended_pair_tests {
+    use super::*;
+
+    fn pair_run(id: &str) -> RunState {
+        let mut st = RunState::new(
+            id,
+            crate::cli::WorkflowKind::Loop,
+            std::path::PathBuf::from("/x"),
+        );
+        st.dry_run = true;
+        st
+    }
+
+    fn staged_files(paths: &SparPaths, run_id: &str) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(paths.run_dir(run_id))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("config.json.tmp."))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pair_persists_both_and_cleans_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = pair_run("r-pair-ok");
+        st.slots.push(executor::init_slot(
+            "review-0-cli-claude",
+            "cli:claude",
+            SlotRole::Reviewer,
+        ));
+        save_amended_pair(&paths, "r-pair-ok", &Config::default(), &st).unwrap();
+        assert!(paths.run_config_file("r-pair-ok").exists());
+        assert!(staged_files(&paths, "r-pair-ok").is_empty());
+    }
+
+    #[test]
+    fn pair_failure_leaves_no_staged_config_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        std::fs::create_dir_all(paths.run_dir("r-pair-bad")).unwrap();
+        std::fs::create_dir(paths.state_file("r-pair-bad")).unwrap();
+        let st = pair_run("r-pair-bad");
+        save_amended_pair(&paths, "r-pair-bad", &Config::default(), &st)
+            .expect_err("saving state into a directory must fail");
+        assert!(!paths.run_config_file("r-pair-bad").exists());
+        assert!(staged_files(&paths, "r-pair-bad").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod resync_panel_tests {
+    use super::*;
+
+    fn resync_state(ids: &[(&str, &str)]) -> RunState {
+        let mut state = RunState::new(
+            "r-resync",
+            crate::cli::WorkflowKind::Loop,
+            std::path::PathBuf::from("/x"),
+        );
+        for &(id, provider) in ids {
+            state
+                .slots
+                .push(executor::init_slot(id, provider, SlotRole::Reviewer));
+        }
+        state
+    }
+
+    fn panel_ids(state: &RunState) -> Vec<String> {
+        state
+            .slots
+            .iter()
+            .filter(|s| is_panel_reviewer(s))
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn swapped_pin_swaps_live_seats_into_position() {
+        let mut state = resync_state(&[
+            ("review-0-cli-claude", "cli:claude"),
+            ("review-1-cli-grok", "cli:grok"),
+        ]);
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:grok".to_string(), "cli:claude".to_string()];
+        let removed = resync_reviewer_panel_to_pin(
+            &mut state,
+            &mut cfg.backups.reviewer,
+            &parse_reviewer_pin(&cfg.roles.reviewer).unwrap(),
+        )
+        .unwrap();
+        assert!(removed.is_empty());
+        assert!(state.retired_seat_ids.is_empty());
+        assert_eq!(
+            panel_ids(&state),
+            vec![
+                "review-1-cli-grok".to_string(),
+                "review-0-cli-claude".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn replaced_provider_retires_and_mints_fresh_at_position() {
+        let mut state = resync_state(&[("review-0-cli-claude", "cli:claude")]);
+        state
+            .retired_seat_ids
+            .insert("review-0-cli-codex".to_string());
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:codex".to_string()];
+        let removed = resync_reviewer_panel_to_pin(
+            &mut state,
+            &mut cfg.backups.reviewer,
+            &parse_reviewer_pin(&cfg.roles.reviewer).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(removed, vec!["review-0-cli-claude".to_string()]);
+        assert_eq!(panel_ids(&state), vec!["review-1-cli-codex".to_string()]);
+        assert!(state.retired_seat_ids.contains("review-0-cli-claude"));
+    }
+
+    /// The re-seat runs wherever live seats exist to reconcile, and nowhere
+    /// else: a first dispatch (no implementer, no panel) mints the panel once
+    /// from the amended config, so the re-seat must not run there too.
+    #[test]
+    fn resync_applies_only_where_seats_exist() {
+        let role = vec!["reviewer=cli:codex".to_string()];
+        let bare: Vec<String> = Vec::new();
+        let empty = resync_state(&[]);
+        assert!(!bound_panel_resync_applies(&empty, &role, 1));
+        assert!(!bound_panel_resync_applies(&empty, &bare, 0));
+        let mut dispatched = resync_state(&[("review-0-cli-claude", "cli:claude")]);
+        assert!(bound_panel_resync_applies(&dispatched, &role, 1));
+        assert!(!bound_panel_resync_applies(&dispatched, &role, 0));
+        assert!(!bound_panel_resync_applies(&dispatched, &bare, 1));
+        dispatched.slots.push(executor::init_slot(
+            "impl",
+            "cli:claude",
+            SlotRole::Implementer,
+        ));
+        assert!(bound_panel_resync_applies(&dispatched, &role, 1));
+        let mut impl_only = resync_state(&[]);
+        impl_only.slots.push(executor::init_slot(
+            "impl",
+            "cli:claude",
+            SlotRole::Implementer,
+        ));
+        assert!(bound_panel_resync_applies(&impl_only, &role, 1));
+    }
+
+    #[test]
+    fn repeated_pin_provider_mints_a_second_seat() {
+        let mut state = resync_state(&[("review-0-cli-claude", "cli:claude")]);
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:claude".to_string(), "cli:claude".to_string()];
+        let removed = resync_reviewer_panel_to_pin(
+            &mut state,
+            &mut cfg.backups.reviewer,
+            &parse_reviewer_pin(&cfg.roles.reviewer).unwrap(),
+        )
+        .unwrap();
+        assert!(removed.is_empty());
+        assert_eq!(panel_ids(&state).len(), 2);
+        let mut ids = panel_ids(&state);
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod widen_id_tests {
+    use super::*;
+
+    /// A pinned widen after a drop must not remint a live `-wide` id: drops
+    /// shrink `slots.len()`, so `review-{len}-wide` can already exist.
+    #[test]
+    fn pinned_widen_never_mints_an_id_a_live_seat_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r-wide",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.slots.push(executor::init_slot(
+            "impl",
+            "cli:grok",
+            SlotRole::Implementer,
+        ));
+        state.slots.push(executor::init_slot(
+            "review-0-cli-claude",
+            "cli:claude",
+            SlotRole::Reviewer,
+        ));
+        state.slots.push(executor::init_slot(
+            "review-3-wide",
+            "cli:claude",
+            SlotRole::Reviewer,
+        ));
+        let mut cfg = Config::default();
+        cfg.roles.reviewer = vec!["cli:claude".to_string()];
+        cfg.cli_role_keys.insert(SlotRole::Reviewer);
+        assert!(try_widen_reviewers(
+            &mut state,
+            &paths,
+            tmp.path(),
+            &cfg,
+            &crate::providers::StubHealth::allow_all(),
+        )
+        .unwrap());
+        let mut ids: Vec<&str> = state.slots.iter().map(|s| s.id.as_str()).collect();
+        ids.sort_unstable();
+        let total = ids.len();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            total,
+            "widen minted a duplicate seat id: {ids:?}"
+        );
+    }
+
+    /// A retired `-wide` id is never reminted either, even when no live slot
+    /// holds it: widening skips it the same way it skips live ids.
+    #[test]
+    fn pinned_widen_never_mints_a_retired_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = RunState::new(
+            "r-wide",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.slots.push(executor::init_slot(
+            "review-0-cli-claude",
+            "cli:claude",
+            SlotRole::Reviewer,
+        ));
+        state.retired_seat_ids.insert("review-1-wide".to_string());
+        assert_eq!(next_wide_id(&state), "review-2-wide");
+    }
+
+    /// The unpinned mint enforces the same rule: a retired
+    /// `review-{provider}-wide` id is not reminted, so widening passes rather
+    /// than resurrecting a moved seat's old id.
+    #[test]
+    fn unpinned_widen_never_mints_a_retired_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r-wide",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.slots.push(executor::init_slot(
+            "impl",
+            "cli:muse",
+            SlotRole::Implementer,
+        ));
+        state.slots.push(executor::init_slot(
+            "review-0-cli-claude",
+            "cli:claude",
+            SlotRole::Reviewer,
+        ));
+        state.providers = vec!["cli:claude".into(), "cli:codex".into()];
+        state.pool_origin = PoolOrigin::CliProviders;
+        state
+            .retired_seat_ids
+            .insert("review-cli-codex-wide".to_string());
+        let cfg = Config::default();
+        assert!(
+            !try_widen_reviewers(
+                &mut state,
+                &paths,
+                tmp.path(),
+                &cfg,
+                &crate::providers::StubHealth::allow_all(),
+            )
+            .unwrap(),
+            "the retired wide id must not come back"
+        );
+        assert!(
+            state.slots.iter().all(|s| s.id != "review-cli-codex-wide"),
+            "no slot resurrects the retired id: {:?}",
+            state.slots.iter().map(|s| &s.id).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod reviewer_drop_history_tests {
+    use super::*;
+
+    fn finding_body(text: &str) -> String {
+        format!("## Verdict\nrequest_changes\n\n## Findings\n- severity: major - {text}\n")
+    }
+
+    fn seat_with_finding(
+        state: &mut RunState,
+        paths: &SparPaths,
+        id: &str,
+        provider: &str,
+        finding: &str,
+    ) {
+        state
+            .slots
+            .push(executor::init_slot(id, provider, SlotRole::Reviewer));
+        let review = review_result::parse_review(&finding_body(finding));
+        review_result::record_review(state, paths, id, &review);
+    }
+
+    /// Sequential drops never renumber survivors: a seat keeps its id for the life
+    /// of the run, the dropped id retires, and the survivor's findings stay
+    /// pinned to its own id instead of vanishing with a later drop.
+    #[test]
+    fn sequential_drops_keep_stable_ids_and_the_survivors_findings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r-drops",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        seat_with_finding(
+            &mut state,
+            &paths,
+            "review-0-cli-claude",
+            "cli:claude",
+            "claude finding",
+        );
+        seat_with_finding(
+            &mut state,
+            &paths,
+            "review-1-cli-codex",
+            "cli:codex",
+            "codex one finding",
+        );
+        seat_with_finding(
+            &mut state,
+            &paths,
+            "review-2-cli-codex",
+            "cli:codex",
+            "codex two finding",
+        );
+
+        let retired = retire_reviewer_seats(&mut state, &[0]).unwrap();
+        delete_dropped_reviewer_files(&state, &paths, &retired).unwrap();
+        let ids: Vec<&str> = state.slots.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["review-1-cli-codex", "review-2-cli-codex"]);
+        assert!(
+            state.retired_seat_ids.contains("review-0-cli-claude"),
+            "the dropped id retires: {:?}",
+            state.retired_seat_ids
+        );
+        let retired = retire_reviewer_seats(&mut state, &[1]).unwrap();
+        delete_dropped_reviewer_files(&state, &paths, &retired).unwrap();
+
+        let ids: Vec<&str> = state.slots.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["review-1-cli-codex"]);
+        assert!(
+            state.retired_seat_ids.contains("review-2-cli-codex"),
+            "the second dropped id retires too: {:?}",
+            state.retired_seat_ids
+        );
+        assert_eq!(state.review_history.len(), 1, "{:?}", state.review_history);
+        let open = review_result::open_findings(&state, tmp.path());
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert!(
+            open[0].finding.text.contains("codex one finding"),
+            "{open:?}"
+        );
+    }
+
+    /// Dropping the middle seat prunes only its own entries: writer ids are
+    /// never shared across seats, so the survivors keep both their ids and
+    /// their findings.
+    #[test]
+    fn middle_drop_prunes_only_the_doomed_seats_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r-middle-drop",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        for (id, provider, finding) in [
+            ("review-0-cli-claude", "cli:claude", "claude finding"),
+            ("review-1-cli-codex", "cli:codex", "codex one finding"),
+            ("review-2-cli-codex", "cli:codex", "codex two finding"),
+        ] {
+            seat_with_finding(&mut state, &paths, id, provider, finding);
+        }
+
+        let retired = retire_reviewer_seats(&mut state, &[1]).unwrap();
+        delete_dropped_reviewer_files(&state, &paths, &retired).unwrap();
+
+        let ids: Vec<&str> = state.slots.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["review-0-cli-claude", "review-2-cli-codex"]);
+        let kept: Vec<&str> = state
+            .review_history
+            .iter()
+            .map(|e| e.slot_id.as_str())
+            .collect();
+        assert_eq!(kept, ["review-0-cli-claude", "review-2-cli-codex"]);
+        let open = review_result::open_findings(&state, tmp.path());
+        assert_eq!(open.len(), 2, "{open:?}");
+        assert!(
+            open.iter().all(|o| !o.finding.text.contains("codex one")),
+            "{open:?}"
+        );
+    }
+}
+
+/// Blank the same-position backup entries a surviving reviewer seat already serves:
+/// the seat rotated to its backup, so the fallback is spent and keeping it would
+/// fail backup-against-primary validation on reload. Runs on the post-drop live
+/// panel positions. Entries are blanked, never removed: the list is positional
+/// and deleting one would hand every higher seat its neighbour's backup. The
+/// comparison is the validation's own storage-key equality, and trailing blanks
+/// trim since an empty list is unset.
+/// Returns whether anything was blanked.
+pub fn disengage_spent_reviewer_backups(state: &RunState, backups: &mut Vec<String>) -> bool {
+    let mut blanked = false;
+    let panel: Vec<&SlotState> = state
+        .slots
+        .iter()
+        .filter(|s| is_panel_reviewer(s))
+        .collect();
+    for (position, s) in panel.iter().enumerate() {
+        if s.source != Some(SeatSource::Backup) {
+            continue;
+        }
+        let Some(entry) = backups.get_mut(position).filter(|b| !b.is_empty()) else {
+            continue;
+        };
+        if backup_key(entry) == backup_key(&s.provider) {
+            entry.clear();
+            blanked = true;
+        }
+    }
+    while backups.last().is_some_and(|s| s.is_empty()) {
+        backups.pop();
+    }
+    blanked
+}
+
+fn backup_key(raw: &str) -> String {
+    crate::provider_ref::ProviderRef::parse(raw)
+        .map(|r| r.storage_key())
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 /// Put another provider in a seat. A reviewer seat is renamed to name its new vendor
@@ -3829,12 +5771,38 @@ fn move_seat(
     pin: &crate::provider_ref::Pin,
     source: SeatSource,
 ) -> Result<String> {
-    let role = state
+    let new_id = stage_move(state, slot_id, pin, source)?;
+    if new_id != slot_id {
+        state.rename_slot(paths, slot_id, &new_id);
+    }
+    Ok(new_id)
+}
+
+/// The disk-free half of a seat move: guards, re-point and rename, the same
+/// outcome `move_seat` leaves in memory. The amend preview runs this on its
+/// throwaway clone so `--validate-only` reads the post-move panel the dispatch
+/// re-seats, and a `--reassign` onto a live or retired id fails the preview
+/// instead of the dispatch. A move onto a retired id fails closed: the id
+/// would come back with the dropped seat's history pruned and its verdict
+/// files deleted.
+fn stage_move(
+    state: &mut RunState,
+    slot_id: &str,
+    pin: &crate::provider_ref::Pin,
+    source: SeatSource,
+) -> Result<String> {
+    let slot = state
         .slots
         .iter()
         .find(|s| s.id == slot_id)
-        .map(|s| s.role)
         .ok_or_else(|| anyhow::anyhow!("unknown slot {slot_id}"))?;
+    let new_id = moved_seat_id(slot.role, reviewer_seat_kind(slot), slot_id, &pin.provider);
+    if new_id != slot_id && state.slots.iter().any(|s| s.id == new_id) {
+        anyhow::bail!("seat {new_id} is already live; refusing to move {slot_id} onto it");
+    }
+    if new_id != slot_id && state.retired_seat_ids.contains(&new_id) {
+        anyhow::bail!("seat {new_id} is retired; refusing to remint it");
+    }
     if let Some(s) = state.slot_mut(slot_id) {
         s.point_at(&pin.display());
         // A level the old CLI took may not exist on the new one; the dispatch then
@@ -3844,25 +5812,44 @@ fn move_seat(
         }
         s.source = Some(source);
     }
-    let new_id = moved_seat_id(role, slot_id, &pin.provider);
-    if new_id != slot_id && state.slots.iter().all(|s| s.id != new_id) {
-        state.rename_slot(paths, slot_id, &new_id);
-        return Ok(new_id);
+    if new_id != slot_id {
+        state.rename_slot_in_memory(slot_id, &new_id);
     }
-    Ok(slot_id.to_string())
+    Ok(new_id)
+}
+
+/// The post-move state an amend preview judges: every resolved `--reassign`
+/// applied in order to a clone, the way the dispatch applies them after the
+/// preview passes, so ordinals, pins and the re-seat simulation all read the
+/// seats the dispatch will actually amend.
+pub(crate) fn simulate_moves(
+    state: &RunState,
+    moves: &[(String, crate::provider_ref::Pin)],
+) -> Result<RunState> {
+    let mut moved = state.clone();
+    for (seat, pin) in moves {
+        stage_move(&mut moved, seat, pin, SeatSource::Reassigned)?;
+    }
+    Ok(moved)
 }
 
 /// The id a seat takes when `provider` fills it: reviewer and tester ids name their
-/// provider (O80), the implementer keeps `impl`.
-fn moved_seat_id(role: SlotRole, slot_id: &str, provider: &str) -> String {
+/// provider (O80), the implementer keeps `impl`. A widened extra keeps its
+/// wideness: it holds no panel position, so no ordinal survives the move.
+fn moved_seat_id(
+    role: SlotRole,
+    kind: Option<ReviewerSeatKind>,
+    slot_id: &str,
+    provider: &str,
+) -> String {
+    if kind == Some(ReviewerSeatKind::Wide) {
+        return format!("review-{}-wide", sanitize_slot(provider));
+    }
     match (role, reviewer_ordinal(slot_id)) {
         (SlotRole::Reviewer, Some(ordinal)) => {
             format!("review-{ordinal}-{}", sanitize_slot(provider))
         }
         (SlotRole::Tester, _) => format!("suite-{}", sanitize_slot(provider)),
-        (SlotRole::Reviewer, None) if slot_id.ends_with("-wide") => {
-            format!("review-{}-wide", sanitize_slot(provider))
-        }
         _ => slot_id.to_string(),
     }
 }
@@ -4047,6 +6034,7 @@ fn seat_dispatch_blocked(
 /// to its configured backup, and a seat with no eligible backup parks.
 #[allow(clippy::too_many_arguments)]
 fn resolve_blocked_slot_next(
+    state: &RunState,
     paths: &SparPaths,
     cfg: &Config,
     slot: &SlotState,
@@ -4059,7 +6047,7 @@ fn resolve_blocked_slot_next(
     let seat = slot.provider_ref();
     let sub = seat.storage_key();
     let ordinal = match slot.role {
-        SlotRole::Reviewer => reviewer_ordinal(&slot.id),
+        SlotRole::Reviewer => panel_position(state, &slot.id),
         _ => Some(0),
     };
     ordinal
@@ -4100,7 +6088,7 @@ fn resolve_healthy_slot_next(
 ) -> SlotNext {
     let (role, pool_idx, role_idx): (SlotRole, usize, usize) = match slot.role {
         SlotRole::Implementer => (SlotRole::Implementer, 0, 0),
-        SlotRole::Reviewer => match reviewer_ordinal(&slot.id) {
+        SlotRole::Reviewer => match panel_position(state, &slot.id) {
             Some(r) => (SlotRole::Reviewer, r + 1, r),
             None => return SlotNext::Keep,
         },
@@ -4202,6 +6190,7 @@ fn recheck_seat(
     }
     let health = providers::LiveHealth::for_dry(state.dry_run);
     let Some((backup_raw, source)) = resolve_blocked_slot_next(
+        state,
         paths,
         cfg,
         &slot,
@@ -4395,7 +6384,7 @@ pub(crate) fn project_continued_fleet(
                         held.insert(slot.id.clone(), raw_ref.display());
                     }
                     fleet.push(FleetSeat {
-                        seat: moved_seat_id(slot.role, &slot.id, &raw),
+                        seat: moved_seat_id(slot.role, reviewer_seat_kind(slot), &slot.id, &raw),
                         provider: raw,
                         source,
                         projected: true,
@@ -4424,6 +6413,7 @@ pub(crate) fn project_continued_fleet(
             continue;
         }
         match resolve_blocked_slot_next(
+            state,
             paths,
             cfg,
             slot,
@@ -4438,7 +6428,7 @@ pub(crate) fn project_continued_fleet(
                     held.insert(slot.id.clone(), raw_ref.display());
                 }
                 fleet.push(FleetSeat {
-                    seat: moved_seat_id(slot.role, &slot.id, &raw),
+                    seat: moved_seat_id(slot.role, reviewer_seat_kind(slot), &slot.id, &raw),
                     provider: raw,
                     source,
                     projected: true,
@@ -4547,10 +6537,7 @@ fn try_rotate_implementer(
     // Candidate order: [roles].implementer, then [providers].order, then the live fleet.
     // Rotation must report the rung it actually drew from (`SlotState::point_at` only
     // touches provider/model), not leave the slot claiming its original source.
-    let implementer_role_source = if cfg
-        .cli_role_keys
-        .contains(SlotRole::Implementer.as_config_key())
-    {
+    let implementer_role_source = if cfg.cli_role_keys.contains(&SlotRole::Implementer) {
         SeatSource::CliRole
     } else {
         SeatSource::RolesFile
@@ -4604,6 +6591,20 @@ fn try_rotate_implementer(
 }
 
 /// Add an extra adversarial reviewer from a provider not already reviewing.
+/// The next free `review-{n}-wide` id. Drops shrink `slots.len()`, so the
+/// length alone can remint an extra seat's live id.
+fn next_wide_id(state: &RunState) -> String {
+    let mut n = state.slots.len();
+    loop {
+        let id = format!("review-{n}-wide");
+        // A retired id is never reminted, even when no live slot holds it.
+        if state.slots.iter().all(|s| s.id != id) && !state.retired_seat_ids.contains(&id) {
+            return id;
+        }
+        n += 1;
+    }
+}
+
 fn try_widen_reviewers(
     state: &mut RunState,
     paths: &SparPaths,
@@ -4636,10 +6637,11 @@ fn try_widen_reviewers(
             return Ok(false);
         };
         let (provider, model, source) = (src.provider.clone(), src.model.clone(), src.source);
-        let id = format!("review-{}-wide", state.slots.len());
+        let id = next_wide_id(state);
         let mut slot = executor::init_slot_model(&id, &provider, SlotRole::Reviewer, model);
         slot.cwd = Some(review_cwd.to_path_buf());
         slot.source = source;
+        slot.reviewer_kind = Some(ReviewerSeatKind::Wide);
         state.slots.push(slot);
         state.save(paths)?;
         return Ok(true);
@@ -4698,21 +6700,24 @@ fn try_widen_reviewers(
             .cloned()
             .unwrap_or_else(|| "cli:claude".into());
         let source = dispatched.and_then(|s| s.source);
-        let id = format!("review-{}-wide", state.slots.len());
+        let id = next_wide_id(state);
         let mut slot = executor::init_slot(&id, &prov, SlotRole::Reviewer);
         slot.cwd = Some(review_cwd.to_path_buf());
         slot.source = source;
+        slot.reviewer_kind = Some(ReviewerSeatKind::Wide);
         state.slots.push(slot);
         state.save(paths)?;
         return Ok(true);
     };
     let id = format!("review-{}-wide", sanitize_slot(&prov));
-    if state.slots.iter().any(|s| s.id == id) {
+    // A retired id is never reminted, even when no live slot holds it.
+    if state.slots.iter().any(|s| s.id == id) || state.retired_seat_ids.contains(&id) {
         return Ok(false);
     }
     let mut slot = executor::init_slot(&id, &prov, SlotRole::Reviewer);
     slot.cwd = Some(review_cwd.to_path_buf());
     slot.source = Some(source);
+    slot.reviewer_kind = Some(ReviewerSeatKind::Wide);
     state.slots.push(slot);
     state.save(paths)?;
     Ok(true)
@@ -4740,7 +6745,9 @@ fn try_rotate_reviewer_provider(
     let cur = slot.provider.clone();
     let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
     if infra && !slot.source.is_some_and(SeatSource::is_backup) {
-        let backup = reviewer_ordinal(rev_id)
+        // The seat's own backup: its live panel position, never the ordinal
+        // baked into its id, which goes stale when a drop retires a lower seat.
+        let backup = panel_position(state, rev_id)
             .and_then(|o| crate::backup::backup_for_role(SlotRole::Reviewer, o, cfg))
             .filter(|b| crate::quota::sub_key(b) != crate::quota::sub_key(&cur))
             .and_then(|b| {
@@ -4770,10 +6777,7 @@ fn try_rotate_reviewer_provider(
         *p != cur && crate::backup::is_provider_eligible(p, &store, state.recorded_route())
     };
     let healthy = |p: &String| -> bool { eligible(p) && health.check(p).usable };
-    let reviewer_role_source = if cfg
-        .cli_role_keys
-        .contains(SlotRole::Reviewer.as_config_key())
-    {
+    let reviewer_role_source = if cfg.cli_role_keys.contains(&SlotRole::Reviewer) {
         SeatSource::CliRole
     } else {
         SeatSource::RolesFile
@@ -4839,30 +6843,54 @@ mod moved_seat_tests {
     #[test]
     fn moved_seat_ids_name_the_new_provider() {
         assert_eq!(
-            moved_seat_id(SlotRole::Reviewer, "review-1-cli-codex", "cli:claude"),
+            moved_seat_id(
+                SlotRole::Reviewer,
+                Some(ReviewerSeatKind::Panel),
+                "review-1-cli-codex",
+                "cli:claude"
+            ),
             "review-1-cli-claude"
         );
         assert_eq!(
-            moved_seat_id(SlotRole::Reviewer, "review-cli-grok-wide", "cli:claude"),
+            moved_seat_id(
+                SlotRole::Reviewer,
+                Some(ReviewerSeatKind::Wide),
+                "review-cli-grok-wide",
+                "cli:claude"
+            ),
             "review-cli-claude-wide"
         );
         assert_eq!(
-            moved_seat_id(SlotRole::Tester, "suite-cli-codex", "cli:pi"),
+            moved_seat_id(
+                SlotRole::Reviewer,
+                Some(ReviewerSeatKind::Wide),
+                "review-3-wide",
+                "cli:claude"
+            ),
+            "review-cli-claude-wide"
+        );
+        assert_eq!(
+            moved_seat_id(SlotRole::Tester, None, "suite-cli-codex", "cli:pi"),
             "suite-cli-pi"
         );
         assert_eq!(
-            moved_seat_id(SlotRole::Implementer, "impl", "cli:pi"),
+            moved_seat_id(SlotRole::Implementer, None, "impl", "cli:pi"),
             "impl"
         );
     }
 
     #[test]
-    fn a_rename_carries_the_artifact_and_remembers_the_old_id() {
+    fn a_rename_carries_the_artifact_and_its_history() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         let mut state = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
         let mut slot = executor::init_slot("review-0-cli-codex", "cli:codex", SlotRole::Reviewer);
         slot.artifact = Some("review-review-0-cli-codex.md".into());
+        state.review_history.push(crate::state::ReviewHistoryEntry {
+            round: 1,
+            slot_id: "review-0-cli-codex".to_string(),
+            review: review_result::parse_review("## Verdict\nrequest_changes\n"),
+        });
         let refused: crate::effort::EffortLevel = crate::effort::EffortLevel::all()
             .iter()
             .map(|r| r.parse().unwrap())
@@ -4882,8 +6910,60 @@ mod moved_seat_tests {
         let s = state.slots.iter().find(|s| s.id == id).unwrap();
         assert_eq!(id, "review-0-cli-claude");
         assert_eq!(s.artifact.as_deref(), Some("review-review-0-cli-claude.md"));
-        assert_eq!(s.former_ids, ["review-0-cli-codex"]);
+        assert_eq!(
+            state
+                .review_history
+                .iter()
+                .map(|e| e.slot_id.as_str())
+                .collect::<Vec<_>>(),
+            ["review-0-cli-claude"],
+            "the seat's own entries move with the rename"
+        );
         assert_eq!(s.effort, None, "a level the new CLI refuses is dropped");
+    }
+
+    /// A rename onto a retired id fails closed instead of resurrecting a seat
+    /// whose history was pruned at its drop.
+    #[test]
+    fn a_rename_onto_a_retired_id_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut state = RunState::new(
+            "r-retired",
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        state.slots.push(executor::init_slot(
+            "review-0-cli-codex",
+            "cli:codex",
+            SlotRole::Reviewer,
+        ));
+        state
+            .retired_seat_ids
+            .insert("review-0-cli-claude".to_string());
+        let pin = crate::provider_ref::Pin::parse("cli:claude").unwrap();
+        let err = move_seat(
+            &mut state,
+            &paths,
+            "review-0-cli-codex",
+            &pin,
+            SeatSource::Reassigned,
+        )
+        .expect_err("reminting a retired id must fail");
+        assert!(
+            err.to_string().contains("retired"),
+            "the refusal names the retired id: {err}"
+        );
+        let seat = state
+            .slots
+            .iter()
+            .find(|s| s.id == "review-0-cli-codex")
+            .expect("the seat is still there");
+        assert_eq!(
+            (seat.provider.as_str(), seat.source),
+            ("cli:codex", None),
+            "the refusal lands before the seat is touched: {seat:?}"
+        );
     }
 }
 
@@ -4926,14 +7006,17 @@ mod recheck_seat_tests {
 
     /// The 2026-10-22 shape: grok paused after the run started. The next grok reviewer
     /// must move to its declared backup, renamed to name its new vendor (O85).
+    /// The backup comes from the seat's live panel position, not the ordinal in
+    /// its id: this seat is still named `review-1` but it is the only seat left,
+    /// so position 0 governs.
     #[test]
-    fn a_seat_paused_mid_run_moves_to_its_backup_before_dispatch() {
+    fn a_paused_seat_moves_to_the_backup_at_its_live_panel_position() {
         let tmp = tempdir().unwrap();
         let paths = SparPaths::new(tmp.path());
         pause(&paths, "cli:grok");
         let mut st = state_with("review-1-cli-grok", "cli:grok", SlotRole::Reviewer);
         let mut cfg = Config::default();
-        cfg.backups.reviewer = vec![String::new(), "cli:codex@gpt-5.6-terra".into()];
+        cfg.backups.reviewer = vec!["cli:codex@gpt-5.6-terra".into()];
         let got = recheck_seat(&mut st, &paths, &cfg, "review-1-cli-grok", false).unwrap();
         let SeatCheck::Ready(id) = got else {
             panic!("expected a move to the backup");
@@ -5258,6 +7341,32 @@ mod recheck_seat_tests {
         assert_eq!(reviewer_ordinal("review-12-cli-codex"), Some(12));
         assert_eq!(reviewer_ordinal("review-cli-grok-wide"), None);
         assert_eq!(reviewer_ordinal("impl"), None);
+    }
+
+    #[test]
+    fn panel_by_ordinal_excludes_widened_extras() {
+        let mut st = RunState::new(
+            "r-wide",
+            crate::cli::WorkflowKind::Loop,
+            PathBuf::from("/tmp/x"),
+        );
+        for (id, provider) in [
+            ("review-0-cli-codex", "cli:codex"),
+            ("review-1-cli-grok", "cli:grok"),
+            ("review-3-wide", "cli:agy"),
+            ("review-cli-pi-wide", "cli:pi"),
+        ] {
+            st.slots
+                .push(executor::init_slot(id, provider, SlotRole::Reviewer));
+        }
+        assert_eq!(
+            reviewer_panel_by_ordinal(&st),
+            vec!["cli:codex".to_string(), "cli:grok".to_string()],
+            "neither the pinned nor the unpinned widened extra is a panel seat"
+        );
+        assert_eq!(panel_position(&st, "review-3-wide"), None);
+        assert_eq!(panel_position(&st, "review-cli-pi-wide"), None);
+        assert_eq!(panel_position(&st, "review-1-cli-grok"), Some(1));
     }
 
     #[test]
@@ -5655,6 +7764,81 @@ mod rotate_reviewer_tests {
         assert_eq!(st.slots[0].provider, "api:openai");
     }
 
+    /// A drop retires the lower seat while survivors keep their ids, so the
+    /// ordinal baked into an id is stale: after dropping reviewer[0] from a
+    /// 3-seat panel with backups [b0,b1,b2], `review-1-*` sits at live
+    /// position 0 and its infra failure must take b1, never the id's b2.
+    #[test]
+    fn infra_failover_after_a_drop_takes_the_seats_own_backup() {
+        let tmp = tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = RunState::new(
+            "r-drop-failover",
+            crate::cli::WorkflowKind::Loop,
+            PathBuf::from("/tmp/x"),
+        );
+        let mut first = executor::init_slot("review-1-cli-codex", "cli:codex", SlotRole::Reviewer);
+        first.status = SlotStatus::Failed;
+        first.error = Some("could not start: spawn failed".into());
+        first.exec_backend = Some(crate::provider_ref::ExecBackend::NativeCli);
+        st.slots.push(first);
+        st.slots.push(executor::init_slot(
+            "review-2-cli-agy",
+            "cli:agy",
+            SlotRole::Reviewer,
+        ));
+        st.providers = vec!["cli:claude".into(), "cli:codex".into(), "cli:agy".into()];
+        st.pool_origin = PoolOrigin::CliProviders;
+        let mut cfg = Config::default();
+        cfg.backups.reviewer = vec!["cli:grok".into(), "cli:pi".into()];
+
+        let id = try_rotate_reviewer_provider(
+            &mut st,
+            &paths,
+            "review-1-cli-codex",
+            tmp.path(),
+            &cfg,
+            true,
+            &crate::providers::StubHealth::allow_all(),
+        )
+        .unwrap()
+        .expect("seat 1 keeps its own backup after the drop");
+        assert_eq!(id, "review-1-cli-grok");
+        assert_eq!(st.slots[0].provider, "cli:grok");
+        assert_eq!(st.slots[0].source, Some(SeatSource::Backup));
+
+        // The second survivor keeps its own backup too: seat 1 took the
+        // position-0 backup, so seat 2 must take the position-1 backup, never
+        // find none because seat 1 consumed the wrong entry.
+        let second = st
+            .slots
+            .iter_mut()
+            .find(|s| s.id == "review-2-cli-agy")
+            .expect("seat 2 survives the first rotation");
+        second.status = SlotStatus::Failed;
+        second.error = Some("could not start: spawn failed".into());
+        second.exec_backend = Some(crate::provider_ref::ExecBackend::NativeCli);
+        let id = try_rotate_reviewer_provider(
+            &mut st,
+            &paths,
+            "review-2-cli-agy",
+            tmp.path(),
+            &cfg,
+            true,
+            &crate::providers::StubHealth::allow_all(),
+        )
+        .unwrap()
+        .expect("seat 2 keeps its own backup after seat 1 failed over");
+        assert_eq!(id, "review-2-cli-pi");
+        let second = st
+            .slots
+            .iter()
+            .find(|s| s.id == "review-2-cli-pi")
+            .expect("seat 2 moved to its backup");
+        assert_eq!(second.provider, "cli:pi");
+        assert_eq!(second.source, Some(SeatSource::Backup));
+    }
+
     /// Run 52588b2c's seat: a claude dispatch hit its weekly limit, then the seat was
     /// rotated to codex. The record must not name codex while still carrying claude's
     /// verdict, or `reviewer_infra_fault` reports codex as rate-limited (O149).
@@ -5837,7 +8021,7 @@ mod try_rotate_implementer_tests {
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
         cfg.roles.implementer = Some("cli:claude".into());
-        cfg.cli_role_keys.insert("implementer".into());
+        cfg.cli_role_keys.insert(SlotRole::Implementer);
         cfg.backups.implementer = Some("cli:grok@backup".into());
         // ensure backup provider is available (detect_all would list claude,grok,codex as available if binaries exist? But we use store only, and available None because we didn't set detect. is_provider_eligible will check store and available; with available None, only store matters. backup grok is not paused, so eligible)
         let health = crate::providers::StubHealth::allow_all();
@@ -5856,7 +8040,7 @@ mod try_rotate_implementer_tests {
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
         cfg.roles.implementer = Some("cli:claude".into());
-        cfg.cli_role_keys.insert("implementer".into());
+        cfg.cli_role_keys.insert(SlotRole::Implementer);
         cfg.backups.implementer = Some("cli:grok@backup".into());
         let health = crate::providers::StubHealth::allow_all();
         let changed = try_rotate_implementer(&mut st, &paths, &cfg, &health).unwrap();
@@ -5889,7 +8073,7 @@ mod try_rotate_implementer_tests {
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
         cfg.roles.implementer = Some("cli:claude".into());
-        cfg.cli_role_keys.insert("implementer".into());
+        cfg.cli_role_keys.insert(SlotRole::Implementer);
         cfg.backups.implementer = None;
         let health = crate::providers::StubHealth::allow_all();
         let changed = try_rotate_implementer(&mut st, &paths, &cfg, &health).unwrap();
@@ -5909,7 +8093,7 @@ mod try_rotate_implementer_tests {
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
         cfg.roles.implementer = Some("cli:claude".into());
-        cfg.cli_role_keys.insert("implementer".into());
+        cfg.cli_role_keys.insert(SlotRole::Implementer);
         cfg.backups.implementer = Some("cli:grok@backup".into());
         let health = crate::providers::StubHealth::allow_all();
         let changed = try_rotate_implementer(&mut st, &paths, &cfg, &health).unwrap();
@@ -5946,7 +8130,7 @@ mod try_rotate_implementer_tests {
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
         cfg.roles.implementer = Some("cli:claude".into());
-        cfg.cli_role_keys.insert("implementer".into());
+        cfg.cli_role_keys.insert(SlotRole::Implementer);
         cfg.backups.implementer = Some("cli:grok@backup".into());
         st.providers = vec!["cli:grok".into(), "cli:codex".into()];
         let health = crate::providers::StubHealth::allow_all();
@@ -5973,7 +8157,7 @@ mod try_rotate_implementer_tests {
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into(), "cli:grok".into()];
         cfg.roles.implementer = Some("cli:claude".into());
-        cfg.cli_role_keys.insert("implementer".into());
+        cfg.cli_role_keys.insert(SlotRole::Implementer);
         cfg.backups.implementer = Some("cli:grok@backup".into());
         let health = crate::providers::StubHealth::allow_all();
         let changed = try_rotate_implementer(&mut st, &paths, &cfg, &health).unwrap();
@@ -5994,7 +8178,7 @@ mod try_rotate_implementer_tests {
         let mut cfg = Config::default();
         cfg.providers.order = vec!["cli:claude".into(), "cli:codex".into()];
         cfg.roles.implementer = Some("cli:claude".into());
-        cfg.cli_role_keys.insert("implementer".into());
+        cfg.cli_role_keys.insert(SlotRole::Implementer);
         cfg.backups.implementer = Some("cli:grok@backup".into());
         let health = crate::providers::StubHealth::allow_all();
         let changed = try_rotate_implementer(&mut st, &paths, &cfg, &health).unwrap();
@@ -6402,9 +8586,10 @@ fn scoped_review_section(state: &RunState, cfg: &Config, review_cwd: &Path) -> S
         return String::new();
     }
     // A critical filed under Follow-up blocked its round, so it is re-judged too.
-    let prior: Vec<_> = review_result::panel_findings(&panel)
+    let prior: Vec<(&str, &review_result::Finding)> = review_result::panel_findings(&panel)
         .into_iter()
         .filter(|(_, f)| !f.follow_up || f.severity == review_result::Severity::Critical)
+        .map(|(e, f)| (e.slot_id.as_str(), f))
         .collect();
     let stat = commit
         .as_deref()
@@ -6489,10 +8674,12 @@ fn blockers_from_disk(
             continue;
         };
         // Whether that review answered a scoped prompt is on its recorded entry.
+        // Writer ids are never shared across seats, so an id match is this
+        // seat's own record.
         let scoped = state
             .review_history
             .iter()
-            .filter(|e| e.slot_id == rev.id || rev.former_ids.contains(&e.slot_id))
+            .filter(|e| e.slot_id == rev.id)
             .max_by_key(|e| e.round)
             .is_some_and(|e| e.review.scoped);
         let res = review_result::ReviewResult {
@@ -6715,7 +8902,7 @@ fn blocking_review_anchor(
     if let Some(entry) = state
         .review_history
         .iter()
-        .filter(|e| e.slot_id == rev.id || rev.former_ids.contains(&e.slot_id))
+        .filter(|e| e.slot_id == rev.id)
         .max_by_key(|e| e.round)
     {
         return (Some(entry.round), entry.review.reviewed_commit.clone());
@@ -7064,7 +9251,7 @@ pub fn continue_run(paths: &SparPaths, cfg: &Config, run_id: &str) -> Result<Exi
             dry_run: state.dry_run,
             ..CommonOpts::default()
         };
-        return run_from_approved(run_id, None, opts, paths, cfg);
+        return run_from_approved(run_id, None, opts, paths, BoundAmendInputs::default());
     }
     if state.workflow == crate::cli::WorkflowKind::Plan {
         return crate::workflow::plan::continue_run(paths, cfg, run_id);
@@ -8923,5 +11110,85 @@ mod carry_forward_tests {
         state.round = 5;
         assert!(escalate_round_ceiling(&mut state, &paths).unwrap());
         assert_eq!(state.phase, Phase::AwaitingRoundExtension);
+    }
+}
+
+#[cfg(test)]
+mod frozen_reread_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn git_fixture(root: &std::path::Path) {
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("README.md"), "test\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+    }
+
+    /// A bound dispatch builds its amend preview from
+    /// the frozen snapshot as of lock time. Whatever the launcher read before
+    /// the lock for its pre-checks must not leak into the dispatch: a concurrent
+    /// amend that froze in between would otherwise be silently overwritten by
+    /// this dispatch's snapshot.
+    #[test]
+    fn bound_dispatch_builds_from_the_snapshot_on_disk() {
+        let tmp = tempdir().unwrap();
+        git_fixture(tmp.path());
+        let paths = crate::paths::SparPaths::new(tmp.path());
+        let run_id = "r-frozen-reread";
+        let mut frozen = Config::default();
+        frozen.roles.implementer = Some("cli:claude".to_string());
+        frozen.roles.reviewer = vec!["cli:grok".to_string(), "cli:claude".to_string()];
+        frozen.suite.enabled = false;
+        frozen.autonomy = crate::config::AutonomyLevel::Full;
+        frozen.save_snapshot(&paths, run_id).unwrap();
+        let mut st = RunState::new(
+            run_id,
+            crate::cli::WorkflowKind::Loop,
+            tmp.path().to_path_buf(),
+        );
+        st.gates.plan_approved = true;
+        st.task = Some("add a hello function".to_string());
+        st.save(&paths).unwrap();
+        // The pre-lock read `implement_ctx` takes for its cheap pre-checks sees
+        // the claude implementer with no CLI pin. A concurrent `--role`
+        // amend lands before the dispatch takes the run lock and pins the
+        // frozen snapshot at grok.
+        let stale = Config::for_run(&paths, run_id).unwrap();
+        assert_eq!(stale.roles.implementer.as_deref(), Some("cli:claude"));
+        assert!(!stale.cli_role_keys.contains(&SlotRole::Implementer));
+        frozen.roles.implementer = Some("cli:grok".to_string());
+        frozen.cli_role_keys.insert(SlotRole::Implementer);
+        frozen.save_snapshot(&paths, run_id).unwrap();
+        let opts = CommonOpts {
+            providers: vec!["cli:claude".to_string(), "cli:grok".to_string()],
+            dry_run: true,
+            json: true,
+            ..CommonOpts::default()
+        };
+        let _ = run_from_approved(run_id, None, opts, &paths, BoundAmendInputs::default()).unwrap();
+        let after = RunState::load(&paths, run_id).unwrap();
+        assert_eq!(
+            after.autonomy,
+            crate::config::AutonomyLevel::Full,
+            "the dispatch carries the frozen snapshot, not a stale pre-lock read"
+        );
+        let implementers: Vec<&str> = after
+            .slots
+            .iter()
+            .filter(|s| s.role == SlotRole::Implementer)
+            .map(|s| s.provider.as_str())
+            .collect();
+        assert_eq!(implementers, vec!["cli:grok"]);
     }
 }

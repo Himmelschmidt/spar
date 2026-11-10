@@ -57,7 +57,20 @@ caught, which is what the sweep is for.
 - **Each run freezes its config** at creation into `.spar/runs/<id>/config.json`. Every later
   phase of that run reads the snapshot, so another agent's edit cannot change its fleet,
   timeouts, spec/suite channels, or ship gate. `spar implement --run <id> --reload-config`
-  re-reads the file and re-freezes; `--role` on a resume without it exits `1`.
+  re-reads the file, re-freezes, and then re-applies the overrides the run was launched
+  or amended with. `--role`, `--backup`, `--effort`, `--without` and `--fleet` amend a
+  resume's frozen config directly (only `--suite-command` still needs `--reload-config`).
+  `--without reviewer[N]` (or an existing seat id) drops a reviewer seat outright: the
+  seat, its review history, and its verdicts stop gating the ship. The ordinal indexes
+  the live panel positions at the moment `--without` is parsed. Dropping the last
+  reviewer is refused, unless `--role reviewer=` in the same amend re-seats the panel
+  to its pin; a run with no live panel seats left fails before dispatch (exit 1) and
+  never reaches the ship gate unreviewed. A bound `--role reviewer=` pin moves, mints
+  or retires live seats to match it, so the panel the dispatch reviews with is the
+  panel the frozen config names. A widened `-wide` extra holds no ordinal (an ordinal
+  past the panel is refused) and keeps reviewing outside the config when the pin it
+  duplicated is dropped. The amend applies only once every launch precondition passes,
+  so a refused launch changes nothing.
 - **`--reassign <role|seat>=<provider>`** on `implement --run <id>` moves a seat that already
   exists to another provider on the same worktree and branch (a reload only changes a
   seat's model). Operator-only; refused while the run's orchestrator is alive and onto a

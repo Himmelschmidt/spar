@@ -38,10 +38,7 @@ pub const DEFAULT_REVIEWERS: usize = 2;
 /// exact too, except `--fleet small` may narrow it (never widen it) to keep the first
 /// pin. Unpinned falls back to the preset override, else `DEFAULT_REVIEWERS`.
 pub fn panel_size(cfg: &Config) -> usize {
-    if cfg
-        .cli_role_keys
-        .contains(SlotRole::Reviewer.as_config_key())
-    {
+    if cfg.cli_role_keys.contains(&SlotRole::Reviewer) {
         return cfg.roles.reviewer.len();
     }
     if !cfg.roles.reviewer.is_empty() {
@@ -60,14 +57,57 @@ pub fn pool_width(cfg: &Config) -> usize {
     1 + panel_size(cfg)
 }
 
+/// The `--select` question the implement panel asks: pool width with the
+/// implementer first, reviewers after. One function, since the launch shaping
+/// resolves it to index `--without` ordinals and the dispatch resolves it to
+/// seat the panel.
+pub fn reviewer_select_question(cfg: &Config) -> (usize, Vec<&'static str>) {
+    let n = pool_width(cfg);
+    let roles: Vec<&'static str> = std::iter::once(SlotRole::Implementer.as_config_key())
+        .chain(std::iter::repeat(SlotRole::Reviewer.as_config_key()))
+        .take(n)
+        .collect();
+    (n, roles)
+}
+
+/// A `--select` resolution the launch already ran (to index a `--without`
+/// reviewer ordinal). The dispatch reuses it instead of benchmarking twice,
+/// but only when it asks the same question: the width and roles that shaped
+/// the ranking travel with the providers, and a different panel shape
+/// re-resolves.
+#[derive(Debug, Clone)]
+pub struct PreselectedPool {
+    pub width: usize,
+    pub roles: Vec<String>,
+    pub providers: Vec<String>,
+    pub artifact: Option<crate::model_select::SelectArtifact>,
+}
+
+impl PreselectedPool {
+    /// Record a resolution against the shaped panel: drops and role overrides
+    /// already ran, so the width and roles are what the dispatch asks. The
+    /// providers stay the pre-shape resolution the `--without` ordinals indexed.
+    pub fn for_shaped_panel(
+        cfg: &Config,
+        resolved: crate::model_select::ResolvedProviders,
+    ) -> Self {
+        let (width, roles) = reviewer_select_question(cfg);
+        Self {
+            width,
+            roles: roles.into_iter().map(str::to_string).collect(),
+            providers: resolved.providers,
+            artifact: resolved.artifact,
+        }
+    }
+}
+
 /// Whether the reviewer panel is pinned (by CLI `--role`, by `[roles].reviewer`, or
 /// narrowed by `--fleet small`), i.e. an exclusion list rather than a floor. Widening a
 /// pinned panel must duplicate an already-dispatched seat, never draw from
 /// `[providers].order` (Bug A) — including the unpinned-but-narrowed `small` panel, or
 /// widening would silently re-add the seat the preset was asked to drop.
 pub fn reviewer_panel_pinned(cfg: &Config) -> bool {
-    cfg.cli_role_keys
-        .contains(SlotRole::Reviewer.as_config_key())
+    cfg.cli_role_keys.contains(&SlotRole::Reviewer)
         || !cfg.roles.reviewer.is_empty()
         || cfg.fleet_reviewer_override.is_some()
 }
@@ -80,9 +120,7 @@ pub fn reviewer_panel_pinned(cfg: &Config) -> bool {
 /// pool / `[providers].order` the way an ordinary unpinned panel does, or a failed
 /// unpinned-but-narrowed reviewer loses its only retry.
 pub fn reviewer_panel_has_pins(cfg: &Config) -> bool {
-    cfg.cli_role_keys
-        .contains(SlotRole::Reviewer.as_config_key())
-        || !cfg.roles.reviewer.is_empty()
+    cfg.cli_role_keys.contains(&SlotRole::Reviewer) || !cfg.roles.reviewer.is_empty()
 }
 
 fn singleton_role_value(role: SlotRole, cfg: &Config) -> Option<String> {
@@ -123,7 +161,7 @@ pub fn resolve_seat(
     used: &[String],
 ) -> Option<(String, SeatSource)> {
     // 1. CLI --role for this role always wins, even under an explicit pool (Bug B).
-    if cfg.cli_role_keys.contains(role.as_config_key()) {
+    if cfg.cli_role_keys.contains(&role) {
         let value = if role == SlotRole::Reviewer {
             cfg.roles.reviewer.get(role_index).cloned()
         } else {
@@ -896,7 +934,7 @@ mod tests {
         let health = StubHealth::allow_all();
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:codex".into()];
-        cfg.cli_role_keys.insert("reviewer".into());
+        cfg.cli_role_keys.insert(SlotRole::Reviewer);
         let pool = vec!["cli:claude".into(), "cli:grok".into(), "cli:agy".into()];
         assert_eq!(
             resolve_seat(
@@ -972,6 +1010,29 @@ mod tests {
         let mut cfg = Config::default();
         cfg.roles.reviewer = vec!["cli:codex".into()];
         assert!(reviewer_panel_has_pins(&cfg));
+    }
+
+    #[test]
+    fn shaped_preselection_answers_the_dispatch_question() {
+        let cfg = Config::default();
+        let recorded = PreselectedPool::for_shaped_panel(
+            &cfg,
+            crate::model_select::ResolvedProviders {
+                providers: vec!["cli:handshake-probe".into()],
+                artifact: None,
+            },
+        );
+        let opts = CommonOpts {
+            preselected_pool: Some(recorded),
+            dry_run: true,
+            ..Default::default()
+        };
+        let (n, roles) = reviewer_select_question(&cfg);
+        let paths = crate::paths::SparPaths::new("/tmp/spar-handshake-probe");
+        assert_eq!(
+            opts.resolve_pool(n, &roles, &paths, &cfg, "probe").unwrap(),
+            vec!["cli:handshake-probe".to_string()]
+        );
     }
 
     #[test]

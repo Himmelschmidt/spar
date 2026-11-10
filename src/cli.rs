@@ -86,7 +86,8 @@ pub enum Command {
         /// file disabled). Composes with `--without` and `--role`: explicit flags win.
         #[arg(long, value_name = "PRESET")]
         fleet: Option<String>,
-        /// Drop seats for THIS run only, comma-separated: `critic`, `spec`, `suite`.
+        /// Drop seats for THIS run only, comma-separated: `critic`, `spec`, `suite`,
+        /// plus reviewer seats as `reviewer[N]` (0-based panel ordinal).
         /// Applied before `--role`, so an explicit role flag still wins.
         #[arg(long, value_delimiter = ',')]
         without: Vec<String>,
@@ -204,20 +205,27 @@ pub enum Command {
         /// file disabled). Composes with `--without` and `--role`: explicit flags win.
         #[arg(long, value_name = "PRESET")]
         fleet: Option<String>,
-        /// Drop seats for THIS run only, comma-separated: `critic`, `spec`, `suite`.
-        /// Applied before `--role`, so an explicit role flag still wins. On an existing
-        /// `--run <id>` this needs `--reload-config`, exactly like `--role`.
+        /// Drop seats for THIS run only, comma-separated: `critic`, `spec`, `suite`,
+        /// plus reviewer seats as `reviewer[N]` (0-based panel ordinal) or an existing
+        /// seat id (`review-1-cli-claude`). Dropping a reviewer removes the seat and
+        /// its verdicts stop gating the ship. On an existing `--run <id>` this amends
+        /// the run's frozen config. Applied before `--role`, so an explicit role flag
+        /// still wins.
         #[arg(long, value_delimiter = ',')]
         without: Vec<String>,
         /// This run's deterministic suite, replacing `[suite].command`: spar runs each
         /// command itself instead of dispatching a tester. Repeatable, one command per
         /// flag. Frozen into the run's config and kept across `--reload-config`;
-        /// on an existing `--run <id>` it needs `--reload-config`, like `--role`.
+        /// on an existing `--run <id>` it needs `--reload-config`.
         #[arg(long = "suite-command", value_name = "CMD")]
         suite_command: Vec<String>,
-        /// Re-read `spar.toml` for an existing run and replace its frozen config.
-        /// Without this, `--run <id>` uses the config the run was created with, whatever
-        /// the project file says now.
+        /// Re-read `spar.toml` for an existing run and replace its frozen config with
+        /// the file plus the overrides the run was launched or amended with (`--role`,
+        /// `--backup`, `--effort`, `--without`, `--fleet`, and any pinned suite
+        /// command), so nothing given before is lost unless restated differently.
+        /// Without this, `--run <id>` uses the config the run was created with,
+        /// whatever the project file says now. Refused while the run's orchestrator
+        /// is alive.
         #[arg(long)]
         reload_config: bool,
         /// With `--reload-config`: also re-capture `[env]` from this shell, replacing the
@@ -328,8 +336,12 @@ pub enum Command {
         /// file disabled). Composes with `--without` and `--role`: explicit flags win.
         #[arg(long, value_name = "PRESET")]
         fleet: Option<String>,
-        /// Drop seats for THIS run only, comma-separated: `critic`, `spec`, `suite`.
-        /// Applied before `--role`, so an explicit role flag still wins.
+        /// Drop seats for THIS run only, comma-separated: `critic`, `spec`, `suite`,
+        /// plus reviewer seats as `reviewer[N]` (0-based panel ordinal). Dropping a
+        /// reviewer removes the seat and its verdicts stop gating the ship. A bound
+        /// run (`implement --run`) also takes an existing seat id
+        /// (`review-1-cli-claude`). Applied before `--role`, so an explicit role flag
+        /// still wins.
         #[arg(long, value_delimiter = ',')]
         without: Vec<String>,
         /// Idempotency key: refuse to start while an unfinished run with this key

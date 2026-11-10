@@ -900,9 +900,7 @@ pub(crate) fn resolve_spec_provider(
     pool_origin: PoolOrigin,
     used: &[String],
 ) -> Result<(String, SeatSource)> {
-    let cli_pinned = cfg
-        .cli_role_keys
-        .contains(SlotRole::TestAuthor.as_config_key());
+    let cli_pinned = cfg.cli_role_keys.contains(&SlotRole::TestAuthor);
     if cli_pinned {
         if let Some(p) = &cfg.roles.test_author {
             crate::provider_ref::ProviderRef::parse(p)

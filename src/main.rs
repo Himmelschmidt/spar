@@ -262,10 +262,10 @@ fn run() -> Result<ExitCode> {
                 if let Some(preset) = &fleet {
                     cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
                 }
-                cfg.apply_without(&without)?;
-                cfg.apply_role_overrides(&role)?;
-                cfg.apply_backup_overrides(&backup)?;
-                cfg.apply_effort_overrides(&effort)?;
+                let preselected_pool = fresh_seat_shapers(
+                    &mut cfg, &providers, &select, &urgency, dry_run, &without, &role, &backup,
+                    &effort,
+                )?;
                 cfg.apply_suite_command(&suite_command, &without)?;
                 // An intaken brief (O41) is the work's identity already, so its slug is
                 // the natural key when the operator names none. Any other file is not.
@@ -304,6 +304,7 @@ fn run() -> Result<ExitCode> {
                     task: Some(task_text.clone()),
                     providers,
                     select,
+                    preselected_pool,
                     urgency,
                     base,
                     detach,
@@ -446,22 +447,42 @@ fn run() -> Result<ExitCode> {
                     Some(path) => Some(brief::read_spec_text(path)?),
                     None => task,
                 };
-                let (paths, cfg) = implement_ctx(
+                // Seat shapers ride along into the dispatch: a bound run amends under
+                // its own lock, after the preconditions below pass. The
+                // preset parses here, so a `--fleet` typo fails at the pre-check
+                // instead of after the dispatch acquired its lock.
+                let amend = workflow::implement::BoundAmendInputs {
+                    role,
+                    backup,
+                    effort,
+                    without,
+                    fleet: fleet
+                        .as_deref()
+                        .map(config::FleetPreset::parse)
+                        .transpose()?,
+                    suite_command,
+                    recapture_env,
+                };
+                let (paths, cfg, preselected_pool) = implement_ctx(
                     run_id.as_deref(),
-                    &role,
-                    &backup,
-                    &effort,
-                    &without,
-                    &suite_command,
+                    &amend.role,
+                    &amend.backup,
+                    &amend.effort,
+                    &amend.without,
+                    &providers,
+                    &select,
+                    &urgency,
+                    dry_run,
+                    &amend.suite_command,
                     fleet.as_deref(),
                     reload_config,
-                    recapture_env,
-                    !validate_only,
+                    amend.recapture_env,
                 )?;
                 let opts = CommonOpts {
                     task: task.clone(),
                     providers,
                     select,
+                    preselected_pool,
                     urgency,
                     base,
                     detach,
@@ -479,12 +500,13 @@ fn run() -> Result<ExitCode> {
                 // The pause check keys the route this process's dispatch will
                 // stamp (new or resumed: continuing entries stamp on entry),
                 // not the previous record.
-                workflow::implement::parse_reassignments(
+                let reassignments = workflow::implement::parse_reassignments(
                     &opts.reassign,
                     &paths,
                     providers::codex::dispatch_route().as_recorded(),
                 )?;
                 let mut fleet = None;
+                let mut shown_cfg = None;
                 let mut precheck_stop: Option<workflow::implement::ProjectionStop> = None;
                 match &run_id {
                     Some(id) => {
@@ -492,6 +514,29 @@ fn run() -> Result<ExitCode> {
                         // The real launch only finds these under the run lock, after the
                         // pre-check has said yes; a front end asking first must hear them too.
                         if validate_only {
+                            // The amend preview runs first and read-only: it validates the
+                            // seat shapers exactly as the dispatch would, before any
+                            // pre-check can swallow its refusal. It reads the post-move
+                            // state, the seats the dispatch amends after applying the
+                            // reassigns.
+                            let moves =
+                                workflow::implement::resolve_reassignments(&st, &reassignments)?;
+                            let moved = workflow::implement::simulate_moves(&st, &moves)?;
+                            let preview = if !reload_config && amend.is_noop() {
+                                None
+                            } else {
+                                let live = if reload_config {
+                                    Some(config::Config::load(&paths.project_root)?)
+                                } else {
+                                    None
+                                };
+                                Some(workflow::implement::preview_bound_amend(
+                                    &cfg,
+                                    live.as_ref(),
+                                    &moved,
+                                    &amend,
+                                )?)
+                            };
                             if !state::is_resumable(&st) {
                                 anyhow::bail!(
                                     "run {id} is not resumable (workflow={:?}, phase={:?})",
@@ -506,7 +551,8 @@ fn run() -> Result<ExitCode> {
                                 && opts.base.is_none()
                                 && !reload_config
                                 && !accept_contract
-                                && opts.reassign.is_empty();
+                                && opts.reassign.is_empty()
+                                && amend.is_noop();
                             if let Some(owner) =
                                 runlock::RunLock::owner(&paths, id).filter(|o| o.alive())
                             {
@@ -518,6 +564,10 @@ fn run() -> Result<ExitCode> {
                                     .into());
                                 }
                             }
+                            if let Some(preview) = &preview {
+                                shown_cfg = Some(preview.cfg.clone());
+                            }
+                            let proj_cfg = shown_cfg.as_ref().unwrap_or(&cfg);
                             // A continued run re-resolves stored seats on dispatch, so
                             // show the projection, not the stored seats. A
                             // projection that would stop the dispatch fails the
@@ -530,14 +580,44 @@ fn run() -> Result<ExitCode> {
                                 crate::state::SlotRole::Implementer,
                                 crate::state::SlotRole::Reviewer,
                             ];
-                            if cfg.suite.enabled {
+                            if proj_cfg.suite.enabled {
                                 panel.push(crate::state::SlotRole::Tester);
                             }
                             let proj = workflow::implement::project_continued_fleet(
-                                &st, &paths, &cfg, &panel,
+                                &moved, &paths, proj_cfg, &panel,
                             );
                             precheck_stop = proj.stop;
-                            fleet = Some(proj.fleet);
+                            let mut seats = proj.fleet;
+                            if let Some(preview) = &preview {
+                                // Show the fleet after the drop: gone seats vanish and
+                                // survivors keep their ids.
+                                if let Some(plan) = workflow::implement::plan_reviewer_drop(
+                                    &moved,
+                                    &preview.dropped,
+                                )? {
+                                    let doomed: std::collections::BTreeSet<&str> =
+                                        plan.removed.iter().map(|s| s.as_str()).collect();
+                                    seats.retain(|s| !doomed.contains(s.seat.as_str()));
+                                }
+                                // A `--role reviewer=` pin re-seats the live panel: show
+                                // the simulated panel instead of exactly the seats the
+                                // re-seat retires. Seats outside the panel (widened
+                                // extras) keep reviewing, so they survive the splice.
+                                // Freshly minted seats are `projected`.
+                                if let Some(resynced) = &preview.resynced_panel {
+                                    let retired: std::collections::BTreeSet<&str> =
+                                        preview.resync_removed.iter().map(|s| s.as_str()).collect();
+                                    seats.retain(|s| !retired.contains(s.seat.as_str()));
+                                    // The simulation re-lists kept panel seats, so the
+                                    // simulated entries replace their live twins and
+                                    // each seat appears once.
+                                    let simulated: std::collections::BTreeSet<&str> =
+                                        resynced.iter().map(|s| s.seat.as_str()).collect();
+                                    seats.retain(|s| !simulated.contains(s.seat.as_str()));
+                                    seats.extend(resynced.iter().cloned());
+                                }
+                            }
+                            fleet = Some(seats);
                         }
                         if let Some(mr) = max_rounds {
                             workflow::implement::check_round_extension(
@@ -566,9 +646,18 @@ fn run() -> Result<ExitCode> {
                     }
                     None => {}
                 }
-                Ok((paths, cfg, opts, task, fleet, precheck_stop))
+                Ok((
+                    paths,
+                    cfg,
+                    opts,
+                    task,
+                    fleet,
+                    amend,
+                    shown_cfg,
+                    precheck_stop,
+                ))
             })();
-            let (paths, cfg, opts, task, fleet, precheck_stop) = match prepared {
+            let (paths, cfg, opts, task, fleet, amend, shown_cfg, precheck_stop) = match prepared {
                 Ok(v) => v,
                 Err(e) => return launch_refused(e, json, run_id.as_deref()),
             };
@@ -587,22 +676,25 @@ fn run() -> Result<ExitCode> {
                 }
             }
             if validate_only {
-                return launch_validated(json, run_id.as_deref(), &cfg, fleet);
+                let shown = shown_cfg.as_ref().unwrap_or(&cfg);
+                return launch_validated(json, run_id.as_deref(), shown, fleet);
             }
             let target = run_id.clone();
             // A round extension refused or found busy after the pre-check is still a
-            // refusal: nothing was dispatched, so `--json` gets the same shape.
-            workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg).or_else(
-                |e| {
+            // refusal: nothing was dispatched, so `--json` gets the same shape. An
+            // amend refusal is one too: the frozen config and run state were left
+            // untouched under the dispatch's lock.
+            workflow::implement::run_from_cli(run_id, plan, task, new, opts, &paths, &cfg, amend)
+                .or_else(|e| {
                     if e.is::<workflow::implement::RoundExtensionRefused>()
                         || e.is::<workflow::implement::ReassignRefused>()
+                        || e.is::<workflow::implement::AmendRefused>()
                         || e.is::<runlock::OrchestratorBusy>()
                     {
                         return launch_refused(e, json, target.as_deref());
                     }
                     Err(e)
-                },
-            )
+                })
         }
         Command::Run {
             workflow,
@@ -663,14 +755,15 @@ fn run() -> Result<ExitCode> {
                 if let Some(preset) = &fleet {
                     cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
                 }
-                cfg.apply_without(&without)?;
-                cfg.apply_role_overrides(&role)?;
-                cfg.apply_backup_overrides(&backup)?;
-                cfg.apply_effort_overrides(&effort)?;
+                let preselected_pool = fresh_seat_shapers(
+                    &mut cfg, &providers, &select, &urgency, dry_run, &without, &role, &backup,
+                    &effort,
+                )?;
                 let opts = CommonOpts {
                     task,
                     providers,
                     select,
+                    preselected_pool,
                     urgency,
                     base,
                     detach,
@@ -1392,16 +1485,64 @@ fn bus_deliver(
     Ok(ExitCode::Success)
 }
 
+/// Seat shapers for a fresh launch: pool resolution, drops, and role/backup/
+/// effort overrides, in launch order. A surviving drop records without pinning
+/// the panel (O183).
+#[allow(clippy::too_many_arguments)]
+fn fresh_seat_shapers(
+    cfg: &mut Config,
+    providers: &[String],
+    select: &[String],
+    urgency: &str,
+    dry_run: bool,
+    without: &[String],
+    role: &[String],
+    backup: &[String],
+    effort: &[String],
+) -> Result<Option<workflow::roles_resolve::PreselectedPool>> {
+    // A reviewer ordinal is the only `--without` item that indexes a panel;
+    // without one the pool (and any `--select` benchmark) is skipped and the
+    // channels apply clean.
+    if !config::without_has_reviewer_item(without) {
+        let dropped = cfg.apply_without(&[], state::PoolOrigin::Synth, dry_run, without)?;
+        cfg.apply_role_overrides(role)?;
+        cfg.refuse_emptied_reviewer_panel(&dropped)?;
+        config::warn_if_role_supersedes_reviewer_drop(role, &dropped, false);
+        cfg.apply_backup_overrides(backup)?;
+        cfg.apply_effort_overrides(effort)?;
+        return Ok(None);
+    }
+    let (resolved, origin) = cfg.fresh_reviewer_pool(providers, select, urgency, dry_run)?;
+    let selected = matches!(&origin, state::PoolOrigin::Selected);
+    let dropped = cfg.apply_without(&resolved.providers, origin, dry_run, without)?;
+    cfg.apply_role_overrides(role)?;
+    // Record after the drops and role overrides shaped the panel, so the
+    // stored width and roles are the question the dispatch asks (O183). The
+    // providers stay the pre-shape resolution the ordinals indexed.
+    let preselected = if selected {
+        Some(workflow::roles_resolve::PreselectedPool::for_shaped_panel(
+            &*cfg, resolved,
+        ))
+    } else {
+        None
+    };
+    cfg.refuse_emptied_reviewer_panel(&dropped)?;
+    config::warn_if_role_supersedes_reviewer_drop(role, &dropped, false);
+    cfg.apply_backup_overrides(backup)?;
+    cfg.apply_effort_overrides(effort)?;
+    Ok(preselected)
+}
+
 /// Config for `spar implement`.
 ///
 /// A new run (`--task` / `--plan`) starts from the project's live config; `--run <id>`
 /// binds to the config that run was created with, so an agent editing `spar.toml` for
 /// its own run cannot change the fleet, timeouts or ship gate of one already in flight.
 /// `--reload-config` is the deliberate way out: it re-reads the file and re-freezes the
-/// run against it.
-///
-/// `persist: false` is `--validate-only`: every check a reload would make, none of
-/// its writes.
+/// run against it. A bound run amends under the dispatch's own lock, after every
+/// launch precondition passes. Nothing here amends anything before those checks,
+/// so a refused launch changes nothing; this context returns the frozen
+/// config untouched.
 #[allow(clippy::too_many_arguments)]
 fn implement_ctx(
     run_id: Option<&str>,
@@ -1409,106 +1550,53 @@ fn implement_ctx(
     backup: &[String],
     effort: &[String],
     without: &[String],
+    providers: &[String],
+    select: &[String],
+    urgency: &str,
+    dry_run: bool,
     suite_command: &[String],
     fleet: Option<&str>,
     reload_config: bool,
     recapture_env: bool,
-    persist: bool,
-) -> Result<(paths::SparPaths, Config)> {
-    let (paths, mut cfg) = project_ctx()?;
+) -> Result<(
+    paths::SparPaths,
+    Config,
+    Option<workflow::roles_resolve::PreselectedPool>,
+)> {
+    let (paths, cfg) = project_ctx()?;
     let Some(run_id) = run_id else {
+        let mut cfg = cfg;
         if let Some(preset) = fleet {
             cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
         }
-        cfg.apply_without(without)?;
-        cfg.apply_role_overrides(role)?;
-        cfg.apply_backup_overrides(backup)?;
-        cfg.apply_effort_overrides(effort)?;
+        let preselected_pool = fresh_seat_shapers(
+            &mut cfg, providers, select, urgency, dry_run, without, role, backup, effort,
+        )?;
         cfg.apply_suite_command(suite_command, without)?;
-        return Ok((paths, cfg));
+        return Ok((paths, cfg, preselected_pool));
     };
-    if !reload_config {
-        if !role.is_empty() {
-            anyhow::bail!(
-                "run {run_id} is bound to the config it was created with; \
-                 pass --reload-config to apply --role to it"
-            );
-        }
-        if !backup.is_empty() {
-            anyhow::bail!(
-                "run {run_id} is bound to the config it was created with; \
-                 pass --reload-config to apply --backup to it"
-            );
-        }
-        if !effort.is_empty() {
-            anyhow::bail!(
-                "run {run_id} is bound to the config it was created with; \
-                 pass --reload-config to apply --effort to it"
-            );
-        }
-        if !without.is_empty() {
-            anyhow::bail!(
-                "run {run_id} is bound to the config it was created with; \
-                 pass --reload-config to apply --without to it"
-            );
-        }
-        if !suite_command.is_empty() {
-            anyhow::bail!(
-                "run {run_id} is bound to the config it was created with; \
-                 pass --reload-config to apply --suite-command to it"
-            );
-        }
-        if let Some(preset) = fleet {
-            // Validate before refusing: an unknown preset name is its own error, not
-            // one the `--reload-config` refusal should swallow. `standard` is a
-            // documented no-op over the file (never re-enables a channel the file
-            // already disabled), so it never needs to change a bound run's frozen
-            // config and must not be refused just for being spelled out.
-            if config::FleetPreset::parse(preset)? != config::FleetPreset::Standard {
-                anyhow::bail!(
-                    "run {run_id} is bound to the config it was created with; \
-                     pass --reload-config to apply --fleet to it"
-                );
-            }
-        }
-        let cfg = Config::for_run(&paths, run_id)?;
-        return Ok((paths, cfg));
+    // `--suite-command` still needs `--reload-config`: it replaces the run's
+    // deterministic suite, a file-shaped change rather than an amendment. The seat
+    // shapers (`--role`, `--backup`, `--effort`, `--without`, `--fleet`) amend the
+    // frozen config in place.
+    if !suite_command.is_empty() && !reload_config {
+        anyhow::bail!(
+            "run {run_id} is bound to the config it was created with; \
+             pass --reload-config to apply --suite-command to it"
+        );
     }
-    // Before the flags, so this invocation's `--without suite` or `--suite-command`
-    // still wins over the carried pin.
+    if recapture_env && !reload_config {
+        anyhow::bail!("--recapture-env needs --reload-config");
+    }
     let frozen = Config::for_run(&paths, run_id)?;
-    cfg.carry_cli_suite_command(&frozen);
-    // A reload re-reads the file, not the shell: the environment stays the one the run
-    // was created in, and only a name newly added to `[env].capture` is taken from now.
-    // `--recapture-env` is the deliberate exception: this shell's values replace them.
-    if !recapture_env {
-        for (k, v) in frozen.env.captured {
-            if cfg.env.capture.contains(&k) {
-                cfg.env.captured.insert(k, v);
-            }
-        }
-    }
-    if let Some(preset) = fleet {
-        cfg.apply_fleet_preset(config::FleetPreset::parse(preset)?);
-    }
-    cfg.apply_without(without)?;
-    cfg.apply_role_overrides(role)?;
-    cfg.apply_backup_overrides(backup)?;
-    cfg.apply_effort_overrides(effort)?;
-    if let Some(owner) = runlock::RunLock::owner(&paths, run_id).filter(|o| o.alive()) {
-        return Err(runlock::OrchestratorBusy {
-            run_id: run_id.to_string(),
-            owner_pid: owner.pid,
-        }
-        .into());
-    }
-    cfg.apply_suite_command(suite_command, without)?;
-    if !persist {
-        return Ok((paths, cfg));
-    }
-    cfg.save_snapshot(&paths, run_id)?;
-    eprintln!("config: re-read spar.toml for run {run_id}");
-    Ok((paths, cfg))
+    // Seat-id `--without` items name slots of this run; they are resolved to panel
+    // ordinals under the dispatch's own lock, against the state the surgery will
+    // apply to. Resolving here, before the launch preconditions run, is the
+    // TOCTOU the amend restructure removes. Nothing below this point may
+    // persist: the frozen config goes back untouched. The only errors raised here
+    // are usage errors that touch no state. (`--fleet` needs no parse here: the
+    // amend inputs parsed it up front, so an unknown preset already failed.)
+    Ok((paths, frozen, None))
 }
 
 fn project_ctx() -> Result<(paths::SparPaths, Config)> {

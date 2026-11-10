@@ -201,7 +201,7 @@ pub fn takeover(
     route: crate::providers::RecordedRoute<'_>,
     health: &dyn crate::providers::HealthSource,
 ) -> Option<crate::state::SeatSource> {
-    let cli = cfg.cli_backup_keys.contains(role.as_config_key());
+    let cli = cfg.cli_backup_keys.contains(&role);
     backup_eligible(backup, store, paths, dry, presence_dry, route, health, cli).then_some(if cli {
         crate::state::SeatSource::CliBackup
     } else {
@@ -1363,11 +1363,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = crate::paths::SparPaths::new(tmp.path());
         let mut cfg = crate::config::Config::default();
-        cfg.cli_backup_keys.insert(
-            crate::state::SlotRole::Implementer
-                .as_config_key()
-                .to_string(),
-        );
+        cfg.cli_backup_keys
+            .insert(crate::state::SlotRole::Implementer);
         let sick = StubHealth::refuse("cli:codex", "probe failed: not logged in");
         let store = QuotaStore::default();
         assert_eq!(
@@ -1392,11 +1389,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = crate::paths::SparPaths::new(tmp.path());
         let mut cfg = crate::config::Config::default();
-        cfg.cli_backup_keys.insert(
-            crate::state::SlotRole::Implementer
-                .as_config_key()
-                .to_string(),
-        );
+        cfg.cli_backup_keys
+            .insert(crate::state::SlotRole::Implementer);
         let health = StubHealth::allow_all();
         let store = QuotaStore::default();
         assert!(
@@ -1422,11 +1416,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = crate::paths::SparPaths::new(tmp.path());
         let mut cfg = crate::config::Config::default();
-        cfg.cli_backup_keys.insert(
-            crate::state::SlotRole::Implementer
-                .as_config_key()
-                .to_string(),
-        );
+        cfg.cli_backup_keys
+            .insert(crate::state::SlotRole::Implementer);
         let health = StubHealth::allow_all();
         let store = QuotaStore::default();
         assert_eq!(

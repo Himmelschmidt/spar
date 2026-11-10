@@ -410,7 +410,7 @@ pane always does. Keep long tasks out of spar's own argv too: `plan --spec <file
 `--fleet small|standard` and `--without critic,spec,suite` shape the seats for one run without
 touching `spar.toml`; see "Fleet shaping" below.
 
-**Run composition (009).** The new-run form is the run's single partial specification. Workflow is optional (`plan` / `implement` / `review` / `arena`) — leaving it unset lets the Chat orchestrator propose one. Each workflow shows its dispatched roles: `plan` is `planner` plus enabled `plan_critic`/`test_author`; `implement` is `implementer` plus the exact reviewer panel plus `tester` only when no deterministic suite replaces it; `review` is the exact reviewer panel; `arena` is a positional pool of `max_agents.max(2)` contenders. The six assignable roles remain the only role rows; `ranker`, `reconciler` and `peer` keep taking fleet positions. Models are opaque free text with local suggestions (`@model` on any `provider@model` ref, stored as storage key plus optional model via the `Pin` boundary — a conflicting `@model` plus separate model is rejected and a double-model ref never emits). `--role ROLE=PROVIDER[@MODEL]` is repeatable and outranks the pool; `--backup ROLE=PROVIDER[@MODEL]` declares a per-role, per-ordinal fallback. A backup fires only for an environmental stop — quota pause, rate limit, or provider unavailable — never on a nonzero work exit, timeout, missing artifact, or adverse review, and it persists as `SeatSource::Backup`. A slot that ended by signal (or exit 143/137) is judged only on the adapter's typed rejection, never on its log text. It replaces O52's blind implementer rotation only on that cause and only while not yet consumed; arena never accepts or emits `--role` or `--backup` and retains its positional quota semantics. `--backup` is new-run-only; `plan --run` and `implement --run` without `--reload-config` reject it. A backup whose canonical storage key equals its primary is rejected even when models differ. Operator defaults that prefill a newly opened form live at `registry::spar_home()/defaults.json`, never in the project's `spar.toml`; a run still freezes its resolved fleet into `.spar/runs/<id>/config.json` (O27) so deleting or corrupting defaults after launch cannot alter a continuation.
+**Run composition (009).** The new-run form is the run's single partial specification. Workflow is optional (`plan` / `implement` / `review` / `arena`). Leaving it unset lets the Chat orchestrator propose one. Each workflow shows its dispatched roles: `plan` is `planner` plus enabled `plan_critic`/`test_author`; `implement` is `implementer` plus the exact reviewer panel plus `tester` only when no deterministic suite replaces it; `review` is the exact reviewer panel; `arena` is a positional pool of `max_agents.max(2)` contenders. The six assignable roles remain the only role rows; `ranker`, `reconciler` and `peer` keep taking fleet positions. Models are opaque free text with local suggestions (`@model` on any `provider@model` ref, stored as storage key plus optional model via the `Pin` boundary: a conflicting `@model` plus separate model is rejected and a double-model ref never emits). `--role ROLE=PROVIDER[@MODEL]` is repeatable and outranks the pool; `--backup ROLE=PROVIDER[@MODEL]` declares a per-role, per-ordinal fallback. A backup fires only for an environmental stop (quota pause, rate limit, or provider unavailable), never on a nonzero work exit, timeout, missing artifact, or adverse review, and it persists as `SeatSource::Backup`. A slot that ended by signal (or exit 143/137) is judged only on the adapter's typed rejection, never on its log text. It replaces O52's blind implementer rotation only on that cause and only while not yet consumed; arena never accepts or emits `--role` or `--backup` and retains its positional quota semantics. `--backup` is refused on `plan --run`; `implement --run <id>` amends it into the run's frozen config. A backup whose canonical storage key equals its primary is rejected even when models differ. Operator defaults that prefill a newly opened form live at `registry::spar_home()/defaults.json`, never in the project's `spar.toml`; a run still freezes its resolved fleet into `.spar/runs/<id>/config.json` (O27) so deleting or corrupting defaults after launch cannot alter a continuation.
 
 | `--workflow` | Slots | Ends at |
 |---|---|---|
@@ -795,9 +795,9 @@ clamped on a word boundary to `[ship] title_max` characters (default 72, `0` = n
 of spar's own), and never past GitHub's 256-character limit.
 The PR **body** is built from the run: OPEN questions from the shipped slot's summary
 (lines under an `Open questions` heading, or lines marked `OPEN`), each reviewer's final
-verdict and the commit it named, an **Open findings (non-blocking)** list (the last
-panel's reviewer findings from `review_history`: minors under `block_on`, follow-ups,
-notes on an approving review), then the summary itself (`summary-<slot>.md`, else
+verdict and the commit it named, an **Open findings (non-blocking)** list (each surviving
+seat's latest recorded review from `review_history`: minors under `block_on`,
+follow-ups, notes on an approving review), then the summary itself (`summary-<slot>.md`, else
 `summary-impl.md`). A body over GitHub's limit is cut from the end of the summary with a
 note naming the full file. It is written to `artifacts/pr-body.md` and passed with
 `--body-file`; dry-run puts both into `artifacts/ship.md`.
@@ -857,9 +857,9 @@ reconcile gate. `--reason` is required (exit `1` without it); it refuses while t
 orchestrator is alive (`spar stop` it first) and inside a slot (operator-only). A ship that
 fails after the override puts the run back in the phase it came from. The override is kept
 on the run (`ship_override`) for the round, so a later re-ship keeps the findings section. It ships the same HEAD with the same push
-safety as a normal ship. Every finding of the last reviewed round, from the structured
-review records (severity, `file:line`, reviewer slot, round, `Reviewed-Commit`), goes in
-the PR body under **Shipped over open findings**, ahead of the summary. The override (who
+safety as a normal ship. Every finding of each surviving seat's latest recorded review,
+from the structured review records (severity, `file:line`, reviewer slot, round,
+`Reviewed-Commit`), goes in the PR body under **Shipped over open findings**, ahead of the summary. The override (who
 from `$USER`, when, reason, the findings) is written to
 `artifacts/ship.md` under `## Gate override` and logged as an `info` event.
 
@@ -1931,7 +1931,9 @@ it before anyone confirms:
   projected implement panel for `plan`, the implement panel for `implement -t` and
   `--workflow loop`, the reviewers for `--workflow review`, and for `implement --run
   <id>` and `plan --run <id>` the run's stored seats projected through the next
-  dispatch's re-resolution: a paused seat shows its backup, a sick seat its
+  dispatch's re-resolution, with a `--without reviewer[N]` amend applied to the
+  shown fleet, so the dropped seat is gone and survivors keep their ids: a paused
+  seat shows its backup, a sick seat its
   fallback. Quota pauses are not re-probed, so a seat the next dispatch would
   park on fails the pre-check instead of showing a fleet: a paused seat with no
   eligible backup exits 4 with the quota message, a seat with nothing healthy
@@ -1976,8 +1978,8 @@ spar plan -t "…" --effort planner=max --effort tester=low
 - **Surface:** repeatable `--effort <role>=<level>` on `plan`, `implement` and `run`,
   plus an `[effort]` block in `spar.toml` with the same six role keys `[roles]`
   takes. The reviewer panel shares one level. `spar plan --run <id>` refuses
-  `--effort`, and `implement --run <id>` needs `--reload-config` for it, exactly
-  like `--role`; values land in the run's frozen `config.json` (O27). `--effort`
+  `--effort`; `implement --run <id>` amends it into the run's frozen `config.json`
+  (O27), exactly like `--role`. `--effort`
   is refused on `arena`/`peer`/`roles` workflows (positional, not role-based),
   like `--backup`.
 - **Precedence:** `--effort` flag, then `[effort]`, then `SPAR_MUSE_REASONING_EFFORT`
@@ -2006,25 +2008,47 @@ spar plan -t "…" --effort planner=max --effort tester=low
 
 ## Fleet shaping (`--fleet`, `--without`, run JSON `fleet`)
 
-`--fleet small|standard` and `--without <critic,spec,suite>` shape one run's seats without
+`--fleet small|standard` and `--without <critic,spec,suite,reviewer[N]>` shape one run's seats without
 touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: preset, then
 `--without`, then `--role` — explicit flags always win over the preset.
 
 - **`--fleet standard`** is a no-op over the file: it never re-enables a channel the
-  project already disabled. Because it changes nothing, it is the one `--fleet`/`--without`/
-  `--role` value that does *not* need `--reload-config` on an existing `--run <id>`.
+  project already disabled. Because it changes nothing, spelling it out never alters
+  a frozen config.
 - **`--fleet small`** is one reviewer (the first pin if the panel is pinned, else the same
   provider the unpinned panel's first seat would get), no `plan_critic`, no `test_author`,
   and no agent `tester` — a configured deterministic `[suite].command` still runs, since it
   is free and never spawns a tester slot anyway.
-- **`--without critic,spec,suite`** drops seats individually: `critic` -> no `plan_critic`
+- **`--without critic,spec,suite,reviewer[N]`** drops seats individually: `critic` -> no `plan_critic`
   slot (and the spec bus protocol coordinates with the planner alone, addressing nothing to
   a critic that does not exist); `spec` -> `[spec] enabled = false` for this run (no
   `test_author`, no `test-contract.md`); `suite` -> `[suite] enabled = false` for this run
-  (no `tester` slot). Unknown names are refused, naming the three valid ones. On an
-  existing `--run <id>` it needs `--reload-config`, exactly like `--role`.
-- Both flags are applied where `--role` is (`main.rs`), so they land in the run's frozen
-  `config.json` and survive a later round with no `--reload-config` (O27).
+  (no `tester` slot); `reviewer[N]` -> the panel's Nth live seat (0-based) is removed,
+  with its per-ordinal backup, or an existing seat id (`review-1-cli-claude`) names
+  the seat directly. A widened `-wide` extra sits outside the panel: it holds no
+  ordinal, and its seat id cannot name it for a drop. The ordinal resolves against
+  the live panel when `--without` is parsed: an explicit `--providers`/`--select`
+  pool beats a `[roles].reviewer` file pin. Dropping a reviewer removes it from the panel, the run's state slots, and
+  the review history, so its verdicts stop gating the ship. Seats keep their ids for
+  the life of the run: nothing renumbers, and a dropped id retires and is never
+  reminted, so a later ordinal always indexes the seats that are actually there.
+  Unknown names are refused, naming
+  the valid ones. Dropping every reviewer is refused, since the run would reach
+  the ship gate unreviewed, unless `--role reviewer=` re-seats the panel to its
+  pin in the same amend; a run left with zero live panel seats fails before
+  dispatch (exit 1) instead of shipping unreviewed. On an existing `--run <id>`
+  a reviewer pin does more than amend the frozen config: the live seats are
+  moved, minted or retired to match it, so the live panel and the frozen panel
+  stay one fact.
+- All of these flags amend under the dispatch's run lock once every launch precondition
+  passes, so a refused launch (`not resumable`, round ceiling, busy run) changes nothing,
+  and the overrides a run
+  was launched or amended with (`--role`, `--backup`, `--effort`, without-channel drops,
+  the `--fleet small` reviewer-width override, and any pinned suite command) are recorded in the frozen
+  `config.json`, so a later `--reload-config` re-reads `spar.toml` and then re-applies
+  them in composition order, so nothing given before is lost unless restated differently
+  (O183). A run's later round with no flags at all still picks the snapshot up unchanged
+  (O27).
 
 **`--suite-command "<cmd>"`** (repeatable, on `plan` and `implement`) sets this run's
 deterministic suite, replacing `[suite].command` and turning the suite channel on even under
@@ -2073,9 +2097,9 @@ So an agent editing `spar.toml` for its own run cannot change another run's flee
 spar implement --run <id> --reload-config   # deliberately re-read spar.toml and re-freeze
 ```
 
-`--reload-config` is the only way to change an existing run's config; it replaces the snapshot, so later resumes keep the reloaded values. `--role` on a `--run <id>` resume without it exits `1` rather than silently re-fleeting the run. Runs created before snapshots existed fall back to the live file.
+`--reload-config` re-reads `spar.toml` into an existing run's snapshot and then re-applies the overrides the run was launched or amended with, so later resumes keep both the file edits and the earlier flags. `--role`, `--backup`, `--effort`, `--without` and `--fleet` amend a `--run <id>` resume's frozen config directly, without `--reload-config`; only `--suite-command` still needs it. Amending and reloading are both refused while the run's orchestrator is alive. Runs created before snapshots existed fall back to the live file.
 
-`--reload-config` re-points an existing seat's **model**, never its provider (O80): a seat id encodes its provider. To change **who** fills a seat that already exists, reassign it:
+An amend that changes the implementer pin re-points the live `impl` seat (provider, model, source) instead of only its model: that id names no provider. The amend is validated read-only in the preview, so a refused one persists nothing (O183). Any other amend leaves existing seats alone, except a `--role reviewer=` pin, which swaps, mints or retires live panel seats until the live panel matches the pin. To change **who** fills a seat that already exists outside a panel pin, reassign it:
 
 ```bash
 spar implement --run <id> --reassign implementer=cli:claude@sonnet
