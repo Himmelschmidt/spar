@@ -988,7 +988,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             // `spar bus send -m …` is filed as the slot, not the human.
             let from = from
                 .or_else(|| bus::slot_caller().0)
-                .unwrap_or_else(|| "human".to_string());
+                .unwrap_or_else(|| bus::HUMAN.to_string());
             let run_state = match run.as_deref() {
                 Some(r) if needs_run || to == "impl" => Some(state::RunState::load(&paths, r)?),
                 _ => None,
@@ -1205,7 +1205,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
             // `spar bus ack <id>` records the slot, not the human.
             let (env_agent, env_run) = bus::slot_caller();
             let run = run.or(env_run);
-            let from = from.or(env_agent).unwrap_or_else(|| "human".to_string());
+            let from = from.or(env_agent).unwrap_or_else(|| bus::HUMAN.to_string());
             let msg = bus::ack(&paths, run.as_deref(), &from, &msg_id)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&msg)?);
@@ -1217,7 +1217,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
         BusCmd::Reserve { path, holder, run } => {
             let holder = holder
                 .or_else(|| bus::slot_caller().0)
-                .unwrap_or_else(|| "human".to_string());
+                .unwrap_or_else(|| bus::HUMAN.to_string());
             bus::reserve(&paths, run.as_deref(), &path, &holder)?;
             println!("reserved {path} by {holder}");
             Ok(ExitCode::Success)
@@ -1225,7 +1225,7 @@ fn bus_cmd(action: BusCmd) -> Result<ExitCode> {
         BusCmd::Release { path, holder, run } => {
             let holder = holder
                 .or_else(|| bus::slot_caller().0)
-                .unwrap_or_else(|| "human".to_string());
+                .unwrap_or_else(|| bus::HUMAN.to_string());
             bus::release(&paths, run.as_deref(), &path, &holder)?;
             println!("released {path}");
             Ok(ExitCode::Success)
