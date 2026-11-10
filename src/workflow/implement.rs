@@ -706,14 +706,15 @@ fn implementer_pin_changed(
 /// config (an amend was applied, or `--reload-config` reloaded the file).
 ///
 /// A reviewer config entry pairs with the live seat at its own panel position,
-/// not only with the id the formula stamps on it: a drop shifts later entries
+/// never with the id the formula stamps on it: a drop shifts later entries
 /// down while slot ids stay stable (O174), so the entry now at config position
 /// `r` governs the survivor at live panel position `r`. The provider must agree
-/// for the positional pairing to hold: a panel the operator replaced re-seats
-/// rather than re-points, so a replaced entry still falls through to the id
-/// lookup and is left alone when no live seat carries that id. A seat the new
-/// config no longer produces is left alone rather than guessed at: dropping it
-/// is `--without`'s job, and this must not become a second path that reaps slots.
+/// for the pairing to hold; on a mismatch the entry is skipped, since a
+/// replaced panel re-seats rather than re-points. Skipping also keeps one slot
+/// from being claimed by two entries: the stamped id of a shifted entry can
+/// name a survivor another entry already governs. A seat the new config no
+/// longer produces is left alone rather than guessed at: dropping it is
+/// `--without`'s job, and this must not become a second path that reaps slots.
 ///
 /// The implementer moves only when the amend changed its pin
 /// (`repoint_implementer`): any other amend leaves the seat alone, so a
@@ -738,29 +739,26 @@ fn repoint_existing_seats(
         &|_| None,
     );
     for seat in seats {
-        // The id formula stamps the config position on the seat
-        // (`review-{r}-{provider}`), so after a drop the stamped id can name a
-        // live survivor the entry no longer governs: the entry at config
-        // position `r` pairs with the seat at live panel position `r`. The
-        // provider must agree for the positional pairing to hold, since a
-        // replaced panel re-seats rather than re-points. When the position
-        // disagrees, the id is still the match: slot order and id-ordinal order
-        // can skew (a reassign moves seats), and the id encodes the provider,
-        // so an id hit with an agreeing provider is the same seat.
-        let position_id = if seat.role == SlotRole::Reviewer {
-            reviewer_ordinal(&seat.seat).and_then(|r| {
-                state
-                    .slots
-                    .iter()
-                    .filter(|s| s.role == SlotRole::Reviewer && !s.id.ends_with("-wide"))
-                    .nth(r)
-                    .filter(|s| s.provider == seat.provider)
-                    .map(|s| s.id.clone())
-            })
+        // Reviewer entries pair positionally; see above. The stamped id is not
+        // a fallback: after a drop it can name a survivor another entry governs.
+        let want = if seat.role == SlotRole::Reviewer {
+            let Some(r) = reviewer_ordinal(&seat.seat) else {
+                continue;
+            };
+            let Some(id) = panel_seat_with_ordinal(state, r) else {
+                continue;
+            };
+            let agrees = state
+                .slots
+                .iter()
+                .any(|s| s.id == id && s.provider == seat.provider);
+            if !agrees {
+                continue;
+            }
+            id
         } else {
-            None
+            seat.seat.clone()
         };
-        let want = position_id.as_deref().unwrap_or(&seat.seat);
         let Some(slot) = state.slots.iter_mut().find(|s| s.id == want) else {
             continue;
         };
@@ -2033,6 +2031,90 @@ mod suite_reap_tests {
             model_of("review-2-cli-codex").as_deref(),
             Some("gpt-5.6-terra"),
             "the second survivor keeps the entry at its live panel position"
+        );
+    }
+
+    /// A drop plus a backup failover must not hand a survivor its neighbour's
+    /// entry: with `[codex@gpt-b, codex@gpt-c]` left by the drop, the entry at
+    /// config position 1 governs the seat at live panel position 1, which now
+    /// serves its backup. Falling back to the stamped id `review-1-cli-codex`
+    /// instead re-points the `gpt-b` survivor sitting at position 0, and the
+    /// later entry wins: the survivor silently becomes `gpt-c` on a no-op
+    /// amend. Failed before the fallback was removed.
+    #[test]
+    fn a_drop_then_backup_never_repoints_a_survivor_from_its_neighbours_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let mut st = run_with_impl("cli:muse", "muse-spark-1.3", SlotStatus::Failed);
+        for (id, provider, model) in [
+            ("review-0-cli-codex", "cli:codex", "gpt-a"),
+            ("review-1-cli-codex", "cli:codex", "gpt-b"),
+            ("review-2-cli-codex", "cli:codex", "gpt-c"),
+        ] {
+            let mut slot =
+                executor::init_slot_model(id, provider, SlotRole::Reviewer, Some(model.into()));
+            slot.status = SlotStatus::Failed;
+            st.slots.push(slot);
+        }
+        st.providers = vec!["cli:muse".into(), "cli:codex".into()];
+
+        let mut cfg = cfg_with_implementer("cli:muse@muse-spark-1.3");
+        cfg.roles.reviewer = vec![
+            "cli:codex@gpt-a".into(),
+            "cli:codex@gpt-b".into(),
+            "cli:codex@gpt-c".into(),
+        ];
+        cfg.cli_role_keys.insert(SlotRole::Reviewer);
+        let dropped = cfg
+            .apply_without(
+                &st.providers.clone(),
+                PoolOrigin::Synth,
+                true,
+                &["reviewer[0]".to_string()],
+            )
+            .unwrap();
+        drop_reviewer_seats(&mut st, &paths, &dropped).unwrap();
+        let pin = crate::provider_ref::Pin::parse("cli:claude@opus").unwrap();
+        let moved = move_seat(
+            &mut st,
+            &paths,
+            "review-2-cli-codex",
+            &pin,
+            SeatSource::Backup,
+        )
+        .unwrap();
+        assert_eq!(moved, "review-2-cli-claude");
+
+        prepare_implement_slots(
+            &mut st,
+            None,
+            PoolOrigin::Synth,
+            true,
+            &cfg,
+            &paths,
+            Reentry {
+                from_round_gate: false,
+                repoint: true,
+                repoint_implementer: false,
+            },
+        )
+        .unwrap();
+
+        let slot_of = |id: &str| {
+            st.slots
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("{id} still seated"))
+        };
+        assert_eq!(
+            slot_of("review-1-cli-codex").model.as_deref(),
+            Some("gpt-b"),
+            "the first survivor keeps its own entry, not its neighbour's"
+        );
+        assert_eq!(
+            slot_of("review-2-cli-claude").model.as_deref(),
+            Some("opus"),
+            "the backup-serving seat keeps the backup model"
         );
     }
 
