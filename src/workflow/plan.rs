@@ -348,8 +348,12 @@ pub fn execute_plan(
             let health = providers::LiveHealth::for_dry(state.dry_run);
             let mut handled_via_backup = false;
             if let Some(slot_state) = slot_state {
-                let cause =
-                    crate::backup::dispatch_stop_cause(&slot_state, &store, state.recorded_route());
+                let cause = crate::backup::dispatch_stop_cause(
+                    &slot_state,
+                    &store,
+                    state.recorded_route(),
+                    providers::is_provider_present(&slot_state.provider, false),
+                );
                 if cause.engages_backup() && !slot_state.source.is_some_and(SeatSource::is_backup) {
                     if let Some(raw) = crate::backup::backup_for_role(job.role, 0, cfg) {
                         if let Some(source) = crate::backup::takeover(
@@ -704,8 +708,12 @@ fn run_test_author(
         let health = providers::LiveHealth::for_dry(state.dry_run);
         let mut handled = false;
         if let Some(slot_state) = slot_state {
-            let cause =
-                crate::backup::dispatch_stop_cause(&slot_state, &store, state.recorded_route());
+            let cause = crate::backup::dispatch_stop_cause(
+                &slot_state,
+                &store,
+                state.recorded_route(),
+                providers::is_provider_present(&slot_state.provider, false),
+            );
             if cause.engages_backup()
                 && !slot_state
                     .source

@@ -2337,6 +2337,7 @@ pub fn execute_loop(
                         &slot_state,
                         &store,
                         state.recorded_route(),
+                        providers::is_provider_present(&slot_state.provider, false),
                     );
                     if cause.engages_backup()
                         && !slot_state.source.is_some_and(SeatSource::is_backup)
@@ -2412,8 +2413,12 @@ pub fn execute_loop(
                     .find(|s| s.id == impl_job.slot_id)
                     .cloned()
                     .unwrap();
-                let cause =
-                    crate::backup::dispatch_stop_cause(&slot_state, &store, state.recorded_route());
+                let cause = crate::backup::dispatch_stop_cause(
+                    &slot_state,
+                    &store,
+                    state.recorded_route(),
+                    providers::is_provider_present(&slot_state.provider, false),
+                );
                 if cause.engages_backup() && !slot_state.source.is_some_and(SeatSource::is_backup) {
                     if let Some(backup_raw) =
                         crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
@@ -3818,7 +3823,12 @@ fn try_rotate_implementer(
     {
         let store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
         let has_backup = cfg.backups.implementer.is_some();
-        let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, state.recorded_route());
+        let cause = crate::backup::dispatch_stop_cause(
+            &slot_state,
+            &store,
+            state.recorded_route(),
+            providers::is_provider_present(&slot_state.provider, false),
+        );
         if has_backup {
             if cause.engages_backup() {
                 if let Some(backup_raw) =

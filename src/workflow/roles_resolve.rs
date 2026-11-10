@@ -198,13 +198,19 @@ pub fn resolve_order_rung(
             .iter()
             .filter(|p| health.check(p).usable)
             .collect();
-        return usable
-            .get(order_idx)
-            .copied()
-            .filter(|p| !seated(used, p))
-            .or_else(|| usable.iter().copied().find(|p| !seated(used, p)))
-            .cloned()
-            .map(|p| (p, SeatSource::ProvidersOrder));
+        // Past the usable entries the seat is `None`: falling back to the
+        // first unheld entry here would wrap the ordinal around the order.
+        // The fallback runs only when the indexed entry exists but is held.
+        return match usable.get(order_idx).copied() {
+            None => None,
+            Some(p) if !seated(used, p) => Some((p.clone(), SeatSource::ProvidersOrder)),
+            Some(_) => usable
+                .iter()
+                .copied()
+                .find(|p| !seated(used, p))
+                .cloned()
+                .map(|p| (p, SeatSource::ProvidersOrder)),
+        };
     }
     let usable_from_here = cfg
         .providers

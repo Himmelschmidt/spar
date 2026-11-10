@@ -250,7 +250,12 @@ pub fn execute(state: &mut RunState, paths: &SparPaths, cfg: &Config) -> Result<
         if slot_state.status != SlotStatus::Failed {
             continue;
         }
-        let cause = crate::backup::dispatch_stop_cause(&slot_state, &store, state.recorded_route());
+        let cause = crate::backup::dispatch_stop_cause(
+            &slot_state,
+            &store,
+            state.recorded_route(),
+            providers::is_provider_present(&slot_state.provider, false),
+        );
         if !cause.engages_backup()
             || slot_state
                 .source
