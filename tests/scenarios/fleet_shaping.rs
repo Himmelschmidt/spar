@@ -2516,3 +2516,91 @@ fn validate_only_shows_the_fleet_after_the_drop() {
         "the dropped seat is gone and the survivor renumbered down: {seats:?}"
     );
 }
+
+/// Every file under a run dir, so a refused re-entry can prove it wrote nothing.
+fn snapshot_run_dir(dir: &std::path::Path, run_id: &str) -> Vec<(String, Vec<u8>)> {
+    fn walk(base: &std::path::Path, path: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(path)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            if p.is_dir() {
+                walk(base, &p, out);
+            } else if p.file_name().unwrap() != "orchestrator.lock" {
+                out.push((
+                    p.strip_prefix(base).unwrap().to_string_lossy().into_owned(),
+                    std::fs::read(&p).unwrap(),
+                ));
+            }
+        }
+    }
+    let base = dir.join(".spar/runs").join(run_id);
+    let mut out = Vec::new();
+    walk(&base, &base, &mut out);
+    out
+}
+
+/// #234 follow-up (item 1c): a refused amend after a valid reassign changes
+/// nothing. The reassign resolves, then the out-of-range `--without` refuses;
+/// the old code applied the reassign (renamed artifact, cleared marker, event)
+/// before the amend ran. The run dir is byte-identical afterwards.
+#[test]
+fn refused_amend_after_a_reassign_changes_nothing() {
+    let tmp = project("[suite]\nenabled = false\n");
+    let v = plan_json(
+        tmp.path(),
+        &["--providers", "cli:claude,cli:codex,cli:grok"],
+    );
+    let run_id = v["run_id"].as_str().unwrap().to_string();
+    spar_cmd()
+        .current_dir(tmp.path())
+        .args(["approve", &run_id, "--json"])
+        .assert()
+        .success();
+    run_json(
+        tmp.path(),
+        &["implement", "--run", &run_id, "--dry-run", "--json"],
+        2,
+    );
+    let state = read_state(tmp.path(), &run_id);
+    let ids = slot_ids_for(&state, "reviewer");
+    assert!(!ids.is_empty(), "the dispatch seated reviewers");
+    let seat = ids[0].clone();
+    let current = providers_for(&state, "reviewer")[0].clone();
+    let other = ["cli:claude", "cli:codex", "cli:grok"]
+        .into_iter()
+        .map(str::to_string)
+        .find(|p| *p != current && !ids.contains(&format!("review-0-{}", p.replace(':', "-"))))
+        .expect("a provider to move the seat to");
+    let before = snapshot_run_dir(tmp.path(), &run_id);
+    let out = run_json(
+        tmp.path(),
+        &[
+            "implement",
+            "--run",
+            &run_id,
+            "--reassign",
+            &format!("{seat}={other}"),
+            "--without",
+            "reviewer[9]",
+            "--dry-run",
+            "--json",
+        ],
+        1,
+    );
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reviewer[9]"),
+        "the refusal names the bad ordinal: {out}"
+    );
+    assert_eq!(
+        snapshot_run_dir(tmp.path(), &run_id),
+        before,
+        "a refused amend leaves state, config, events, artifacts and markers alone"
+    );
+}

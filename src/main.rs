@@ -438,13 +438,18 @@ fn run() -> Result<ExitCode> {
                     None => task,
                 };
                 // Seat shapers ride along into the dispatch: a bound run amends under
-                // its own lock, after the preconditions below pass (O154).
+                // its own lock, after the preconditions below pass (O154). The
+                // preset parses here, so a `--fleet` typo fails at the pre-check
+                // instead of after the dispatch acquired its lock.
                 let amend = workflow::implement::BoundAmendInputs {
                     role,
                     backup,
                     effort,
                     without,
-                    fleet,
+                    fleet: fleet
+                        .as_deref()
+                        .map(config::FleetPreset::parse)
+                        .transpose()?,
                     suite_command,
                     recapture_env,
                 };
@@ -459,7 +464,7 @@ fn run() -> Result<ExitCode> {
                     &urgency,
                     dry_run,
                     &amend.suite_command,
-                    amend.fleet.as_deref(),
+                    fleet.as_deref(),
                     reload_config,
                     amend.recapture_env,
                 )?;
@@ -492,7 +497,7 @@ fn run() -> Result<ExitCode> {
                             // The amend preview runs first and read-only: it validates the
                             // seat shapers exactly as the dispatch would, before any
                             // pre-check can swallow its refusal.
-                            let preview = if amend.is_noop(reload_config) {
+                            let preview = if !reload_config && amend.is_noop() {
                                 None
                             } else {
                                 let live = if reload_config {
@@ -505,7 +510,6 @@ fn run() -> Result<ExitCode> {
                                     live.as_ref(),
                                     &st,
                                     &amend,
-                                    reload_config,
                                 )?)
                             };
                             if !state::is_resumable(&st) {
@@ -523,7 +527,7 @@ fn run() -> Result<ExitCode> {
                                 && !reload_config
                                 && !accept_contract
                                 && opts.reassign.is_empty()
-                                && amend.is_noop(reload_config);
+                                && amend.is_noop();
                             if let Some(owner) =
                                 runlock::RunLock::owner(&paths, id).filter(|o| o.alive())
                             {

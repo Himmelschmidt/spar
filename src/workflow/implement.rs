@@ -25,24 +25,26 @@ pub struct BoundAmendInputs {
     pub backup: Vec<String>,
     pub effort: Vec<String>,
     pub without: Vec<String>,
-    pub fleet: Option<String>,
+    pub fleet: Option<crate::config::FleetPreset>,
     pub suite_command: Vec<String>,
     pub recapture_env: bool,
 }
 
 impl BoundAmendInputs {
-    pub fn is_noop(&self, reload_config: bool) -> bool {
-        !reload_config
-            && self.role.is_empty()
+    /// No seat shaper was passed. Whether the dispatch reloads the file config
+    /// is not part of this: callers pair it with the live config's presence
+    /// (`live.is_none() && amend.is_noop()`), so a reload alone still replays
+    /// the recorded pool.
+    pub fn is_noop(&self) -> bool {
+        self.role.is_empty()
             && self.backup.is_empty()
             && self.effort.is_empty()
             && self.without.is_empty()
             && self.suite_command.is_empty()
-            && self
-                .fleet
-                .as_deref()
-                .map(|f| f == "standard")
-                .unwrap_or(true)
+            && matches!(
+                self.fleet,
+                None | Some(crate::config::FleetPreset::Standard)
+            )
     }
 }
 
@@ -60,11 +62,11 @@ impl std::fmt::Display for AmendRefused {
 impl std::error::Error for AmendRefused {}
 
 /// The amended config plus the reviewer ordinals the amend dropped, computed
-/// read-only from the frozen config, the live file config (only when reloading),
-/// and the run state the surgery will apply to. Both the `--validate-only`
-/// preview and the under-lock dispatch path use it; the dispatch path calls it
-/// after acquiring the run lock so seat-id resolution and the panel pin see the
-/// state the surgery is about to change.
+/// read-only from the frozen config, the run state the surgery will apply to,
+/// and the live file config when that is present (its presence means reload).
+/// Both the `--validate-only` preview and the under-lock dispatch path use it;
+/// the dispatch path calls it after acquiring the run lock so seat-id
+/// resolution and the panel pin see the state the surgery is about to change.
 pub struct BoundAmend {
     pub cfg: Config,
     pub dropped: Vec<usize>,
@@ -75,39 +77,47 @@ pub fn preview_bound_amend(
     live: Option<&Config>,
     state: &RunState,
     inputs: &BoundAmendInputs,
-    reload_config: bool,
 ) -> Result<BoundAmend> {
-    let mut cfg = if reload_config {
-        let live =
-            live.ok_or_else(|| anyhow::anyhow!("--reload-config needs the live project config"))?;
+    let mut cfg = if let Some(live) = live {
         let mut cfg = live.clone();
         cfg.reapply_cli_overrides(frozen);
-        // The live config captured the current process at load; without
-        // `--recapture-env` the run keeps the values captured at creation.
+        // A reload re-reads the file, not the shell: names still captured keep
+        // the creation values, a name removed from `capture` is dropped, and
+        // only a name newly added to `capture` takes this process's value (O130).
+        // `--recapture-env` is the deliberate exception: everything is retaken.
         if !inputs.recapture_env {
-            cfg.env.captured = frozen.env.captured.clone();
+            for (k, v) in &frozen.env.captured {
+                if cfg.env.capture.contains(k) {
+                    cfg.env.captured.insert(k.clone(), v.clone());
+                }
+            }
         }
         cfg
     } else {
         frozen.clone()
     };
-    if let Some(name) = inputs.fleet.as_deref() {
-        let preset = crate::config::FleetPreset::parse(name)?;
+    if let Some(preset) = inputs.fleet {
         cfg.apply_fleet_preset(preset);
     }
     let without = resolve_without_seat_ids(state, &inputs.without)?;
     if without
         .iter()
         .any(|w| crate::config::parse_reviewer_without(w).is_ok())
-        && state.slots.iter().any(|s| s.role == SlotRole::Reviewer)
     {
-        cfg.roles.reviewer = state
+        // The pin is the run's own panel in ordinal order, never slot order and
+        // never a widened extra (their ids carry no ordinal): a reassign may
+        // have moved seats around, and widening appends `-wide` seats past it.
+        let mut panel: Vec<(usize, String)> = state
             .slots
             .iter()
             .filter(|s| s.role == SlotRole::Reviewer)
-            .map(|s| s.provider_ref().display())
+            .filter_map(|s| reviewer_ordinal(&s.id).map(|o| (o, s.provider_ref().display())))
             .collect();
-        cfg.cli_role_keys.insert(SlotRole::Reviewer);
+        panel.sort_by_key(|(o, _)| *o);
+        if !panel.is_empty() {
+            cfg.roles.reviewer = panel.into_iter().map(|(_, p)| p).collect();
+            cfg.cli_role_keys.insert(SlotRole::Reviewer);
+        }
     }
     let (pool, pool_origin, dry) = if !state.providers.is_empty() {
         (state.providers.clone(), state.pool_origin, state.dry_run)
@@ -190,16 +200,96 @@ mod preview_amend_tests {
             without: vec!["reviewer[0]".to_string()],
             ..BoundAmendInputs::default()
         };
-        let amend = preview_bound_amend(
-            &Config::default(),
-            None,
-            &dry_stateless_run(),
-            &inputs,
-            false,
-        )
-        .unwrap();
+        let amend =
+            preview_bound_amend(&Config::default(), None, &dry_stateless_run(), &inputs).unwrap();
         assert_eq!(amend.dropped, vec![0]);
         assert_eq!(amend.cfg.roles.reviewer, vec!["cli:grok".to_string()]);
+    }
+
+    /// #234 follow-up: the bound pin is the run's panel in ordinal order, never
+    /// slot order, and widened extras (ids with no ordinal) are not panel seats.
+    /// Slots stored codex-first still pin claude-first, and the `-wide` extra
+    /// is neither pinned nor counted.
+    #[test]
+    fn bound_pin_sorts_by_ordinal_and_ignores_wide_extras() {
+        let mut st = dry_stateless_run();
+        for (id, provider) in [
+            ("review-1-cli-codex", "cli:codex"),
+            ("review-0-cli-claude", "cli:claude"),
+            ("review-cli-grok-wide", "cli:grok"),
+        ] {
+            st.slots
+                .push(executor::init_slot(id, provider, SlotRole::Reviewer));
+        }
+        let inputs = BoundAmendInputs {
+            without: vec!["reviewer[1]".to_string()],
+            ..BoundAmendInputs::default()
+        };
+        let amend = preview_bound_amend(&Config::default(), None, &st, &inputs).unwrap();
+        assert_eq!(amend.dropped, vec![1]);
+        assert_eq!(amend.cfg.roles.reviewer, vec!["cli:claude".to_string()]);
+    }
+
+    /// O130: a reload re-reads the file, not the shell. Names still captured keep
+    /// the creation values, a name removed from `capture` is dropped, and only a
+    /// name newly added to `capture` takes this process's value; `--recapture-env`
+    /// retakes everything.
+    #[test]
+    fn reload_merges_env_per_name() {
+        fn env(capture: &[&str], captured: &[(&str, &str)]) -> crate::config::EnvConfig {
+            crate::config::EnvConfig {
+                capture: capture.iter().map(|s| s.to_string()).collect(),
+                captured: captured
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }
+        }
+        let frozen = Config {
+            env: env(
+                &["KEEP", "GONE"],
+                &[("KEEP", "frozen"), ("GONE", "frozen-gone")],
+            ),
+            ..Config::default()
+        };
+        let live = Config {
+            env: env(&["KEEP", "NEW"], &[("KEEP", "shell"), ("NEW", "shell-new")]),
+            ..Config::default()
+        };
+        let kept = preview_bound_amend(
+            &frozen,
+            Some(&live),
+            &dry_stateless_run(),
+            &BoundAmendInputs::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            kept.cfg.env.captured.get("KEEP").map(String::as_str),
+            Some("frozen")
+        );
+        assert_eq!(
+            kept.cfg.env.captured.get("NEW").map(String::as_str),
+            Some("shell-new")
+        );
+        assert!(!kept.cfg.env.captured.contains_key("GONE"));
+        let retaken = preview_bound_amend(
+            &frozen,
+            Some(&live),
+            &dry_stateless_run(),
+            &BoundAmendInputs {
+                recapture_env: true,
+                ..BoundAmendInputs::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            retaken.cfg.env.captured.get("KEEP").map(String::as_str),
+            Some("shell")
+        );
+        assert_eq!(
+            retaken.cfg.env.captured.get("NEW").map(String::as_str),
+            Some("shell-new")
+        );
     }
 }
 
@@ -788,7 +878,7 @@ fn run_from_approved(
             && !opts.reload_config
             && !opts.accept_contract
             && opts.reassign.is_empty()
-            && amend.is_noop(opts.reload_config);
+            && amend.is_noop();
         let live = crate::runlock::RunLock::owner(paths, run_id).filter(|o| o.alive());
         if let (true, Some(owner)) = (extension_only, live) {
             if let Some(code) =
@@ -807,6 +897,15 @@ fn run_from_approved(
                 Err(code) => return Ok(code),
             }
         }
+    };
+    // The live file config loads before the run's captured env is re-applied:
+    // `Config::load` fills `captured` from this process, and the re-apply below
+    // overwrites the process env with the creation values (O130), so loading
+    // after it would freeze the creation values as this shell's (O157 round 2).
+    let live = if opts.reload_config {
+        Some(Config::load(&paths.project_root)?)
+    } else {
+        None
     };
     // Every way back into a run (`--run`, `resume`, a `--plan` the run wrote) dispatches
     // under the environment the run was created in (O130), from its own snapshot.
@@ -832,6 +931,19 @@ fn run_from_approved(
     }
     let moves = resolve_reassignments(&state, &reassignments)
         .map_err(|e| ReassignRefused(format!("{e:#}")))?;
+    // The amend previews here, read-only, before any side effect below (the
+    // stopped-marker removal, the terminal-slot clearing, the base worktrees,
+    // the reassigns): a refused amend — a bad seat id, a malformed override, the
+    // last-seat drop — changes nothing on disk or in the saved state. It is
+    // applied after the preconditions, further down.
+    let preview = if live.is_none() && amend.is_noop() {
+        None
+    } else {
+        Some(
+            preview_bound_amend(cfg, live.as_ref(), &state, &amend)
+                .map_err(|e| AmendRefused(format!("{e:#}")))?,
+        )
+    };
     // Resuming a stopped run: drop the marker so execute_loop dispatches instead
     // of halting again at its first boundary.
     if state.phase == Phase::Stopped {
@@ -906,23 +1018,15 @@ fn run_from_approved(
             );
         }
     }
-    // Bound amend, under this same lock and after every launch precondition passed
-    // (resumable, round extension, reassign resolution, base): the frozen config is
-    // amended, reviewer seats are dropped with their slots, and the snapshot is
-    // re-frozen — so a refused launch changes nothing (O154). The amended config
-    // shadows the frozen one for the rest of this dispatch.
+    // Bound amend, applied under this same lock and after every launch
+    // precondition passed (resumable, round extension, reassign resolution,
+    // base): the frozen config is amended, reviewer seats are dropped with
+    // their slots, and the snapshot is re-frozen — so a refused launch changes
+    // nothing (O154). The amended config shadows the frozen one for the rest
+    // of this dispatch. The `preview` above already passed every check, so a
+    // refusal here means the surgery itself failed mid-apply.
     let amended;
-    let cfg: &Config = if amend.is_noop(opts.reload_config) {
-        cfg
-    } else {
-        let live = if opts.reload_config {
-            Some(Config::load(&paths.project_root)?)
-        } else {
-            None
-        };
-        let mut preview =
-            preview_bound_amend(cfg, live.as_ref(), &state, &amend, opts.reload_config)
-                .map_err(|e| AmendRefused(format!("{e:#}")))?;
+    let cfg: &Config = if let Some(mut preview) = preview {
         if !preview.dropped.is_empty() {
             let removed = drop_reviewer_seats(&mut state, paths, &preview.dropped)
                 .map_err(|e| AmendRefused(format!("{e:#}")))?;
@@ -955,6 +1059,8 @@ fn run_from_approved(
         state.autonomy = amended.cfg.autonomy;
         state.message_budget = amended.cfg.message_budget;
         &amended.cfg
+    } else {
+        cfg
     };
     if state.dry_run {
         std::env::set_var("SPAR_DRY_RUN", "1");
