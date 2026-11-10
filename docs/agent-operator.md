@@ -157,14 +157,17 @@ adopt a `test-contract.md` that drifted mid-round exits `1` until you pass
 
 **One-pass runs (O196).** `spar implement -t ... --one-pass` (or `run --workflow
 loop --one-pass`) implies `--fleet small` and caps a fresh run at one round: at
-the end of it a passed gate ships, and a failed gate ships anyway when no open
-finding reaches `[review] block_on`, reusing the `ship --override-gate`
-machinery with an automatic reason so the findings ride along as follow-ups in
-the PR body. A finding at or above `block_on` parks at the round-ceiling gate
-(exit 2) exactly as without the flag. On an existing run,
-`implement --run <id> --one-pass` allows one more round and then applies the
-same verdict. The mode is frozen into the run's `config.json`; an explicit
-`--fleet` or `--max-rounds` still wins over the implied preset and ceiling.
+the end of it a passed gate ships, and so does a gate failed on reviewer
+findings alone, reusing the `ship --override-gate` machinery with an automatic
+reason so the findings ride along as follow-ups in the PR body. Findings-alone
+means every seat's latest review is non-blocking under the gate's own predicates
+with acceptance and the suite clear; a blocking finding, a failed or missing
+acceptance line, a failing suite, or a missing/synthetic/verdict-less review
+parks at the round-ceiling gate (exit 2) exactly as without the flag. On an
+existing run, `implement --run <id> --one-pass` allows one more round and then
+applies the same verdict. The mode is frozen into the run's `config.json`; an
+explicit `--fleet` or `--max-rounds` still wins over the implied preset and
+ceiling.
 
 `--providers` is **required** for plan / implement / run (no implicit fleet).
 

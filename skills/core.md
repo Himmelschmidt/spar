@@ -2098,11 +2098,17 @@ touching `spar.toml`, on `plan`, `implement` and `run`. Composition order: prese
 it implies `--fleet small` (an explicit `--fleet` still wins), caps a fresh run at one
 round (on a bound `--run <id>` it allows one more round instead), and ships at the end
 of it through the real ship path (push plus draft PR, including the base forward
-merge). A passed gate ships; a failed gate ships anyway when no open finding reaches
-`[review] block_on`, with the findings recorded as follow-ups under "Shipped over
-open findings" in the PR body. A finding at or above `block_on` parks at the
-existing gate (exit 2), as without the flag. Frozen into the run's `config.json`;
-nothing changes for runs launched without it (O196).
+merge). A passed gate ships; so does a gate failed on reviewer findings alone,
+reusing the `ship --override-gate` machinery with an automatic reason so the
+findings ride along under "Shipped over open findings" in the PR body.
+Findings-alone means every seat's latest review is non-blocking under the gate's
+own predicates and acceptance and the suite are clear; anything else (a finding
+at or above `[review] block_on`, a failed or missing acceptance line, a failing
+suite, a missing/synthetic/verdict-less review, a failed reviewer slot) parks at
+the existing gate (exit 2), as without the flag. A sub-threshold
+`request_changes` already counts as approve-with-notes, so it ships clean with no
+override. Frozen into the run's `config.json`; nothing changes for runs launched
+without it (O196).
 
 **`--suite-command "<cmd>"`** (repeatable, on `plan` and `implement`) sets this run's
 deterministic suite, replacing `[suite].command` and turning the suite channel on even under
