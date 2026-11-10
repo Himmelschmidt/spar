@@ -95,8 +95,6 @@ pub fn run_slots_parallel(
                     s.quota_hit = false;
                     s.auth_fault = false;
                     s.timeout_cause = None;
-                    s.dispatch_head = None;
-                    s.dispatch_tree = None;
                     s.classifier = None;
                 }
                 let _ =
@@ -380,7 +378,6 @@ fn prepare_slot_execution(
     reset_slot_log(&log_path);
     let round = state.round;
     state.dispatched_round = round;
-    let run_id = state.id.clone();
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.status = SlotStatus::Running;
         // A dispatch's outcome fields describe *that* dispatch. Carried into the next
@@ -409,7 +406,6 @@ fn prepare_slot_execution(
                 .then(|| worktree_snapshot(&cwd))
                 .flatten();
         }
-        clear_expected_artifact(paths, &run_id, &job);
         s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
@@ -1207,6 +1203,8 @@ fn execute_prepared(
             timeout,
             dry_run: false,
             model_override: model.clone(),
+            role: prep.job.role,
+            credentials: Default::default(),
         })?;
         let (ok, err, usage, timeout_cause) = (
             outcome.ok,
@@ -1353,6 +1351,10 @@ fn execute_prepared(
     }
     let (program, args) = providers::command_to_parts(&cmd);
     let (program, args) = sandbox::maybe_wrap(isolation, &prep.cwd, &program, &args);
+    // The previous round's expected artifact dies only now that the dispatch is
+    // really going: every fallible pre-spawn step (adapter, binary) is above,
+    // so a failure there can no longer orphan the carried file.
+    clear_expected_artifact(&prep.paths, &prep.run_id, &prep.job);
     let cmdline = format!("{} {}", program.display(), args.join(" "));
     // Adapter-derived env (e.g. muse's self-timeout alignment) rides the request:
     // `command_to_parts` drops anything set via `cmd.env`, so merging here is the
@@ -1769,11 +1771,11 @@ struct ArtifactRecovery<'a> {
 /// A failed slot in those roles is the correct outcome: the existing salvage path records
 /// why, and a human sees it. Only the implementer's deliverable is genuinely on disk with
 /// only the write-up missing.
-fn role_is_recoverable(role: SlotRole) -> bool {
+pub(crate) fn role_is_recoverable(role: SlotRole) -> bool {
     matches!(role, SlotRole::Implementer)
 }
 
-/// Whether a ceiling-killed slot finished its work anyway (O114). The hard ceiling is a
+/// Whether a ceiling-killed slot finished its work anyway. The hard ceiling is a
 /// wall clock, not a verdict: a slot that committed and then hung on a final command, or
 /// wrote its artifact and never exited, has done the round. A fresh artifact keeps it as
 /// is; new commits since the dispatch began earn the same artifact-only recovery turn a
@@ -1826,13 +1828,12 @@ fn committed_since_dispatch(r: &ArtifactRecovery) -> bool {
     head_moved_since_dispatch(r.cwd, r.dispatch_head, r.banked_head)
 }
 
-/// The round's own banked WIP commit, if the ceiling already recorded one.
+/// The carried bank for `round`: the latest partial at or below it, so a
+/// same-round resume and a later round measure against the same bank.
 fn banked_partial_commit(state: &RunState, round: u32) -> Option<String> {
     state
-        .ceiling_partial_rounds
-        .iter()
-        .find(|e| e.round == round)
-        .and_then(|e| e.commit.clone())
+        .ceiling_bank_at_or_below(round)
+        .and_then(|(_, _, commit)| commit)
 }
 
 /// Raw snapshot input: the tracked diff plus a separator plus every untracked
@@ -1896,7 +1897,7 @@ fn snapshot_combo(cwd: &Path) -> Option<Vec<u8>> {
                 input.push(b'\n');
             }
             let mut child = std::process::Command::new("git")
-                .args(["hash-object", "--stdin-paths"])
+                .args(["hash-object", "--stdin-paths", "--"])
                 .current_dir(cwd)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -1905,19 +1906,18 @@ fn snapshot_combo(cwd: &Path) -> Option<Vec<u8>> {
             // The write overlaps the stdout drain on its own thread: the main
             // thread's `wait_with_output` drains stdout while the writer
             // feeds stdin, so a large set never fills both pipes with both
-            // sides blocked.
+            // sides blocked. The writer joins before any early return: an
+            // output failure must not strand the feeding thread.
             let stdin = child.stdin.take()?;
             let writer = std::thread::spawn(move || {
                 let mut stdin = stdin;
                 stdin.write_all(&input).is_ok()
             });
-            let out = child
-                .wait_with_output()
-                .ok()
-                .filter(|o| o.status.success())?;
+            let out = child.wait_with_output().ok();
             if !writer.join().unwrap_or(false) {
                 return None;
             }
+            let out = out.filter(|o| o.status.success())?;
             let mut shas = out.stdout.split(|b| *b == b'\n');
             for rel in &lined {
                 match shas.next() {
@@ -1937,6 +1937,7 @@ fn snapshot_combo(cwd: &Path) -> Option<Vec<u8>> {
         for rel in odd {
             let sha = std::process::Command::new("git")
                 .arg("hash-object")
+                .arg("--")
                 .arg(std::ffi::OsStr::from_bytes(rel))
                 .current_dir(cwd)
                 .output()
@@ -2879,7 +2880,6 @@ pub fn run_slot(
     reset_slot_log(&log_path);
     let round = state.round;
     state.dispatched_round = round;
-    let run_id = state.id.clone();
     if let Some(s) = state.slot_mut(&job.slot_id) {
         s.status = SlotStatus::Running;
         // A dispatch's outcome fields describe *that* dispatch. Carried into the next
@@ -2908,7 +2908,6 @@ pub fn run_slot(
                 .then(|| worktree_snapshot(&cwd))
                 .flatten();
         }
-        clear_expected_artifact(paths, &run_id, job);
         s.classifier = None;
         s.reviewed_commit = None;
         s.review = None;
@@ -3000,6 +2999,7 @@ pub fn run_slot(
             &prompt_path,
             &prompt,
             timeout,
+            Default::default(),
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -3364,6 +3364,19 @@ fn resets_at_from_epoch_secs(secs: Option<i64>) -> Option<chrono::DateTime<chron
 /// The write key is caller-chosen ([`quota_write_key`]) from the same outcome this
 /// scrapes, never recomputed here: the witness, the classifier verdict and every
 /// pause write below must act on one key, so the choice lives in exactly one place.
+///
+/// `scope` decides how far the prose scrapes may reach. A hard-ceiling kill hands
+/// over the provider's own transcript, which is also full of the agent's own
+/// prose (`editing src/quota.rs, test capacity check passed`), so it runs typed
+/// signals and the strong scrape only: the broad needles would pause the provider
+/// project-wide off an agent narrating its work.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum QuotaScrapeScope {
+    Full,
+    CeilingKill,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn detect_and_pause_quota(
     paths: &SparPaths,
     pref: &ProviderRef,
@@ -3372,6 +3385,7 @@ fn detect_and_pause_quota(
     structured: Option<RateLimitWindow>,
     resets_at: Option<chrono::DateTime<chrono::Utc>>,
     quota_recovered: bool,
+    scope: QuotaScrapeScope,
 ) -> bool {
     if quota_recovered && structured.is_none() {
         return false;
@@ -3384,25 +3398,29 @@ fn detect_and_pause_quota(
     {
         return false;
     }
-    if let Some(hint) = crate::quota::QuotaStore::scrape_log_hint(log_text) {
-        let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-        store.pause_quota(key, hint);
-        let _ = store.save(paths);
-    }
-    if let Some((until, hint)) =
-        crate::quota::scrape_claude_rate_limits(&pref.storage_key(), log_text)
-    {
-        let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-        store.pause_quota_until(key, until, hint);
-        let _ = store.save(paths);
-    }
-    if let Some((until, hint)) =
-        crate::quota::scrape_agy_stated_reset(&pref.storage_key(), log_text)
-    {
-        let until = until.filter(|u| implausible_reset(*u).is_none());
-        let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
-        store.pause_quota_until(key, until, hint);
-        let _ = store.save(paths);
+    // Full-text needles never run on a ceiling kill (`QuotaScrapeScope::CeilingKill`):
+    // the killed dispatch's own transcript is full of agent prose that matches them.
+    if scope == QuotaScrapeScope::Full {
+        if let Some(hint) = crate::quota::QuotaStore::scrape_log_hint(log_text) {
+            let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+            store.pause_quota(key, hint);
+            let _ = store.save(paths);
+        }
+        if let Some((until, hint)) =
+            crate::quota::scrape_claude_rate_limits(&pref.storage_key(), log_text)
+        {
+            let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+            store.pause_quota_until(key, until, hint);
+            let _ = store.save(paths);
+        }
+        if let Some((until, hint)) =
+            crate::quota::scrape_agy_stated_reset(&pref.storage_key(), log_text)
+        {
+            let until = until.filter(|u| implausible_reset(*u).is_none());
+            let mut store = crate::quota::QuotaStore::load(paths).unwrap_or_default();
+            store.pause_quota_until(key, until, hint);
+            let _ = store.save(paths);
+        }
     }
     if let Some(window) = structured {
         // The adapter stated when the window reopens, so pause until exactly then rather
@@ -3487,9 +3505,11 @@ fn mark_pause_strong(paths: &SparPaths, key: &str) {
 /// The log tail a failed dispatch is judged on. A dispatch that ended by signal is
 /// judged on its typed verdicts only, never on log text, with one exception: a hard
 /// ceiling kill ran its full budget, so its log is the provider's own record and a
-/// quota signal in it parks like any other. Any other kill (a stop, a nudge, the
-/// machine) says nothing about the provider, and a log that happens to mention
-/// "quota" or "429" must not pause the provider for every run in the project (#174).
+/// typed or strong quota signal in it still parks and pauses. The broad bare-word
+/// scrapes never run on that tail — the transcript is also the agent's own prose,
+/// and a line like `editing src/quota.rs, test capacity check passed` must not pause
+/// the provider for every run in the project. Any other kill (a stop, a nudge, the
+/// machine) says nothing about the provider and reads as empty.
 fn outcome_log_text(log_path: &Path, outcome: &SlotOutcome) -> String {
     if process::ended_by_signal(outcome.signal, outcome.exit_code)
         && outcome.timeout_cause != Some(TimeoutCause::HardCeiling)
@@ -3532,6 +3552,13 @@ fn quota_hit_for_outcome(
     log_text: &str,
     outcome: &SlotOutcome,
 ) -> bool {
+    // The scope rides the typed cause, never a comment: a ceiling kill's own
+    // transcript must not pause the provider off bare words.
+    let scope = if outcome.timeout_cause == Some(TimeoutCause::HardCeiling) {
+        QuotaScrapeScope::CeilingKill
+    } else {
+        QuotaScrapeScope::Full
+    };
     detect_and_pause_quota(
         paths,
         pref,
@@ -3540,6 +3567,7 @@ fn quota_hit_for_outcome(
         outcome.quota_rejected,
         outcome.quota_resets_at,
         outcome.quota_recovered,
+        scope,
     ) || outcome.agy_quota_hit
 }
 
@@ -3563,7 +3591,16 @@ fn detect_and_pause_quota_with_err(
 ) -> bool {
     let text = format!("{log_text}\n{extra}");
     let key = quota_write_key(pref, None, &text, route);
-    detect_and_pause_quota(paths, pref, &key, &text, None, None, false)
+    detect_and_pause_quota(
+        paths,
+        pref,
+        &key,
+        &text,
+        None,
+        None,
+        false,
+        QuotaScrapeScope::Full,
+    )
 }
 
 /// `state.slots` lookup used by every caller that maps a `run_slot` failure onto
@@ -4357,6 +4394,7 @@ fn run_api(
     prompt_path: &Path,
     prompt: &str,
     timeout: Duration,
+    credentials: api::runtime::ApiCredentialOverride,
 ) -> Result<SlotOutcome> {
     let expected = job
         .expected_artifact
@@ -4375,6 +4413,8 @@ fn run_api(
         timeout,
         dry_run: false,
         model_override: model.clone(),
+        role: job.role,
+        credentials,
     })?;
     let (ok, err, usage, timeout_cause) = (
         outcome.ok,
@@ -4551,6 +4591,9 @@ fn run_headless(
     }
     let (program, args) = providers::command_to_parts(&cmd);
     let (program, args) = sandbox::maybe_wrap(state.isolation, cwd, &program, &args);
+    // See `execute_prepared`: the previous round's expected artifact dies only
+    // once the dispatch is really going, never on a pre-spawn failure.
+    clear_expected_artifact(paths, &state.id, job);
     let cmdline = format!("{} {}", program.display(), args.join(" "));
     // See `execute_prepared`: adapter-derived env rides the request, not the `Command`.
     let mut dispatch_env = env.to_vec();
@@ -5049,6 +5092,9 @@ fn run_tmux(
     let bin = adapter
         .resolve_binary()
         .ok_or_else(|| anyhow::anyhow!("provider {} not on PATH", job.provider))?;
+    // See `execute_prepared`: the previous round's expected artifact dies only
+    // once the dispatch is really going, never on a pre-spawn failure.
+    clear_expected_artifact(paths, &state.id, job);
     let mut opts = SpawnOpts {
         prompt: prompt.to_string(),
         prompt_file: Some(prompt_path.to_path_buf()),
@@ -6975,7 +7021,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(markers::read_session_id(&paths, "run1", "slotZ", "shell").is_none());
     }
 
-    /// The real claude wording from the 2026-10-24 incident (#174).
+    /// The real claude wording of a revoked OAuth token.
     const CLAUDE_REVOKED: &str = r#"API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked. Please obtain a new token or refresh your existing token."}}"#;
 
     fn dispatch_shell(
@@ -7079,7 +7125,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &log,
             None,
             None,
-            false
+            false,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(
@@ -7102,7 +7149,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             "test result: ok. 429 passed; 0 failed\nerror: lint failed\n",
             None,
             None,
-            false
+            false,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(
@@ -7118,7 +7166,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             "You've hit your usage limit. Try again later.\n",
             None,
             None,
-            false
+            false,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(store.blocks_live_dispatch("cli:codex"));
@@ -7808,7 +7857,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             WEEKLY_LIMIT_LOG,
             None,
             None,
-            false
+            false,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(!store.is_usable("cli:claude"));
@@ -7834,7 +7884,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             FIVE_HOUR_REJECTION_LOG,
             Some(RateLimitWindow::FiveHour),
             Some(until),
-            true
+            true,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         let q = store.get("cli:claude");
@@ -7859,7 +7910,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             log,
             Some(RateLimitWindow::SevenDayOpus),
             Some(until),
-            false
+            false,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(!store.is_usable("cli:claude@opus"));
@@ -7894,7 +7946,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             log,
             Some(RateLimitWindow::SevenDaySonnet),
             Some(until),
-            false
+            false,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(!store.is_usable("cli:claude"));
@@ -7929,7 +7982,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             log,
             Some(RateLimitWindow::SevenDayOpus),
             Some(until),
-            false
+            false,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(!store.is_usable("cli:claude"));
@@ -7960,7 +8014,14 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             "the weak parent holds the family through the combined view"
         );
         assert!(detect_and_pause_quota(
-            &paths, &seat, &key, log, None, None, false
+            &paths,
+            &seat,
+            &key,
+            log,
+            None,
+            None,
+            false,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         let own = store.record("cli:claude@fable");
@@ -7987,7 +8048,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
                 FIVE_HOUR_REJECTION_LOG,
                 Some(window),
                 Some(until),
-                false
+                false,
+                QuotaScrapeScope::Full
             ));
             let store = crate::quota::QuotaStore::load(&paths).unwrap();
             assert!(!store.is_usable("cli:claude"), "{window}");
@@ -8011,7 +8073,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             log,
             None,
             None,
-            false
+            false,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(!store.is_usable("cli:claude@fable"));
@@ -8060,7 +8123,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             FIVE_HOUR_REJECTION_LOG,
             Some(RateLimitWindow::FiveHour),
             Some(until),
-            true
+            true,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         let q = store.get("cli:claude");
@@ -8087,7 +8151,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             FIVE_HOUR_REJECTION_LOG,
             Some(RateLimitWindow::FiveHour),
             Some(until),
-            true
+            true,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         let q = store.get("cli:claude");
@@ -8122,7 +8187,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             "",
             Some(RateLimitWindow::FiveHour),
             Some(past),
-            true
+            true,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         let q = store.get("cli:claude");
@@ -8154,7 +8220,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             "",
             Some(RateLimitWindow::FiveHour),
             Some(absurd),
-            true
+            true,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         let q = store.get("cli:claude");
@@ -8185,7 +8252,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             "",
             Some(RateLimitWindow::Unknown),
             None,
-            true
+            true,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(
@@ -8233,7 +8301,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             WEEKLY_LIMIT_LOG,
             Some(RateLimitWindow::SevenDay),
             Some(past),
-            true
+            true,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         let q = store.get("cli:claude");
@@ -8260,7 +8329,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             log,
             None,
             None,
-            false
+            false,
+            QuotaScrapeScope::Full
         ));
         let q = crate::quota::QuotaStore::load(&paths)
             .unwrap()
@@ -8285,7 +8355,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             log,
             None,
             None,
-            false
+            false,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         for key in ["cli:agy", "cli:agy@flash", "cli:agy@pro"] {
@@ -8353,7 +8424,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             log,
             None,
             None,
-            false
+            false,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         let slot = &st.slots[0];
@@ -8436,7 +8508,7 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         assert!(outcome_hit(&paths, "cli:claude", &log_path, &outcome).0);
     }
 
-    /// #174: a slot killed by a signal (or by a wrapper reporting `128 + signo`) whose log
+    /// A slot killed by a signal (or by a wrapper reporting `128 + signo`) whose log
     /// mentions quota, a 429, capacity, even a full rejection line, must not pause the
     /// provider for the whole project nor route the run to quota.
     #[test]
@@ -8471,6 +8543,61 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
                 "signal {signal:?} / exit {exit_code:?} must leave the provider unpaused"
             );
         }
+    }
+
+    /// A hard-ceiling kill hands over the provider's own transcript, which is also
+    /// full of the agent's own prose: bare words there must not pause the provider,
+    /// while a typed or strong signal on the same kill still does.
+    #[test]
+    fn ceiling_kill_pauses_only_on_typed_or_strong_signals() {
+        let killed = SlotOutcome {
+            signal: Some(9),
+            timeout_cause: Some(TimeoutCause::HardCeiling),
+            ..SlotOutcome::err("killed")
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("s1.log");
+        std::fs::write(
+            &log_path,
+            "editing src/quota.rs, test capacity check passed\n",
+        )
+        .unwrap();
+        assert!(!outcome_hit(&paths, "cli:claude", &log_path, &killed).0);
+        let store = crate::quota::QuotaStore::load(&paths).unwrap_or_default();
+        assert!(
+            store.is_usable("cli:claude"),
+            "agent prose on a ceiling kill must leave the provider unpaused"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("s1.log");
+        std::fs::write(&log_path, WEEKLY_LIMIT_LOG).unwrap();
+        assert!(outcome_hit(&paths, "cli:claude", &log_path, &killed).0);
+        let store = crate::quota::QuotaStore::load(&paths).unwrap_or_default();
+        assert!(
+            !store.is_usable("cli:claude"),
+            "a strong line on a ceiling kill still pauses"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SparPaths::new(tmp.path());
+        let log_path = tmp.path().join("s1.log");
+        std::fs::write(&log_path, FIVE_HOUR_REJECTION_LOG).unwrap();
+        let typed = SlotOutcome {
+            signal: Some(9),
+            timeout_cause: Some(TimeoutCause::HardCeiling),
+            quota_rejected: Some(RateLimitWindow::FiveHour),
+            quota_resets_at: Some(chrono::Utc::now() + chrono::Duration::hours(2)),
+            ..SlotOutcome::err("killed")
+        };
+        assert!(outcome_hit(&paths, "cli:claude", &log_path, &typed).0);
+        let store = crate::quota::QuotaStore::load(&paths).unwrap_or_default();
+        assert!(
+            !store.is_usable("cli:claude"),
+            "a typed rejection on a ceiling kill still pauses"
+        );
     }
 
     /// #153 end to end: muse's dispatch-time rejection in the log makes the outcome a
@@ -8529,7 +8656,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
                 FIVE_HOUR_REJECTION_LOG,
                 None,
                 None,
-                true
+                true,
+                QuotaScrapeScope::Full
             ),
             "a recovered stream (quota_recovered, no current rejection) must not route on a \
              rendered rejection line an earlier, already-recovered event left behind"
@@ -8548,7 +8676,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
                 FIVE_HOUR_REJECTION_LOG,
                 None,
                 None,
-                false
+                false,
+                QuotaScrapeScope::Full
             ),
             "the same log, with quota_recovered false (adapter never spoke this dispatch), \
              must still reach the prose fallback"
@@ -8609,7 +8738,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             log,
             None,
             None,
-            false
+            false,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(store.is_usable("cli:claude"));
@@ -8631,7 +8761,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             log,
             None,
             None,
-            false
+            false,
+            QuotaScrapeScope::Full
         ));
     }
 
@@ -8652,7 +8783,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
                 log,
                 None,
                 None,
-                false
+                false,
+                QuotaScrapeScope::Full
             ),
             "the log alone carries no rate-limit signal"
         );
@@ -8715,7 +8847,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             log,
             None,
             None,
-            false
+            false,
+            QuotaScrapeScope::Full
         ));
         let store = crate::quota::QuotaStore::load(&paths).unwrap();
         assert!(!store.is_usable("cli:codex"));
@@ -8738,7 +8871,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             log,
             None,
             None,
-            false
+            false,
+            QuotaScrapeScope::Full
         ));
         let err = crate::quota::ensure_usable(&paths, &["cli:codex@gpt-5.6-terra".to_string()])
             .unwrap_err();
@@ -8766,7 +8900,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
                 log,
                 None,
                 None,
-                false
+                false,
+                QuotaScrapeScope::Full
             ),
             "bare usage telemetry with no rejection must not route to Phase::Quota"
         );
@@ -8804,7 +8939,8 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
                     log,
                     None,
                     None,
-                    false
+                    false,
+                    QuotaScrapeScope::Full
                 ),
                 "FIXTURES[{i}] must not route"
             );
@@ -9741,11 +9877,12 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
     }
 
     /// The api-sdk kept-read stamps its `since` before `run_api_slot` starts,
-    /// the way `execute_prepared` stamps its own. The artifact is already on
-    /// disk when the dispatch begins and the fake server never answers, so the
-    /// ceiling fires ~2s in: a `since` taken after the dispatch lands past the
-    /// write plus the 1s grace and the kept-read misses it, failing a round
-    /// whose work is done. Fails if the stamp moves back below the dispatch.
+    /// the way `execute_prepared` stamps its own. The fake server writes the
+    /// artifact the moment the dispatch reaches it, the way a real agent
+    /// writes mid-dispatch, and never answers, so the ceiling fires ~2s in:
+    /// the write lands after the dispatch start without touching any grace
+    /// window, and the kept-read counts it. Fails if the stamp moves back
+    /// below the dispatch. Credentials ride the call; no test mutates env.
     #[test]
     fn run_api_ceiling_keep_sees_an_artifact_written_before_the_ceiling() {
         use crate::state::RunState;
@@ -9755,7 +9892,6 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
         std::fs::create_dir_all(&cwd).unwrap();
         let artifact = paths.artifact("r1", "summary.md");
         std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
-        std::fs::write(&artifact, "done\n").unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -9764,12 +9900,10 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
                 let Ok(mut stream) = conn else { continue };
                 let mut buf = vec![0u8; 65536];
                 let _ = stream.read(&mut buf);
+                std::fs::write(&artifact, "done\n").unwrap();
                 std::thread::sleep(std::time::Duration::from_secs(5));
             }
         });
-        let _key = crate::util::EnvRestore::set("OPENAI_API_KEY", "test-key");
-        let _url =
-            crate::util::EnvRestore::set("OPENAI_BASE_URL", &format!("http://127.0.0.1:{port}/v1"));
         let mut st = RunState::new("r1", crate::cli::WorkflowKind::Loop, tmp.path().into());
         st.worktrees.push(crate::state::WorktreeRecord {
             slot_id: "impl".into(),
@@ -9802,6 +9936,10 @@ echo '{"type":"session","version":3,"id":"sid-1","timestamp":"t","cwd":"/w"}'"#;
             &prompt,
             "do it",
             std::time::Duration::from_secs(2),
+            crate::api::runtime::ApiCredentialOverride {
+                api_key: Some("test-key".into()),
+                base_url: Some(format!("http://127.0.0.1:{port}/v1")),
+            },
         );
         // The hang itself is what the test measures: the masked call waits out
         // the ceiling instead of failing on an EINTR from the test runner's own
@@ -10338,8 +10476,7 @@ mod round_start_work_tests {
     /// Dirt that predates the round-start snapshot is not the round's work: an
     /// idle ceiling kill over the test-author overlay still fails the round
     /// instead of recording a partial one, while any edit past the snapshot
-    /// counts. Fails on the old any-dirty-tree check, which read the overlay
-    /// as work.
+    /// counts.
     #[test]
     fn round_start_dirt_is_not_round_work() {
         let tmp = tempfile::tempdir().unwrap();
