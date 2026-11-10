@@ -90,6 +90,15 @@ JSON and in `status --json` (both the single-run and the list form). It is a com
 uncommitted work in your tree is not in it — spar warns about that on **stderr**, which is the
 only channel for it, so capture stderr as well as stdout. `implement --run <id>` inherits the
 base; a run cannot be re-based after creation (`--base` with a different commit exits `1`).
+The base does merge forward, though (O195): at each round start (round 2+, after
+leftovers are committed) and before `ship` pushes, spar fetches the base branch from
+its remote and merges it into the implementer branch — `[rounds] merge_base`
+(default `true`) governs both. A clean merge is silent (one event); a conflicted
+round-start merge goes to the round's implementer as the first prompt section, and a
+conflicted pre-ship merge aborts and parks at the ship gate (**exit 2**) with the
+`spar implement --run <id>` remedy. Detached sha bases and bases the remote does not
+know are skipped with an event. Run JSON reports `merged_base`, the last base commit
+merged in; `base_commit` stays the creation cut.
 
 ```bash
 BASE=$(spar run --workflow review -t "$TASK" --providers cli:grok,cli:claude --json | jq -r .base_commit)

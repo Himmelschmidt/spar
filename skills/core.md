@@ -425,8 +425,11 @@ touching `spar.toml`; see "Fleet shaping" below.
 straight into build/review with **no** planner, critic or test-contract, which is the cheap
 middle setting between `--workflow review` and the full `plan → approve → implement` path.
 `loop` builds a change against a fixed base; it is not for chasing a moving one. A run cannot be
-re-based after creation (O26), so "make PR #N mergeable" runs re-merge main every round and do not
-converge. Resolve conflicts by hand, or cap such a run at `--max-rounds 1 --fleet small`.
+re-based after creation (O26), but it merges its base forward every round (O195), so
+"make PR #N mergeable" runs converge unless the base conflicts — then the round's
+implementer resolves it, or the run parks at the ship gate. Pass
+`--max-rounds 1 --fleet small` to bound such a run to a single small round (with
+`[rounds] merge_base = false` to skip the forward merge).
 `spar reconcile <id>` is an arena continuation, not a workflow: it adds a `reconciler` plus
 two more `reviewer` slots on the reconciled tree.
 
@@ -773,6 +776,28 @@ warns on stderr, `--json` included, and records the count as **`base_behind`** i
 JSON and `state.json`. It is absent with `--base` or when the branch has no upstream. The
 default base does not change: pass `--base origin/main` to build on the upstream (O110).
 
+The base is fixed, but it is **merged forward, not frozen** (O195). At each round
+start (round 2 and later, after the previous round's leftovers are committed) and
+again before `ship` pushes (never under `--dry-run`, which previews without
+touching branches), spar fetches the run's base branch from its remote and
+merges it into the implementer branch. `[rounds] merge_base` (default `true`)
+governs both; turning it off keeps a long run on its creation base. A clean merge
+proceeds silently (one event in `events.jsonl`); a conflicted round-start merge is
+left in progress in the worktree and handed to that round's implementer as the first
+section of its prompt, naming the conflicting files, and a round whose tree is still
+mid-merge after the pre-review commit fails instead of going to the panel. A
+conflicted pre-ship merge is aborted and the run parks at the ship-confirm gate
+(**exit 2**) naming the conflict and the remedy (`spar implement --run <id>`, then
+ship again). The park flags the run, so the remedy re-enters even a
+`--workflow loop` run with no plan gate behind it; opening the round clears the
+flag and the park error. Only branch bases with a remote merge forward: a detached sha, a base
+the remote does not know, and a repo with no remote are skipped with an event.
+Run JSON and `status --json` report **`merged_base`**, the last upstream base commit
+merged in; diffs that mean "the run's change relative to now" read it, while
+`base_commit` stays the commit the worktrees were cut from. `SPAR_MERGE_BASE_DRY_RUN=1`
+is a test-only hook: it lets the scenario suite exercise the forward merge inside
+`--dry-run` runs, which otherwise never merge. Operators do not need it.
+
 Assert it before you trust a run — every run reports it:
 
 ```bash
@@ -810,9 +835,18 @@ unpushed branch falls through to the repo default, with a note on stderr. `spar 
 (`PR base:`), on the dry-run path too.
 
 `spar ship` pushes the slot worktree's **HEAD** to `spar/<id>/<slot>`, never the branch by
-name, and **never rewinds the remote branch**. Before pushing it fetches the remote branch;
-if the remote has commits HEAD lacks (someone pushed by hand), ship exits `1` with "remote
-<branch> has commits the run lacks". `spar ship <id> --adopt-remote` fast-forwards the
+name, and **never rewinds the remote branch**. Before pushing it fetches the remote
+branch; if the remote has commits HEAD lacks (someone pushed by hand), ship exits `1`
+with "remote <branch> has commits the run lacks" before touching the worktree, so a
+later `--adopt-remote` still fast-forwards cleanly. Then it merges the run's base
+branch forward (`[rounds] merge_base`, O195): clean or already-current proceeds, a
+skipped base is one event, and a conflict aborts the merge and parks the run at the
+ship-confirm gate (**exit 2**) with the remedy. The merge is skipped (one event)
+when the worktree is not on the run branch — merging there would land the commit
+on the wrong checkout — and a merge the tree refuses to start (a dirty tree over
+the upstream change) is a recorded refusal (exit `1`), not a bare error. The park
+drops the spent ship confirm, so the remedy round's push needs a fresh `--confirm`.
+`spar ship <id> --adopt-remote` fast-forwards the
 worktree onto `origin/<branch>` and ships (O125); it refuses (exit `1`, nothing moved) when the
 worktree has uncommitted changes to tracked files, is not on the run branch, or the remote
 is not a fast-forward of HEAD (the run has commits of its own on top), which is yours to reconcile by hand. The push is leased on the exact tip it fetched, so a push landing in between
@@ -2214,6 +2248,7 @@ enabled = true
 [rounds]
 max = 8
 carry_forward_chars = 4000
+merge_base = true
 # Implementer checkpoints are always kept locally at refs/spar-checkpoint/<id>/<slot>.
 # push = true also publishes them to origin, readable by anyone who can read origin.
 [checkpoint]

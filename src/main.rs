@@ -897,11 +897,13 @@ fn run() -> Result<ExitCode> {
             } else if reason.is_some() {
                 anyhow::bail!("--reason only applies with --override-gate");
             }
-            if confirm || confirm_only {
+            if confirm_only {
                 ship::confirm_ship(&paths, &run_id, json)?;
-                if confirm_only {
-                    return Ok(ExitCode::Success);
-                }
+                return Ok(ExitCode::Success);
+            } else if confirm {
+                // Silent here: the ship below emits the final state once, so
+                // `--json` stays one document.
+                ship::mark_ship_confirmed(&paths, &run_id)?;
             }
             let opts = ship::ShipOpts {
                 base: base.as_deref(),
@@ -2339,6 +2341,7 @@ fn brief_cmd(run_id: &str, full: bool, json: bool) -> Result<ExitCode> {
             "brief": brief_text,
             "base_ref": state.base_ref,
             "base_commit": state.base_commit,
+            "merged_base": state.merged_base,
             "worktrees": state.worktrees,
             "fleet": executor::role_assignments(&state),
             "gates": state.gates,

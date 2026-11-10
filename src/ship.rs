@@ -9,6 +9,19 @@ use std::path::Path;
 use std::process::Command;
 
 pub fn confirm_ship(paths: &SparPaths, run_id: &str, json: bool) -> Result<ExitCode> {
+    let state = mark_ship_confirmed(paths, run_id)?;
+    if json {
+        executor::emit_run_json(&state)?;
+    } else {
+        println!("ship confirmed for {run_id}; run: spar ship {run_id}");
+    }
+    Ok(ExitCode::Success)
+}
+
+/// Record the ship confirm without emitting anything: `--confirm` combined
+/// with a ship in one invocation stays silent and the ship emits the final
+/// state once, so `--json` stays one document.
+pub fn mark_ship_confirmed(paths: &SparPaths, run_id: &str) -> Result<RunState> {
     let mut state = RunState::load(paths, run_id)?;
     if !matches!(
         state.phase,
@@ -28,12 +41,7 @@ pub fn confirm_ship(paths: &SparPaths, run_id: &str, json: bool) -> Result<ExitC
     state.gates.ship_confirmed = true;
     state.set_phase(Phase::AwaitingShipConfirm);
     state.save(paths)?;
-    if json {
-        executor::emit_run_json(&state)?;
-    } else {
-        println!("ship confirmed for {run_id}; run: spar ship {run_id}");
-    }
-    Ok(ExitCode::Success)
+    Ok(state)
 }
 
 /// PR target branch: `--base` wins outright (the operator's call, passed through even if
@@ -612,16 +620,44 @@ pub fn ship(
         return Ok(ExitCode::Success);
     }
     let remote = "origin";
+    if opts.adopt_remote {
+        // Adopting runs before the base merge: merging first would put HEAD on
+        // a merge commit the remote tip is not an ancestor of, and the later
+        // fast-forward would read as diverged (#229).
+        if let Err(e) = adopt_remote_tip(&cwd, remote, &branch) {
+            state.error = Some(format!("ship refused: {e}"));
+            state.save(paths)?;
+            if json {
+                executor::emit_run_json(&state)?;
+            } else {
+                eprintln!("ship refused: {e}");
+            }
+            return Ok(ExitCode::Failure);
+        }
+    } else if let Err(e) = remote_tip(&cwd, remote, &branch, false) {
+        // Fail fast before the base merge: merging first would put HEAD on a
+        // merge commit the remote tip is not an ancestor of, and a later
+        // `--adopt-remote` would read as diverged instead of fast-forwarding.
+        state.error = Some(format!("ship refused: {e}"));
+        state.save(paths)?;
+        if json {
+            executor::emit_run_json(&state)?;
+        } else {
+            eprintln!("ship refused: {e}");
+        }
+        return Ok(ExitCode::Failure);
+    }
+    // The run branch last saw its base when it was cut or merged; pushing a
+    // stale branch lands the PR behind and conflicting, so the base merges
+    // forward here too (#229). A conflict parks the run at the ship gate.
+    if let Some(code) = merge_base_before_push(paths, &mut state, cfg, &cwd, &branch, json)? {
+        return Ok(code);
+    }
     let title = pr_title(state.task.as_deref(), cfg.ship.title_max);
     let body_file = paths.artifact(run_id, "pr-body.md");
 
-    let push_args = match push_args(
-        &cwd,
-        remote,
-        &branch,
-        state.base_commit.as_deref(),
-        opts.adopt_remote,
-    ) {
+    // Adopted above when requested, so the lease here only ever fast-forwards.
+    let push_args = match push_args(&cwd, remote, &branch, state.base_commit.as_deref(), false) {
         Ok(args) => args,
         Err(e) => {
             state.error = Some(format!("ship refused: {e}"));
@@ -791,6 +827,121 @@ pub fn ship(
 /// rather than rewind a remote branch (O10): a lease against the local tracking ref alone
 /// passes after any fetch, which is how a hand-pushed branch got reset. With
 /// `adopt_remote`, a remote tip ahead of HEAD is fast-forwarded into the worktree first.
+/// Merge the run's base branch forward before pushing (#229). Clean (or
+/// already current): record the tip and proceed. A branch base with no remote
+/// is skipped with an event, as is a worktree not on the run branch (the
+/// supported ship-from-elsewhere path ships HEAD as-is; merging here would
+/// land the commit on the wrong checkout). A merge the tree refuses to start
+/// (a dirty tree overlapping the upstream change) is a recorded refusal, not
+/// a bare error. Conflict: abort the merge and park the run at
+/// the ship-confirm gate (exit 2) naming the conflict and the remedy, so
+/// `spar implement --run <id>` can hand the resolution to the next round's
+/// implementer. Returns `Some` exit code when the run parked or refused.
+fn merge_base_before_push(
+    paths: &SparPaths,
+    state: &mut RunState,
+    cfg: &Config,
+    cwd: &Path,
+    branch: &str,
+    json: bool,
+) -> Result<Option<ExitCode>> {
+    if state.dry_run || !cfg.rounds.merge_base {
+        return Ok(None);
+    }
+    let Some(base_ref) = state.base_ref.clone() else {
+        return Ok(None);
+    };
+    if worktree::named_head(cwd).as_deref() != Some(branch) {
+        crate::events::append(
+            paths,
+            &state.id,
+            &crate::events::Event::info(format!(
+                "skipping base forward merge before ship push: worktree is not on {branch}"
+            )),
+        )?;
+        return Ok(None);
+    }
+    let merged = match worktree::merge_base_forward(cwd, Some(&base_ref)) {
+        Ok(merged) => merged,
+        Err(e) => {
+            let msg = format!("ship refused: could not merge base {base_ref} forward: {e:#}");
+            state.error = Some(msg.clone());
+            state.save(paths)?;
+            let _ =
+                crate::events::append(paths, &state.id, &crate::events::Event::info(msg.clone()));
+            if json {
+                executor::emit_run_json(state)?;
+            } else {
+                eprintln!("{msg}");
+            }
+            return Ok(Some(ExitCode::Failure));
+        }
+    };
+    match merged {
+        worktree::BaseMerge::Clean { merged } => {
+            state.merged_base = Some(merged.clone());
+            state.gates.ship_parked = false;
+            state.save(paths)?;
+            crate::events::append(
+                paths,
+                &state.id,
+                &crate::events::Event::info(format!(
+                    "merged base {base_ref} forward ({}) before ship push",
+                    merged.chars().take(8).collect::<String>(),
+                )),
+            )?;
+            Ok(None)
+        }
+        worktree::BaseMerge::AlreadyCurrent { tip } => {
+            state.merged_base = Some(tip);
+            state.gates.ship_parked = false;
+            state.save(paths)?;
+            Ok(None)
+        }
+        worktree::BaseMerge::Skipped(skip) => {
+            crate::events::append(
+                paths,
+                &state.id,
+                &crate::events::Event::info(format!(
+                    "skipping base forward merge before ship push: {skip}"
+                )),
+            )?;
+            Ok(None)
+        }
+        worktree::BaseMerge::Conflict { files, .. } => {
+            worktree::abort_base_merge(cwd);
+            let files = if files.is_empty() {
+                "run `git status` for the list".to_string()
+            } else {
+                files.join(", ")
+            };
+            let msg = format!(
+                "base {base_ref} conflicts with the run branch ({files}); resolve it with \
+                 `spar implement --run {}` then ship again",
+                state.id
+            );
+            state.error = Some(msg.clone());
+            // The confirm the operator gave with `--confirm` was for the
+            // unmerged push; the remedy round ships new commits, so it needs
+            // a fresh human confirm rather than sailing through on this one.
+            state.gates.ship_confirmed = false;
+            state.gates.ship_parked = true;
+            state.save(paths)?;
+            crate::events::append(
+                paths,
+                &state.id,
+                &crate::events::Event::info(format!("ship parked: {msg}")),
+            )?;
+            if json {
+                executor::emit_run_json(state)?;
+            } else {
+                eprintln!("ship parked: {msg}");
+            }
+            Ok(Some(ExitCode::HumanGate))
+        }
+    }
+}
+
 fn push_args(
     cwd: &Path,
     remote: &str,
@@ -862,15 +1013,9 @@ fn check_head_branch(cwd: &Path, branch: &str, base: Option<&str>) -> Result<boo
     Ok(false)
 }
 
-/// The remote's current tip of `branch`, fetched, or `None` when the branch does not
-/// exist there. Errors when that tip is not contained in HEAD, unless `adopt_remote`
-/// and the worktree can fast-forward to it.
-fn remote_tip(
-    cwd: &Path,
-    remote: &str,
-    branch: &str,
-    adopt_remote: bool,
-) -> Result<Option<String>> {
+/// The remote's current tip of `branch`, fetched, or `None` when the branch does
+/// not exist there. Errors when the fetch itself fails.
+fn fetch_remote_tip(cwd: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
     let out = Command::new("git")
         .args([
             "ls-remote",
@@ -902,6 +1047,41 @@ fn remote_tip(
     }
     let Some(tip) = worktree::git_out(cwd, &["rev-parse", "--verify", &tracking]) else {
         bail!("could not resolve {tracking} after fetch");
+    };
+    Ok(Some(tip))
+}
+
+/// `--adopt-remote` before the base merge: move a clean worktree on `branch`
+/// forward to the remote tip when the remote has commits the run lacks. A
+/// diverged or dirty worktree, or one checked out elsewhere, refuses exactly
+/// as the push-time adopt does.
+fn adopt_remote_tip(cwd: &Path, remote: &str, branch: &str) -> Result<()> {
+    let Some(tip) = fetch_remote_tip(cwd, remote, branch)? else {
+        return Ok(());
+    };
+    if git_ok(cwd, &["merge-base", "--is-ancestor", &tip, "HEAD"]) {
+        return Ok(());
+    }
+    if worktree::named_head(cwd).as_deref() != Some(branch) {
+        bail!(
+            "--adopt-remote fast-forwards only {branch}, and worktree {} is not on it; check out {branch} and retry",
+            cwd.display()
+        );
+    }
+    fast_forward(cwd, &tip, &format!("{remote}/{branch}"))
+}
+
+/// The remote's current tip of `branch`, or `None` when the branch does not
+/// exist there. Errors when that tip is not contained in HEAD, unless
+/// `adopt_remote` and the worktree can fast-forward to it.
+fn remote_tip(
+    cwd: &Path,
+    remote: &str,
+    branch: &str,
+    adopt_remote: bool,
+) -> Result<Option<String>> {
+    let Some(tip) = fetch_remote_tip(cwd, remote, branch)? else {
+        return Ok(None);
     };
     if git_ok(cwd, &["merge-base", "--is-ancestor", &tip, "HEAD"]) {
         return Ok(Some(tip));

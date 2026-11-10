@@ -5960,6 +5960,7 @@ pub fn emit_run_json(state: &RunState) -> Result<()> {
         "fleet": run_fleet_seats(state),
         "base_ref": state.base_ref,
         "base_commit": state.base_commit,
+        "merged_base": state.merged_base,
         "base_behind": state.base_behind,
         "config_source_drift": state.config_source_drift,
         "parent_run": state.parent_run,

@@ -55,6 +55,12 @@ pub struct RunState {
     /// Commit `base_ref` resolved to. This is what worktrees actually branch from.
     #[serde(default)]
     pub base_commit: Option<String>,
+    /// Last upstream base commit merged into the run branch (#229). Starts at
+    /// `base_commit` and advances on every clean forward merge; diffs that mean
+    /// "the run's change relative to now" (`base..HEAD` review ranges, added-file
+    /// detection) read this, while `base_commit` stays the creation cut (O26).
+    #[serde(default)]
+    pub merged_base: Option<String>,
     /// Commits the invoking HEAD was behind its upstream tracking branch when the base
     /// was taken from it (no `--base`). `None` when `--base` was given or there is no
     /// upstream to compare against.
@@ -447,6 +453,12 @@ pub struct Gates {
     pub winner_confirmed: Option<String>,
     #[serde(default)]
     pub ship_confirmed: bool,
+    /// A conflicted pre-ship base merge parked the run with the implement
+    /// remedy named (#229). `implement --run` clears it when the remedy
+    /// round opens; a successful pre-ship merge clears it when the park
+    /// lifts without a new round.
+    #[serde(default)]
+    pub ship_parked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1044,6 +1056,7 @@ impl RunState {
             project_root,
             base_ref: None,
             base_commit: None,
+            merged_base: None,
             base_behind: None,
             config_source_drift: false,
             backend: Backend::Auto,
@@ -1546,6 +1559,15 @@ pub fn is_resumable(state: &RunState) -> bool {
         // that workflow does not have.
         || (matches!(state.phase, Phase::Failed | Phase::Stuck)
             && state.workflow == WorkflowKind::Loop)
+        // A conflicted pre-ship base merge parks the run at the ship gate
+        // with the implement remedy named in `error` (#229). That remedy is
+        // `implement --run`, which has to be resumable even when no plan
+        // gate ever ran (`--workflow loop`): without this clause the loop
+        // run the park message addresses gets "not resumable". The flag is
+        // set only by the park and cleared when the remedy round opens (or
+        // by a later successful pre-ship merge), so it cannot walk a
+        // plain awaiting-confirm run past its human gate.
+        || (state.gates.ship_parked && state.phase == Phase::AwaitingShipConfirm)
 }
 
 /// Whether a run wants the operator: a human gate, the `PlanApproved` handoff nothing
@@ -2692,6 +2714,18 @@ mod resumable_tests {
     fn an_approved_plan_run_is_resumable_from_a_terminal_park() {
         let mut st = run(crate::cli::WorkflowKind::Plan, Phase::Failed);
         st.gates.plan_approved = true;
+        assert!(is_resumable(&st));
+    }
+
+    /// #229: a run the ship-conflict park flagged stays resumable through the
+    /// remedy in the park message (`implement --run`), even when no plan gate
+    /// ever ran (`--workflow loop`). Without the flag the same phase is not
+    /// resumable: a plain awaiting-confirm run waits for `ship`, not a round.
+    #[test]
+    fn a_ship_parked_run_is_resumable_through_the_remedy() {
+        let mut st = run(crate::cli::WorkflowKind::Loop, Phase::AwaitingShipConfirm);
+        assert!(!is_resumable(&st));
+        st.gates.ship_parked = true;
         assert!(is_resumable(&st));
     }
 }

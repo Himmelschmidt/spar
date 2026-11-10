@@ -196,6 +196,10 @@ name = "ship_flow"
 path = "tests/scenarios/ship_flow.rs"
 
 [[test]]
+name = "base_forward_merge"
+path = "tests/scenarios/base_forward_merge.rs"
+
+[[test]]
 name = "review_gating"
 path = "tests/scenarios/review_gating.rs"
 
