@@ -62,17 +62,33 @@ exit 0
     }
 }
 
+fn git(args: &[&str], dir: &std::path::Path) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?} failed");
+}
+
 #[test]
 fn credential_refresh_retry_uses_a_fresh_session_id() {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
-    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+    git(&["init", "-q"], &proj);
+    git(&["config", "user.email", "test@example.com"], &proj);
+    git(&["config", "user.name", "Test"], &proj);
     std::fs::write(proj.join("CLAUDE.md"), "# proj\n").unwrap();
     std::fs::write(
         proj.join("spar.toml"),
         "[suite]\nenabled = false\n[rounds]\nmax = 1\n",
     )
     .unwrap();
+    git(&["add", "CLAUDE.md", "spar.toml"], &proj);
+    git(&["commit", "-q", "-m", "init"], &proj);
     let bin = tmp.path().join("bin");
     let state = tmp.path().join("state");
     std::fs::create_dir_all(&bin).unwrap();

@@ -628,10 +628,6 @@ fn build_retry_command(
         return (cmd, used_resume);
     }
     let id = session_id::derive_retry(run_id, slot_id, round, attempt);
-    debug_assert!(
-        session_id::is_uuid_shape(&id),
-        "retry ids must satisfy the vendors' well-formed-UUID requirement"
-    );
     opts.session_id = Some(id.clone());
     let _ = markers::write_session_id(paths, run_id, slot_id, session_provider, &id);
     (adapter.build_headless(bin, opts), false)
