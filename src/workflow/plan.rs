@@ -73,7 +73,8 @@ pub fn run(
     ) {
         state.pool_intent = requested.clone();
     }
-    state.providers = providers::pick_providers(&requested, n_slots, Some(&requested), dry, pool_origin);
+    state.providers =
+        providers::pick_providers(&requested, n_slots, Some(&requested), dry, pool_origin);
     // `state.providers` is positional, but CLI `--role` pins outrank it (O79). A
     // preflight quota gate that checks the pool before seat resolution sees the
     // *pool* entry as paused and parks, even though the seat's own provider (from
@@ -340,9 +341,7 @@ pub fn execute_plan(
             if let Some(slot_state) = slot_state {
                 let cause =
                     crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
-                if cause.engages_backup()
-                    && !slot_state.source.is_some_and(SeatSource::is_backup)
-                {
+                if cause.engages_backup() && !slot_state.source.is_some_and(SeatSource::is_backup) {
                     if let Some(raw) = crate::backup::backup_for_role(job.role, 0, cfg) {
                         if let Some(source) = crate::backup::takeover(
                             &raw,

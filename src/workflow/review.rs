@@ -88,6 +88,20 @@ pub fn run(opts: CommonOpts, paths: &SparPaths, cfg: &Config) -> Result<ExitCode
     for (i, prov) in state.providers.iter().enumerate() {
         let mut provider = prov.clone();
         let mut source = sources.get(i).copied();
+        if let Some((pin_provider, pin_source)) = crate::workflow::roles_resolve::resolve_seat(
+            SlotRole::Reviewer,
+            i,
+            i,
+            &requested,
+            pool_origin,
+            cfg,
+            dry,
+        ) {
+            if pin_source.is_explicit_pin() {
+                provider = pin_provider;
+                source = Some(pin_source);
+            }
+        }
         let mut model = crate::provider_ref::Pin::parse(&provider)
             .ok()
             .and_then(|p| p.model);

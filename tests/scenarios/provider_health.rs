@@ -209,7 +209,7 @@ fn an_implementer_auth_rejection_moves_to_the_declared_backup() {
         .code(4);
     let slot = fx.slot("implementer");
     assert_eq!(slot["provider"], "cli:codex", "{slot}");
-    assert_eq!(slot["source"], "backup");
+    assert_eq!(slot["source"], "cli-backup");
     assert_eq!(fx.count("codex"), 2, "the backup gets its own retry");
     assert!(fx.state()["error"].as_str().unwrap().contains("auth"));
 }
@@ -497,7 +497,7 @@ fn a_quota_paused_backup_is_probed_and_used_when_it_answers() {
         .code(1);
     let slot = fx.slot("implementer");
     assert_eq!(slot["provider"], "cli:codex", "{slot}");
-    assert_eq!(slot["source"], "backup");
+    assert_eq!(slot["source"], "cli-backup");
     assert_eq!(fx.count("codex"), 2, "one probe, one dispatch");
     assert!(
         fx.quota()["providers"].get("cli:codex").is_none()
@@ -591,7 +591,7 @@ fn a_pause_set_mid_run_moves_the_next_reviewer_to_its_backup() {
     let rev = fx.slot("reviewer");
     assert_eq!(rev["id"], "review-0-cli-codex", "{rev}");
     assert_eq!(rev["provider"], "cli:codex");
-    assert_eq!(rev["source"], "backup");
+    assert_eq!(rev["source"], "cli-backup");
     assert_eq!(fx.state()["phase"], "awaiting_ship_confirm");
 }
 
@@ -676,7 +676,7 @@ fn a_reviewer_that_cannot_run_is_retried_on_its_backup_not_counted_as_a_verdict(
     );
     let rev = fx.slot("reviewer");
     assert_eq!(rev["id"], "review-0-cli-grok");
-    assert_eq!(rev["source"], "backup");
+    assert_eq!(rev["source"], "cli-backup");
     assert_eq!(fx.count("codex"), 1);
     assert_eq!(fx.count("grok"), 1);
     let stub = fx
@@ -800,7 +800,7 @@ fn a_tester_log_saying_429_passed_neither_parks_the_run_nor_moves_a_seat() {
     assert_eq!(rev["id"], "review-0-cli-codex", "{rev}");
     assert_eq!(rev["provider"], "cli:codex");
     for slot in state["slots"].as_array().unwrap() {
-        assert_ne!(slot["source"], "backup", "no seat was moved: {slot}");
+        assert_ne!(slot["source"], "cli-backup", "no seat was moved: {slot}");
     }
     let events = fs::read_to_string(
         fx.proj
@@ -1240,7 +1240,7 @@ fn unhealthy_provider_is_skipped_by_auto_select_and_unknown_is_kept() {
 }
 
 #[test]
-fn unhealthy_backup_is_skipped_by_rotation_and_stays_on_the_primary() {
+fn unhealthy_cli_backup_still_dispatches_with_a_warning() {
     let fx = Fixture::new();
     fx.cli(
         "claude",
@@ -1277,22 +1277,102 @@ fn unhealthy_backup_is_skipped_by_rotation_and_stays_on_the_primary() {
         stderr.contains("cli:claude") && stderr.contains("unhealthy"),
         "the pinned primary warns: {stderr}"
     );
-    let run: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(
-        run["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("cli:claude")),
-        "the --json launch output carries the warning: {run}"
+        stderr.contains("cli:codex") && stderr.contains("unhealthy"),
+        "the unhealthy CLI backup warns when it engages: {stderr}"
     );
     let slot = fx.slot("implementer");
+    assert_eq!(slot["provider"], "cli:codex", "{slot}");
+    assert_eq!(slot["source"], "cli-backup", "{slot}");
+    assert!(
+        fx.count("codex") >= 1,
+        "a --backup naming a provider is a pin and still dispatches"
+    );
+    let warnings = fx.state()["warnings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("cli:codex")),
+        "the engaged backup warning is recorded: {warnings:?}"
+    );
+}
+
+#[test]
+fn unhealthy_file_backup_is_skipped_and_the_run_stays_on_the_primary() {
+    let fx = Fixture::new();
+    fx.cli(
+        "claude",
+        &unhealthy_cli(
+            "claude",
+            "auth",
+            &format!("echo '{CLAUDE_REVOKED}'\nexit 1"),
+        ),
+    );
+    fx.cli(
+        "codex",
+        &unhealthy_cli("codex", "login", "echo 'Not logged in' >&2\nexit 1"),
+    );
+    std::fs::write(
+        fx.proj.join("spar.toml"),
+        "[backups]\nimplementer = \"cli:codex\"\n",
+    )
+    .unwrap();
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--providers",
+            "cli:claude",
+            "--without",
+            "suite",
+            "--json",
+        ])
+        .assert()
+        .code(4)
+        .get_output();
+    let slot = fx.slot("implementer");
     assert_eq!(slot["provider"], "cli:claude", "{slot}");
-    assert_ne!(slot["source"], "backup", "rotation skipped codex: {slot}");
+    assert_eq!(slot["source"], "cli-providers", "{slot}");
     assert_eq!(
         fx.count("codex"),
         0,
-        "the unhealthy backup never dispatches"
+        "a [backups] entry is fallback, not a pin: skipped while unhealthy"
+    );
+}
+
+#[test]
+fn unhealthy_first_order_entry_yields_to_the_next_usable_one_at_launch() {
+    let fx = Fixture::new();
+    fx.cli("claude", &unhealthy_cli("claude", "auth", "exit 1"));
+    fx.cli("grok", &counted("grok", "exit 0"));
+    std::fs::write(
+        fx.proj.join("spar.toml"),
+        "[providers]\norder = [\"cli:claude\", \"cli:grok\"]\n[roles]\nplanner = \"cli:grok\"\n",
+    )
+    .unwrap();
+    fx.spar()
+        .args([
+            "implement",
+            "-t",
+            "add a feature",
+            "--without",
+            "suite",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .get_output();
+    let slot = fx.slot("implementer");
+    assert_eq!(slot["provider"], "cli:grok", "{slot}");
+    assert_eq!(slot["source"], "providers-order", "{slot}");
+    assert_eq!(
+        fx.count("claude"),
+        0,
+        "auto-selection never dispatches the unhealthy first entry"
     );
 }
 
@@ -1364,7 +1444,7 @@ fn unknown_backup_rotates_when_the_primary_fails() {
         .failure();
     let slot = fx.slot("implementer");
     assert_eq!(slot["provider"], "cli:grok", "{slot}");
-    assert_eq!(slot["source"], "backup", "{slot}");
+    assert_eq!(slot["source"], "cli-backup", "{slot}");
     assert!(fx.count("grok") >= 1, "an Unknown backup still rotates");
     assert!(
         fx.state().get("warnings").is_none(),

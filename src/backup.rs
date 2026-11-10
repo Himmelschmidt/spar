@@ -153,7 +153,9 @@ fn backup_eligible(
     dry: bool,
     cli: bool,
 ) -> bool {
-    if is_provider_eligible(backup, store, available) && (cli || health_allows(backup, dry)) {
+    if is_provider_eligible(backup, store, if cli { None } else { available })
+        && (cli || health_allows(backup, dry))
+    {
         return true;
     }
     let key = crate::quota::quota_key(backup);
@@ -168,7 +170,8 @@ fn backup_eligible(
         );
     }
     let fresh = QuotaStore::load(paths).unwrap_or_default();
-    is_provider_eligible(backup, &fresh, available) && (cli || health_allows(backup, dry))
+    is_provider_eligible(backup, &fresh, if cli { None } else { available })
+        && (cli || health_allows(backup, dry))
 }
 
 /// Whether `backup` may take `role`'s seat, and the source the winning seat records.
@@ -185,12 +188,10 @@ pub fn takeover(
     dry: bool,
 ) -> Option<crate::state::SeatSource> {
     let cli = cfg.cli_backup_keys.contains(role.as_config_key());
-    backup_eligible(backup, store, available, paths, dry, cli).then(|| {
-        if cli {
-            crate::state::SeatSource::CliBackup
-        } else {
-            crate::state::SeatSource::Backup
-        }
+    backup_eligible(backup, store, available, paths, dry, cli).then_some(if cli {
+        crate::state::SeatSource::CliBackup
+    } else {
+        crate::state::SeatSource::Backup
     })
 }
 
@@ -801,9 +802,7 @@ mod tests {
         let cfg = crate::config::Config::default();
         let role = crate::state::SlotRole::Implementer;
         let mut store = QuotaStore::default();
-        assert!(
-            takeover("cli:codex", role, &cfg, &store, None, &paths, false).is_some()
-        );
+        assert!(takeover("cli:codex", role, &cfg, &store, None, &paths, false).is_some());
 
         store.pause_quota("cli:codex", "possible quota signal: quota");
         assert!(

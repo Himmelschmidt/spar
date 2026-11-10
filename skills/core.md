@@ -82,10 +82,11 @@ login status` (logged out). grok, muse and agy have no local check that fails on
 login, so they report unknown; use `spar provider probe <ref>` for a real call. Limit:
 no local probe sees a token revoked server-side; that surfaces at dispatch as an auth
 fault. An `unhealthy` provider is skipped by auto-selection and backup rotation
-(`unknown` stays eligible). An explicit pin (`--providers` naming it, or a `--role`
-seat) still dispatches, with a launch warning carried on the run as `warnings`
-(stderr and `--json`). A `--backup` naming an unhealthy provider is skipped like any
-rotation candidate: it is a fallback, not a pin, so the run stays on the primary.
+(`unknown` stays eligible). An explicit pin (`--providers` or `--backup` naming
+it, or a `--role` seat) still dispatches, with a launch warning carried on the
+run as `warnings` (stderr and `--json`); a dispatched `--backup` records source
+`cli-backup`. A `[backups]`-file entry stays a fallback and is skipped while
+unhealthy.
 
 **A reviewer that cannot run is not a verdict (O103).** In the implement loop, a
 reviewer dispatch that fails because the provider could not serve it (rate limit, auth
@@ -1585,7 +1586,7 @@ stderr and the purge or sweep goes on.
   "id": "ab12cd34", "task": "first line of the task", "workflow": "loop",
   "dry_run": false, "phase": "done",
   "roles": [{"slot": "review-0-cli-codex", "role": "reviewer", "provider": "cli:codex",
-             "model": null, "source": "backup" | null, "parked_run": false}],
+             "model": null, "source": "backup" | "cli-backup" | null, "parked_run": false}],
   "rounds": 3, "max_rounds": 5,
   "review_rounds": [{"round": 2,
                      "verdicts": [{"slot": "review-0-cli-codex", "verdict": "request_changes",

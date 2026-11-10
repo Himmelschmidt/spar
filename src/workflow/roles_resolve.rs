@@ -210,9 +210,15 @@ pub fn build_implement_seats(
     }
     for r in 0..panel_size(cfg) {
         let pool_index = r + 1;
-        let Some((raw, source)) =
-            resolve_seat(SlotRole::Reviewer, pool_index, r, pool, pool_origin, cfg, dry)
-        else {
+        let Some((raw, source)) = resolve_seat(
+            SlotRole::Reviewer,
+            pool_index,
+            r,
+            pool,
+            pool_origin,
+            cfg,
+            dry,
+        ) else {
             continue;
         };
         let (provider, model) = split_model(&raw, model_for(pool_index));
@@ -281,8 +287,7 @@ pub fn project_implement_fleet(
     run_id: Option<&str>,
 ) -> Vec<FleetSeat> {
     let width = pool_width(cfg);
-    let expanded =
-        crate::providers::pick_providers(pool, width, Some(pool), dry, pool_origin);
+    let expanded = crate::providers::pick_providers(pool, width, Some(pool), dry, pool_origin);
     let pool = if expanded.is_empty() { pool } else { &expanded };
     let art = match (paths, run_id) {
         (Some(paths), Some(run_id)) => crate::model_select::load_select_artifact(paths, run_id)

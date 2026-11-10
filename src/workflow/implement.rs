@@ -1889,8 +1889,7 @@ fn run_with_task(
     // via `run_from_approved`'s frozen-pool reuse, so it has to be recorded here too, not
     // just at the plan phase.
     state.pool_origin = pool_origin;
-    state.providers =
-        providers::pick_providers(&requested, n, Some(&requested), dry, pool_origin);
+    state.providers = providers::pick_providers(&requested, n, Some(&requested), dry, pool_origin);
     // Quota gate is now backup-aware and runs after seat resolution: a paused primary
     // with an eligible backup must not park the run.
     prepare_implement_slots(
@@ -2333,30 +2332,30 @@ pub fn execute_loop(
                                     source,
                                 )?;
                                 // Retry the implementer with backup in the same round
-                            let retry_impl_slot = state
-                                .slots
-                                .iter()
-                                .find(|s| s.id == impl_job.slot_id)
-                                .cloned()
-                                .unwrap();
-                            let retry_job = SlotJob {
-                                slot_id: retry_impl_slot.id.clone(),
-                                provider: retry_impl_slot.provider.clone(),
-                                role: SlotRole::Implementer,
-                                template: "implementer".into(),
-                                extra_vars: extra.clone(),
-                                expected_artifact: Some(format!(
-                                    "summary-{}.md",
-                                    retry_impl_slot.id
-                                )),
-                                model: retry_impl_slot.model.clone(),
-                                effort: None,
-                            };
-                            if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
-                                let quota_hit2 =
-                                    executor::slot_parks_on_quota(state, &retry_job.slot_id);
-                                return fail(state, paths, e2, quota_hit2);
-                            }
+                                let retry_impl_slot = state
+                                    .slots
+                                    .iter()
+                                    .find(|s| s.id == impl_job.slot_id)
+                                    .cloned()
+                                    .unwrap();
+                                let retry_job = SlotJob {
+                                    slot_id: retry_impl_slot.id.clone(),
+                                    provider: retry_impl_slot.provider.clone(),
+                                    role: SlotRole::Implementer,
+                                    template: "implementer".into(),
+                                    extra_vars: extra.clone(),
+                                    expected_artifact: Some(format!(
+                                        "summary-{}.md",
+                                        retry_impl_slot.id
+                                    )),
+                                    model: retry_impl_slot.model.clone(),
+                                    effort: None,
+                                };
+                                if let Err(e2) = executor::run_slot(state, paths, cfg, &retry_job) {
+                                    let quota_hit2 =
+                                        executor::slot_parks_on_quota(state, &retry_job.slot_id);
+                                    return fail(state, paths, e2, quota_hit2);
+                                }
                                 // Retry succeeded, continue to review phase
                             } else {
                                 return fail(state, paths, e, quota_hit);
@@ -2387,9 +2386,7 @@ pub fn execute_loop(
                     .unwrap();
                 let cause =
                     crate::backup::dispatch_stop_cause(&slot_state, &store, available.as_ref());
-                if cause.engages_backup()
-                    && !slot_state.source.is_some_and(SeatSource::is_backup)
-                {
+                if cause.engages_backup() && !slot_state.source.is_some_and(SeatSource::is_backup) {
                     if let Some(backup_raw) =
                         crate::backup::backup_for_role(SlotRole::Implementer, 0, cfg)
                     {
