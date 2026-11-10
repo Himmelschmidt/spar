@@ -339,7 +339,7 @@ fn a_ceiling_killed_implementer_with_new_commits_is_recovered() {
     assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
 }
 
-/// A fake `muse` for the #228 tests. The implementer hangs past the hard ceiling
+/// A fake `muse` for the ceiling-kill tests. The implementer hangs past the hard ceiling
 /// like `install_ceiling_muse`, but leaves its work uncommitted (`dirty`) or leaves
 /// nothing at all. Reviewers approve whatever HEAD they are shown.
 fn install_ceiling_leftover_muse(bin: &Path, dirty: bool) {
@@ -396,7 +396,7 @@ fn run_ceiling_leftover_implement(
     bin: &Path,
     calls_dir: &Path,
     backend: Option<&str>,
-) -> String {
+) -> (String, std::process::ExitStatus) {
     let mut cmd = spar_cmd();
     cmd.current_dir(proj)
         .env(
@@ -424,18 +424,21 @@ fn run_ceiling_leftover_implement(
     let out = cmd.output().unwrap();
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
         if let Some(run_id) = v.get("run_id").and_then(|r| r.as_str()) {
-            return run_id.to_string();
+            return (run_id.to_string(), out.status);
         }
     }
-    std::fs::read_dir(proj.join(".spar/runs"))
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .find(|e| e.path().join("state.json").is_file())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .expect("run created")
+    (
+        std::fs::read_dir(proj.join(".spar/runs"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().join("state.json").is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .expect("run created"),
+        out.status,
+    )
 }
 
-/// #228: a ceiling kill with uncommitted edits commits them as a WIP round and the
+/// A ceiling kill with uncommitted edits commits them as a WIP round and the
 /// run goes to review, not Failed. No recovery turn runs; the panel judges the WIP
 /// commit in the same round.
 #[test]
@@ -453,7 +456,7 @@ fn a_ceiling_kill_with_uncommitted_edits_becomes_a_wip_round() {
     let calls_dir = tmp.path().join("muse-state");
     std::fs::create_dir_all(&calls_dir).unwrap();
 
-    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
+    let (run_id, _status) = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
     assert_eq!(st["round"], 1, "same round goes on to review: {st}");
@@ -519,7 +522,7 @@ fn a_ceiling_kill_with_uncommitted_edits_becomes_a_wip_round() {
     );
 }
 
-/// #228: a ceiling kill with nothing left behind still fails the round.
+/// A ceiling kill with nothing left behind still fails the round.
 #[test]
 fn a_ceiling_kill_with_no_work_still_fails() {
     let tmp = tempdir().unwrap();
@@ -535,7 +538,7 @@ fn a_ceiling_kill_with_no_work_still_fails() {
     let calls_dir = tmp.path().join("muse-state");
     std::fs::create_dir_all(&calls_dir).unwrap();
 
-    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
+    let (run_id, _status) = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "failed", "{st}");
     let calls = std::fs::read_to_string(calls_dir.join("calls")).unwrap();
@@ -552,14 +555,12 @@ fn a_ceiling_kill_with_no_work_still_fails() {
     );
 }
 
-/// #228 follow-up (1): round-start dirt is not round work. A commit-msg hook
-/// refuses every commit, so round 1 dies at the ceiling with an edit that stays
-/// uncommitted (a Refused round whose leftovers remain in the tree); the first
-/// review requests changes and the round-2 implementer hangs with no edits at
-/// all. A dirty tree alone would record a second partial round, but nothing
-/// changed since the round-2 dispatch, so the run must fail there instead.
+/// Dirt no commit will take is not work to review. A commit-msg hook refuses every
+/// commit, so round 1 dies at the ceiling with an edit that stays uncommitted;
+/// the round fails with exit 1 instead of sending a HEAD without the round's
+/// work to review, and no second round runs.
 #[test]
-fn a_second_round_ceiling_kill_over_refused_leftovers_fails_the_run() {
+fn a_ceiling_kill_with_a_refused_wip_commit_fails_the_round() {
     let tmp = tempdir().unwrap();
     let proj = tmp.path().join("proj");
     init_repo(&proj);
@@ -586,10 +587,15 @@ fn a_second_round_ceiling_kill_over_refused_leftovers_fails_the_run() {
     let calls_dir = tmp.path().join("muse-state");
     std::fs::create_dir_all(&calls_dir).unwrap();
 
-    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
+    let (run_id, status) = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a refused partial fails the round with exit 1"
+    );
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "failed", "{st}");
-    assert_eq!(st["round"], 2, "{st}");
+    assert_eq!(st["round"], 1, "the refused round fails the run: {st}");
     let partials = st["ceiling_partial_rounds"]
         .as_array()
         .unwrap_or_else(|| panic!("no partial rounds recorded: {st}"));
@@ -598,23 +604,18 @@ fn a_second_round_ceiling_kill_over_refused_leftovers_fails_the_run() {
     assert_eq!(partials[0]["kind"], "refused", "{st}");
     let calls = std::fs::read_to_string(calls_dir.join("calls")).unwrap();
     assert_eq!(
-        calls.lines().filter(|l| *l == "ceiling").count(),
-        2,
-        "both rounds died at the ceiling: {calls}"
+        calls.lines().collect::<Vec<_>>(),
+        ["ceiling"],
+        "no review and no second round ran: {calls}"
     );
+    let err = st["error"].as_str().expect("a failure reason: {st}");
     assert!(
-        !calls.lines().any(|l| l == "artifact-impl-artifact"),
-        "a refused commit is no commit: without HEAD movement neither kill earns \
-         the artifact-recovery turn: {calls}"
-    );
-    assert_eq!(
-        calls.lines().filter(|l| l.starts_with("review-")).count(),
-        1,
-        "the empty round-2 kill never reached review: {calls}"
+        err.contains("failing the round"),
+        "the failure says what it does instead: {err}"
     );
 }
 
-/// #228 (tmux backend): a ceiling kill terminates the agent's process group
+/// A ceiling kill terminates the agent's process group
 /// before the WIP snapshot, so the round still goes to review on the committed
 /// partial work and nothing is left alive to keep mutating the tree under the
 /// suite and panel.
@@ -633,7 +634,7 @@ fn a_ceiling_kill_on_tmux_kills_the_agent_before_the_wip_snapshot() {
     let calls_dir = tmp.path().join("muse-state");
     std::fs::create_dir_all(&calls_dir).unwrap();
 
-    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, Some("tmux"));
+    let (run_id, _status) = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, Some("tmux"));
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "awaiting_ship_confirm", "{st}");
     let branch = format!("spar/{run_id}/impl");
@@ -659,7 +660,7 @@ fn a_ceiling_kill_on_tmux_kills_the_agent_before_the_wip_snapshot() {
     );
 }
 
-/// A fake `muse` for the #228 follow-ups. The implementer hangs past the hard
+/// A fake `muse` for the ceiling-cut follow-ups. The implementer hangs past the hard
 /// ceiling leaving its edit uncommitted; the first review requests changes, the
 /// rest approve whatever HEAD they are shown.
 fn install_ceiling_requesting_muse(bin: &Path) {
@@ -727,10 +728,10 @@ fn run_requesting_ceiling_implement(proj: &Path, bin: &Path, calls_dir: &Path, m
     .unwrap();
     install_ceiling_requesting_muse(bin);
     std::fs::create_dir_all(calls_dir).unwrap();
-    run_ceiling_leftover_implement(proj, bin, calls_dir, None)
+    run_ceiling_leftover_implement(proj, bin, calls_dir, None).0
 }
 
-/// #228 follow-up: the round after a ceiling-cut WIP round is told the previous
+/// The round after a ceiling-cut WIP round is told the previous
 /// pass never finished. The first review requests changes, so the fix round's
 /// implementer prompt carries the cut-short notice.
 #[test]
@@ -759,7 +760,7 @@ fn ceiling_cut_notice_reaches_the_next_round_implementer() {
     );
 }
 
-/// #228 follow-up: the cut-short notice survives the round-ceiling gate. Past it
+/// The cut-short notice survives the round-ceiling gate. Past it
 /// the operator buys a round and a fresh process re-enters; the rebuilt
 /// `prompt-impl.md` still tells the new round its WIP commit is partial work.
 #[test]
@@ -806,11 +807,11 @@ fn ceiling_cut_notice_survives_the_round_ceiling_gate() {
     );
 }
 
-/// A fake `muse` for the #228 dispatch-HEAD regression test. The first
+/// A fake `muse` for the dispatch-HEAD tests. The first
 /// implementer dispatch leaves an edit uncommitted and hangs past the hard
-/// ceiling, so round 1 becomes a WIP round; every later implementer dispatch
-/// hangs with no edits at all. The first review requests changes, the rest
-/// approve whatever HEAD they are shown.
+/// ceiling; every later implementer dispatch hangs with no edits at all. The
+/// first review requests changes, the rest approve whatever HEAD they are
+/// shown.
 fn install_ceiling_idle_fix_round_muse(bin: &Path) {
     std::fs::create_dir_all(bin).unwrap();
     let p = bin.join("muse");
@@ -866,7 +867,7 @@ exit 0
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// #228 follow-up: work is measured against the dispatch's own start HEAD, not
+/// Work is measured against the dispatch's own start HEAD, not
 /// the run's base commit. Round 1 dies at the ceiling with an edit (WIP round),
 /// the review requests changes, and the round 2 implementer hangs with no edits
 /// at all. The run must fail; measuring against the base commit would see round
@@ -887,7 +888,7 @@ fn a_second_round_ceiling_kill_with_no_new_edits_fails_the_run() {
     let calls_dir = tmp.path().join("muse-state");
     std::fs::create_dir_all(&calls_dir).unwrap();
 
-    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
+    let (run_id, _status) = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "failed", "{st}");
     assert_eq!(st["round"], 2, "{st}");
@@ -982,7 +983,7 @@ exit 0
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// #228 follow-up: a run stopped after a ceiling-cut partial round resumes in
+/// A run stopped after a ceiling-cut partial round resumes in
 /// the same round. The resumed implementer sees the cut-short notice for its
 /// own round, and finishing normally clears the round's mark, so the run
 /// ships the real summary instead of the stale notice.
@@ -1694,7 +1695,7 @@ fn status_names_the_partial_round_after_a_failed_fix_round() {
     let calls_dir = tmp.path().join("muse-state");
     std::fs::create_dir_all(&calls_dir).unwrap();
 
-    let run_id = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
+    let (run_id, _status) = run_ceiling_leftover_implement(&proj, &bin, &calls_dir, None);
     let st = read_state(&proj, &run_id);
     assert_eq!(st["phase"], "failed", "{st}");
 

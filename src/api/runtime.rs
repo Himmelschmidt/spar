@@ -33,6 +33,17 @@ pub struct ApiSlotRequest<'a> {
     pub dry_run: bool,
     /// Override model from env default (model-select).
     pub model_override: Option<String>,
+    pub role: crate::state::SlotRole,
+    pub credentials: ApiCredentialOverride,
+}
+
+/// Key and base URL passed in through the call, so tests never mutate process
+/// env to point a dispatch at a fake server. Production passes the default
+/// (resolve from config and env as before); the override wins when set.
+#[derive(Debug, Clone, Default)]
+pub struct ApiCredentialOverride {
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
 }
 
 /// What one api-sdk dispatch produced. The hard ceiling is reported with the
@@ -94,7 +105,15 @@ pub fn run_api_slot(req: &ApiSlotRequest<'_>) -> Result<ApiSlotOutcome> {
         return Ok(ApiSlotOutcome::done(usage));
     }
 
-    let mut cfg = ApiProviderConfig::resolve(req.provider_name)?;
+    let mut cfg = ApiProviderConfig::resolve_with(
+        req.provider_name,
+        req.credentials.api_key.as_deref(),
+        req.credentials.base_url.as_deref(),
+    )?;
+    // The expected artifact is cleared only once the dispatch actually starts:
+    // a resolve failure above must leave the previous round's file alone, and
+    // the dry-run arm above returns before any clear the same way.
+    crate::executor::clear_expected_artifact(req.role, req.expected_artifact);
     if let Some(m) = &req.model_override {
         if !m.is_empty() {
             cfg.model = m.clone();
@@ -422,13 +441,11 @@ mod tests {
     /// The api-sdk backend reports the typed hard-ceiling cause the same way
     /// the native-cli path does, so the workflow treats both backends
     /// identically. A zero timeout reaches the ceiling arm before any network
-    /// call. The credential comes from the environment like every other
-    /// caller. Fails on the old untyped timeout error, which carried
-    /// `timeout_cause: None` and failed the round empty.
+    /// call. The credential rides the request so the test never touches
+    /// process env.
     #[test]
     fn hard_ceiling_reports_a_typed_cause() {
         let tmp = tempdir().unwrap();
-        let _key = crate::util::EnvRestore::set("OPENAI_API_KEY", "test-key");
         let outcome = run_api_slot(&ApiSlotRequest {
             provider_name: "openai",
             prompt: "hello",
@@ -438,12 +455,112 @@ mod tests {
             timeout: std::time::Duration::ZERO,
             dry_run: false,
             model_override: None,
+            role: crate::state::SlotRole::Implementer,
+            credentials: ApiCredentialOverride {
+                api_key: Some("test-key".into()),
+                base_url: None,
+            },
         })
         .unwrap();
         assert!(!outcome.ok, "a ceiling kill is not a success");
         assert_eq!(
             outcome.timeout_cause,
             Some(crate::executor::TimeoutCause::HardCeiling)
+        );
+    }
+
+    /// The api-sdk dispatch holds the SIGCHLD mask for the whole HTTP call:
+    /// signals directed at the reading thread must not fail it with an EINTR
+    /// read. Removing the mask fails this test.
+    #[test]
+    fn api_slot_survives_sigchld_churn() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::mpsc;
+
+        let _serial = crate::util::sigchld_test::serialize();
+        let _handler = crate::util::sigchld_test::InstalledHandler::install();
+        // Directed signals, not a reaping storm: the kernel delivers a child's
+        // SIGCHLD to the thread that forked it, so the reader wins a lottery
+        // and sometimes observes none of the storm. The killer starts on the
+        // server's go (the request is in, the client blocks on the response)
+        // and the server answers once the signals are out.
+        let tid = unsafe { libc::pthread_self() };
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let killer = std::thread::spawn(move || {
+            go_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the request reaches the loopback");
+            for _ in 0..5 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let rc = unsafe { libc::pthread_kill(tid, libc::SIGCHLD) };
+                assert_eq!(rc, 0, "directing SIGCHLD at the reading thread");
+            }
+            done_tx.send(()).unwrap();
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let len = head
+                .windows(b"Content-Length:".len())
+                .position(|w| w.eq_ignore_ascii_case(b"Content-Length:"))
+                .and_then(|at| {
+                    std::str::from_utf8(&head[at + b"Content-Length:".len()..])
+                        .ok()
+                        .and_then(|rest| {
+                            rest.lines()
+                                .next()
+                                .and_then(|line| line.trim().parse().ok())
+                        })
+                })
+                .unwrap_or(0usize);
+            let mut body = vec![0u8; len];
+            let _ = stream.read_exact(&mut body);
+            // Hold the response until the signals are out on the reader.
+            go_tx.send(()).unwrap();
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the signals go out before the response");
+            let body = r#"{"choices":[{"message":{"content":"FINAL: done"}}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let tmp = tempdir().unwrap();
+        let outcome = run_api_slot(&ApiSlotRequest {
+            provider_name: "openai",
+            prompt: "hello",
+            cwd: tmp.path(),
+            log_path: &tmp.path().join("api.log"),
+            expected_artifact: None,
+            timeout: std::time::Duration::from_secs(30),
+            dry_run: false,
+            model_override: None,
+            role: crate::state::SlotRole::Implementer,
+            credentials: ApiCredentialOverride {
+                api_key: Some("test-key".into()),
+                base_url: Some(format!("http://127.0.0.1:{port}")),
+            },
+        })
+        .expect("masked api slot survives directed SIGCHLD");
+        server.join().unwrap();
+        killer.join().unwrap();
+        assert!(
+            outcome.ok,
+            "the signaled POST is a success: {}",
+            outcome.error.as_deref().unwrap_or("no error")
         );
     }
 

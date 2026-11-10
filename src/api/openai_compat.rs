@@ -13,26 +13,33 @@ pub struct ApiProviderConfig {
 }
 
 impl ApiProviderConfig {
-    /// Credentials and endpoints come from the process environment, the same
-    /// source every caller reads, so there is no per-call injection path.
-    pub fn resolve(name: &str) -> Result<Self> {
+    /// Credentials and endpoints resolve from the process environment unless
+    /// the call carries its own: an explicit key or base URL wins over the env,
+    /// so a test injects credentials through the request, never process env.
+    pub fn resolve_with(name: &str, api_key: Option<&str>, base_url: Option<&str>) -> Result<Self> {
         let key = |env_name: &str| {
-            env::var(env_name)
-                .ok()
+            api_key
+                .map(str::to_string)
+                .or_else(|| env::var(env_name).ok())
                 .context(format!("{env_name} required"))
+        };
+        let base = |env_name: &str, fallback: &str| {
+            base_url
+                .map(str::to_string)
+                .or_else(|| env::var(env_name).ok())
+                .unwrap_or_else(|| fallback.into())
         };
         let name = name.trim().to_ascii_lowercase();
         match name.as_str() {
             "openai" => Ok(Self {
                 name: "openai".into(),
-                base_url: env::var("OPENAI_BASE_URL")
-                    .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
+                base_url: base("OPENAI_BASE_URL", "https://api.openai.com/v1"),
                 api_key: key("OPENAI_API_KEY")?,
                 model: env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
             }),
             "xai" => Ok(Self {
                 name: "xai".into(),
-                base_url: env::var("XAI_BASE_URL").unwrap_or_else(|_| "https://api.x.ai/v1".into()),
+                base_url: base("XAI_BASE_URL", "https://api.x.ai/v1"),
                 api_key: key("XAI_API_KEY")?,
                 model: env::var("XAI_MODEL").unwrap_or_else(|_| "grok-3-mini".into()),
             }),
@@ -40,12 +47,21 @@ impl ApiProviderConfig {
                 // OpenAI-compatible gateways only for v0; native Anthropic later
                 Ok(Self {
                     name: "anthropic".into(),
-                    base_url: env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| {
-                        env::var("OPENAI_BASE_URL")
-                            .unwrap_or_else(|_| "https://api.openai.com/v1".into())
-                    }),
-                    api_key: env::var("ANTHROPIC_API_KEY")
-                        .or_else(|_| env::var("OPENAI_API_KEY"))
+                    base_url: base_url
+                        .map(str::to_string)
+                        .or_else(|| {
+                            env::var("ANTHROPIC_BASE_URL")
+                                .or_else(|_| env::var("OPENAI_BASE_URL"))
+                                .ok()
+                        })
+                        .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+                    api_key: api_key
+                        .map(str::to_string)
+                        .or_else(|| {
+                            env::var("ANTHROPIC_API_KEY")
+                                .or_else(|_| env::var("OPENAI_API_KEY"))
+                                .ok()
+                        })
                         .context("ANTHROPIC_API_KEY or OPENAI_API_KEY required")?,
                     model: env::var("ANTHROPIC_MODEL")
                         .unwrap_or_else(|_| "claude-3-5-sonnet-latest".into()),
@@ -53,8 +69,7 @@ impl ApiProviderConfig {
             }
             "google" | "meta" => Ok(Self {
                 name: name.clone(),
-                base_url: env::var("OPENAI_BASE_URL")
-                    .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
+                base_url: base("OPENAI_BASE_URL", "https://api.openai.com/v1"),
                 api_key: key("OPENAI_API_KEY")?,
                 model: env::var("SPAR_API_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
             }),

@@ -9,23 +9,8 @@ mod common;
 use std::path::Path;
 use tempfile::tempdir;
 
-fn spar_home_dir() -> std::path::PathBuf {
-    use std::sync::OnceLock;
-    static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
-    HOME.get_or_init(|| {
-        let d = std::env::temp_dir().join(format!("spar-test-home-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    })
-    .clone()
-}
-
 fn spar_cmd() -> assert_cmd::Command {
     let mut c = common::spar();
-    c.env("SPAR_HOME", spar_home_dir());
-    c.env_remove("SPAR_PROJECT_ROOT");
-    c.env_remove("SPAR_RUN_ID");
-    c.env_remove("SPAR_AGENT_ID");
     c.env_remove("SPAR_DRY_RUN");
     c
 }

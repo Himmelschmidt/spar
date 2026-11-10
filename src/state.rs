@@ -464,6 +464,21 @@ impl RunState {
             .find(|s| s.role == SlotRole::TestAuthor)
     }
 
+    /// The latest bank at or below `round`: a same-round resume and a later
+    /// round both measure against the carried bank, never just the round's own.
+    /// One function, one rule; both the dispatch freshness gate and the commit
+    /// path read through this.
+    pub fn ceiling_bank_at_or_below(
+        &self,
+        round: u32,
+    ) -> Option<(u32, CeilingPartialKind, Option<String>)> {
+        self.ceiling_partial_rounds
+            .iter()
+            .filter(|e| e.round <= round)
+            .max_by_key(|e| e.round)
+            .map(|e| (e.round, e.kind, e.commit.clone()))
+    }
+
     /// How to name the cut-short rounds in a sentence: "round 1 ... was ... its"
     /// or "rounds 1, 2 ... were ... their". `None` when no round was cut short.
     pub fn partial_round_phrase(&self) -> Option<PartialRoundPhrase> {
@@ -695,6 +710,13 @@ impl SlotState {
         self.quota_hit || self.auth_fault
     }
 
+    /// The ref this seat dispatches as: its stored provider plus its recorded
+    /// model. Quota gates resolve through this so a seat whose model came from
+    /// config or model-select keys identically to the writer's backfilled job.
+    pub fn provider_ref(&self) -> crate::provider_ref::ProviderRef {
+        crate::provider_ref::ProviderRef::for_seat(&self.provider, self.model.as_deref())
+    }
+
     /// Put `provider` (`cli:x` or `cli:x@model`) in this seat, pending its first
     /// dispatch. `provider` stays model-free (it keys the quota bucket and slot naming)
     /// and any `@model` moves to `model`, so the new CLI is never handed the old one's
@@ -705,13 +727,6 @@ impl SlotState {
     /// or usage reports that failure against a provider that never ran. `dispatch_head`
     /// is not an outcome: rotation keeps the round and the worktree, so the round's
     /// start HEAD still measures this round's work and survives the rotation.
-    /// The ref this seat dispatches as: its stored provider plus its recorded
-    /// model. Quota gates resolve through this so a seat whose model came from
-    /// config or model-select keys identically to the writer's backfilled job.
-    pub fn provider_ref(&self) -> crate::provider_ref::ProviderRef {
-        crate::provider_ref::ProviderRef::for_seat(&self.provider, self.model.as_deref())
-    }
-
     pub fn point_at(&mut self, provider: &str) {
         match crate::provider_ref::ProviderRef::parse(provider) {
             Ok(pref) => {
