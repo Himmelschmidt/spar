@@ -4,6 +4,44 @@ All notable changes to spar are recorded here.
 
 ## [Unreleased]
 
+## [0.0.10] - 2026-11-12
+
+### Added
+
+- **One-pass runs for small changes.** `implement --one-pass` uses the small fleet, runs a
+  single round, and ships unless a review finding is serious enough to block. Minor
+  findings ship as follow-ups.
+- **Urgent messages can interrupt a working agent.** `bus send --urgent` stops a
+  mid-turn Claude or Grok agent and resumes the same session with your message first.
+  Other targets get the message at their next turn as before, and the send says so.
+- **Agy agents now receive bus messages**, and `bus log` shows whether each message is
+  queued, delivered or acknowledged.
+- **Runs keep up with their base branch.** Each new round, and every ship, merges the
+  latest base in first. Conflicts go to the implementer at round start, and park the run
+  for you at ship.
+- **Amend a run's fleet without reloading config.** With `--run`, the role, backup,
+  effort, fleet and `--without` flags change the run in place, `--without` can drop a
+  reviewer seat, and `--reload-config` keeps your earlier overrides.
+
+### Changed
+
+- **One seat hitting a rate limit no longer pauses every seat** on Codex, pi and API
+  providers. A paused reviewer moves to its backup or stands down instead of stopping
+  the run.
+- **Unhealthy providers are skipped by auto-selection and backups.** Providers you pin
+  explicitly still run, with a warning.
+- **A stalled implementer is caught early.** A round that changes nothing while a review
+  asks for changes gets one warning retry, then parks for you instead of paying for
+  another review.
+- **Work cut off by the hard time limit is kept** as a partial round and reviewed,
+  instead of failing the run.
+
+### Fixed
+
+- **Retries after a credential refresh no longer fail with "Session ID already in use".**
+- **Codex seats are tracked against the model and route they actually run on**, so
+  pauses and stats land on the right one.
+
 ## [0.0.9] - 2026-11-03
 
 ### Changed
